@@ -42,15 +42,6 @@ under thirty seconds. C++ is the slowest per file because the grammar's nested
 declarators make extraction heavier; Abseil's 875 headers and sources produce
 the second-largest symbol count.
 
-## Small and medium repositories
-
-| Repository | Lang | Files | Deps | Symbols | Call edges | APIs | Findings | Risk | Time | Peak heap |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| python-bottle | Python | 30 | 215 | 1 085 | 3 906 | 75 | 5 | Medium | 0.81 s | 4.4 MB |
-| gorilla/mux | Go | 17 | 75 | 273 | 2 292 | 89 | 0 | Low | 0.51 s | 2.5 MB |
-| dtolnay/anyhow | Rust | 37 | 142 | 332 | 1 089 | 0 | 2 | Medium | 0.58 s | 1.6 MB |
-| jarro2783/cxxopts | C++ | 9 | 331 | 2 750 | 5 003 | 0 | 0 | Medium | 1.2 s | 7.1 MB |
-
 ## AI-assisted ("vibe-coded") repositories
 
 Small projects generated quickly with AI assistance — the workload Ovecc is
