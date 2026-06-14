@@ -1,0 +1,1213 @@
+//! TypeScript/JavaScript language adapter.
+//!
+//! One adapter handles the whole JS/TS family (js, jsx, ts, tsx); the grammar
+//! is chosen from the file's language. A single recursive walk extracts every
+//! fact kind so the AST is traversed once:
+//!
+//! - symbols (functions, classes, methods, interfaces, type aliases, enums,
+//!   module-level constants/variables) with within-file qualified names;
+//! - imports (static / re-export / require / dynamic / type-only) with the
+//!   imported names when available;
+//! - calls (direct, method, constructor) attributed to the enclosing callable;
+//! - APIs (Express/Fastify/Koa-style HTTP routes);
+//! - schema references (raw SQL embedded in string/template literals).
+//!
+//! Extraction never panics: malformed nodes are skipped, and the adapter
+//! reports a [`ParseFailure`] only when the grammar cannot be loaded or the
+//! tree cannot be produced.
+
+use crate::security;
+use ovecc_core::facts::{
+    ApiFact, ApiKind, CallFact, CallKind, FileFacts, ImportFact, ImportFactKind, ParseFailure,
+    SchemaAccess, SchemaObjectKind, SchemaRefFact, SecurityPatternFact, SourceFile, Span,
+    SymbolFact, SymbolKind, Visibility,
+};
+use ovecc_core::lang::SourceLanguage;
+use ovecc_core::traits::LanguageAdapter;
+use tree_sitter::{Node, Parser};
+
+/// Stateless adapter for the JavaScript/TypeScript family.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct TypeScriptAdapter;
+
+impl LanguageAdapter for TypeScriptAdapter {
+    fn language(&self) -> SourceLanguage {
+        SourceLanguage::TypeScript
+    }
+
+    fn detect(&self, file: &SourceFile) -> f32 {
+        if file.language.is_js_family() {
+            1.0
+        } else {
+            0.0
+        }
+    }
+
+    fn extract(&self, file: &SourceFile) -> Result<FileFacts, ParseFailure> {
+        let grammar = grammar_for(file.language).ok_or_else(|| ParseFailure {
+            path: file.path.clone(),
+            message: format!("{} is not a JS/TS language", file.language.as_str()),
+        })?;
+
+        let mut parser = Parser::new();
+        parser
+            .set_language(&grammar)
+            .map_err(|error| ParseFailure {
+                path: file.path.clone(),
+                message: format!("failed to load grammar: {error}"),
+            })?;
+        let tree = parser
+            .parse(file.contents.as_bytes(), None)
+            .ok_or_else(|| ParseFailure {
+                path: file.path.clone(),
+                message: "tree-sitter returned no syntax tree".to_string(),
+            })?;
+
+        let mut extractor = Extractor::new(file.contents.as_bytes());
+        extractor.visit(tree.root_node(), false);
+        Ok(extractor.into_facts())
+    }
+}
+
+fn grammar_for(language: SourceLanguage) -> Option<tree_sitter::Language> {
+    match language {
+        SourceLanguage::JavaScript | SourceLanguage::Jsx => {
+            Some(tree_sitter_javascript::LANGUAGE.into())
+        }
+        SourceLanguage::TypeScript => Some(tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()),
+        SourceLanguage::Tsx => Some(tree_sitter_typescript::LANGUAGE_TSX.into()),
+        _ => None,
+    }
+}
+
+/// HTTP verbs recognized as route definitions on a router/app object.
+const HTTP_VERBS: &[&str] = &[
+    "get", "post", "put", "delete", "patch", "options", "head", "all",
+];
+
+/// One enclosing scope on the qualified-name stack.
+struct Frame {
+    name: String,
+    /// True for functions/methods (call attribution targets), false for
+    /// classes/interfaces (they nest names but do not "call").
+    callable: bool,
+}
+
+struct Extractor<'a> {
+    source: &'a [u8],
+    frames: Vec<Frame>,
+    symbols: Vec<SymbolFact>,
+    imports: Vec<ImportFact>,
+    calls: Vec<CallFact>,
+    apis: Vec<ApiFact>,
+    schema_refs: Vec<SchemaRefFact>,
+    security: Vec<SecurityPatternFact>,
+    suppressed: Vec<u32>,
+    local_types: Vec<(String, String)>,
+}
+
+impl<'a> Extractor<'a> {
+    fn new(source: &'a [u8]) -> Self {
+        Self {
+            source,
+            frames: Vec::new(),
+            symbols: Vec::new(),
+            imports: Vec::new(),
+            calls: Vec::new(),
+            apis: Vec::new(),
+            schema_refs: Vec::new(),
+            security: Vec::new(),
+            suppressed: Vec::new(),
+            local_types: Vec::new(),
+        }
+    }
+
+    fn into_facts(mut self) -> FileFacts {
+        self.imports.sort_by(|a, b| {
+            a.line
+                .cmp(&b.line)
+                .then_with(|| a.specifier.cmp(&b.specifier))
+        });
+        self.symbols.sort_by(|a, b| {
+            a.span
+                .start_line
+                .cmp(&b.span.start_line)
+                .then_with(|| a.qualified_name.cmp(&b.qualified_name))
+        });
+        self.calls.sort_by(|a, b| {
+            a.line
+                .cmp(&b.line)
+                .then_with(|| a.callee_name.cmp(&b.callee_name))
+        });
+        self.apis
+            .sort_by(|a, b| a.line.cmp(&b.line).then_with(|| a.path.cmp(&b.path)));
+        self.schema_refs.sort_by(|a, b| {
+            a.line
+                .cmp(&b.line)
+                .then_with(|| a.object_name.cmp(&b.object_name))
+        });
+        self.security.sort_by(|a, b| {
+            a.line
+                .cmp(&b.line)
+                .then_with(|| (a.kind as u8).cmp(&(b.kind as u8)))
+        });
+        self.security.dedup();
+        self.suppressed.sort_unstable();
+        self.suppressed.dedup();
+        FileFacts {
+            symbols: self.symbols,
+            imports: self.imports,
+            calls: self.calls,
+            apis: self.apis,
+            schema_refs: self.schema_refs,
+            security_patterns: self.security,
+            suppressed_lines: self.suppressed,
+            local_types: self.local_types,
+        }
+    }
+
+    fn text(&self, node: Node<'_>) -> &str {
+        node.utf8_text(self.source).unwrap_or("")
+    }
+
+    fn line(&self, node: Node<'_>) -> u32 {
+        node.start_position().row as u32 + 1
+    }
+
+    fn span(&self, node: Node<'_>) -> Span {
+        Span {
+            start_line: node.start_position().row as u32 + 1,
+            end_line: node.end_position().row as u32 + 1,
+        }
+    }
+
+    /// Qualified name of `name` within the current scope (e.g. `Class.method`).
+    fn qualified(&self, name: &str) -> String {
+        if self.frames.is_empty() {
+            return name.to_string();
+        }
+        let mut parts: Vec<&str> = self
+            .frames
+            .iter()
+            .map(|frame| frame.name.as_str())
+            .collect();
+        parts.push(name);
+        parts.join(".")
+    }
+
+    /// Qualified name of the nearest enclosing callable, for call attribution.
+    fn current_caller(&self) -> Option<String> {
+        let last = self.frames.iter().rposition(|frame| frame.callable)?;
+        let parts: Vec<&str> = self.frames[..=last]
+            .iter()
+            .map(|frame| frame.name.as_str())
+            .collect();
+        Some(parts.join("."))
+    }
+
+    /// True when no enclosing callable scope is open (module or class level).
+    /// Used to keep local variables out of the symbol table.
+    fn at_declaration_level(&self) -> bool {
+        !self.frames.iter().any(|frame| frame.callable)
+    }
+
+    fn visit(&mut self, node: Node<'_>, exported: bool) {
+        match node.kind() {
+            "export_statement" => {
+                // Mark direct declaration children as exported (public).
+                let mut cursor = node.walk();
+                for child in node.children(&mut cursor) {
+                    self.visit(child, true);
+                }
+                return;
+            }
+            "import_statement" => {
+                self.extract_import(node);
+                return;
+            }
+            "function_declaration" | "generator_function_declaration" => {
+                self.extract_function(node, exported);
+                return;
+            }
+            "class_declaration" | "abstract_class_declaration" => {
+                self.extract_class(node, exported);
+                return;
+            }
+            "method_definition" => {
+                self.extract_method(node);
+                return;
+            }
+            "interface_declaration" => {
+                self.record_named_symbol(node, SymbolKind::Interface, exported);
+            }
+            "type_alias_declaration" => {
+                self.record_named_symbol(node, SymbolKind::TypeAlias, exported);
+            }
+            "enum_declaration" => {
+                self.record_named_symbol(node, SymbolKind::Enum, exported);
+            }
+            "lexical_declaration" | "variable_declaration" => {
+                self.extract_variable_declaration(node, exported);
+                return;
+            }
+            "call_expression" => {
+                self.extract_call(node);
+                // fall through to recurse into arguments (nested calls)
+            }
+            "new_expression" => {
+                self.extract_new(node);
+            }
+            "pair" => {
+                self.extract_permissive_cors(node);
+            }
+            "comment" => {
+                self.extract_suppression(node);
+            }
+            "string" | "template_string" => {
+                self.extract_schema_ref(node);
+                self.extract_secret(node);
+            }
+            _ => {}
+        }
+
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            self.visit(child, false);
+        }
+    }
+
+    fn extract_import(&mut self, node: Node<'_>) {
+        let Some(source_node) = node.child_by_field_name("source") else {
+            return;
+        };
+        let Some(specifier) = string_literal_value(self.text(source_node)) else {
+            return;
+        };
+        // `import type ... ` → type-only dependency.
+        let type_only = node
+            .child(1)
+            .map(|child| self.text(child) == "type")
+            .unwrap_or(false);
+        let imported_names = self.collect_imported_names(node);
+        self.imports.push(ImportFact {
+            specifier,
+            line: self.line(node),
+            kind: if type_only {
+                ImportFactKind::TypeOnly
+            } else {
+                ImportFactKind::Static
+            },
+            imported_names,
+        });
+    }
+
+    fn collect_imported_names(&self, node: Node<'_>) -> Vec<String> {
+        let mut names = Vec::new();
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            if child.kind() != "import_clause" {
+                continue;
+            }
+            collect_descendant_names(child, self.source, &mut names);
+        }
+        names.sort();
+        names.dedup();
+        names
+    }
+
+    fn extract_function(&mut self, node: Node<'_>, exported: bool) {
+        let Some(name_node) = node.child_by_field_name("name") else {
+            // anonymous: still recurse for inner facts
+            self.recurse_pushed(node, "<anonymous>", true);
+            return;
+        };
+        let name = self.text(name_node).to_string();
+        self.symbols.push(SymbolFact {
+            qualified_name: self.qualified(&name),
+            name: name.clone(),
+            kind: SymbolKind::Function,
+            span: self.span(node),
+            visibility: Some(if exported {
+                Visibility::Public
+            } else {
+                Visibility::Internal
+            }),
+            type_signature: self.signature(node),
+        });
+        self.recurse_pushed(node, &name, true);
+    }
+
+    fn extract_class(&mut self, node: Node<'_>, exported: bool) {
+        let Some(name_node) = node.child_by_field_name("name") else {
+            return;
+        };
+        let name = self.text(name_node).to_string();
+        self.symbols.push(SymbolFact {
+            qualified_name: self.qualified(&name),
+            name: name.clone(),
+            kind: SymbolKind::Class,
+            span: self.span(node),
+            visibility: Some(if exported {
+                Visibility::Public
+            } else {
+                Visibility::Internal
+            }),
+            type_signature: None,
+        });
+        self.recurse_pushed(node, &name, false);
+    }
+
+    fn extract_method(&mut self, node: Node<'_>) {
+        let Some(name_node) = node.child_by_field_name("name") else {
+            return;
+        };
+        let name = self.text(name_node).to_string();
+        self.symbols.push(SymbolFact {
+            qualified_name: self.qualified(&name),
+            name: name.clone(),
+            kind: SymbolKind::Method,
+            span: self.span(node),
+            visibility: Some(self.method_visibility(node)),
+            type_signature: self.signature(node),
+        });
+        self.recurse_pushed(node, &name, true);
+    }
+
+    fn extract_variable_declaration(&mut self, node: Node<'_>, exported: bool) {
+        let is_const = node
+            .child(0)
+            .map(|child| self.text(child) == "const")
+            .unwrap_or(false);
+
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            if child.kind() != "variable_declarator" {
+                continue;
+            }
+            let Some(name_node) = child.child_by_field_name("name") else {
+                continue;
+            };
+            // Only simple identifiers; destructuring is skipped for now.
+            if name_node.kind() != "identifier" {
+                self.visit_children(child);
+                continue;
+            }
+            let name = self.text(name_node).to_string();
+            let value = child.child_by_field_name("value");
+            self.record_local_type(child, &name, value);
+            let is_function = value
+                .map(|value| {
+                    matches!(
+                        value.kind(),
+                        "arrow_function" | "function_expression" | "function"
+                    )
+                })
+                .unwrap_or(false);
+
+            if is_function {
+                // `const handler = (req) => {...}` is a function symbol.
+                self.symbols.push(SymbolFact {
+                    qualified_name: self.qualified(&name),
+                    name: name.clone(),
+                    kind: SymbolKind::Function,
+                    span: self.span(child),
+                    visibility: Some(if exported {
+                        Visibility::Public
+                    } else {
+                        Visibility::Internal
+                    }),
+                    type_signature: None,
+                });
+                if let Some(value) = value {
+                    self.recurse_pushed(value, &name, true);
+                }
+            } else {
+                // Record module/class-level constants and variables only,
+                // not function-local ones.
+                if self.at_declaration_level() {
+                    self.symbols.push(SymbolFact {
+                        qualified_name: self.qualified(&name),
+                        name: name.clone(),
+                        kind: if is_const {
+                            SymbolKind::Constant
+                        } else {
+                            SymbolKind::Variable
+                        },
+                        span: self.span(child),
+                        visibility: Some(if exported {
+                            Visibility::Public
+                        } else {
+                            Visibility::Internal
+                        }),
+                        type_signature: None,
+                    });
+                }
+                // Recurse the initializer for calls/routes (e.g. `app.get(...)`).
+                self.visit_children(child);
+            }
+        }
+    }
+
+    fn extract_call(&mut self, node: Node<'_>) {
+        let Some(function_node) = node.child_by_field_name("function") else {
+            return;
+        };
+        match function_node.kind() {
+            "identifier" => {
+                let callee = self.text(function_node).to_string();
+                // require()/import() are imports, not architectural calls.
+                match callee.as_str() {
+                    "require" => self.push_call_import(node, ImportFactKind::Require),
+                    "import" => self.push_call_import(node, ImportFactKind::Dynamic),
+                    "eval" => {
+                        let caller = self.current_caller();
+                        self.security
+                            .push(security::eval_fact(self.line(node), "eval", caller));
+                    }
+                    _ => self.calls.push(CallFact {
+                        caller_qualified_name: self.current_caller(),
+                        callee_name: callee,
+                        kind: CallKind::Direct,
+                        line: self.line(node),
+                        receiver: None,
+                    }),
+                }
+            }
+            "member_expression" => {
+                self.extract_member_call(node, function_node);
+            }
+            _ => {}
+        }
+    }
+
+    fn extract_member_call(&mut self, call: Node<'_>, member: Node<'_>) {
+        let property = member
+            .child_by_field_name("property")
+            .map(|property| self.text(property).to_string())
+            .unwrap_or_default();
+        let receiver = member
+            .child_by_field_name("object")
+            .map(|object| self.text(object).to_string());
+
+        // Express/Fastify/Koa-style route: <object>.<verb>("/path", ..., handler)
+        if HTTP_VERBS.contains(&property.as_str())
+            && let Some(api) = self.try_http_route(call, &property)
+        {
+            self.apis.push(api);
+            // A matched route is still recorded as a call for the graph.
+        }
+
+        // Weak hash: createHash("md5") / createHmac("sha1").
+        if matches!(property.as_str(), "createHash" | "createHmac")
+            && let Some(algo) = self
+                .first_string_argument(call)
+                .and_then(|value| security::weak_hash(&value))
+        {
+            self.security
+                .push(security::weak_hash_fact(self.line(call), algo));
+        }
+
+        // OS command execution: `child_process.exec(...)` and friends. The
+        // receiver must denote child_process so `regex.exec` is not flagged.
+        if security::COMMAND_EXEC_METHODS.contains(&property.as_str()) {
+            let object_is_cp = member
+                .child_by_field_name("object")
+                .filter(|object| object.kind() == "identifier")
+                .map(|object| security::COMMAND_EXEC_OBJECTS.contains(&self.text(object)))
+                .unwrap_or(false);
+            if object_is_cp {
+                let caller = self.current_caller();
+                self.security.push(security::command_exec_fact(
+                    self.line(call),
+                    &property,
+                    caller,
+                ));
+            }
+        }
+
+        self.calls.push(CallFact {
+            caller_qualified_name: self.current_caller(),
+            callee_name: property,
+            kind: CallKind::Method,
+            line: self.line(call),
+            receiver,
+        });
+    }
+
+    /// Value of the first string-literal argument of a call, if any.
+    fn first_string_argument(&self, call: Node<'_>) -> Option<String> {
+        let arguments = call.child_by_field_name("arguments")?;
+        let mut cursor = arguments.walk();
+        for child in arguments.children(&mut cursor) {
+            if child.kind() == "string" {
+                return string_literal_value(self.text(child));
+            }
+        }
+        None
+    }
+
+    fn try_http_route(&self, call: Node<'_>, verb: &str) -> Option<ApiFact> {
+        let arguments = call.child_by_field_name("arguments")?;
+        let mut args = Vec::new();
+        let mut cursor = arguments.walk();
+        for child in arguments.children(&mut cursor) {
+            if child.is_named() {
+                args.push(child);
+            }
+        }
+        // A route needs at least a path and a handler.
+        if args.len() < 2 {
+            return None;
+        }
+        let path = string_literal_value(self.text(args[0]))?;
+        if !path.starts_with('/') {
+            return None;
+        }
+        // Handler = last named argument, when it is an identifier reference.
+        let handler_name = args.last().and_then(|last| match last.kind() {
+            "identifier" => Some(self.text(*last).to_string()),
+            _ => None,
+        });
+        Some(ApiFact {
+            kind: ApiKind::HttpRoute,
+            method: Some(verb.to_ascii_uppercase()),
+            path: Some(path),
+            name: None,
+            handler_name,
+            request_type: None,
+            response_type: None,
+            line: self.line(call),
+        })
+    }
+
+    fn extract_new(&mut self, node: Node<'_>) {
+        let Some(constructor) = node.child_by_field_name("constructor") else {
+            return;
+        };
+        let callee_name = match constructor.kind() {
+            "identifier" => self.text(constructor).to_string(),
+            "member_expression" => constructor
+                .child_by_field_name("property")
+                .map(|property| self.text(property).to_string())
+                .unwrap_or_default(),
+            _ => return,
+        };
+        if callee_name.is_empty() {
+            return;
+        }
+        // Dynamic code execution: `new Function("...")`.
+        if callee_name == "Function" {
+            let caller = self.current_caller();
+            self.security
+                .push(security::eval_fact(self.line(node), "new Function", caller));
+        }
+        self.calls.push(CallFact {
+            caller_qualified_name: self.current_caller(),
+            callee_name,
+            kind: CallKind::Constructor,
+            line: self.line(node),
+            receiver: None,
+        });
+    }
+
+    /// Hardcoded-secret detection on a string/template literal: provider
+    /// patterns plus the high-entropy heuristic gated by the binding name.
+    fn extract_secret(&mut self, node: Node<'_>) {
+        let raw = self.text(node);
+        let value = string_literal_value(raw).unwrap_or_else(|| raw.to_string());
+        if let Some(label) = security::provider_secret(&value) {
+            self.security
+                .push(security::secret_fact(self.line(node), label));
+            return;
+        }
+        if let Some(name) = self.binding_name(node)
+            && security::is_secret_name(&name)
+            && security::looks_like_high_entropy_secret(&value)
+        {
+            self.security
+                .push(security::secret_fact(self.line(node), "high-entropy value"));
+        }
+    }
+
+    /// Name a literal is bound to, for the secret heuristic: the property key,
+    /// the declared variable, or the assignment target.
+    fn binding_name(&self, node: Node<'_>) -> Option<String> {
+        let parent = node.parent()?;
+        match parent.kind() {
+            "pair" => parent.child_by_field_name("key").map(|key| {
+                string_literal_value(self.text(key)).unwrap_or_else(|| self.text(key).to_string())
+            }),
+            "variable_declarator" => parent
+                .child_by_field_name("name")
+                .map(|name| self.text(name).to_string()),
+            "assignment_expression" => parent
+                .child_by_field_name("left")
+                .map(|left| self.text(left).to_string()),
+            _ => None,
+        }
+    }
+
+    /// from a `const v: T` annotation or a `const v = new T()`
+    /// initializer. The type name is stripped of any namespace and generics.
+    fn record_local_type(&mut self, declarator: Node<'_>, name: &str, value: Option<Node<'_>>) {
+        if let Some(type_node) = declarator.child_by_field_name("type")
+            && let Some(type_name) = self.annotation_type_name(type_node)
+        {
+            self.local_types.push((name.to_string(), type_name));
+            return;
+        }
+        if let Some(value) = value
+            && value.kind() == "new_expression"
+            && let Some(constructor) = value.child_by_field_name("constructor")
+            && constructor.kind() == "identifier"
+        {
+            self.local_types
+                .push((name.to_string(), self.text(constructor).to_string()));
+        }
+    }
+
+    /// Extracts the base type name from a `: Type` / `: Type<...>` annotation.
+    fn annotation_type_name(&self, type_node: Node<'_>) -> Option<String> {
+        let text = self.text(type_node).trim_start_matches([':', ' ', '\t']);
+        let head: String = text
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '.')
+            .collect();
+        let base = head.rsplit('.').next().unwrap_or(&head);
+        // Ignore primitive/built-in types — only class-like names dispatch.
+        if base.is_empty() || base.chars().next().is_some_and(|c| c.is_lowercase()) {
+            None
+        } else {
+            Some(base.to_string())
+        }
+    }
+
+    /// Records an inline suppression comment:
+    /// `// ovecc-ignore-next-line` suppresses the following line, a bare
+    /// `// ovecc-ignore` suppresses the comment's own line (trailing form).
+    fn extract_suppression(&mut self, node: Node<'_>) {
+        let text = self.text(node);
+        if !text.contains("ovecc-ignore") {
+            return;
+        }
+        let line = self.line(node);
+        if text.contains("ovecc-ignore-next-line") {
+            self.suppressed.push(line + 1);
+        } else {
+            self.suppressed.push(line);
+        }
+    }
+
+    /// Permissive CORS: an object property `origin: "*"`.
+    fn extract_permissive_cors(&mut self, node: Node<'_>) {
+        let Some(key) = node.child_by_field_name("key") else {
+            return;
+        };
+        let key_text =
+            string_literal_value(self.text(key)).unwrap_or_else(|| self.text(key).to_string());
+        if key_text != "origin" {
+            return;
+        }
+        let Some(value) = node.child_by_field_name("value") else {
+            return;
+        };
+        if string_literal_value(self.text(value)).as_deref() == Some("*") {
+            self.security.push(security::cors_fact(self.line(node)));
+        }
+    }
+
+    fn push_call_import(&mut self, call: Node<'_>, kind: ImportFactKind) {
+        let Some(arguments) = call.child_by_field_name("arguments") else {
+            return;
+        };
+        let mut cursor = arguments.walk();
+        for child in arguments.children(&mut cursor) {
+            if child.kind() == "string" {
+                if let Some(specifier) = string_literal_value(self.text(child)) {
+                    self.imports.push(ImportFact {
+                        specifier,
+                        line: self.line(call),
+                        kind,
+                        imported_names: Vec::new(),
+                    });
+                }
+                break;
+            }
+        }
+    }
+
+    fn extract_schema_ref(&mut self, node: Node<'_>) {
+        let raw = self.text(node);
+        let inner = string_literal_value(raw).unwrap_or_else(|| raw.to_string());
+        if let Some((object_name, object_kind, access)) = detect_sql(&inner) {
+            self.schema_refs.push(SchemaRefFact {
+                object_name,
+                object_kind,
+                access,
+                line: self.line(node),
+                caller_qualified_name: self.current_caller(),
+            });
+        }
+    }
+
+    /// Records a declaration that owns a `name` field and recurses its body
+    /// without opening a new scope (interfaces, type aliases, enums).
+    fn record_named_symbol(&mut self, node: Node<'_>, kind: SymbolKind, exported: bool) {
+        if let Some(name_node) = node.child_by_field_name("name") {
+            let name = self.text(name_node).to_string();
+            self.symbols.push(SymbolFact {
+                qualified_name: self.qualified(&name),
+                name,
+                kind,
+                span: self.span(node),
+                visibility: Some(if exported {
+                    Visibility::Public
+                } else {
+                    Visibility::Internal
+                }),
+                type_signature: None,
+            });
+        }
+    }
+
+    fn method_visibility(&self, node: Node<'_>) -> Visibility {
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            if child.kind() == "accessibility_modifier" {
+                return match self.text(child) {
+                    "private" => Visibility::Private,
+                    "protected" => Visibility::Protected,
+                    _ => Visibility::Public,
+                };
+            }
+        }
+        Visibility::Public
+    }
+
+    /// First line of the declaration as a coarse signature (everything up to
+    /// the body `{`), trimmed.
+    fn signature(&self, node: Node<'_>) -> Option<String> {
+        let text = self.text(node);
+        let head = text.split('{').next().unwrap_or(text).trim();
+        if head.is_empty() {
+            None
+        } else {
+            Some(
+                head.replace(['\n', '\r'], " ")
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            )
+        }
+    }
+
+    fn recurse_pushed(&mut self, node: Node<'_>, name: &str, callable: bool) {
+        self.frames.push(Frame {
+            name: name.to_string(),
+            callable,
+        });
+        self.visit_children(node);
+        self.frames.pop();
+    }
+
+    fn visit_children(&mut self, node: Node<'_>) {
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            self.visit(child, false);
+        }
+    }
+}
+
+/// Strips matching surrounding quotes/backticks from a string literal token.
+fn string_literal_value(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    let first = trimmed.chars().next()?;
+    let last = trimmed.chars().last()?;
+    if trimmed.len() >= 2 && matches!(first, '\'' | '"' | '`') && first == last {
+        Some(trimmed[1..trimmed.len() - 1].to_string())
+    } else {
+        None
+    }
+}
+
+/// Collects identifier names under an `import_clause` (default, namespace, and
+/// named specifiers) for symbol-level dependency resolution.
+fn collect_descendant_names(node: Node<'_>, source: &[u8], names: &mut Vec<String>) {
+    match node.kind() {
+        "identifier" => {
+            if let Ok(text) = node.utf8_text(source) {
+                names.push(text.to_string());
+            }
+        }
+        "import_specifier" => {
+            // Prefer the local alias (the `name` field) when present.
+            let target = node
+                .child_by_field_name("alias")
+                .or_else(|| node.child_by_field_name("name"));
+            if let Some(target) = target
+                && let Ok(text) = target.utf8_text(source)
+            {
+                names.push(text.to_string());
+            }
+            return;
+        }
+        _ => {}
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_descendant_names(child, source, names);
+    }
+}
+
+/// Detects raw SQL in a literal and returns the primary object touched, its
+/// kind, and the access mode. Deterministic, dependency-free token scanner;
+/// intentionally conservative to limit false positives (feeds database access facts and the
+/// future taint sinks).
+fn detect_sql(text: &str) -> Option<(String, SchemaObjectKind, SchemaAccess)> {
+    let trimmed = text.trim();
+    // Require a statement-shaped string: a SQL verb followed by whitespace.
+    let upper = trimmed.to_ascii_uppercase();
+    let tokens = sql_tokens(trimmed);
+    if tokens.len() < 2 {
+        return None;
+    }
+
+    if upper.starts_with("SELECT ") {
+        table_after(&tokens, "FROM").map(|t| (t, SchemaObjectKind::Table, SchemaAccess::Read))
+    } else if upper.starts_with("INSERT ") {
+        table_after(&tokens, "INTO").map(|t| (t, SchemaObjectKind::Table, SchemaAccess::Write))
+    } else if upper.starts_with("UPDATE ") {
+        token_at(&tokens, 1).map(|t| (t, SchemaObjectKind::Table, SchemaAccess::Write))
+    } else if upper.starts_with("DELETE ") {
+        table_after(&tokens, "FROM").map(|t| (t, SchemaObjectKind::Table, SchemaAccess::Write))
+    } else if upper.starts_with("CREATE TABLE") {
+        table_after(&tokens, "TABLE").map(|t| (t, SchemaObjectKind::Table, SchemaAccess::Define))
+    } else if upper.starts_with("ALTER TABLE") {
+        table_after(&tokens, "TABLE").map(|t| (t, SchemaObjectKind::Table, SchemaAccess::Define))
+    } else if upper.starts_with("DROP TABLE") {
+        table_after(&tokens, "TABLE").map(|t| (t, SchemaObjectKind::Table, SchemaAccess::Define))
+    } else {
+        None
+    }
+}
+
+/// Splits SQL into bare tokens, breaking on whitespace and punctuation.
+fn sql_tokens(sql: &str) -> Vec<String> {
+    sql.split(|c: char| c.is_whitespace() || matches!(c, '(' | ')' | ',' | ';'))
+        .filter(|token| !token.is_empty())
+        .map(|token| token.to_string())
+        .collect()
+}
+
+/// SQL keywords that may sit between a clause keyword and the table name
+/// (e.g. `CREATE TABLE IF NOT EXISTS users`).
+const SQL_NOISE: &[&str] = &["IF", "NOT", "EXISTS"];
+
+fn table_after(tokens: &[String], keyword: &str) -> Option<String> {
+    let index = tokens
+        .iter()
+        .position(|token| token.eq_ignore_ascii_case(keyword))?;
+    let mut next = index + 1;
+    while let Some(token) = tokens.get(next) {
+        if SQL_NOISE
+            .iter()
+            .any(|noise| token.eq_ignore_ascii_case(noise))
+        {
+            next += 1;
+            continue;
+        }
+        return clean_identifier(token);
+    }
+    None
+}
+
+fn token_at(tokens: &[String], index: usize) -> Option<String> {
+    tokens.get(index).and_then(|token| clean_identifier(token))
+}
+
+/// Strips quoting and a schema prefix from a SQL identifier (`"public"."u"` →
+/// `u`). Returns `None` if nothing identifier-like remains.
+fn clean_identifier(token: &str) -> Option<String> {
+    let last_segment = token.rsplit('.').next().unwrap_or(token);
+    let cleaned: String = last_segment
+        .chars()
+        .filter(|c| c.is_alphanumeric() || *c == '_')
+        .collect();
+    if cleaned.is_empty() {
+        None
+    } else {
+        Some(cleaned)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn extract(source: &str, language: SourceLanguage) -> FileFacts {
+        let file = SourceFile {
+            path: "test.ts".to_string(),
+            absolute_path: PathBuf::from("test.ts"),
+            language,
+            contents: source.to_string(),
+        };
+        TypeScriptAdapter.extract(&file).expect("extraction")
+    }
+
+    #[test]
+    fn extracts_symbols_with_qualified_names_and_visibility() {
+        let facts = extract(
+            r#"
+export class BillingService {
+    private secret: string;
+    public createInvoice(id: string): string {
+        return id;
+    }
+}
+
+function helper(): void {}
+
+export const RATE = 0.2;
+"#,
+            SourceLanguage::TypeScript,
+        );
+
+        let names: Vec<_> = facts
+            .symbols
+            .iter()
+            .map(|s| (s.qualified_name.as_str(), s.kind))
+            .collect();
+        assert!(names.contains(&("BillingService", SymbolKind::Class)));
+        assert!(names.contains(&("BillingService.createInvoice", SymbolKind::Method)));
+        assert!(names.contains(&("helper", SymbolKind::Function)));
+        assert!(names.contains(&("RATE", SymbolKind::Constant)));
+
+        let class = facts
+            .symbols
+            .iter()
+            .find(|s| s.name == "BillingService")
+            .unwrap();
+        assert_eq!(class.visibility, Some(Visibility::Public));
+        let method = facts
+            .symbols
+            .iter()
+            .find(|s| s.name == "createInvoice")
+            .unwrap();
+        assert_eq!(method.visibility, Some(Visibility::Public));
+    }
+
+    #[test]
+    fn does_not_record_function_local_variables() {
+        let facts = extract(
+            r#"
+function run(): void {
+    const local = 1;
+    let other = 2;
+}
+"#,
+            SourceLanguage::TypeScript,
+        );
+        assert!(facts.symbols.iter().all(|s| s.name != "local"));
+        assert!(facts.symbols.iter().all(|s| s.name != "other"));
+    }
+
+    #[test]
+    fn extracts_calls_attributed_to_enclosing_callable() {
+        let facts = extract(
+            r#"
+function outer(): void {
+    helper();
+    obj.method();
+    new Widget();
+}
+"#,
+            SourceLanguage::TypeScript,
+        );
+
+        let helper = facts
+            .calls
+            .iter()
+            .find(|c| c.callee_name == "helper")
+            .unwrap();
+        assert_eq!(helper.kind, CallKind::Direct);
+        assert_eq!(helper.caller_qualified_name.as_deref(), Some("outer"));
+
+        let method = facts
+            .calls
+            .iter()
+            .find(|c| c.callee_name == "method")
+            .unwrap();
+        assert_eq!(method.kind, CallKind::Method);
+
+        let widget = facts
+            .calls
+            .iter()
+            .find(|c| c.callee_name == "Widget")
+            .unwrap();
+        assert_eq!(widget.kind, CallKind::Constructor);
+    }
+
+    #[test]
+    fn extracts_imports_with_names_and_kinds() {
+        let facts = extract(
+            r#"
+import { a, b as c } from "./mod";
+import type { T } from "./types";
+const d = require("./legacy");
+"#,
+            SourceLanguage::TypeScript,
+        );
+
+        let m = facts
+            .imports
+            .iter()
+            .find(|i| i.specifier == "./mod")
+            .unwrap();
+        assert_eq!(m.kind, ImportFactKind::Static);
+        assert!(m.imported_names.contains(&"a".to_string()));
+        assert!(m.imported_names.contains(&"c".to_string()));
+
+        let types = facts
+            .imports
+            .iter()
+            .find(|i| i.specifier == "./types")
+            .unwrap();
+        assert_eq!(types.kind, ImportFactKind::TypeOnly);
+
+        let legacy = facts
+            .imports
+            .iter()
+            .find(|i| i.specifier == "./legacy")
+            .unwrap();
+        assert_eq!(legacy.kind, ImportFactKind::Require);
+    }
+
+    #[test]
+    fn extracts_express_routes() {
+        let facts = extract(
+            r#"
+import express from "express";
+const app = express();
+app.get("/users/:id", getUser);
+app.post("/users", (req, res) => { res.send("ok"); });
+"#,
+            SourceLanguage::Jsx,
+        );
+
+        let get = facts
+            .apis
+            .iter()
+            .find(|a| a.method.as_deref() == Some("GET"))
+            .unwrap();
+        assert_eq!(get.path.as_deref(), Some("/users/:id"));
+        assert_eq!(get.handler_name.as_deref(), Some("getUser"));
+
+        let post = facts
+            .apis
+            .iter()
+            .find(|a| a.method.as_deref() == Some("POST"))
+            .unwrap();
+        assert_eq!(post.path.as_deref(), Some("/users"));
+        assert_eq!(post.handler_name, None); // anonymous handler
+    }
+
+    #[test]
+    fn detects_raw_sql_access() {
+        assert_eq!(
+            detect_sql("SELECT id FROM users WHERE id = 1"),
+            Some((
+                "users".to_string(),
+                SchemaObjectKind::Table,
+                SchemaAccess::Read
+            ))
+        );
+        assert_eq!(
+            detect_sql("insert into orders (id) values (1)"),
+            Some((
+                "orders".to_string(),
+                SchemaObjectKind::Table,
+                SchemaAccess::Write
+            ))
+        );
+        assert_eq!(
+            detect_sql("UPDATE customers SET name = 'x'"),
+            Some((
+                "customers".to_string(),
+                SchemaObjectKind::Table,
+                SchemaAccess::Write
+            ))
+        );
+        assert_eq!(
+            detect_sql("CREATE TABLE IF NOT EXISTS sessions (id TEXT)"),
+            Some((
+                "sessions".to_string(),
+                SchemaObjectKind::Table,
+                SchemaAccess::Define
+            ))
+        );
+        assert_eq!(detect_sql("just a normal sentence"), None);
+    }
+
+    #[test]
+    fn extracts_sql_schema_refs_from_source() {
+        let facts = extract(
+            r#"
+function load(db) {
+    return db.query("SELECT * FROM customers");
+}
+"#,
+            SourceLanguage::JavaScript,
+        );
+        let reference = facts
+            .schema_refs
+            .iter()
+            .find(|r| r.object_name == "customers")
+            .unwrap();
+        assert_eq!(reference.access, SchemaAccess::Read);
+    }
+
+    #[test]
+    fn detects_command_exec_only_for_child_process() {
+        use ovecc_core::facts::SecurityPatternKind;
+        let facts = extract(
+            r#"
+import child_process from "child_process";
+function run(cmd) { child_process.exec(cmd); }
+function scan(re, s) { re.exec(s); }
+"#,
+            SourceLanguage::JavaScript,
+        );
+        let exec_sinks: Vec<_> = facts
+            .security_patterns
+            .iter()
+            .filter(|p| p.kind == SecurityPatternKind::CommandExec)
+            .collect();
+        assert_eq!(
+            exec_sinks.len(),
+            1,
+            "child_process.exec only, not regex.exec"
+        );
+        assert_eq!(exec_sinks[0].caller_qualified_name.as_deref(), Some("run"));
+    }
+
+    #[test]
+    fn detects_inline_suppressions() {
+        let facts = extract(
+            "// ovecc-ignore-next-line\nconst apiKey = \"AKIAIOSFODNN7EXAMPLE\";\neval(x); // ovecc-ignore\n",
+            SourceLanguage::TypeScript,
+        );
+        // next-line comment (line 1) suppresses the secret on line 2.
+        assert!(
+            facts.suppressed_lines.contains(&2),
+            "{:?}",
+            facts.suppressed_lines
+        );
+        // trailing comment suppresses its own line 3 (the eval).
+        assert!(
+            facts.suppressed_lines.contains(&3),
+            "{:?}",
+            facts.suppressed_lines
+        );
+    }
+}

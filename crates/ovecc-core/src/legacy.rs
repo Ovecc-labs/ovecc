@@ -1,3 +1,10 @@
+//! Transitional types carried over from the monolithic MVP.
+//!
+//! These keep the migrated crates iso-functional during the workspace split.
+//! Each of them is scheduled for replacement by the richer `facts`/`report`
+//! models as the roadmap steps land (DB schema step, parser step, graph
+//! step). Do not add new features on top of these types.
+
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -7,6 +14,10 @@ pub enum SourceLanguage {
     Jsx,
     TypeScript,
     Tsx,
+    Python,
+    Rust,
+    Go,
+    Cpp,
 }
 
 impl SourceLanguage {
@@ -16,6 +27,11 @@ impl SourceLanguage {
             "jsx" => Some(Self::Jsx),
             "ts" | "mts" | "cts" => Some(Self::TypeScript),
             "tsx" => Some(Self::Tsx),
+            "py" | "pyi" => Some(Self::Python),
+            "rs" => Some(Self::Rust),
+            "go" => Some(Self::Go),
+            "cpp" | "cc" | "cxx" | "c++" | "hpp" | "hh" | "hxx" | "h++" | "h" | "c" | "cu"
+            | "cuh" => Some(Self::Cpp),
             _ => None,
         }
     }
@@ -26,6 +42,10 @@ impl SourceLanguage {
             Self::Jsx => "jsx",
             Self::TypeScript => "typescript",
             Self::Tsx => "tsx",
+            Self::Python => "python",
+            Self::Rust => "rust",
+            Self::Go => "go",
+            Self::Cpp => "cpp",
         }
     }
 }
@@ -52,6 +72,18 @@ impl ImportKind {
             Self::Export => "re_export",
             Self::Require => "require",
             Self::Dynamic => "dynamic_import",
+        }
+    }
+
+    /// Inverse of [`ImportKind::as_str`], used to reconstruct import facts
+    /// from persisted dependency rows.
+    pub fn from_kind_str(value: &str) -> Option<Self> {
+        match value {
+            "static_import" => Some(Self::Static),
+            "re_export" => Some(Self::Export),
+            "require" => Some(Self::Require),
+            "dynamic_import" => Some(Self::Dynamic),
+            _ => None,
         }
     }
 }
@@ -102,9 +134,32 @@ pub struct IndexReport {
     pub snapshot_id: String,
     pub files_scanned: usize,
     pub files_indexed: usize,
+    /// Files actually parsed this run (parse-cache misses).
+    pub files_parsed: usize,
+    /// Files whose facts were served from the parse cache.
+    pub files_from_cache: usize,
     pub modules: usize,
     pub dependencies: usize,
     pub external_dependencies: usize,
+    /// Code facts persisted this run.
+    pub symbols: usize,
+    pub calls: usize,
+    pub apis: usize,
+    pub tables: usize,
+    /// New Git commits ingested this run.
+    pub commits_ingested: usize,
+    /// Per-file failures that did not abort the run.
+    pub parse_failures: Vec<IndexFailure>,
+    /// Per-phase wall-clock breakdown, surfaced by `--stats`.
+    #[serde(default)]
+    pub timings: crate::report::IndexTimings,
+}
+
+/// A non-fatal per-file indexing failure.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IndexFailure {
+    pub path: String,
+    pub message: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -116,6 +171,7 @@ pub struct SummaryReport {
     pub dependencies: usize,
     pub external_dependencies: usize,
     pub circular_dependencies: usize,
+    pub boundary_violations: usize,
     pub coupling_density: f64,
     pub hotspots: Vec<Hotspot>,
     pub risk_score: RiskLevel,
@@ -127,9 +183,12 @@ pub struct Hotspot {
     pub score: usize,
     pub fan_in: usize,
     pub fan_out: usize,
+    /// Module instability `fan_out / (fan_in + fan_out)`: near 0 =
+    /// stable (depended upon), near 1 = unstable (depends on many).
+    pub instability: f64,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RiskLevel {
     Low,
     Medium,
@@ -148,7 +207,56 @@ impl RiskLevel {
     }
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize, clap::ValueEnum)]
+/// A technical-debt hotspot with the explainable components of its score.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HotspotEntry {
+    pub module: String,
+    /// Weighted score on a 0–100 scale.
+    pub score: f64,
+    /// Raw churn (file-change events touching the module).
+    pub churn: f64,
+    pub fan_in: usize,
+    pub fan_out: usize,
+    pub coupling: usize,
+    /// Fraction of the module's files with low majority ownership.
+    pub ownership_fragmentation: f64,
+    pub violations: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HotspotsReport {
+    pub hotspots: Vec<HotspotEntry>,
+}
+
+/// A learned repository convention with its confidence.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Convention {
+    pub kind: String,
+    /// Human-readable form, e.g. `controller -> service`.
+    pub description: String,
+    /// Ratio of conforming examples to total, in `[0,1]`.
+    pub confidence: f64,
+    pub matching: usize,
+    pub total: usize,
+}
+
+/// A fact that contradicts a high-confidence convention.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Deviation {
+    pub description: String,
+    pub reason: String,
+    /// `"warning"` (confidence 0.70–0.85) or `"violation"` (> 0.85).
+    pub severity: String,
+    pub evidence: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConventionsReport {
+    pub conventions: Vec<Convention>,
+    pub deviations: Vec<Deviation>,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 pub enum ImpactDirection {
     Downstream,
     Upstream,
@@ -199,7 +307,17 @@ pub struct DriftReport {
     pub dependency_delta: isize,
     pub circular_dependency_delta: isize,
     pub coupling_delta_percent: f64,
+    /// Per-metric base→head deltas across the drift metrics.
+    pub metric_deltas: Vec<MetricDelta>,
     pub trend: DriftTrend,
+}
+
+/// One architecture metric compared between two snapshots.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MetricDelta {
+    pub metric: String,
+    pub base: f64,
+    pub head: f64,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -218,5 +336,29 @@ impl DriftTrend {
             Self::Worsening => "worsening",
             Self::Unknown => "unknown",
         }
+    }
+}
+
+/// Pure trend classification on snapshot metric deltas. Lives here (not in
+/// ovecc-graph) so ovecc-db can classify drift without depending on a sibling
+/// crate.
+pub fn drift_trend(
+    module_delta: isize,
+    dependency_delta: isize,
+    cycle_delta: isize,
+    coupling_delta_percent: f64,
+) -> DriftTrend {
+    if module_delta == 0
+        && dependency_delta == 0
+        && cycle_delta == 0
+        && coupling_delta_percent.abs() < 1.0
+    {
+        DriftTrend::Stable
+    } else if cycle_delta > 0 || coupling_delta_percent > 10.0 || dependency_delta > 10 {
+        DriftTrend::Worsening
+    } else if cycle_delta < 0 || coupling_delta_percent < -10.0 || dependency_delta < -10 {
+        DriftTrend::Improving
+    } else {
+        DriftTrend::Stable
     }
 }

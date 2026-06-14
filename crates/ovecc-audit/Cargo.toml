@@ -1,0 +1,14 @@
+[package]
+name = "ovecc-audit"
+description = "Offline dependency vulnerability audit (OSV) for Ovecc."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+ovecc-core = { workspace = true }
+chrono = { workspace = true }
+semver = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }

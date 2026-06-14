@@ -1,71 +1,124 @@
-# Setup Guide: Compiling Ovecc on Windows
+# Setup Guide: Building Ovecc from Source on Windows
 
-Ovecc bundles and compiles DuckDB from source (using `duckdb-sys` with the `bundled` feature) on the first build. Because DuckDB is a C++ library, compilation on Windows requires a working C++ compiler toolchain. 
+Ovecc bundles **DuckDB** and compiles it from source on the first build, so you need a
+working C++ toolchain in addition to Rust. The workspace officially targets the
+**Windows GNU (MinGW-w64)** toolchain: `.cargo/config.toml` is preconfigured for it
+(big-object assembly for DuckDB's unity sources, static linking of the MinGW runtime,
+and the Windows Restart Manager import library). Follow the steps below for a clean
+from-scratch build.
 
-Ovecc officially targets the **Windows GNU toolchain**. Follow the steps below to set up your environment before compiling.
+> **Result:** a self-contained `target/release/ovecc.exe` (~95 MB) that runs on any
+> Windows machine — no MSYS2 on PATH required at runtime.
 
 ---
 
 ## Prerequisites
 
-### 1. Install Rust
-If you haven't already, install Rust via [rustup](https://rustup.rs/).
-Ensure you have Rust version **1.96** or higher:
+- Windows 10/11 (x64)
+- [rustup](https://rustup.rs/) with Rust **1.96+**
+- ~3 GB free disk (toolchains + DuckDB build artifacts)
+
+---
+
+## 1. Rust — GNU toolchain
+
 ```sh
 rustup update
-```
-
-### 2. Configure the GNU Toolchain
-Set your default Rust toolchain to target `x86_64-pc-windows-gnu`:
-```sh
 rustup toolchain install stable-x86_64-pc-windows-gnu
 rustup default stable-x86_64-pc-windows-gnu
 ```
 
-### 3. Install MinGW-w64 via MSYS2
-To compile the C++ source code of DuckDB, you need a C++ compiler (`gcc`/`g++`) and library archiving tools:
+Verify the active host:
 
-1. Download and run the installer from the **[MSYS2 Website](https://www.msys2.org/)**.
-2. Open the **MSYS2 UCRT64** or **MSYS2 MinGW 64-bit** terminal from your Start Menu.
-3. Update the package database and core system packages by running:
-   ```sh
-   pacman -Syu
-   ```
-   *(If prompted, close the terminal and reopen it to complete the update).*
-4. Install the compiler toolchain and development build tools:
-   ```sh
-   pacman -S mingw-w64-x86_64-toolchain base-devel
-   ```
+```sh
+rustc -vV        # expect: host: x86_64-pc-windows-gnu
+```
 
-### 4. Update Windows Environment PATH
-You must add the folder containing the newly installed GCC compiler to your Windows environment `PATH` so Cargo can find it:
+> To switch back to MSVC later: `rustup default stable-x86_64-pc-windows-msvc`.
 
-1. Press `Win + R`, type `sysdm.cpl`, and press **Enter**.
-2. Go to the **Advanced** tab and click **Environment Variables...**.
-3. Under **User variables** (or **System variables**), select `Path` and click **Edit...**.
-4. Click **New** and add the absolute path to the MSYS2 Mingw64 bin directory:
-   * **Default path**: `C:\msys64\mingw64\bin`
-5. Click **OK** to save and close all dialogs.
-6. **Restart your terminal/IDE** to reload the updated path variables.
+## 2. MinGW-w64 (C/C++ compiler) via MSYS2
+
+Install MSYS2:
+
+- **winget:** `winget install --id MSYS2.MSYS2 -e`
+- **or** the installer from <https://www.msys2.org/> (installs to `C:\msys64`).
+
+Then install the compiler. Open **"MSYS2 MINGW64"** from the Start Menu and run:
+
+```sh
+pacman -Syu        # update; if it asks to close the terminal, reopen it and re-run
+pacman -S --needed mingw-w64-x86_64-gcc
+```
+
+This provides `gcc`, `g++`, the assembler (`as`, with `-mbig-obj`), the MinGW runtime,
+and the Windows import libraries — including `librstrtmgr.a`, which DuckDB needs. The
+full `mingw-w64-x86_64-toolchain` group also works but is larger.
+
+> **Mirror timeouts?** If a download stalls (`error: ... Operation too slow ...`), just
+> re-run the `pacman -S` command — it resumes from the package cache.
+
+## 3. Add MinGW to PATH
+
+Add `C:\msys64\mingw64\bin` to your PATH **before** any older MinGW (e.g. a legacy
+`C:\MinGW`), so the correct compiler wins:
+
+- **GUI:** System Properties → Environment Variables → edit `Path` → add
+  `C:\msys64\mingw64\bin` and move it to the top.
+- **PowerShell (user PATH):**
+  ```powershell
+  [Environment]::SetEnvironmentVariable('Path',
+    'C:\msys64\mingw64\bin;' + [Environment]::GetEnvironmentVariable('Path','User'), 'User')
+  ```
+
+**Restart your terminal**, then verify you get a recent MSYS2 build (e.g. 16.x), not an
+old MinGW.org 6.x:
+
+```sh
+gcc --version
+```
+
+## 4. Build & test
+
+```sh
+cargo build --release
+cargo test --workspace
+```
+
+- The **first build takes ~15–20 min** — DuckDB's C++ amalgamation compiles from source.
+  Subsequent builds are incremental and fast.
+- Smoke-test the binary:
+  ```sh
+  ./target/release/ovecc.exe --help
+  ```
+
+The binary is `ovecc` (from `crates/ovecc-cli`).
 
 ---
 
-## Verification and Compilation
+## Notes & troubleshooting
 
-Once the PATH is updated, open a fresh terminal (PowerShell or Command Prompt) and run:
+- **Link error `ld: cannot find -lssp` / `-lwinpthread` / `-lrstrtmgr`?** An older MinGW on
+  your PATH (typically a legacy `C:\MinGW` from MinGW.org) is shadowing the MSYS2 toolchain.
+  The libraries *are* installed — confirm with
+  `x86_64-w64-mingw32-gcc -print-file-name=librstrtmgr.a`, which should print a path under
+  `C:\msys64\mingw64\lib`. Fix: ensure `C:\msys64\mingw64\bin` is first on PATH **and remove
+  the old MinGW entry**, then open a fresh terminal. (This commonly surfaces on `cargo test`,
+  since that links extra test executables that a plain `cargo build` does not.)
+- **Don't edit the `C(XX)FLAGS` in `.cargo/config.toml`** unless necessary — changing them
+  invalidates the `libduckdb-sys` cache and forces a full ~10-min C++ rebuild.
+- The GNU-specific settings in `.cargo/config.toml` (scoped to `x86_64-pc-windows-gnu`)
+  handle DuckDB's oversized objects (`-Wa,-mbig-obj`) and statically link
+  `libstdc++`/`libgcc`/`winpthread` plus the Restart Manager (`-lrstrtmgr`). They do not
+  affect other targets.
+- The resulting `ovecc.exe` is statically linked, so it runs on machines without MSYS2.
 
-1. **Verify Compiler Access**:
-   ```sh
-   g++ --version
-   ```
-   *(This should output details about the GCC/MinGW installation).*
+## Alternative: MSVC (not the supported path)
 
-2. **Compile the Workspace**:
-   ```sh
-   cargo build --release
-   ```
+The workspace is wired for GNU. To build with MSVC you must:
 
-3. **Run the Workspace Tests**:
-   ```sh
-   cargo test --workspace
-   ```
+1. Widen the Restart Manager link in `crates/ovecc-db/build.rs` from
+   `target_env == "gnu"` to `target_os == "windows"` (`libduckdb-sys` does not emit the
+   import library for MSVC).
+2. Use the **VS 2022 (MSVC 14.41)** toolset — **not** VS 2026 / 14.51, which removed
+   `stdext::checked_array_iterator`, a symbol DuckDB's bundled `fmt` still uses. Build
+   from the *"x64 Native Tools Command Prompt for VS 2022"*.

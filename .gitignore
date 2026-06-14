@@ -1,3 +1,14 @@
+# Build output
 /target/
-/.ovecc/
 *.pdb
+
+# Local architecture database and parse cache (regenerated per run)
+.ovecc/
+
+# Scratch logs and ad-hoc command output
+*.log
+export.json
+
+# Local benchmark checkouts — large third-party clones, never committed.
+# Measured results live in BENCHMARKS.md instead.
+/benchmarks/

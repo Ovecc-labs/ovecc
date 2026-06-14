@@ -1,0 +1,590 @@
+//! Architecture facts.
+//!
+//! Two families of types live here:
+//!
+//! - Raw `*Fact` types: what a language adapter extracts from a single file,
+//!   before any cross-file resolution (no stable IDs, no module attribution).
+//! - Normalized `*Record` types: the resolved, persisted form, mirroring the
+//!   database tables one to one.
+//!
+//! The indexer (`ovecc-indexer`) is the only component that converts facts
+//! into records.
+
+use crate::graph::NodeKind;
+use crate::id::{
+    ApiId, CallId, CommitId, DependencyId, FileChangeId, FileId, FindingId, MetricId, MigrationId,
+    ModuleId, OwnershipId, RepositoryId, SchemaObjectId, SnapshotId, SymbolId,
+};
+use crate::lang::SourceLanguage;
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
+
+// ---------------------------------------------------------------------------
+// Shared value types
+// ---------------------------------------------------------------------------
+
+/// Severity grading shared by rules, findings, and risk mapping.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Severity {
+    Low,
+    Medium,
+    High,
+    Critical,
+}
+
+/// Confidence score in `[0.0, 1.0]` attached to inferred facts.
+#[derive(Debug, Clone, Copy, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Confidence(pub f64);
+
+impl Confidence {
+    /// Below this threshold a convention is never reported.
+    pub const REPORT_THRESHOLD: f64 = 0.70;
+    /// Above this threshold a deviation is a violation, not a warning.
+    pub const VIOLATION_THRESHOLD: f64 = 0.85;
+}
+
+/// Traceable evidence: every finding must point back to explicit facts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Evidence {
+    /// Repository-relative, '/'-normalized path.
+    pub file_path: String,
+    pub line: Option<u32>,
+    pub symbol: Option<String>,
+    pub detail: Option<String>,
+}
+
+/// Inclusive line span of a declaration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Span {
+    pub start_line: u32,
+    pub end_line: u32,
+}
+
+/// Typed reference to any graph entity. Used wherever an edge can point at
+/// heterogeneous targets (dependencies, ownership, findings, metrics).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EntityRef {
+    pub kind: NodeKind,
+    pub id: String,
+}
+
+// ---------------------------------------------------------------------------
+// Normalized records (persisted; mirror database tables)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RepositoryRecord {
+    pub id: RepositoryId,
+    pub root_path: String,
+    pub name: String,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FileRecord {
+    pub id: FileId,
+    pub repository_id: RepositoryId,
+    /// Repository-relative, '/'-normalized path.
+    pub path: String,
+    /// `None` for non-source files that are still indexed (configs, SQL, ...).
+    pub language: Option<SourceLanguage>,
+    pub content_hash: String,
+    pub size_bytes: u64,
+    pub module_id: Option<ModuleId>,
+    pub last_indexed_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ModuleRecord {
+    pub id: ModuleId,
+    pub repository_id: RepositoryId,
+    pub name: String,
+    pub path_prefix: Option<String>,
+    pub kind: ModuleKind,
+    pub detected_layer: Option<String>,
+    pub detected_domain: Option<String>,
+    /// Module inference must be explainable: why this module exists and why
+    /// files belong to it.
+    pub inference_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModuleKind {
+    /// Inferred from directory boundaries (`src/billing/**`).
+    PathInferred,
+    /// Declared package (package.json, pyproject, go.mod).
+    Package,
+    /// Workspace member (Cargo workspace, pnpm/yarn workspace).
+    WorkspaceMember,
+    /// Language namespace.
+    Namespace,
+    /// Explicitly configured in `.ovecc/config.toml`.
+    Configured,
+    /// External package (npm, crates.io, ...) — not part of this repository.
+    External,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SymbolRecord {
+    pub id: SymbolId,
+    pub repository_id: RepositoryId,
+    pub file_id: FileId,
+    pub module_id: Option<ModuleId>,
+    pub language: SourceLanguage,
+    pub kind: SymbolKind,
+    pub name: String,
+    pub qualified_name: String,
+    pub span: Option<Span>,
+    pub visibility: Option<Visibility>,
+    pub type_signature: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SymbolKind {
+    Function,
+    Method,
+    Class,
+    Struct,
+    Enum,
+    Interface,
+    Trait,
+    TypeAlias,
+    Constant,
+    Variable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Visibility {
+    Public,
+    Protected,
+    Private,
+    Crate,
+    Internal,
+}
+
+/// A resolved dependency between two entities, at any level: file-to-file,
+/// module-to-module, symbol-to-symbol, package-to-package.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DependencyRecord {
+    pub id: DependencyId,
+    pub repository_id: RepositoryId,
+    pub source: EntityRef,
+    pub target: EntityRef,
+    pub kind: DependencyKind,
+    pub is_external: bool,
+    pub evidence: Option<Evidence>,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DependencyKind {
+    SourceImport,
+    TypeImport,
+    RuntimeImport,
+    Framework,
+    Database,
+    Api,
+    Event,
+    Test,
+}
+
+/// An execution relationship. Unresolved calls keep the callee name and
+/// evidence instead of being discarded.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CallRecord {
+    pub id: CallId,
+    pub repository_id: RepositoryId,
+    pub caller_symbol_id: SymbolId,
+    /// `None` when the callee could not be resolved with confidence.
+    pub callee_symbol_id: Option<SymbolId>,
+    pub callee_name: Option<String>,
+    pub kind: CallKind,
+    pub evidence: Option<Evidence>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CallKind {
+    Direct,
+    Method,
+    Constructor,
+    Handler,
+    Route,
+    Rpc,
+    Event,
+}
+
+/// An exposed route, endpoint, RPC method, event, or CLI command.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ApiRecord {
+    pub id: ApiId,
+    pub repository_id: RepositoryId,
+    pub module_id: Option<ModuleId>,
+    pub kind: ApiKind,
+    pub method: Option<String>,
+    pub path: Option<String>,
+    pub name: Option<String>,
+    pub handler_symbol_id: Option<SymbolId>,
+    pub request_type: Option<String>,
+    pub response_type: Option<String>,
+    pub evidence: Option<Evidence>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApiKind {
+    HttpRoute,
+    GraphqlOperation,
+    RpcMethod,
+    MessageHandler,
+    EventProducer,
+    EventConsumer,
+    CliCommand,
+}
+
+/// A database object: table, view, column, index, foreign key, enum.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SchemaObjectRecord {
+    pub id: SchemaObjectId,
+    pub repository_id: RepositoryId,
+    pub kind: SchemaObjectKind,
+    pub name: String,
+    /// Column -> table, index -> table, etc.
+    pub parent_id: Option<SchemaObjectId>,
+    pub evidence: Option<Evidence>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SchemaObjectKind {
+    Table,
+    View,
+    Column,
+    Index,
+    ForeignKey,
+    Enum,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MigrationRecord {
+    pub id: MigrationId,
+    pub repository_id: RepositoryId,
+    pub path: String,
+    pub migration_name: Option<String>,
+    pub sequence_number: Option<String>,
+    pub created_at: Option<DateTime<Utc>>,
+    pub content_hash: String,
+}
+
+/// Owner attached to a file or module, distinguishing explicit from inferred
+/// ownership.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OwnershipRecord {
+    pub id: OwnershipId,
+    pub repository_id: RepositoryId,
+    pub owner: String,
+    pub target: EntityRef,
+    pub source: OwnershipSource,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OwnershipSource {
+    Codeowners,
+    RepositoryConfig,
+    GitHistory,
+    PathConvention,
+    ServiceMetadata,
+}
+
+impl OwnershipSource {
+    /// Explicit (CODEOWNERS, config) vs inferred (git history, conventions).
+    pub fn is_explicit(self) -> bool {
+        todo!()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CommitRecord {
+    pub id: CommitId,
+    pub repository_id: RepositoryId,
+    pub sha: String,
+    pub parent_shas: Vec<String>,
+    pub author_name: Option<String>,
+    pub author_email: Option<String>,
+    pub committed_at: DateTime<Utc>,
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FileChangeRecord {
+    pub id: FileChangeId,
+    pub repository_id: RepositoryId,
+    pub commit_id: CommitId,
+    pub file_path: String,
+    pub kind: ChangeKind,
+    pub additions: Option<u32>,
+    pub deletions: Option<u32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChangeKind {
+    Added,
+    Modified,
+    Deleted,
+    Renamed,
+    Copied,
+}
+
+/// Point-in-time architecture state.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SnapshotRecord {
+    pub id: SnapshotId,
+    pub repository_id: RepositoryId,
+    pub commit_sha: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub summary_hash: String,
+}
+
+/// A computed architecture measurement attached to a snapshot.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MetricRecord {
+    pub id: MetricId,
+    pub repository_id: RepositoryId,
+    pub snapshot_id: SnapshotId,
+    pub name: String,
+    pub scope: MetricScope,
+    pub target: Option<EntityRef>,
+    pub value: f64,
+    pub unit: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MetricScope {
+    Repository,
+    Module,
+    File,
+    Symbol,
+    Api,
+    Schema,
+}
+
+/// A violation, drift warning, hotspot, or risk report.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FindingRecord {
+    pub id: FindingId,
+    pub repository_id: RepositoryId,
+    pub snapshot_id: Option<SnapshotId>,
+    pub kind: FindingKind,
+    pub severity: Severity,
+    /// Name of the rule that produced the finding, when rule-based.
+    pub rule_name: Option<String>,
+    pub target: Option<EntityRef>,
+    pub title: String,
+    pub description: String,
+    pub evidence: Vec<Evidence>,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FindingKind {
+    CrossDomainDependency,
+    LayerViolation,
+    ForbiddenImport,
+    DirectDatabaseAccess,
+    CircularDependency,
+    OwnershipBoundaryViolation,
+    ConventionDeviation,
+    Hotspot,
+    DriftWarning,
+    // Security findings.
+    HardcodedSecret,
+    InsecurePattern,
+    WeakCrypto,
+    PermissiveCors,
+    VulnerableDependency,
+    TaintedFlow,
+}
+
+// ---------------------------------------------------------------------------
+// Raw extraction facts (language adapter output, pre-resolution)
+// ---------------------------------------------------------------------------
+
+/// In-memory source file handed to language adapters.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SourceFile {
+    /// Repository-relative, '/'-normalized path.
+    pub path: String,
+    pub absolute_path: PathBuf,
+    pub language: SourceLanguage,
+    pub contents: String,
+}
+
+/// Everything one adapter extracted from one file.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct FileFacts {
+    pub symbols: Vec<SymbolFact>,
+    pub imports: Vec<ImportFact>,
+    pub calls: Vec<CallFact>,
+    pub apis: Vec<ApiFact>,
+    pub schema_refs: Vec<SchemaRefFact>,
+    /// Deterministic security patterns detected during the AST pass.
+    #[serde(default)]
+    pub security_patterns: Vec<SecurityPatternFact>,
+    /// 1-based lines suppressed by an inline `// ovecc-ignore` comment — a
+    /// finding whose evidence lands on one is dropped.
+    #[serde(default)]
+    pub suppressed_lines: Vec<u32>,
+    /// `(variable, type)` bindings from `const v = new T()` or `const v: T`,
+    /// for receiver-typed dispatch resolution.
+    #[serde(default)]
+    pub local_types: Vec<(String, String)>,
+}
+
+/// A security-relevant pattern found in source, classified into a finding by
+/// `ovecc-rules`. Detection is deterministic and AST/literal-based;
+/// provider-pattern secret matching uses exact prefixes and charset scanners,
+/// and the high-entropy secret heuristic.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SecurityPatternFact {
+    pub kind: SecurityPatternKind,
+    pub line: u32,
+    /// Human-readable specifics, e.g. the provider name or weak algorithm.
+    pub detail: Option<String>,
+    /// Qualified name of the enclosing symbol, when known — lets the taint
+    /// engine treat dangerous calls (`eval`, `exec`) as sinks.
+    #[serde(default)]
+    pub caller_qualified_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SecurityPatternKind {
+    /// A hardcoded credential (provider-pattern or high-entropy).
+    HardcodedSecret,
+    /// Dynamic code execution: `eval` / `new Function`.
+    DynamicEval,
+    /// OS command execution: `child_process.exec` / `execSync` / `spawn`.
+    CommandExec,
+    /// Obsolete hashing algorithm (MD5, SHA-1).
+    WeakHash,
+    /// Permissive CORS configuration (`origin: "*"`).
+    PermissiveCors,
+}
+
+impl SecurityPatternKind {
+    /// True for kinds that are dangerous *call* sinks for taint analysis
+    /// (untrusted input reaching them is code/command injection).
+    pub fn is_taint_sink(self) -> bool {
+        matches!(self, Self::DynamicEval | Self::CommandExec)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SymbolFact {
+    pub name: String,
+    pub qualified_name: String,
+    pub kind: SymbolKind,
+    pub span: Span,
+    pub visibility: Option<Visibility>,
+    pub type_signature: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImportFact {
+    pub specifier: String,
+    pub line: u32,
+    pub kind: ImportFactKind,
+    /// Imported names when available (enables symbol-level dependencies).
+    pub imported_names: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImportFactKind {
+    Static,
+    ReExport,
+    Require,
+    Dynamic,
+    TypeOnly,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CallFact {
+    /// Qualified name of the enclosing symbol, when known.
+    pub caller_qualified_name: Option<String>,
+    pub callee_name: String,
+    pub kind: CallKind,
+    pub line: u32,
+    /// For a method call `obj.m()`, the receiver expression text (`this`, a
+    /// variable name, ...) — drives receiver-typed dispatch resolution.
+    #[serde(default)]
+    pub receiver: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApiFact {
+    pub kind: ApiKind,
+    pub method: Option<String>,
+    pub path: Option<String>,
+    pub name: Option<String>,
+    pub handler_name: Option<String>,
+    pub request_type: Option<String>,
+    pub response_type: Option<String>,
+    pub line: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SchemaRefFact {
+    pub object_name: String,
+    pub object_kind: SchemaObjectKind,
+    pub access: SchemaAccess,
+    pub line: u32,
+    /// Qualified name of the enclosing symbol, when known — the accessor that
+    /// `reads`/`writes` the object. Becomes a candidate SQL sink.
+    #[serde(default)]
+    pub caller_qualified_name: Option<String>,
+}
+
+/// How code touches a schema object — becomes `reads`/`writes` edges.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SchemaAccess {
+    Read,
+    Write,
+    Define,
+}
+
+/// Per-file parser failure. Must not abort the index run: it is recorded and
+/// surfaced in the summary.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ParseFailure {
+    pub path: String,
+    pub message: String,
+}
+
+/// Batch of resolved records handed from the indexer to the store in one
+/// write transaction.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct FactBatch {
+    pub files: Vec<FileRecord>,
+    pub modules: Vec<ModuleRecord>,
+    pub symbols: Vec<SymbolRecord>,
+    pub dependencies: Vec<DependencyRecord>,
+    pub calls: Vec<CallRecord>,
+    pub apis: Vec<ApiRecord>,
+    pub schema_objects: Vec<SchemaObjectRecord>,
+    pub migrations: Vec<MigrationRecord>,
+    pub ownership: Vec<OwnershipRecord>,
+}
