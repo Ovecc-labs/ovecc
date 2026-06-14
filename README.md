@@ -1,6 +1,6 @@
 <div align="center">
 
-  <img src="docs/img/ovecc_normal_logo.png" alt="Ovecc logo" width="160" />
+  <img src="docs/img/ovecc_white_logo.png" alt="Ovecc logo" width="200" />
 
   <p>
     <b>CLI-first architecture intelligence for modern codebases</b>
