@@ -1,0 +1,14 @@
+[package]
+name = "ovecc-git"
+description = "Native Git history extraction (commits, churn, changed files) via gitoxide for Ovecc."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+gix = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

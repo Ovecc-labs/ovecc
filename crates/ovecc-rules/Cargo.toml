@@ -1,0 +1,12 @@
+[package]
+name = "ovecc-rules"
+description = "Architectural rule evaluation and violation classification for Ovecc."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+ovecc-core = { workspace = true }
+ovecc-graph = { workspace = true }
+chrono = { workspace = true }

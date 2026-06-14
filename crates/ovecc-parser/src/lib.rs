@@ -1,5 +1,23 @@
-use crate::model::{ImportFact, ImportKind, SourceLanguage};
+//! Tree-sitter based fact extraction.
+//!
+//! Two layers coexist during the migration:
+//! - [`extract_imports`]: the MVP import-only helper returning `legacy`
+//!   types, still used by the indexer until step 6b wires the adapter in.
+//! - [`typescript::TypeScriptAdapter`]: the full [`LanguageAdapter`] producing
+//!   rich [`FileFacts`] (symbols, imports, calls, APIs, schema refs).
+//!
+//! [`LanguageAdapter`]: ovecc_core::traits::LanguageAdapter
+//! [`FileFacts`]: ovecc_core::facts::FileFacts
+
+pub mod generic;
+pub mod security;
+pub mod typescript;
+
+pub use generic::GenericAdapter;
+pub use typescript::TypeScriptAdapter;
+
 use anyhow::{Context, Result};
+use ovecc_core::legacy::{ImportFact, ImportKind, SourceLanguage};
 use tree_sitter::{Node, Parser};
 
 pub fn extract_imports(source: &str, language: SourceLanguage) -> Result<Vec<ImportFact>> {
@@ -8,6 +26,9 @@ pub fn extract_imports(source: &str, language: SourceLanguage) -> Result<Vec<Imp
         SourceLanguage::JavaScript | SourceLanguage::Jsx => tree_sitter_javascript::LANGUAGE.into(),
         SourceLanguage::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
         SourceLanguage::Tsx => tree_sitter_typescript::LANGUAGE_TSX.into(),
+        // This MVP import-only helper is JS/TS-only; non-JS languages go through
+        // `GenericAdapter` instead.
+        other => anyhow::bail!("extract_imports does not support {}", other.as_str()),
     };
     parser
         .set_language(&tree_sitter_language)
@@ -108,10 +129,10 @@ fn first_string_child(node: Node<'_>) -> Option<Node<'_>> {
         if child.kind() == "string" {
             return Some(child);
         }
-        if matches!(child.kind(), "_from_clause" | "arguments") {
-            if let Some(found) = first_string_child(child) {
-                return Some(found);
-            }
+        if matches!(child.kind(), "_from_clause" | "arguments")
+            && let Some(found) = first_string_child(child)
+        {
+            return Some(found);
         }
     }
     None

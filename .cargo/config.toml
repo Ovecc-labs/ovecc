@@ -1,0 +1,55 @@
+# Build configuration for the x86_64-pc-windows-gnu toolchain (MinGW).
+#
+# DuckDB's bundled unity sources exceed the default COFF object section limit
+# under MinGW's assembler, so -Wa,-mbig-obj is mandatory. -g0 -O1 keeps the
+# object files small enough and the compile time reasonable. The variables are
+# target-scoped (suffix) so an MSVC build would be unaffected.
+#
+# Keep these in sync: changing C(XX)FLAGS invalidates the libduckdb-sys build
+# cache and triggers a ~10 minute C++ rebuild.
+
+[env]
+CFLAGS_x86_64_pc_windows_gnu = "-Wa,-mbig-obj -g0 -O1"
+CXXFLAGS_x86_64_pc_windows_gnu = "-Wa,-mbig-obj -g0 -O1"
+# Stop the cc crate from emitting its own `-lstdc++`: rustc wraps build-script
+# libs in -Wl,-Bdynamic, which would import libstdc++-6.dll even under
+# -static. We link libstdc++ statically ourselves via rustflags below.
+CXXSTDLIB_x86_64_pc_windows_gnu = ""
+
+# Static-link the MinGW runtime (libstdc++, libgcc, winpthread) so ovecc.exe
+# runs without C:\msys64\mingw64\bin on PATH (§7.1: portable single binaries).
+#
+# Everything here must land AFTER the rlibs (GNU ld resolves archives strictly
+# left-to-right, and the libduckdb-sys rlib needs both libstdc++ and the
+# Restart Manager symbols); `-C link-arg` flags are appended at the end of the
+# link line, in order.
+# rustc links with -nodefaultlibs, so the gcc driver appends no support libs
+# after ours: libstdc++.a's own dependencies must be listed in full.
+# --start-group makes ld re-scan until everything resolves. mingw32 boots the
+# MinGW runtime, moldname provides the POSIX aliases (fdopen, fileno, ...),
+# winpthread provides clock_gettime used by libstdc++ chrono. The trailing
+# -Wl,-Bdynamic restores dynamic mode for the system DLLs: rstrtmgr
+# (RmStartSession used by DuckDB) and kernel32 (FormatMessageA) must resolve
+# against their import libraries after every static archive.
+[target.x86_64-pc-windows-gnu]
+rustflags = [
+    "-C", "link-arg=-static",
+    "-C", "link-arg=-Wl,-Bstatic",
+    "-C", "link-arg=-Wl,--start-group",
+    "-C", "link-arg=-lstdc++",
+    "-C", "link-arg=-lmingw32",
+    "-C", "link-arg=-lmoldname",
+    "-C", "link-arg=-lmingwex",
+    "-C", "link-arg=-lmsvcrt",
+    "-C", "link-arg=-lgcc",
+    "-C", "link-arg=-lgcc_eh",
+    "-C", "link-arg=-lssp",
+    "-C", "link-arg=-lwinpthread",
+    "-C", "link-arg=-Wl,--end-group",
+    "-C", "link-arg=-Wl,-Bdynamic",
+    "-C", "link-arg=-lrstrtmgr",
+    "-C", "link-arg=-lkernel32",
+    "-C", "link-arg=-luser32",
+    "-C", "link-arg=-ladvapi32",
+    "-C", "link-arg=-lshell32",
+]

@@ -1,0 +1,155 @@
+//! End-to-end pipeline tests: index a committed fixture
+//! through the real crates and assert deterministic, persisted facts. These
+//! exercise the full chain — walk, parse, resolve, persist — for both the
+//! TypeScript family and the Python/Go/Rust/C++ generic adapters, and pin the
+//! incremental parse-cache behaviour.
+
+use ovecc_core::config::{OveccConfig, ProjectPaths};
+use ovecc_db::ArchitectureStore;
+use ovecc_indexer::index_repository;
+use std::fs;
+use std::path::Path;
+
+/// Copies a committed fixture into a fresh temp dir so the `.ovecc` database
+/// and parse cache never touch the source tree.
+fn staged_fixture(name: &str) -> tempfile::TempDir {
+    let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("tests")
+        .join("fixtures")
+        .join(name);
+    let temp = tempfile::tempdir().expect("temp dir");
+    copy_dir(&source, temp.path());
+    temp
+}
+
+/// Opens the persisted store, retrying briefly. `index_repository` writes the
+/// DuckDB file in this same process and, on Windows, the file handle can lag a
+/// few milliseconds behind the writer being dropped; the real CLI never hits
+/// this (each command is a fresh process).
+fn open_store(db_path: &Path) -> ArchitectureStore {
+    for attempt in 0..20 {
+        match ArchitectureStore::open(db_path) {
+            Ok(store) => return store,
+            Err(_) if attempt < 19 => {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            Err(error) => panic!("failed to reopen store: {error:#}"),
+        }
+    }
+    unreachable!()
+}
+
+fn copy_dir(source: &Path, destination: &Path) {
+    fs::create_dir_all(destination).expect("create dir");
+    for entry in fs::read_dir(source).expect("read fixture dir") {
+        let entry = entry.expect("dir entry");
+        let target = destination.join(entry.file_name());
+        if entry.file_type().expect("file type").is_dir() {
+            copy_dir(&entry.path(), &target);
+        } else {
+            fs::copy(entry.path(), &target).expect("copy file");
+        }
+    }
+}
+
+#[test]
+fn typescript_service_indexes_and_resolves_internally() {
+    let staged = staged_fixture("small-service");
+    let paths = ProjectPaths::resolve(staged.path()).unwrap();
+    let config = OveccConfig::default();
+
+    let report = index_repository(&paths, &config, true).unwrap();
+    assert_eq!(report.files_indexed, 5, "{report:?}");
+    assert!(report.parse_failures.is_empty(), "{report:?}");
+    assert!(report.symbols >= 5, "expected symbols, got {report:?}");
+    // The relative imports resolve to files; only `express` stays external.
+    assert!(report.external_dependencies >= 1, "{report:?}");
+    assert!(
+        report.dependencies > report.external_dependencies,
+        "internal deps must resolve: {report:?}"
+    );
+
+    let repository_id = paths.repository_id().0;
+    let store = open_store(&paths.db_path);
+    let dependencies = store.current_dependencies(&repository_id).unwrap();
+    let internal = dependencies.iter().filter(|d| !d.is_external).count();
+    assert!(internal >= 5, "expected >=5 internal deps, got {internal}");
+    assert!(
+        dependencies
+            .iter()
+            .any(|d| !d.is_external && d.target_module == "user"),
+        "billing/user should resolve to an internal dependency"
+    );
+    // Release the single-writer connection before re-indexing (DuckDB allows
+    // one connection per file per process).
+    drop(store);
+
+    // Determinism + parse cache: an unchanged re-run reads everything from
+    // cache and yields identical counts.
+    let again = index_repository(&paths, &config, true).unwrap();
+    assert_eq!(again.files_from_cache, 5, "{again:?}");
+    assert_eq!(again.files_parsed, 0, "{again:?}");
+    assert_eq!(again.symbols, report.symbols);
+    assert_eq!(again.dependencies, report.dependencies);
+}
+
+#[test]
+fn polyglot_repository_indexes_every_language() {
+    let staged = staged_fixture("polyglot");
+    let paths = ProjectPaths::resolve(staged.path()).unwrap();
+    let config = OveccConfig::default();
+
+    let report = index_repository(&paths, &config, true).unwrap();
+    assert_eq!(report.files_indexed, 8, "{report:?}");
+    assert!(report.parse_failures.is_empty(), "{report:?}");
+    // Python + Go + Rust + C++ all contribute symbols and calls.
+    assert!(
+        report.symbols >= 10,
+        "expected polyglot symbols, got {report:?}"
+    );
+    assert!(report.calls >= 4, "expected polyglot calls, got {report:?}");
+
+    let repository_id = paths.repository_id().0;
+    let store = open_store(&paths.db_path);
+    let dependencies = store.current_dependencies(&repository_id).unwrap();
+
+    let internal: Vec<_> = dependencies.iter().filter(|d| !d.is_external).collect();
+    assert!(
+        internal.len() >= 4,
+        "every language's intra-repo import should resolve, got {}: {:?}",
+        internal.len(),
+        internal
+            .iter()
+            .map(|d| format!("{} -> {}", d.source_module, d.target_module))
+            .collect::<Vec<_>>()
+    );
+    // Python/Rust both depend on `user`; Go `svc` depends on the `store` package.
+    assert!(
+        dependencies
+            .iter()
+            .any(|d| !d.is_external && d.target_module == "user"),
+        "python/rust -> user must resolve"
+    );
+    assert!(
+        dependencies
+            .iter()
+            .any(|d| !d.is_external && d.target_module == "store"),
+        "go svc -> store must resolve"
+    );
+
+    // Stdlib/external imports (`os`, `std::*`, `fmt`, `<string>`) stay external.
+    assert!(report.external_dependencies >= 4, "{report:?}");
+
+    // Phase instrumentation is populated: the total bounds every phase.
+    let t = &report.timings;
+    assert!(
+        t.total_ms >= t.parse_ms,
+        "timings should be measured: {t:?}"
+    );
+    assert!(
+        t.total_ms >= t.persist_ms,
+        "timings should be measured: {t:?}"
+    );
+}
