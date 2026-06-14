@@ -97,6 +97,13 @@ The binary is `ovecc` (from `crates/ovecc-cli`).
 
 ## Notes & troubleshooting
 
+- **Link error `ld: cannot find -lssp` / `-lwinpthread` / `-lrstrtmgr`?** An older MinGW on
+  your PATH (typically a legacy `C:\MinGW` from MinGW.org) is shadowing the MSYS2 toolchain.
+  The libraries *are* installed — confirm with
+  `x86_64-w64-mingw32-gcc -print-file-name=librstrtmgr.a`, which should print a path under
+  `C:\msys64\mingw64\lib`. Fix: ensure `C:\msys64\mingw64\bin` is first on PATH **and remove
+  the old MinGW entry**, then open a fresh terminal. (This commonly surfaces on `cargo test`,
+  since that links extra test executables that a plain `cargo build` does not.)
 - **Don't edit the `C(XX)FLAGS` in `.cargo/config.toml`** unless necessary — changing them
   invalidates the `libduckdb-sys` cache and forces a full ~10-min C++ rebuild.
 - The GNU-specific settings in `.cargo/config.toml` (scoped to `x86_64-pc-windows-gnu`)
