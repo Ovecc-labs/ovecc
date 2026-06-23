@@ -8,8 +8,21 @@ use sha2::{Digest, Sha256};
 use std::path::Path;
 
 /// Normalizes a path to forward slashes for stable, platform-independent IDs.
+///
+/// Strips the Windows verbatim/UNC prefixes that `std::fs::canonicalize`
+/// emits (`\\?\C:\...`, `\\?\UNC\server\share\...`) so they never leak into
+/// IDs or reports as `//?/C:/...`.
 pub fn normalize_path(path: &Path) -> String {
-    path.to_string_lossy().replace('\\', "/")
+    let raw = path.to_string_lossy();
+    let stripped = if let Some(rest) = raw.strip_prefix(r"\\?\UNC\") {
+        // `\\?\UNC\server\share` denotes the network path `\\server\share`.
+        format!(r"\\{rest}")
+    } else if let Some(rest) = raw.strip_prefix(r"\\?\") {
+        rest.to_string()
+    } else {
+        raw.into_owned()
+    };
+    stripped.replace('\\', "/")
 }
 
 /// Repository-relative '/'-normalized path, or an error if outside the root.

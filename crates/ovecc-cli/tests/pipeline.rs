@@ -9,6 +9,7 @@ use ovecc_db::ArchitectureStore;
 use ovecc_indexer::index_repository;
 use std::fs;
 use std::path::Path;
+use std::process::Command;
 
 /// Copies a committed fixture into a fresh temp dir so the `.ovecc` database
 /// and parse cache never touch the source tree.
@@ -152,4 +153,114 @@ fn polyglot_repository_indexes_every_language() {
         t.total_ms >= t.persist_ms,
         "timings should be measured: {t:?}"
     );
+}
+
+/// The capability manifest is self-describing and lists every command — the
+/// contract an AI agent reads first. Needs no database.
+#[test]
+fn capabilities_manifest_lists_commands() {
+    let output = Command::new(env!("CARGO_BIN_EXE_ovecc"))
+        .args(["capabilities", "--format", "json"])
+        .output()
+        .expect("run ovecc capabilities");
+    assert!(output.status.success(), "capabilities failed");
+    let stdout = String::from_utf8(output.stdout).expect("utf8");
+    assert!(stdout.contains("\"schema_version\": 1"), "{stdout}");
+    assert!(stdout.contains("\"command\": \"capabilities\""), "{stdout}");
+    for command in [
+        "index", "summary", "impact", "security", "audit", "gate", "report", "violations",
+    ] {
+        assert!(
+            stdout.contains(&format!("\"name\": \"{command}\"")),
+            "capabilities should list `{command}`"
+        );
+    }
+}
+
+/// Determinism invariant: for an unchanged database, structured output is
+/// byte-for-byte identical across runs. Every step is a fresh process, so the
+/// DuckDB writer is fully released before the readers run.
+#[test]
+fn summary_json_is_byte_identical_across_runs() {
+    let staged = staged_fixture("small-service");
+    let repo = staged.path().to_str().expect("utf8 path").to_string();
+    let bin = env!("CARGO_BIN_EXE_ovecc");
+
+    let indexed = Command::new(bin)
+        .args(["--repo", &repo, "index"])
+        .output()
+        .expect("run ovecc index");
+    assert!(
+        indexed.status.success(),
+        "index failed: {}",
+        String::from_utf8_lossy(&indexed.stderr)
+    );
+
+    let run_summary = || {
+        Command::new(bin)
+            .args(["--repo", &repo, "summary", "--format", "json"])
+            .output()
+            .expect("run ovecc summary")
+    };
+    let first = run_summary();
+    let second = run_summary();
+    assert!(
+        first.status.success(),
+        "summary failed: {}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    // The envelope carries the contract; the payload is deterministic.
+    let stdout = String::from_utf8(first.stdout.clone()).expect("utf8");
+    assert!(stdout.contains("\"schema_version\": 1"), "{stdout}");
+    assert!(stdout.contains("\"command\": \"summary\""), "{stdout}");
+    assert_eq!(
+        first.stdout, second.stdout,
+        "summary JSON must be byte-identical across runs"
+    );
+    // Paths in the payload are POSIX-normalized with no Windows verbatim prefix.
+    assert!(
+        !stdout.contains("//?/"),
+        "normalized output must not leak the Windows \\\\?\\ prefix: {stdout}"
+    );
+}
+
+/// The one-shot `report` composes several sub-reports, each of which opens the
+/// store; it must keep only one DuckDB connection open at a time and emit the
+/// full composite payload.
+#[test]
+fn report_command_produces_composite_payload() {
+    let staged = staged_fixture("small-service");
+    let repo = staged.path().to_str().expect("utf8 path").to_string();
+    let bin = env!("CARGO_BIN_EXE_ovecc");
+
+    let indexed = Command::new(bin)
+        .args(["--repo", &repo, "index"])
+        .output()
+        .expect("run ovecc index");
+    assert!(
+        indexed.status.success(),
+        "index failed: {}",
+        String::from_utf8_lossy(&indexed.stderr)
+    );
+
+    let out = Command::new(bin)
+        .args(["--repo", &repo, "report", "--format", "json"])
+        .output()
+        .expect("run ovecc report");
+    assert!(
+        out.status.success(),
+        "report failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8(out.stdout).expect("utf8");
+    assert!(stdout.contains("\"command\": \"report\""), "{stdout}");
+    for key in [
+        "\"summary\"",
+        "\"cycles\"",
+        "\"security\"",
+        "\"hotspots\"",
+        "\"findings\"",
+    ] {
+        assert!(stdout.contains(key), "report json should contain {key}");
+    }
 }

@@ -6,9 +6,7 @@
 //! (`ovecc-parser`, `ovecc-db`, `ovecc-git`, `ovecc-graph`, `ovecc-rules`,
 //! `ovecc-query`, `ovecc-export`, `ovecc-ai`) implement.
 
-// Signature phase: `todo!()` bodies are filled in by the next roadmap steps.
-#![allow(unused_variables)]
-
+pub mod capabilities;
 pub mod config;
 pub mod error;
 pub mod facts;

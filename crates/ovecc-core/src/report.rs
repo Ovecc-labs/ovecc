@@ -11,17 +11,123 @@ use crate::id::SnapshotId;
 use crate::query::TargetSelector;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
-/// Version of the machine-readable output contract.
-pub const REPORT_SCHEMA_VERSION: &str = "1.0";
+// SPDX-License-Identifier: MIT
+// The envelope/Meta shapes below are adapted from fallow (github.com/fallow-rs/
+// fallow), MIT (c) 2026 Bart Waardenburg — see THIRD-PARTY-NOTICES.md — switched
+// to an integer schema_version and Ovecc's command vocabulary.
 
-/// Envelope for stable, versioned JSON output.
+/// Integer version of the machine-readable output contract. Bump policy:
+/// ADDITIVE changes (new optional fields, new array entries, new commands) do
+/// NOT bump — consumers receive new keys without breaking, so detect new fields
+/// by JSON-key presence, not by gating on this number. BREAKING changes (renamed
+/// or removed fields, type or semantic changes) DO bump.
+pub const SCHEMA_VERSION: u32 = 1;
+
+/// The tool that produced an envelope.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct VersionedReport<T> {
-    pub schema_version: String,
-    pub command: String,
-    #[serde(flatten)]
-    pub payload: T,
+pub struct ToolInfo {
+    pub name: String,
+    pub version: String,
+}
+
+impl Default for ToolInfo {
+    fn default() -> Self {
+        Self {
+            name: "ovecc".to_string(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+        }
+    }
+}
+
+/// Stable, self-describing envelope wrapping every command's JSON output. The
+/// `data` payload is byte-identical across runs for identical inputs; all
+/// time/nondeterminism is confined to `meta.timing`, which is only present under
+/// `--stats`.
+#[derive(Serialize)]
+pub struct Envelope<'a, T: Serialize + ?Sized> {
+    pub schema_version: u32,
+    pub tool: ToolInfo,
+    pub command: &'a str,
+    #[serde(skip_serializing_if = "Meta::is_empty")]
+    pub meta: Meta,
+    pub data: &'a T,
+}
+
+impl<'a, T: Serialize + ?Sized> Envelope<'a, T> {
+    pub fn new(command: &'a str, data: &'a T, meta: Meta) -> Self {
+        Self {
+            schema_version: SCHEMA_VERSION,
+            tool: ToolInfo::default(),
+            command,
+            meta,
+            data,
+        }
+    }
+}
+
+/// Self-interpreting metadata so an agent or CI system can read a command's
+/// output without consulting the docs site: field/metric/rule definitions plus
+/// optional diagnostic timing.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Meta {
+    /// Documentation pointer for the command.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub docs: Option<String>,
+    /// Per-field definitions for the payload's fields.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub field_definitions: BTreeMap<String, String>,
+    /// Per-metric definitions: what it measures, its range, how to read it.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub metrics: BTreeMap<String, MetaMetric>,
+    /// Per-rule definitions for the finding kinds a command can surface.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub rules: BTreeMap<String, MetaRule>,
+    /// Diagnostic wall-clock; present only under `--stats`, so default output
+    /// stays byte-identical across runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timing: Option<Timing>,
+}
+
+impl Meta {
+    pub fn is_empty(&self) -> bool {
+        self.docs.is_none()
+            && self.field_definitions.is_empty()
+            && self.metrics.is_empty()
+            && self.rules.is_empty()
+            && self.timing.is_none()
+    }
+}
+
+/// Single-metric definition inside [`Meta::metrics`].
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct MetaMetric {
+    pub description: String,
+    /// Valid value range, e.g. `"[0, 100]"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub range: Option<String>,
+    /// How to read the value, e.g. `"lower is better"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interpretation: Option<String>,
+}
+
+/// Single-rule definition inside [`Meta::rules`].
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct MetaRule {
+    pub description: String,
+    /// Default severity the rule emits at.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub severity: Option<String>,
+}
+
+/// Diagnostic timing, emitted in `meta` only under `--stats`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Timing {
+    /// RFC3339 generation time. Lives here (never in `data`) to preserve the
+    /// byte-for-byte determinism of payloads.
+    pub generated_at: String,
+    pub elapsed_ms: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -42,8 +148,17 @@ pub struct RiskScore {
 }
 
 impl RiskScore {
+    /// Maps a raw score to its severity band: 0-24 Low, 25-49 Medium,
+    /// 50-74 High, 75+ Critical. `value` is preserved as-is (callers cap it
+    /// for display where appropriate); the band uses the uncapped score.
     pub fn from_value(value: u32) -> Self {
-        todo!()
+        let level = match value {
+            0..=24 => RiskLevel::Low,
+            25..=49 => RiskLevel::Medium,
+            50..=74 => RiskLevel::High,
+            _ => RiskLevel::Critical,
+        };
+        Self { value, level }
     }
 }
 

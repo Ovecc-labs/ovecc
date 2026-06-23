@@ -28,7 +28,7 @@ use ovecc_db::{ArchitectureStore, ResolvedCode};
 use ovecc_parser::{GenericAdapter, TypeScriptAdapter};
 use rayon::prelude::*;
 use resolve::{ImportBinding, ResolveUnit};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 const SOURCE_EXTENSIONS: &[&str] = &[
@@ -42,7 +42,7 @@ const RESOLUTION_EXTENSIONS: &[&str] = &["ts", "tsx", "js", "jsx", "mjs", "cjs"]
 
 /// `(variable, type)` bindings; older entries
 /// miss and re-parse.
-const PARSE_CACHE_VERSION: &str = "v8";
+const PARSE_CACHE_VERSION: &str = "v9";
 
 pub fn index_repository(
     paths: &ProjectPaths,
@@ -273,6 +273,115 @@ pub fn index_repository(
         Some(&snapshot_id),
         &packages,
         &osv,
+    ));
+
+    // Complexity (oxc cyclomatic + cognitive) → repo metrics + HighComplexity
+    // findings for functions over the maintainability thresholds.
+    let (mut max_cyclomatic, mut max_cognitive, mut function_count) = (0u16, 0u16, 0usize);
+    for (path, facts) in &file_facts {
+        for complexity in &facts.complexity {
+            function_count += 1;
+            max_cyclomatic = max_cyclomatic.max(complexity.cyclomatic);
+            max_cognitive = max_cognitive.max(complexity.cognitive);
+            let severity = if complexity.cognitive >= 25 || complexity.cyclomatic >= 20 {
+                ovecc_core::facts::Severity::High
+            } else if complexity.cognitive >= 15 || complexity.cyclomatic >= 10 {
+                ovecc_core::facts::Severity::Medium
+            } else {
+                continue;
+            };
+            findings.push(ovecc_core::facts::FindingRecord {
+                id: ovecc_core::id::FindingId::from_parts(&[
+                    &repository_id,
+                    "complexity",
+                    path,
+                    &complexity.line.to_string(),
+                    &complexity.qualified_name,
+                ]),
+                repository_id: RepositoryId::from_raw(&repository_id),
+                snapshot_id: Some(ovecc_core::id::SnapshotId::from_raw(&snapshot_id)),
+                kind: FindingKind::HighComplexity,
+                severity,
+                rule_name: Some("complexity".to_string()),
+                target: None,
+                title: format!(
+                    "High complexity: {} (cyclomatic {}, cognitive {})",
+                    complexity.qualified_name, complexity.cyclomatic, complexity.cognitive
+                ),
+                description: format!(
+                    "{} at {}:{} has cyclomatic {} and cognitive {} complexity; consider refactoring.",
+                    complexity.qualified_name,
+                    path,
+                    complexity.line,
+                    complexity.cyclomatic,
+                    complexity.cognitive
+                ),
+                evidence: vec![ovecc_core::facts::Evidence {
+                    file_path: path.clone(),
+                    line: Some(complexity.line),
+                    symbol: Some(complexity.qualified_name.clone()),
+                    detail: Some(format!(
+                        "cyclomatic {}, cognitive {}",
+                        complexity.cyclomatic, complexity.cognitive
+                    )),
+                }],
+                created_at: chrono::Utc::now(),
+            });
+        }
+    }
+    metrics.push(("functions".to_string(), function_count as f64));
+    metrics.push(("max_cyclomatic".to_string(), max_cyclomatic as f64));
+    metrics.push(("max_cognitive".to_string(), max_cognitive as f64));
+
+    // Dead-code analysis (unused exports/files) over the in-memory facts: oxc
+    // exports + resolved internal import edges (carrying the imported names) +
+    // detected entry points. Runs at index time and persists only findings.
+    let all_files: Vec<String> = files.iter().map(|file| file.path.clone()).collect();
+    let entry_points = detect_entry_points(&paths.root, &files);
+    let export_facts: Vec<(String, ovecc_core::facts::ExportFact)> = file_facts
+        .iter()
+        .flat_map(|(path, facts)| {
+            facts
+                .exports
+                .iter()
+                .map(move |export| (path.clone(), export.clone()))
+        })
+        .collect();
+    let import_edges: Vec<ovecc_rules::deadcode::ImportEdge> = dependencies
+        .iter()
+        .filter_map(|dependency| {
+            let target = dependency.target_file_path.clone()?;
+            if dependency.is_external {
+                return None;
+            }
+            let names: Vec<String> = file_facts
+                .get(&dependency.source_file_path)
+                .map(|facts| {
+                    facts
+                        .imports
+                        .iter()
+                        .filter(|import| import.specifier == dependency.specifier)
+                        .flat_map(|import| import.imported_names.clone())
+                        .collect()
+                })
+                .unwrap_or_default();
+            Some(ovecc_rules::deadcode::ImportEdge {
+                is_namespace: names.is_empty(),
+                source_file: dependency.source_file_path.clone(),
+                target_file: target,
+                imported_names: names,
+            })
+        })
+        .collect();
+    findings.extend(ovecc_rules::deadcode::analyze(
+        &ovecc_rules::deadcode::DeadCodeInput {
+            repository_id: &repository_id,
+            snapshot_id: Some(&snapshot_id),
+            files: &all_files,
+            entry_points: &entry_points,
+            exports: &export_facts,
+            imports: &import_edges,
+        },
     ));
 
     // Drop findings explicitly suppressed by an inline `// ovecc-ignore`.
@@ -616,7 +725,17 @@ fn process_file(
         }
     };
     match extracted {
-        Ok(facts) => {
+        Ok(mut facts) => {
+            // For the JS/TS family, enrich with oxc-computed exports + per-function
+            // complexity — the semantically-hard facts tree-sitter cannot produce.
+            // oxc is confined behind the parser boundary; only neutral facts return.
+            if core_lang.is_js_family()
+                && let Some((exports, complexity)) =
+                    ovecc_parser::oxc_extractor::extract(&source_input.contents, core_lang)
+            {
+                facts.exports = exports;
+                facts.complexity = complexity;
+            }
             cache.store(&file.content_hash, &facts);
             ProcessedFile {
                 imports: legacy_imports(&facts),
@@ -812,6 +931,39 @@ fn compute_snapshot_metrics(
     ]
 }
 
+/// Tokenizes every indexed source file into a normalized token stream for
+/// clone detection. Reuses the same discovery and excludes as `index`, so
+/// `dupes` sees exactly the indexed set. Parallel and best-effort: unreadable
+/// or ungrammared files are skipped. Output keeps discovery order (sorted) for
+/// determinism.
+pub fn collect_file_tokens(
+    paths: &ProjectPaths,
+    config: &OveccConfig,
+) -> Result<Vec<ovecc_graph::dupes::FileTokens>> {
+    let files = discover_source_files(&paths.root, config)?;
+    let tokens = files
+        .par_iter()
+        .filter_map(|path| {
+            let bytes = std::fs::read(path).ok()?;
+            let relative = relative_path(&paths.root, path).ok()?;
+            let language = language_for_path(path)?;
+            let (token_hashes, token_lines) = ovecc_parser::tokenize::tokenize(
+                &String::from_utf8_lossy(&bytes),
+                core_language(language),
+            );
+            if token_hashes.is_empty() {
+                return None;
+            }
+            Some(ovecc_graph::dupes::FileTokens {
+                path: relative,
+                token_hashes,
+                token_lines,
+            })
+        })
+        .collect();
+    Ok(tokens)
+}
+
 fn discover_source_files(root: &Path, config: &OveccConfig) -> Result<Vec<PathBuf>> {
     let mut files = Vec::new();
     let mut builder = WalkBuilder::new(root);
@@ -820,6 +972,19 @@ fn discover_source_files(root: &Path, config: &OveccConfig) -> Result<Vec<PathBu
         .parents(true)
         .git_ignore(true)
         .git_exclude(true);
+
+    // Prune vendored/build/cache directories at walk time so we never descend
+    // into them (e.g. a Python `.venv` with thousands of files). The root entry
+    // (depth 0) is always kept so running inside a dir named `build`/`dist`
+    // still works; `should_skip_path` is the post-filter backstop.
+    builder.filter_entry(|entry| {
+        entry.depth() == 0
+            || entry
+                .file_name()
+                .to_str()
+                .map(|name| !is_excluded_component(name))
+                .unwrap_or(true)
+    });
 
     // Include/exclude globs, on top of the built-in exclusions.
     if !config.index.include.is_empty() || !config.index.exclude.is_empty() {
@@ -883,26 +1048,35 @@ fn config_language(language: SourceLanguage) -> ovecc_core::lang::SourceLanguage
     }
 }
 
+/// Directory/component names excluded from indexing by default: VCS metadata,
+/// dependency/vendor trees, virtualenvs, and build/cache output across the JS,
+/// Python, Rust, Go, and JVM ecosystems. This is the built-in baseline; users
+/// add more via `[index] exclude` / `--exclude`. Kept deliberately
+/// language-agnostic so a new language inherits sane defaults.
+pub fn is_excluded_component(name: &str) -> bool {
+    matches!(
+        name,
+        // VCS + ovecc's own state
+        ".git" | ".hg" | ".svn" | ".ovecc"
+        // JavaScript / TypeScript
+        | "node_modules" | "bower_components" | ".next" | ".nuxt" | ".svelte-kit"
+        | ".turbo" | ".angular" | ".parcel-cache" | ".yarn" | ".pnpm-store"
+        // Python
+        | ".venv" | "venv" | "__pycache__" | ".tox" | ".nox" | ".mypy_cache"
+        | ".pytest_cache" | ".ruff_cache" | ".eggs"
+        // Rust / Go / JVM / general build, cache, vendor, and editor metadata
+        | "target" | "vendor" | "dist" | "build" | "coverage" | ".gradle"
+        | ".cache" | ".idea" | ".vscode"
+    )
+}
+
 fn should_skip_path(root: &Path, path: &Path) -> bool {
     let Ok(relative) = path.strip_prefix(root) else {
         return true;
     };
-    relative.components().any(|component| {
-        let value = component.as_os_str().to_string_lossy();
-        matches!(
-            value.as_ref(),
-            ".git"
-                | ".ovecc"
-                | "node_modules"
-                | "target"
-                | "dist"
-                | "build"
-                | "coverage"
-                | ".next"
-                | ".turbo"
-                | "vendor"
-        )
-    })
+    relative
+        .components()
+        .any(|component| is_excluded_component(&component.as_os_str().to_string_lossy()))
 }
 
 fn language_for_path(path: &Path) -> Option<SourceLanguage> {
@@ -963,6 +1137,10 @@ fn resolve_dependencies(
     // resolution.
     let suffix_index = build_path_suffix_index(files);
     let dir_index = build_dir_suffix_index(files);
+    // One shared oxc_resolver for the whole run (per-file tsconfig discovery is
+    // internal); resolves relative, bare/package, and tsconfig-aliased JS/TS
+    // imports — a strict superset of the old relative-only resolution.
+    let js_resolver = create_js_resolver();
 
     for file in files {
         let Some(imports) = parsed_imports.get(&file.path) else {
@@ -974,18 +1152,13 @@ fn resolve_dependencies(
                 SourceLanguage::JavaScript
                 | SourceLanguage::Jsx
                 | SourceLanguage::TypeScript
-                | SourceLanguage::Tsx => {
-                    if is_relative_specifier(&import.specifier) {
-                        resolve_relative_import(
-                            &paths.root,
-                            &file.path,
-                            &import.specifier,
-                            file_by_path,
-                        )
-                    } else {
-                        None
-                    }
-                }
+                | SourceLanguage::Tsx => resolve_js_ts_import(
+                    &js_resolver,
+                    &paths.root,
+                    file,
+                    &import.specifier,
+                    file_by_path,
+                ),
                 SourceLanguage::Python => resolve_suffix_unique(
                     &python_import_candidates(&file.path, &import.specifier),
                     &suffix_index,
@@ -1063,6 +1236,131 @@ fn resolve_dependencies(
             .then_with(|| left.specifier.cmp(&right.specifier))
     });
     dependencies
+}
+
+// --- oxc_resolver-backed JS/TS resolution ------------------------------------
+//
+// Portions adapted from fallow (research/fallow/crates/graph/src/resolve/
+// specifier.rs), MIT (c) 2026 Bart Waardenburg. See THIRD-PARTY-NOTICES.md.
+// SPDX-License-Identifier: MIT
+//
+// Real tsconfig paths/baseUrl, package `exports`, and extension/index fallbacks
+// for the JS/TS family. Non-JS languages keep the suffix/dir resolvers. oxc is
+// confined to this resolution seam — no oxc type crosses into the fact model.
+
+/// JS/TS extensions to probe, TS family first so a `.ts` shadowing a built `.js`
+/// wins (fallow `specifier.rs:34`).
+fn js_resolver_extensions() -> Vec<String> {
+    [".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs", ".json"]
+        .iter()
+        .map(|extension| (*extension).to_string())
+        .collect()
+}
+
+/// Package `exports`/`imports` condition names, highest priority first
+/// (fallow `react_native.rs` baseline, minus the RN conditions).
+fn js_resolver_conditions() -> Vec<String> {
+    ["development", "import", "require", "default", "types", "node"]
+        .iter()
+        .map(|condition| (*condition).to_string())
+        .collect()
+}
+
+/// Builds one shared resolver for the whole index run; per-file tsconfig
+/// discovery is internal (fallow `specifier.rs:33-60`).
+fn create_js_resolver() -> oxc_resolver::Resolver {
+    let mut options = oxc_resolver::ResolveOptions {
+        extensions: js_resolver_extensions(),
+        // `import './x.js'` resolves to `x.ts`/`x.tsx` (fallow `specifier.rs:36-51`).
+        extension_alias: vec![
+            (
+                ".js".to_string(),
+                vec![".ts".into(), ".tsx".into(), ".js".into()],
+            ),
+            (".jsx".to_string(), vec![".tsx".into(), ".jsx".into()]),
+            (".mjs".to_string(), vec![".mts".into(), ".mjs".into()]),
+            (".cjs".to_string(), vec![".cts".into(), ".cjs".into()]),
+        ],
+        condition_names: js_resolver_conditions(),
+        main_fields: vec!["module".into(), "main".into()],
+        ..Default::default()
+    };
+    options.tsconfig = Some(oxc_resolver::TsconfigDiscovery::Auto);
+    oxc_resolver::Resolver::new(options)
+}
+
+/// True for errors raised while *loading a tsconfig* (vs. the specifier itself),
+/// so a broken sibling tsconfig doesn't poison plain relative/bare resolution
+/// (fallow `specifier.rs:74-83`).
+fn is_tsconfig_error(error: &oxc_resolver::ResolveError) -> bool {
+    use oxc_resolver::ResolveError;
+    matches!(
+        error,
+        ResolveError::TsconfigNotFound(_)
+            | ResolveError::TsconfigCircularExtend(_)
+            | ResolveError::TsconfigSelfReference(_)
+            | ResolveError::Json(_)
+            | ResolveError::IOError(_)
+    )
+}
+
+/// Resolves one JS/TS import specifier — relative, bare/package, OR
+/// tsconfig-aliased — to an indexed [`FileRecord`], or `None` when it resolves
+/// outside the indexed set (`node_modules`, `dist`, …) or cannot be resolved.
+/// `None` makes the caller record it as external, exactly as before. Strictly
+/// widens resolution over the old relative-only path (fallow `specifier.rs:99-135`).
+fn resolve_js_ts_import(
+    resolver: &oxc_resolver::Resolver,
+    root: &Path,
+    file: &FileRecord,
+    specifier: &str,
+    file_by_path: &HashMap<String, FileRecord>,
+) -> Option<FileRecord> {
+    // oxc_resolver wants a plain absolute path; strip the Windows verbatim
+    // prefix that `std::fs::canonicalize` adds (oxc uses dunce-style paths),
+    // or every resolve fails and falls through to external.
+    let from_file = strip_verbatim_prefix(file.absolute_path.as_path());
+    let resolved_abs = match resolver.resolve_file(&from_file, specifier) {
+        Ok(resolution) => resolution.path().to_path_buf(),
+        // A broken tsconfig: retry dir-based so relative/bare still resolve.
+        Err(error) if is_tsconfig_error(&error) => {
+            let dir = from_file.parent().unwrap_or(&from_file);
+            resolver.resolve(dir, specifier).ok()?.path().to_path_buf()
+        }
+        Err(_) => return None,
+    };
+    // Map the absolute resolution back to a repo-relative '/'-path and into the
+    // indexed set; outside root or a miss (node_modules) => external.
+    let relative = repo_relative_path(root, &resolved_abs)?;
+    file_by_path.get(&relative).cloned()
+}
+
+/// Strips the Windows `\\?\` / `\\?\UNC\` verbatim prefix from an absolute path
+/// (oxc_resolver does not understand verbatim paths).
+fn strip_verbatim_prefix(path: &Path) -> PathBuf {
+    let raw = path.to_string_lossy();
+    if let Some(rest) = raw.strip_prefix(r"\\?\UNC\") {
+        PathBuf::from(format!(r"\\{rest}"))
+    } else if let Some(rest) = raw.strip_prefix(r"\\?\") {
+        PathBuf::from(rest)
+    } else {
+        path.to_path_buf()
+    }
+}
+
+/// Repo-relative '/'-normalized path of `abs` under `root`, compared on
+/// normalized string forms (verbatim-prefix-stripped, forward slashes,
+/// case-insensitive drive letter) so `canonicalize`'s `\\?\C:\…` and
+/// oxc_resolver's plain `C:\…` still match. `None` when `abs` is outside `root`.
+fn repo_relative_path(root: &Path, abs: &Path) -> Option<String> {
+    let root_norm = ovecc_core::util::normalize_path(root);
+    let abs_norm = ovecc_core::util::normalize_path(abs);
+    if abs_norm.len() < root_norm.len()
+        || !abs_norm[..root_norm.len()].eq_ignore_ascii_case(&root_norm)
+    {
+        return None;
+    }
+    Some(abs_norm[root_norm.len()..].trim_start_matches('/').to_string())
 }
 
 fn is_relative_specifier(specifier: &str) -> bool {
@@ -1355,6 +1653,79 @@ fn external_module_name(specifier: &str) -> String {
         parts.first().copied().unwrap_or(specifier).to_string()
     };
     format!("external:{package}")
+}
+
+/// Entry points anchoring dead-code reachability: package.json
+/// main/module/types (resolved to indexed files), the conventional `src/index`
+/// / `src/main` / root `index` / `main`, and all test/spec files. Ported from
+/// fallow's entry-point detection (crates/core/src/discover/entry_points.rs).
+fn detect_entry_points(root: &Path, files: &[FileRecord]) -> HashSet<String> {
+    let mut entries = HashSet::new();
+    let file_paths: HashSet<&str> = files.iter().map(|file| file.path.as_str()).collect();
+
+    if let Ok(content) = std::fs::read_to_string(root.join("package.json"))
+        && let Ok(package) = serde_json::from_str::<serde_json::Value>(&content)
+    {
+        for key in ["main", "module", "types", "typings"] {
+            if let Some(spec) = package.get(key).and_then(|value| value.as_str())
+                && let Some(resolved) = resolve_entry_spec(spec, &file_paths)
+            {
+                entries.insert(resolved);
+            }
+        }
+    }
+    for file in files {
+        if is_default_entry(&file.path) || is_test_file(&file.path) {
+            entries.insert(file.path.clone());
+        }
+    }
+    entries
+}
+
+/// Resolves a package.json entry spec (e.g. `"./dist/index.js"`) to an indexed
+/// source file, mapping `dist/`→`src/` and trying source extensions / index.
+fn resolve_entry_spec(spec: &str, file_paths: &HashSet<&str>) -> Option<String> {
+    let cleaned = spec.trim_start_matches("./");
+    for base in [cleaned.to_string(), cleaned.replacen("dist/", "src/", 1)] {
+        if file_paths.contains(base.as_str()) {
+            return Some(base);
+        }
+        let stem = base
+            .trim_end_matches(".js")
+            .trim_end_matches(".mjs")
+            .trim_end_matches(".cjs")
+            .trim_end_matches(".d.ts");
+        for ext in ["ts", "tsx", "js", "jsx", "mts", "cts", "mjs", "cjs"] {
+            for candidate in [format!("{stem}.{ext}"), format!("{stem}/index.{ext}")] {
+                if file_paths.contains(candidate.as_str()) {
+                    return Some(candidate);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// True for the conventional root / `src` entry files (`index.*` / `main.*`).
+fn is_default_entry(path: &str) -> bool {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    if !(name.starts_with("index.") || name.starts_with("main.")) {
+        return false;
+    }
+    let depth = path.matches('/').count();
+    depth == 0 || (path.starts_with("src/") && depth == 1)
+}
+
+/// True for test/spec/mock files; their imports keep targets reachable.
+fn is_test_file(path: &str) -> bool {
+    if path.contains("/__tests__/")
+        || path.contains("/__mocks__/")
+        || path.starts_with("__tests__/")
+    {
+        return true;
+    }
+    let name = path.rsplit('/').next().unwrap_or(path);
+    name.contains(".test.") || name.contains(".spec.")
 }
 
 #[cfg(test)]

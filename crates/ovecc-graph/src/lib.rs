@@ -7,6 +7,8 @@
 
 pub mod blast;
 pub mod conventions;
+pub mod cycles;
+pub mod dupes;
 
 use ovecc_core::legacy::{
     DependencyRecord, Hotspot, HotspotEntry, ImpactDirection, ImpactReport, RiskLevel,

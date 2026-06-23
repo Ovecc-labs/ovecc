@@ -11,6 +11,8 @@
 //! database-access rules need module-layer detection and the
 //! `reads`/`writes` schema edges — are intentionally deferred and noted.
 
+pub mod deadcode;
+
 use chrono::Utc;
 use ovecc_core::config::RulesConfig;
 use ovecc_core::facts::{
@@ -38,10 +40,81 @@ pub struct RuleInput<'a> {
 pub fn evaluate(input: &RuleInput<'_>) -> Vec<FindingRecord> {
     let mut findings = Vec::new();
     findings.extend(boundary_rules(input));
+    findings.extend(banned_import_rules(input));
     findings.extend(circular_dependency_rule(input));
     findings.extend(security_rules(input));
     findings.sort_by(|a, b| a.id.0.cmp(&b.id.0));
     findings
+}
+
+/// Declarative banned-import rule pack: one finding per `[[rules.banned_imports]]`
+/// rule that matches at least one resolved import specifier, with every
+/// offending import as file:line evidence. Operates on the neutral dependency
+/// facts, so it governs every language's imports.
+fn banned_import_rules(input: &RuleInput<'_>) -> Vec<FindingRecord> {
+    let mut findings = Vec::new();
+    for rule in &input.config.banned_imports {
+        let offending: Vec<&DependencyRecord> = input
+            .dependencies
+            .iter()
+            .filter(|dependency| specifier_matches(&dependency.specifier, &rule.pattern))
+            .collect();
+        if offending.is_empty() {
+            continue;
+        }
+        let evidence = offending
+            .iter()
+            .take(20)
+            .map(|dependency| Evidence {
+                file_path: dependency.source_file_path.clone(),
+                line: Some(dependency.evidence_line as u32),
+                symbol: None,
+                detail: Some(dependency.specifier.clone()),
+            })
+            .collect();
+        findings.push(FindingRecord {
+            id: FindingId::from_parts(&[
+                input.repository_id,
+                "banned-import",
+                &rule.name,
+                &rule.pattern,
+            ]),
+            repository_id: RepositoryId::from_raw(input.repository_id),
+            snapshot_id: input.snapshot_id.map(SnapshotId::from_raw),
+            kind: FindingKind::ForbiddenImport,
+            severity: rule.severity,
+            rule_name: Some(format!("banned-import/{}", rule.name)),
+            target: Some(EntityRef {
+                kind: NodeKind::Module,
+                id: offending
+                    .first()
+                    .map(|dependency| dependency.source_module.clone())
+                    .unwrap_or_default(),
+            }),
+            title: format!("Banned import: {}", rule.pattern),
+            description: rule.message.clone().unwrap_or_else(|| {
+                format!(
+                    "Importing '{}' is banned by rule '{}' ({} occurrence(s)).",
+                    rule.pattern,
+                    rule.name,
+                    offending.len()
+                )
+            }),
+            evidence,
+            created_at: Utc::now(),
+        });
+    }
+    findings
+}
+
+/// Minimal specifier glob: exact, `prefix*`, `*suffix`, or `*infix*`.
+fn specifier_matches(specifier: &str, pattern: &str) -> bool {
+    match (pattern.strip_prefix('*'), pattern.strip_suffix('*')) {
+        (Some(_), Some(_)) => specifier.contains(pattern.trim_matches('*')),
+        (None, Some(prefix)) => specifier.starts_with(prefix),
+        (Some(suffix), None) => specifier.ends_with(suffix),
+        (None, None) => specifier == pattern,
+    }
 }
 
 /// Classifies parser-detected security patterns into findings. The
@@ -190,12 +263,19 @@ fn boundary_rules(input: &RuleInput<'_>) -> Vec<FindingRecord> {
     findings
 }
 
-/// high-severity finding.
+/// One high-severity finding per *elementary* cycle (the actual loop
+/// `A -> B -> C -> A`, not just the strongly-connected component), each carrying
+/// file:line evidence for every hop so the loop is traceable to source.
 fn circular_dependency_rule(input: &RuleInput<'_>) -> Vec<FindingRecord> {
-    ovecc_graph::strongly_connected_modules(input.modules, input.dependencies)
+    ovecc_graph::cycles::elementary_cycles(input.modules, input.dependencies)
         .into_iter()
         .map(|members| {
-            let label = members.join(" -> ");
+            // Render the loop closing back to its first module: A -> B -> A.
+            let mut closed = members.clone();
+            if let Some(first) = members.first() {
+                closed.push(first.clone());
+            }
+            let label = closed.join(" -> ");
             FindingRecord {
                 id: FindingId::from_parts(&[input.repository_id, "cycle", &members.join(",")]),
                 repository_id: RepositoryId::from_raw(input.repository_id),
@@ -209,12 +289,39 @@ fn circular_dependency_rule(input: &RuleInput<'_>) -> Vec<FindingRecord> {
                 }),
                 title: format!("Circular dependency: {label}"),
                 description: format!(
-                    "{} modules form a dependency cycle: {label}.",
+                    "{} modules form a dependency cycle: {label}. Break the loop by \
+                     inverting or extracting one of its edges.",
                     members.len()
                 ),
-                evidence: Vec::new(),
+                evidence: cycle_evidence(&members, input.dependencies),
                 created_at: Utc::now(),
             }
+        })
+        .collect()
+}
+
+/// One evidence row per cycle hop (`X -> Y`), each pointing at a representative
+/// import edge with its file:line, so the cycle is traceable to source. The
+/// representative is the first edge in (deterministic) dependency order.
+fn cycle_evidence(members: &[String], dependencies: &[DependencyRecord]) -> Vec<Evidence> {
+    let len = members.len();
+    (0..len)
+        .filter_map(|i| {
+            let source = &members[i];
+            let target = &members[(i + 1) % len];
+            dependencies
+                .iter()
+                .find(|dependency| {
+                    !dependency.is_external
+                        && &dependency.source_module == source
+                        && &dependency.target_module == target
+                })
+                .map(|edge| Evidence {
+                    file_path: edge.source_file_path.clone(),
+                    line: Some(edge.evidence_line as u32),
+                    symbol: None,
+                    detail: Some(format!("{source} -> {target}: {}", edge.specifier)),
+                })
         })
         .collect()
 }
@@ -222,7 +329,7 @@ fn circular_dependency_rule(input: &RuleInput<'_>) -> Vec<FindingRecord> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ovecc_core::config::BoundaryRuleConfig;
+    use ovecc_core::config::{BannedImportRule, BoundaryRuleConfig};
 
     fn dependency(source: &str, target: &str, path: &str, line: usize) -> DependencyRecord {
         DependencyRecord {
@@ -371,5 +478,52 @@ mod tests {
             .collect();
         assert_eq!(cycles.len(), 1);
         assert!(cycles[0].title.contains("a") && cycles[0].title.contains("b"));
+    }
+
+    #[test]
+    fn specifier_glob_matches_each_form() {
+        assert!(specifier_matches("lodash", "lodash")); // exact
+        assert!(!specifier_matches("lodash/fp", "lodash"));
+        assert!(specifier_matches("@internal/db", "@internal/*")); // prefix
+        assert!(specifier_matches("../user/legacy", "*legacy")); // suffix
+        assert!(specifier_matches("../legacy/x", "*legacy*")); // infix
+        assert!(!specifier_matches("../user/x", "*legacy*"));
+    }
+
+    #[test]
+    fn banned_import_rule_pack_flags_matching_specifiers() {
+        // The `dependency` helper sets specifier to `../{target}/x`.
+        let deps = vec![
+            dependency("billing", "user", "src/billing/a.ts", 3),
+            dependency("billing", "user", "src/billing/b.ts", 7),
+            dependency("billing", "tasks", "src/billing/c.ts", 1),
+        ];
+        let config = RulesConfig {
+            banned_imports: vec![BannedImportRule {
+                name: "no-user-internals".to_string(),
+                pattern: "*user*".to_string(),
+                message: Some("import via the public api instead".to_string()),
+                severity: Severity::Medium,
+            }],
+            ..Default::default()
+        };
+        let input = RuleInput {
+            repository_id: "repo:test",
+            snapshot_id: None,
+            modules: &[],
+            dependencies: &deps,
+            config: &config,
+            security_patterns: &[],
+        };
+        let findings = evaluate(&input);
+        let banned: Vec<_> = findings
+            .iter()
+            .filter(|f| f.kind == FindingKind::ForbiddenImport)
+            .collect();
+        assert_eq!(banned.len(), 1, "one finding for the rule");
+        assert_eq!(banned[0].severity, Severity::Medium);
+        assert_eq!(banned[0].evidence.len(), 2, "both ../user imports");
+        assert_eq!(banned[0].evidence[0].line, Some(3));
+        assert!(banned[0].description.contains("public api"));
     }
 }

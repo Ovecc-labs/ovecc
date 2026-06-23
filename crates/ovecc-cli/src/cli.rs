@@ -1,6 +1,7 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
 use ovecc_ai::DeterministicExplainer;
+use ovecc_core::capabilities;
 use ovecc_core::config::{ConfigOverrides, OutputFormat, OveccConfig, ProjectPaths};
 use ovecc_core::error::OveccError;
 use ovecc_core::facts::{FindingKind, FindingRecord, Severity};
@@ -9,13 +10,56 @@ use ovecc_core::legacy::{
     IndexReport, RiskLevel, SummaryReport,
 };
 use ovecc_core::query::{Query, TargetSelector};
-use ovecc_core::report::ContextSlice;
+use ovecc_core::report::{ContextSlice, Envelope, Meta, ToolInfo};
 use ovecc_core::traits::ExplanationProvider;
 use ovecc_db::ArchitectureStore;
 use ovecc_graph as graph;
 use ovecc_graph::blast::{self, BlastEdge, BlastNode, BlastResult};
 use ovecc_indexer::index_repository;
 use std::path::PathBuf;
+
+/// Prints `data` wrapped in the stable, self-describing JSON envelope
+/// (schema_version + tool + command + meta). The `data` payload is
+/// byte-identical across runs for identical inputs.
+fn emit_json<T: serde::Serialize + ?Sized>(command: &str, data: &T, meta: Meta) -> Result<()> {
+    let envelope = Envelope::new(command, data, meta);
+    println!("{}", serde_json::to_string_pretty(&envelope)?);
+    Ok(())
+}
+
+/// Prints the NDJSON envelope header line carrying the schema_version, tool, and
+/// command, so an NDJSON stream is self-describing without buffering.
+fn emit_ndjson_meta(command: &str, meta: &Meta) -> Result<()> {
+    let header = serde_json::json!({
+        "type": "meta",
+        "schema_version": ovecc_core::report::SCHEMA_VERSION,
+        "tool": ToolInfo::default(),
+        "command": command,
+        "meta": meta,
+    });
+    println!("{}", serde_json::to_string(&header)?);
+    Ok(())
+}
+
+/// Builds the `meta` block for a command from the capability catalog: the
+/// metric and/or rule dictionaries relevant to it, so an agent can interpret the
+/// payload without the docs site. Static and therefore deterministic.
+fn meta_for(command: &str) -> Meta {
+    let mut meta = Meta::default();
+    if matches!(
+        command,
+        "summary" | "report" | "drift" | "diff" | "hotspots" | "index" | "health"
+    ) {
+        meta.metrics = capabilities::metric_definitions();
+    }
+    if matches!(
+        command,
+        "violations" | "security" | "audit" | "gate" | "report" | "summary" | "health" | "deadcode"
+    ) {
+        meta.rules = capabilities::rule_definitions();
+    }
+    meta
+}
 
 #[derive(Debug, Parser)]
 #[command(name = "ovecc")]
@@ -96,7 +140,17 @@ pub enum Command {
         /// Skip Git facts for this run.
         #[arg(long)]
         no_git: bool,
+        /// Extra glob(s) to exclude, on top of the built-in defaults
+        /// (node_modules, .venv, dist, target, ...). Repeatable.
+        #[arg(long, value_name = "GLOB")]
+        exclude: Vec<String>,
+        /// Restrict indexing to these glob(s). Repeatable.
+        #[arg(long, value_name = "GLOB")]
+        include: Vec<String>,
     },
+    /// List every command, metric, rule, severity, exit code, and format Ovecc
+    /// supports — the machine-readable contract for AI agents.
+    Capabilities,
     /// Show current architecture health.
     Summary,
     /// Analyze blast radius for a module.
@@ -164,6 +218,58 @@ pub enum Command {
         /// Target to explain, e.g. `Billing`, `table:customers`, `api:GET:/x`.
         target: String,
     },
+    /// Surface security findings: hardcoded secrets, insecure patterns, weak
+    /// crypto, and tainted source→sink flows, with explicit scanned counts.
+    Security {
+        /// Only show findings at or above this severity.
+        #[arg(long, value_enum)]
+        severity: Option<SeverityArg>,
+        /// Exit with code 1 when a finding crosses this threshold (CI check).
+        #[arg(long, value_enum)]
+        fail_on: Option<FailOn>,
+    },
+    /// Audit declared dependencies against the offline OSV database.
+    Audit {
+        /// Exit with code 1 when a finding crosses this threshold (CI check).
+        #[arg(long, value_enum)]
+        fail_on: Option<FailOn>,
+    },
+    /// Produce a one-shot architecture report (summary + cycles + violations +
+    /// security + hotspots). Markdown by default; `--format json` for agents.
+    Report,
+    /// CI gate: fail when a change introduces new cycles or violations versus a
+    /// base snapshot. Models a PR check over Ovecc's `diff`.
+    Gate {
+        #[arg(default_value = "previous")]
+        base: String,
+        #[arg(default_value = "latest")]
+        head: String,
+        /// Fail threshold: `any` new change, or new findings at `medium`/`high`.
+        #[arg(long, value_enum, default_value_t = FailOn::Any)]
+        fail_on: FailOn,
+    },
+    /// Detect duplicated code (clone families) over a normalized token stream.
+    Dupes {
+        /// Minimum shared run, in tokens, to report as a clone.
+        #[arg(long, default_value_t = 50)]
+        min_tokens: usize,
+        /// Minimum line span for a clone region.
+        #[arg(long, default_value_t = 5)]
+        min_lines: usize,
+        /// Also report clones confined to a single file (off by default).
+        #[arg(long)]
+        include_intra_file: bool,
+    },
+    /// Report code-health hotspots: functions over the complexity thresholds
+    /// (cyclomatic / cognitive), computed by the oxc TS/JS extractor.
+    Health,
+    /// Report likely dead code: unused exports and unreachable files (from the
+    /// oxc-extracted exports + entry-point reachability).
+    Deadcode {
+        /// Exit with code 1 when a finding crosses this threshold (CI check).
+        #[arg(long, value_enum)]
+        fail_on: Option<FailOn>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -200,15 +306,32 @@ pub fn run() -> Result<u8> {
     let started = std::time::Instant::now();
 
     let outcome = match cli.command {
-        Command::Index { path, no_git } => {
+        Command::Index {
+            path,
+            no_git,
+            exclude,
+            include,
+        } => {
             let root = path.or(cli.repo).unwrap_or_else(|| PathBuf::from("."));
             let paths = ProjectPaths::resolve(root)?;
-            let config = load_config(&paths, format_override)?;
+            let overrides = ConfigOverrides {
+                format: format_override.map(Into::into),
+                include: (!include.is_empty()).then_some(include),
+                exclude: (!exclude.is_empty()).then_some(exclude),
+                ..Default::default()
+            };
+            let config = OveccConfig::load(&paths.root, &overrides)?;
             let report = index_repository(&paths, &config, no_git)?;
             render_index_report(&report, config.output.default_format)?;
             if stats {
                 render_index_timings(&report.timings);
             }
+            Ok(0)
+        }
+        Command::Capabilities => {
+            let paths = ProjectPaths::resolve(cli.repo.unwrap_or_else(|| PathBuf::from(".")))?;
+            let config = load_config(&paths, format_override)?;
+            render_capabilities(config.output.default_format)?;
             Ok(0)
         }
         Command::Summary => {
@@ -287,7 +410,7 @@ pub fn run() -> Result<u8> {
             }
 
             render_violations(&findings, config.output.default_format)?;
-            Ok(violations_exit(&findings, fail_on))
+            Ok(findings_exit(&findings, fail_on))
         }
         Command::Hotspots { limit } => {
             let paths = ProjectPaths::resolve(cli.repo.unwrap_or_else(|| PathBuf::from(".")))?;
@@ -341,6 +464,118 @@ pub fn run() -> Result<u8> {
             let explanation = DeterministicExplainer.explain(&slice)?;
             render_explanation(&slice, &explanation, config.output.default_format)?;
             Ok(0)
+        }
+        Command::Security { severity, fail_on } => {
+            let paths = ProjectPaths::resolve(cli.repo.unwrap_or_else(|| PathBuf::from(".")))?;
+            let config = load_config(&paths, format_override)?;
+            let store = open_store(&paths)?;
+            let findings = store.findings(&paths.repository_id().0, None)?;
+            let report = build_security_report(&findings, severity.map(Into::into));
+            render_security(&report, config.output.default_format)?;
+            Ok(findings_exit(&report.findings, fail_on))
+        }
+        Command::Audit { fail_on } => {
+            let paths = ProjectPaths::resolve(cli.repo.unwrap_or_else(|| PathBuf::from(".")))?;
+            let config = load_config(&paths, format_override)?;
+            let packages = ovecc_audit::discover_packages(&paths.root);
+            let osv = ovecc_audit::load_osv_dir(&paths.ovecc_dir.join("osv"));
+            let findings = ovecc_audit::audit(&paths.repository_id().0, None, &packages, &osv);
+            let report = AuditReport {
+                packages_scanned: packages.len(),
+                advisories_loaded: osv.len(),
+                vulnerabilities: findings.len(),
+                findings,
+            };
+            render_audit(&report, config.output.default_format)?;
+            Ok(findings_exit(&report.findings, fail_on))
+        }
+        Command::Report => {
+            let paths = ProjectPaths::resolve(cli.repo.unwrap_or_else(|| PathBuf::from(".")))?;
+            let config = load_config(&paths, format_override)?;
+            render_full_report(&paths, config.output.default_format)?;
+            Ok(0)
+        }
+        Command::Gate {
+            base,
+            head,
+            fail_on,
+        } => {
+            let paths = ProjectPaths::resolve(cli.repo.unwrap_or_else(|| PathBuf::from(".")))?;
+            let config = load_config(&paths, format_override)?;
+            let store = open_store(&paths)?;
+            let base = resolve_ref(&paths.root, &base);
+            let head = resolve_ref(&paths.root, &head);
+            let report = build_gate_report(&store, &paths.repository_id().0, &base, &head, fail_on)?;
+            let failed = report.verdict == "fail";
+            render_gate(&report, config.output.default_format)?;
+            Ok(u8::from(failed))
+        }
+        Command::Dupes {
+            min_tokens,
+            min_lines,
+            include_intra_file,
+        } => {
+            let paths = ProjectPaths::resolve(cli.repo.unwrap_or_else(|| PathBuf::from(".")))?;
+            let config = load_config(&paths, format_override)?;
+            let files = ovecc_indexer::collect_file_tokens(&paths, &config)?;
+            let families =
+                ovecc_graph::dupes::detect(&files, min_tokens, min_lines, !include_intra_file);
+            let duplicated_lines: u32 = families.iter().map(|family| family.line_span).sum();
+            let report = DupesReport {
+                files_scanned: files.len(),
+                min_tokens,
+                min_lines,
+                clone_families: families.len(),
+                duplicated_lines,
+                families,
+            };
+            render_dupes(&report, config.output.default_format)?;
+            Ok(0)
+        }
+        Command::Health => {
+            let paths = ProjectPaths::resolve(cli.repo.unwrap_or_else(|| PathBuf::from(".")))?;
+            let config = load_config(&paths, format_override)?;
+            let store = open_store(&paths)?;
+            let mut findings: Vec<FindingRecord> = store
+                .findings(&paths.repository_id().0, None)?
+                .into_iter()
+                .filter(|finding| finding.kind == FindingKind::HighComplexity)
+                .collect();
+            findings.sort_by(|a, b| b.severity.cmp(&a.severity).then_with(|| a.title.cmp(&b.title)));
+            let report = HealthReport {
+                high_complexity_functions: findings.len(),
+                findings,
+            };
+            render_health(&report, config.output.default_format)?;
+            Ok(0)
+        }
+        Command::Deadcode { fail_on } => {
+            let paths = ProjectPaths::resolve(cli.repo.unwrap_or_else(|| PathBuf::from(".")))?;
+            let config = load_config(&paths, format_override)?;
+            let store = open_store(&paths)?;
+            let findings: Vec<FindingRecord> = store
+                .findings(&paths.repository_id().0, None)?
+                .into_iter()
+                .filter(|finding| {
+                    matches!(
+                        finding.kind,
+                        FindingKind::UnusedExport | FindingKind::UnusedFile
+                    )
+                })
+                .collect();
+            let report = DeadcodeReport {
+                unused_exports: findings
+                    .iter()
+                    .filter(|f| f.kind == FindingKind::UnusedExport)
+                    .count(),
+                unused_files: findings
+                    .iter()
+                    .filter(|f| f.kind == FindingKind::UnusedFile)
+                    .count(),
+                findings,
+            };
+            render_deadcode(&report, config.output.default_format)?;
+            Ok(findings_exit(&report.findings, fail_on))
         }
     };
 
@@ -418,7 +653,18 @@ fn run_query(paths: &ProjectPaths, query: &Query, format: OutputFormat) -> Resul
             let repository_id = paths.repository_id().0;
             let modules = store.current_modules(&repository_id)?;
             let dependencies = store.current_dependencies(&repository_id)?;
-            let cycles = ovecc_graph::strongly_connected_modules(&modules, &dependencies);
+            // Actual elementary loops (A -> B -> C -> A), shortest-first, each
+            // closed back to its first module for display.
+            let cycles: Vec<Vec<String>> =
+                ovecc_graph::cycles::elementary_cycles(&modules, &dependencies)
+                    .into_iter()
+                    .map(|mut members| {
+                        if let Some(first) = members.first().cloned() {
+                            members.push(first);
+                        }
+                        members
+                    })
+                    .collect();
             print_query_paths("Cycles", &cycles, format)?;
             return Ok(0);
         }
@@ -602,8 +848,9 @@ fn build_context_slice(
 
 fn render_conventions(report: &ConventionsReport, format: OutputFormat) -> Result<()> {
     match format {
-        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(report)?),
+        OutputFormat::Json => emit_json("conventions", report, meta_for("conventions"))?,
         OutputFormat::Ndjson => {
+            emit_ndjson_meta("conventions", &meta_for("conventions"))?;
             for convention in &report.conventions {
                 println!("{}", ndjson_line("convention", convention)?);
             }
@@ -683,8 +930,14 @@ fn load_hotspots(paths: &ProjectPaths, limit: usize) -> Result<HotspotsReport> {
     // ownership (< 50%).
     let file_modules: HashMap<String, String> =
         store.file_modules(&repository_id)?.into_iter().collect();
+    let ownership_rows = store.ownership_metrics(&repository_id)?;
+    // No ingested commits => no git history, so churn and ownership are
+    // unavailable ("n/a"), not genuinely zero. `module_churn` can't be the
+    // signal: it LEFT JOINs file_changes and returns a 0 row per module even
+    // with no history.
+    let has_git_history = store.count_rows("commits", &repository_id)? > 0;
     let mut fragmented: HashMap<String, (usize, usize)> = HashMap::new();
-    for ownership in store.ownership_metrics(&repository_id)? {
+    for ownership in &ownership_rows {
         if let Some(module) = file_modules.get(&ownership.file_path) {
             let entry = fragmented.entry(module.clone()).or_insert((0, 0));
             entry.1 += 1;
@@ -724,13 +977,15 @@ fn load_hotspots(paths: &ProjectPaths, limit: usize) -> Result<HotspotsReport> {
             &violations,
             limit,
         ),
+        has_git_history,
     })
 }
 
 fn render_hotspots(report: &HotspotsReport, format: OutputFormat) -> Result<()> {
     match format {
-        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(report)?),
+        OutputFormat::Json => emit_json("hotspots", report, meta_for("hotspots"))?,
         OutputFormat::Ndjson => {
+            emit_ndjson_meta("hotspots", &meta_for("hotspots"))?;
             for hotspot in &report.hotspots {
                 println!("{}", ndjson_line("hotspot", hotspot)?);
             }
@@ -738,39 +993,61 @@ fn render_hotspots(report: &HotspotsReport, format: OutputFormat) -> Result<()> 
         OutputFormat::Markdown => {
             println!("# Hotspots");
             println!();
+            if !report.has_git_history {
+                println!("> Churn and owner-fragmentation are **n/a** — no git history indexed.");
+                println!();
+            }
             println!(
                 "| # | Module | Score | Churn | Coupling | Fan-in | Fan-out | Owner frag. | Violations |"
             );
             println!("| --- | --- | --- | --- | --- | --- | --- | --- | --- |");
             for (rank, hotspot) in report.hotspots.iter().enumerate() {
+                let churn = if report.has_git_history {
+                    format!("{:.0}", hotspot.churn)
+                } else {
+                    "n/a".to_string()
+                };
+                let owner = if report.has_git_history {
+                    format!("{:.0}%", hotspot.ownership_fragmentation * 100.0)
+                } else {
+                    "n/a".to_string()
+                };
                 println!(
-                    "| {} | {} | {:.0} | {:.0} | {} | {} | {} | {:.0}% | {} |",
+                    "| {} | {} | {:.0} | {} | {} | {} | {} | {} | {} |",
                     rank + 1,
                     hotspot.module,
                     hotspot.score,
-                    hotspot.churn,
+                    churn,
                     hotspot.coupling,
                     hotspot.fan_in,
                     hotspot.fan_out,
-                    hotspot.ownership_fragmentation * 100.0,
+                    owner,
                     hotspot.violations
                 );
             }
         }
         OutputFormat::Text => {
             println!("Hotspots:");
+            if !report.has_git_history {
+                println!("  (churn and ownership: n/a — no git history indexed)");
+            }
             for (rank, hotspot) in report.hotspots.iter().enumerate() {
                 println!();
                 println!("{}. {}", rank + 1, hotspot.module);
                 println!("   Score: {:.0}", hotspot.score);
-                println!("   Churn: {:.0}", hotspot.churn);
+                if report.has_git_history {
+                    println!("   Churn: {:.0}", hotspot.churn);
+                    println!(
+                        "   Ownership fragmentation: {:.0}%",
+                        hotspot.ownership_fragmentation * 100.0
+                    );
+                } else {
+                    println!("   Churn: n/a (no git history)");
+                    println!("   Ownership fragmentation: n/a (no git history)");
+                }
                 println!(
                     "   Coupling: {} (fan-in {}, fan-out {})",
                     hotspot.coupling, hotspot.fan_in, hotspot.fan_out
-                );
-                println!(
-                    "   Ownership fragmentation: {:.0}%",
-                    hotspot.ownership_fragmentation * 100.0
                 );
                 println!("   Violations: {}", hotspot.violations);
             }
@@ -792,8 +1069,9 @@ fn load_baseline(path: &std::path::Path) -> std::collections::HashSet<String> {
         .unwrap_or_default()
 }
 
-/// CI exit code for `violations`: 1 when a finding crosses the threshold.
-fn violations_exit(findings: &[FindingRecord], fail_on: Option<FailOn>) -> u8 {
+/// CI exit code for finding-bearing commands (`violations`, `security`,
+/// `audit`): 1 when a finding crosses the threshold, else 0.
+fn findings_exit(findings: &[FindingRecord], fail_on: Option<FailOn>) -> u8 {
     let Some(fail_on) = fail_on else {
         return 0;
     };
@@ -807,8 +1085,9 @@ fn violations_exit(findings: &[FindingRecord], fail_on: Option<FailOn>) -> u8 {
 
 fn render_violations(findings: &[FindingRecord], format: OutputFormat) -> Result<()> {
     match format {
-        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(findings)?),
+        OutputFormat::Json => emit_json("violations", findings, meta_for("violations"))?,
         OutputFormat::Ndjson => {
+            emit_ndjson_meta("violations", &meta_for("violations"))?;
             for finding in findings {
                 println!("{}", ndjson_line("violation", finding)?);
             }
@@ -855,6 +1134,647 @@ fn format_evidence(evidence: &ovecc_core::facts::Evidence) -> String {
         text.push_str(&format!(" ({detail})"));
     }
     text
+}
+
+// ---------------------------------------------------------------------------
+// ovecc capabilities
+// ---------------------------------------------------------------------------
+
+/// Renders the capability manifest: JSON for agents (the primary consumer), a
+/// readable catalog for humans. Needs no database — it is pure contract.
+fn render_capabilities(format: OutputFormat) -> Result<()> {
+    let caps = capabilities::capabilities();
+    match format {
+        OutputFormat::Json | OutputFormat::Ndjson => {
+            emit_json("capabilities", &caps, Meta::default())?
+        }
+        OutputFormat::Markdown => {
+            println!("# Ovecc capabilities");
+            println!();
+            println!("Schema version: `{}`", ovecc_core::report::SCHEMA_VERSION);
+            println!();
+            println!("## Commands");
+            println!();
+            for command in caps.commands {
+                let ro = if command.read_only { " _(read-only)_" } else { "" };
+                println!("- **{}** — {}{ro}", command.name, command.summary);
+            }
+            println!();
+            println!("## Exit codes");
+            println!();
+            for code in caps.exit_codes {
+                println!("- `{}` {} — {}", code.code, code.name, code.meaning);
+            }
+        }
+        OutputFormat::Text => {
+            println!("ovecc — deterministic architecture intelligence");
+            println!("schema_version: {}", ovecc_core::report::SCHEMA_VERSION);
+            println!("formats: {}", caps.formats.join(", "));
+            println!("severities: {}", caps.severities.join(", "));
+            println!();
+            println!("Commands:");
+            for command in caps.commands {
+                println!("  {:<16} {}", command.name, command.summary);
+            }
+            println!();
+            println!("Exit codes:");
+            for code in caps.exit_codes {
+                println!("  {} {:<16} {}", code.code, code.name, code.meaning);
+            }
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// ovecc security
+// ---------------------------------------------------------------------------
+
+/// The finding kinds the `security` command surfaces (dependency vulnerabilities
+/// are surfaced by `audit` instead).
+fn is_security_kind(kind: FindingKind) -> bool {
+    matches!(
+        kind,
+        FindingKind::HardcodedSecret
+            | FindingKind::InsecurePattern
+            | FindingKind::WeakCrypto
+            | FindingKind::PermissiveCors
+            | FindingKind::TaintedFlow
+    )
+}
+
+/// Security findings grouped by category, with explicit per-category counts so a
+/// "0 findings" result is stated rather than silent.
+#[derive(serde::Serialize)]
+struct SecurityReport {
+    secrets: usize,
+    insecure_patterns: usize,
+    weak_crypto: usize,
+    permissive_cors: usize,
+    tainted_flows: usize,
+    total: usize,
+    findings: Vec<FindingRecord>,
+}
+
+/// Filters all findings to the security kinds (optionally by minimum severity)
+/// and tallies per category.
+fn build_security_report(all: &[FindingRecord], min_severity: Option<Severity>) -> SecurityReport {
+    let findings: Vec<FindingRecord> = all
+        .iter()
+        .filter(|finding| is_security_kind(finding.kind))
+        .filter(|finding| min_severity.is_none_or(|min| finding.severity >= min))
+        .cloned()
+        .collect();
+    let count = |kind: FindingKind| findings.iter().filter(|f| f.kind == kind).count();
+    SecurityReport {
+        secrets: count(FindingKind::HardcodedSecret),
+        insecure_patterns: count(FindingKind::InsecurePattern),
+        weak_crypto: count(FindingKind::WeakCrypto),
+        permissive_cors: count(FindingKind::PermissiveCors),
+        tainted_flows: count(FindingKind::TaintedFlow),
+        total: findings.len(),
+        findings,
+    }
+}
+
+fn render_security(report: &SecurityReport, format: OutputFormat) -> Result<()> {
+    match format {
+        OutputFormat::Json => emit_json("security", report, meta_for("security"))?,
+        OutputFormat::Ndjson => {
+            emit_ndjson_meta("security", &meta_for("security"))?;
+            for finding in &report.findings {
+                println!("{}", ndjson_line("security_finding", finding)?);
+            }
+        }
+        OutputFormat::Markdown => {
+            println!("# Security ({} finding(s))", report.total);
+            println!();
+            println!("- Hardcoded secrets: {}", report.secrets);
+            println!("- Insecure patterns (eval/exec): {}", report.insecure_patterns);
+            println!("- Weak crypto: {}", report.weak_crypto);
+            println!("- Permissive CORS: {}", report.permissive_cors);
+            println!("- Tainted flows: {}", report.tainted_flows);
+            for finding in &report.findings {
+                println!();
+                println!("## [{:?}] {}", finding.severity, finding.title);
+                println!("- {}", finding.description);
+                for evidence in &finding.evidence {
+                    println!("- Evidence: `{}`", format_evidence(evidence));
+                }
+            }
+        }
+        OutputFormat::Text => {
+            println!("Security findings: {} (scanned the indexed repository)", report.total);
+            println!(
+                "  secrets {}, insecure {}, weak-crypto {}, cors {}, tainted-flows {}",
+                report.secrets,
+                report.insecure_patterns,
+                report.weak_crypto,
+                report.permissive_cors,
+                report.tainted_flows
+            );
+            for finding in &report.findings {
+                println!();
+                println!("[{:?}] {}", finding.severity, finding.title);
+                for evidence in &finding.evidence {
+                    println!("  Evidence: {}", format_evidence(evidence));
+                }
+            }
+            if report.total == 0 {
+                println!("  (no security findings)");
+            }
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// ovecc audit (OSV dependency vulnerabilities)
+// ---------------------------------------------------------------------------
+
+/// OSV audit result with explicit scanned counts (packages, advisories) so a
+/// clean result is stated, not silent.
+#[derive(serde::Serialize)]
+struct AuditReport {
+    packages_scanned: usize,
+    advisories_loaded: usize,
+    vulnerabilities: usize,
+    findings: Vec<FindingRecord>,
+}
+
+fn render_audit(report: &AuditReport, format: OutputFormat) -> Result<()> {
+    match format {
+        OutputFormat::Json => emit_json("audit", report, meta_for("audit"))?,
+        OutputFormat::Ndjson => {
+            emit_ndjson_meta("audit", &meta_for("audit"))?;
+            for finding in &report.findings {
+                println!("{}", ndjson_line("vulnerability", finding)?);
+            }
+        }
+        OutputFormat::Markdown => {
+            println!("# Dependency audit (OSV)");
+            println!();
+            println!("- Packages scanned: {}", report.packages_scanned);
+            println!("- Advisories loaded: {}", report.advisories_loaded);
+            println!("- Vulnerabilities: {}", report.vulnerabilities);
+            for finding in &report.findings {
+                println!();
+                println!("## [{:?}] {}", finding.severity, finding.title);
+                println!("- {}", finding.description);
+            }
+        }
+        OutputFormat::Text => {
+            println!(
+                "Dependency audit (OSV): scanned {} package(s) against {} advisor(ies)",
+                report.packages_scanned, report.advisories_loaded
+            );
+            println!("Vulnerabilities: {}", report.vulnerabilities);
+            for finding in &report.findings {
+                println!();
+                println!("[{:?}] {}", finding.severity, finding.title);
+            }
+            if report.advisories_loaded == 0 {
+                println!("  (no OSV database in .ovecc/osv/ — sync advisories to enable matching)");
+            } else if report.vulnerabilities == 0 {
+                println!("  (no known vulnerabilities)");
+            }
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// ovecc gate (CI gate over diff/drift)
+// ---------------------------------------------------------------------------
+
+/// CI gate verdict and the signals (new cycles/structure/risk) behind it.
+#[derive(serde::Serialize)]
+struct GateReport {
+    base: String,
+    head: String,
+    /// `"pass"` or `"fail"`.
+    verdict: String,
+    new_cycles: i64,
+    new_modules: usize,
+    new_dependencies: usize,
+    risk: String,
+    signals: Vec<String>,
+}
+
+/// Computes the gate verdict from the diff (added modules/deps + risk) and the
+/// drift (cycle delta) between base and head. New cycles always fail; new
+/// structure and diff risk fail per `fail_on`.
+fn build_gate_report(
+    store: &ArchitectureStore,
+    repository_id: &str,
+    base: &str,
+    head: &str,
+    fail_on: FailOn,
+) -> Result<GateReport> {
+    let diff = store.diff(repository_id, base, head)?;
+    let drift = store.drift(repository_id, base, head)?;
+    let new_cycles = i64::from(drift.circular_dependency_delta.max(0) as i32);
+    let new_modules = diff.added_modules.len();
+    let new_dependencies = diff.added_dependencies.len();
+
+    let mut signals = Vec::new();
+    if new_cycles > 0 {
+        signals.push(format!("{new_cycles} new circular-dependency component(s)"));
+    }
+    let risk_fail = diff_crosses_threshold(&diff, fail_on);
+    if risk_fail {
+        signals.push(format!(
+            "diff risk {} crosses --fail-on {:?}",
+            diff.risk_score.as_str(),
+            fail_on
+        ));
+    }
+    if matches!(fail_on, FailOn::Any) {
+        if new_modules > 0 {
+            signals.push(format!("{new_modules} new module(s)"));
+        }
+        if new_dependencies > 0 {
+            signals.push(format!("{new_dependencies} new dependency edge(s)"));
+        }
+    }
+    let failed = new_cycles > 0
+        || risk_fail
+        || (matches!(fail_on, FailOn::Any) && (new_modules > 0 || new_dependencies > 0));
+
+    Ok(GateReport {
+        base: diff.base.id,
+        head: diff.head.id,
+        verdict: if failed { "fail" } else { "pass" }.to_string(),
+        new_cycles,
+        new_modules,
+        new_dependencies,
+        risk: diff.risk_score.as_str().to_string(),
+        signals,
+    })
+}
+
+fn render_gate(report: &GateReport, format: OutputFormat) -> Result<()> {
+    match format {
+        OutputFormat::Json | OutputFormat::Ndjson => emit_json("gate", report, meta_for("gate"))?,
+        OutputFormat::Markdown => {
+            println!("# CI gate: {}", report.verdict.to_uppercase());
+            println!();
+            println!("- Base: `{}`", report.base);
+            println!("- Head: `{}`", report.head);
+            println!("- New cycles: {}", report.new_cycles);
+            println!("- Risk: {}", report.risk);
+            if report.signals.is_empty() {
+                println!("- No gating signals.");
+            } else {
+                println!();
+                println!("## Signals");
+                println!();
+                for signal in &report.signals {
+                    println!("- {signal}");
+                }
+            }
+        }
+        OutputFormat::Text => {
+            println!("Gate: {} ({} -> {})", report.verdict, report.base, report.head);
+            println!(
+                "New cycles: {}, new modules: {}, new deps: {}, risk: {}",
+                report.new_cycles, report.new_modules, report.new_dependencies, report.risk
+            );
+            for signal in &report.signals {
+                println!("  - {signal}");
+            }
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// ovecc report (one-shot composite)
+// ---------------------------------------------------------------------------
+
+/// First evidence location of a finding, formatted as ` (path:line)`, or empty.
+fn first_evidence(finding: &FindingRecord) -> String {
+    finding
+        .evidence
+        .first()
+        .map(|evidence| format!(" ({})", format_evidence(evidence)))
+        .unwrap_or_default()
+}
+
+/// Renders a one-shot report stitching health, cycles, all findings, a security
+/// breakdown, and hotspots — so the report no longer has to be hand-assembled
+/// from six commands. Markdown for humans; structured JSON for agents.
+fn render_full_report(paths: &ProjectPaths, format: OutputFormat) -> Result<()> {
+    let repository_id = paths.repository_id().0;
+    // `load_summary` and `load_hotspots` each open and release their own store,
+    // so gather them before opening one here: DuckDB permits only one
+    // connection per file per process.
+    let summary = load_summary(paths)?;
+    let hotspots = load_hotspots(paths, 10)?;
+
+    let store = open_store(paths)?;
+    let modules = store.current_modules(&repository_id)?;
+    let dependencies = store.current_dependencies(&repository_id)?;
+    let cycles: Vec<Vec<String>> =
+        ovecc_graph::cycles::elementary_cycles(&modules, &dependencies)
+            .into_iter()
+            .map(|mut members| {
+                if let Some(first) = members.first().cloned() {
+                    members.push(first);
+                }
+                members
+            })
+            .collect();
+    let mut findings = store.findings(&repository_id, None)?;
+    drop(store);
+    // Highest severity first, then stable by title, for deterministic output.
+    findings.sort_by(|a, b| b.severity.cmp(&a.severity).then_with(|| a.title.cmp(&b.title)));
+    let security = build_security_report(&findings, None);
+
+    match format {
+        OutputFormat::Json | OutputFormat::Ndjson => {
+            let data = serde_json::json!({
+                "summary": summary,
+                "cycles": cycles,
+                "findings": findings,
+                "security": security,
+                "hotspots": hotspots,
+            });
+            emit_json("report", &data, meta_for("report"))?;
+        }
+        _ => {
+            println!("# Architecture report: {}", summary.repository_root);
+            println!();
+            println!("## Health");
+            println!();
+            println!(
+                "- Files: {} · Modules: {} · Dependencies: {} ({} external)",
+                summary.files, summary.modules, summary.dependencies, summary.external_dependencies
+            );
+            println!(
+                "- Circular dependencies: {} · Coupling density: {:.2}% · Risk: **{}**",
+                summary.circular_dependencies,
+                summary.coupling_density * 100.0,
+                summary.risk_score.as_str()
+            );
+            println!();
+            println!("## Circular dependencies ({})", cycles.len());
+            println!();
+            if cycles.is_empty() {
+                println!("_None._");
+            }
+            for cycle in &cycles {
+                println!("- `{}`", cycle.join(" -> "));
+            }
+            println!();
+            println!("## Findings ({})", findings.len());
+            println!();
+            if findings.is_empty() {
+                println!("_None._");
+            }
+            for finding in &findings {
+                println!(
+                    "- [{:?}] {}{}",
+                    finding.severity,
+                    finding.title,
+                    first_evidence(finding)
+                );
+            }
+            println!();
+            println!("## Security");
+            println!();
+            println!(
+                "- Secrets {}, insecure {}, weak-crypto {}, CORS {}, tainted-flows {} (total {})",
+                security.secrets,
+                security.insecure_patterns,
+                security.weak_crypto,
+                security.permissive_cors,
+                security.tainted_flows,
+                security.total
+            );
+            println!();
+            println!("## Hotspots");
+            println!();
+            if hotspots.hotspots.is_empty() {
+                println!("_None._");
+            }
+            for (rank, hotspot) in hotspots.hotspots.iter().enumerate() {
+                println!(
+                    "{}. {} (score {:.0}, fan-in {}, fan-out {})",
+                    rank + 1,
+                    hotspot.module,
+                    hotspot.score,
+                    hotspot.fan_in,
+                    hotspot.fan_out
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// ovecc dupes (clone detection)
+// ---------------------------------------------------------------------------
+
+/// Duplication report: scan parameters and the clone families found.
+#[derive(serde::Serialize)]
+struct DupesReport {
+    files_scanned: usize,
+    min_tokens: usize,
+    min_lines: usize,
+    clone_families: usize,
+    duplicated_lines: u32,
+    families: Vec<ovecc_graph::dupes::CloneFamily>,
+}
+
+fn render_dupes(report: &DupesReport, format: OutputFormat) -> Result<()> {
+    let plural = |n: usize| if n == 1 { "y" } else { "ies" };
+    match format {
+        OutputFormat::Json => emit_json("dupes", report, meta_for("dupes"))?,
+        OutputFormat::Ndjson => {
+            emit_ndjson_meta("dupes", &meta_for("dupes"))?;
+            for family in &report.families {
+                println!("{}", ndjson_line("clone_family", family)?);
+            }
+        }
+        OutputFormat::Markdown => {
+            println!(
+                "# Duplication ({} clone famil{})",
+                report.clone_families,
+                plural(report.clone_families)
+            );
+            println!();
+            println!("- Files scanned: {}", report.files_scanned);
+            println!(
+                "- Thresholds: >= {} tokens, >= {} lines",
+                report.min_tokens, report.min_lines
+            );
+            for (rank, family) in report.families.iter().enumerate() {
+                println!();
+                println!(
+                    "## Clone {} ({} tokens, {} lines, {} copies)",
+                    rank + 1,
+                    family.token_length,
+                    family.line_span,
+                    family.instances.len()
+                );
+                for instance in &family.instances {
+                    println!(
+                        "- `{}:{}-{}`",
+                        instance.path, instance.start_line, instance.end_line
+                    );
+                }
+            }
+        }
+        OutputFormat::Text => {
+            println!(
+                "Duplication: {} clone famil{} (scanned {} files, >= {} tokens / {} lines)",
+                report.clone_families,
+                plural(report.clone_families),
+                report.files_scanned,
+                report.min_tokens,
+                report.min_lines
+            );
+            for (rank, family) in report.families.iter().enumerate() {
+                println!();
+                println!(
+                    "{}. {} tokens / {} lines, {} copies:",
+                    rank + 1,
+                    family.token_length,
+                    family.line_span,
+                    family.instances.len()
+                );
+                for instance in &family.instances {
+                    println!(
+                        "   {}:{}-{}",
+                        instance.path, instance.start_line, instance.end_line
+                    );
+                }
+            }
+            if report.families.is_empty() {
+                println!("  (no duplication above the threshold)");
+            }
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// ovecc health (complexity hotspots)
+// ---------------------------------------------------------------------------
+
+/// Code-health report: functions over the complexity thresholds.
+#[derive(serde::Serialize)]
+struct HealthReport {
+    high_complexity_functions: usize,
+    findings: Vec<FindingRecord>,
+}
+
+fn render_health(report: &HealthReport, format: OutputFormat) -> Result<()> {
+    match format {
+        OutputFormat::Json => emit_json("health", report, meta_for("health"))?,
+        OutputFormat::Ndjson => {
+            emit_ndjson_meta("health", &meta_for("health"))?;
+            for finding in &report.findings {
+                println!("{}", ndjson_line("complexity", finding)?);
+            }
+        }
+        OutputFormat::Markdown => {
+            println!(
+                "# Health: {} high-complexity function(s)",
+                report.high_complexity_functions
+            );
+            println!();
+            if report.findings.is_empty() {
+                println!("_No functions over the complexity thresholds._");
+            }
+            for finding in &report.findings {
+                println!(
+                    "- [{:?}] {}{}",
+                    finding.severity,
+                    finding.title,
+                    first_evidence(finding)
+                );
+            }
+        }
+        OutputFormat::Text => {
+            println!(
+                "Code health: {} high-complexity function(s)",
+                report.high_complexity_functions
+            );
+            for finding in &report.findings {
+                println!();
+                println!("[{:?}] {}", finding.severity, finding.title);
+                for evidence in &finding.evidence {
+                    println!("  {}", format_evidence(evidence));
+                }
+            }
+            if report.findings.is_empty() {
+                println!("  (no functions over the complexity thresholds)");
+            }
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// ovecc deadcode (unused exports / files)
+// ---------------------------------------------------------------------------
+
+/// Dead-code report: unused exports and unreachable files.
+#[derive(serde::Serialize)]
+struct DeadcodeReport {
+    unused_exports: usize,
+    unused_files: usize,
+    findings: Vec<FindingRecord>,
+}
+
+fn render_deadcode(report: &DeadcodeReport, format: OutputFormat) -> Result<()> {
+    match format {
+        OutputFormat::Json => emit_json("deadcode", report, meta_for("deadcode"))?,
+        OutputFormat::Ndjson => {
+            emit_ndjson_meta("deadcode", &meta_for("deadcode"))?;
+            for finding in &report.findings {
+                println!("{}", ndjson_line("dead_code", finding)?);
+            }
+        }
+        OutputFormat::Markdown => {
+            println!(
+                "# Dead code ({} unused export(s), {} unused file(s))",
+                report.unused_exports, report.unused_files
+            );
+            println!();
+            if report.findings.is_empty() {
+                println!("_No dead code detected (or no entry points)._");
+            }
+            for finding in &report.findings {
+                println!(
+                    "- [{:?}] {}{}",
+                    finding.severity,
+                    finding.title,
+                    first_evidence(finding)
+                );
+            }
+        }
+        OutputFormat::Text => {
+            println!(
+                "Dead code: {} unused export(s), {} unused file(s)",
+                report.unused_exports, report.unused_files
+            );
+            for finding in &report.findings {
+                println!();
+                println!("[{:?}] {}", finding.severity, finding.title);
+                for evidence in &finding.evidence {
+                    println!("  {}", format_evidence(evidence));
+                }
+            }
+            if report.findings.is_empty() {
+                println!("  (none — or no entry points detected)");
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Resolves a CLI ref argument for `diff`/`drift`. Snapshot keywords
@@ -1019,8 +1939,11 @@ fn ndjson_header<T: serde::Serialize>(kind: &str, payload: &T, drop: &[&str]) ->
 
 fn render_index_report(report: &IndexReport, format: OutputFormat) -> Result<()> {
     match format {
-        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(report)?),
-        OutputFormat::Ndjson => println!("{}", ndjson_line("index", report)?),
+        OutputFormat::Json => emit_json("index", report, meta_for("index"))?,
+        OutputFormat::Ndjson => {
+            emit_ndjson_meta("index", &meta_for("index"))?;
+            println!("{}", ndjson_line("index", report)?);
+        }
         OutputFormat::Markdown => {
             println!("# Ovecc index");
             println!();
@@ -1077,8 +2000,9 @@ fn render_index_report(report: &IndexReport, format: OutputFormat) -> Result<()>
 
 fn render_summary_report(report: &SummaryReport, format: OutputFormat) -> Result<()> {
     match format {
-        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(report)?),
+        OutputFormat::Json => emit_json("summary", report, meta_for("summary"))?,
         OutputFormat::Ndjson => {
+            emit_ndjson_meta("summary", &meta_for("summary"))?;
             println!("{}", ndjson_header("summary", report, &["hotspots"])?);
             for hotspot in &report.hotspots {
                 println!("{}", ndjson_line("hotspot", hotspot)?);
@@ -1156,10 +2080,20 @@ fn render_summary_report(report: &SummaryReport, format: OutputFormat) -> Result
 fn render_blast(target: &str, result: Option<&BlastResult>, format: OutputFormat) -> Result<()> {
     let Some(result) = result else {
         match format {
-            OutputFormat::Json | OutputFormat::Ndjson => println!(
-                "{}",
-                serde_json::to_string(&serde_json::json!({"target": target, "matched": false}))?
-            ),
+            OutputFormat::Json => emit_json(
+                "impact",
+                &serde_json::json!({"target": target, "matched": false}),
+                meta_for("impact"),
+            )?,
+            OutputFormat::Ndjson => {
+                emit_ndjson_meta("impact", &meta_for("impact"))?;
+                println!(
+                    "{}",
+                    serde_json::to_string(
+                        &serde_json::json!({"type": "impact", "target": target, "matched": false})
+                    )?
+                );
+            }
             OutputFormat::Markdown => {
                 println!("# Impact: {target}");
                 println!();
@@ -1174,8 +2108,9 @@ fn render_blast(target: &str, result: Option<&BlastResult>, format: OutputFormat
     };
 
     match format {
-        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(result)?),
+        OutputFormat::Json => emit_json("impact", result, meta_for("impact"))?,
         OutputFormat::Ndjson => {
+            emit_ndjson_meta("impact", &meta_for("impact"))?;
             println!(
                 "{}",
                 ndjson_header("impact", result, &["impacted_labels", "paths"])?
@@ -1229,8 +2164,9 @@ fn render_blast(target: &str, result: Option<&BlastResult>, format: OutputFormat
 
 fn render_diff_report(report: &DiffReport, format: OutputFormat) -> Result<()> {
     match format {
-        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(report)?),
+        OutputFormat::Json => emit_json("diff", report, meta_for("diff"))?,
         OutputFormat::Ndjson => {
+            emit_ndjson_meta("diff", &meta_for("diff"))?;
             println!(
                 "{}",
                 ndjson_header(
@@ -1311,8 +2247,11 @@ fn render_diff_report(report: &DiffReport, format: OutputFormat) -> Result<()> {
 
 fn render_drift_report(report: &DriftReport, format: OutputFormat) -> Result<()> {
     match format {
-        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(report)?),
-        OutputFormat::Ndjson => println!("{}", ndjson_line("drift", report)?),
+        OutputFormat::Json => emit_json("drift", report, meta_for("drift"))?,
+        OutputFormat::Ndjson => {
+            emit_ndjson_meta("drift", &meta_for("drift"))?;
+            println!("{}", ndjson_line("drift", report)?);
+        }
         OutputFormat::Markdown => {
             println!("# Drift: `{}` -> `{}`", report.base.id, report.head.id);
             println!();

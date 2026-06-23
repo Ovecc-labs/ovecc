@@ -226,6 +226,11 @@ pub struct HotspotEntry {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HotspotsReport {
     pub hotspots: Vec<HotspotEntry>,
+    /// False when no git history was indexed: the churn and ownership-
+    /// fragmentation signals are then unavailable (rendered "n/a"), not
+    /// genuinely zero. Lets agents distinguish "no data" from "0".
+    #[serde(default)]
+    pub has_git_history: bool,
 }
 
 /// A learned repository convention with its confidence.

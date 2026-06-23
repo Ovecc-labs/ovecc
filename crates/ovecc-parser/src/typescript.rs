@@ -163,6 +163,8 @@ impl<'a> Extractor<'a> {
             security_patterns: self.security,
             suppressed_lines: self.suppressed,
             local_types: self.local_types,
+            // complexity + exports are computed by the oxc extractor, not here.
+            ..FileFacts::default()
         }
     }
 

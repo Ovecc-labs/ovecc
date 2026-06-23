@@ -16,6 +16,7 @@ ovecc-db = { workspace = true }
 ovecc-git = { workspace = true }
 ovecc-graph = { workspace = true }
 ovecc-indexer = { workspace = true }
+ovecc-audit = { workspace = true }
 ovecc-ai = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }

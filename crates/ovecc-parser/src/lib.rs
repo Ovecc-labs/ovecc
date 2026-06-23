@@ -10,7 +10,9 @@
 //! [`FileFacts`]: ovecc_core::facts::FileFacts
 
 pub mod generic;
+pub mod oxc_extractor;
 pub mod security;
+pub mod tokenize;
 pub mod typescript;
 
 pub use generic::GenericAdapter;

@@ -60,9 +60,17 @@ pub enum EdgeKind {
 }
 
 impl EdgeKind {
-    /// Edge kinds traversed by default during blast-radius analysis.
+    /// Edge kinds traversed by default during blast-radius analysis. Mirrors
+    /// `ovecc_graph::blast::IMPACT_EDGE_KINDS` in typed form.
     pub fn default_impact_kinds() -> &'static [EdgeKind] {
-        todo!()
+        &[
+            EdgeKind::DependsOn,
+            EdgeKind::Calls,
+            EdgeKind::Reads,
+            EdgeKind::Writes,
+            EdgeKind::Exposes,
+            EdgeKind::Handles,
+        ]
     }
 }
 

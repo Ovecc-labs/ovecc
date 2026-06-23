@@ -12,3 +12,8 @@ export.json
 # Local benchmark checkouts — large third-party clones, never committed.
 # Measured results live in BENCHMARKS.md instead.
 /benchmarks/
+
+.github/workflows-example/
+
+*.pdf
+docs/local/

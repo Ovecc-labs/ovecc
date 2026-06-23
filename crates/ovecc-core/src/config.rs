@@ -142,6 +142,10 @@ pub struct RulesConfig {
     pub boundaries: Vec<BoundaryRuleConfig>,
     /// `[[rules.layers]]` entries.
     pub layers: Vec<LayerRuleConfig>,
+    /// `[[rules.banned_imports]]` entries: a declarative rule pack banning
+    /// imports of specifier patterns, evaluated over the neutral fact model so
+    /// it works across every language.
+    pub banned_imports: Vec<BannedImportRule>,
 }
 
 impl Default for RulesConfig {
@@ -153,8 +157,24 @@ impl Default for RulesConfig {
             enable_domain_rules: true,
             boundaries: Vec::new(),
             layers: Vec::new(),
+            banned_imports: Vec::new(),
         }
     }
+}
+
+/// A declarative policy rule banning imports whose specifier matches a pattern,
+/// e.g. `pattern = "lodash"`, `pattern = "@internal/*"`, or `pattern = "*legacy*"`.
+/// Language-neutral: it matches the resolved import specifier, so it governs
+/// JS/TS, Python, Go, Rust, and C++ imports alike.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BannedImportRule {
+    pub name: String,
+    /// Specifier pattern: exact, `prefix*`, `*suffix`, or `*infix*`.
+    pub pattern: String,
+    /// Optional guidance surfaced in the finding (e.g. "use @scope/x instead").
+    #[serde(default)]
+    pub message: Option<String>,
+    pub severity: Severity,
 }
 
 /// Explicit boundary rule, e.g. "Billing must not depend on User".

@@ -57,24 +57,99 @@ The binary is `ovecc` (`crates/ovecc-cli`).
 ## Quick start
 
 ```sh
-ovecc index .              # parse, resolve, and persist the model into .ovecc/
-ovecc summary              # coupling, density, cycles, risk score
-ovecc violations           # rule and security findings
-ovecc impact Billing       # blast radius of a change
-ovecc query "deps Billing" # structured architecture query
-ovecc explain Billing      # offline, deterministic explanation
-ovecc index . --stats      # per-phase timing and peak memory
+ovecc index .                 # parse, resolve, and persist the model into .ovecc/
+ovecc capabilities            # machine-readable contract: commands, metrics, rules, exit codes
+ovecc summary                 # coupling, density, cycles, risk score
+ovecc violations              # architecture + security findings, with file:line
+ovecc security                # secrets, insecure patterns, weak crypto, tainted flows
+ovecc audit                   # offline OSV dependency vulnerabilities
+ovecc impact Billing          # blast radius of a change
+ovecc hotspots                # churn x coupling x ownership debt ranking
+ovecc dupes                   # duplicated code (clone families), file:line
+ovecc health                  # functions over the complexity thresholds (oxc)
+ovecc deadcode                # unused exports + unreachable files (oxc + reachability)
+ovecc query "cycles"          # actual elementary dependency cycles (A -> B -> A)
+ovecc report                  # one-shot architecture report (markdown or json)
+ovecc gate                    # CI gate: fail a PR on new cycles / violations
+ovecc explain Billing         # offline, deterministic explanation
+ovecc index . --exclude "vendored/**"   # built-in excludes (node_modules, .venv, ...) plus your own
 ```
 
 Every command renders as `text`, `json`, `ndjson`, or `markdown` via `--format`,
 and returns stable exit codes for CI.
 
+## For AI agents
+
+Ovecc is built to be consumed by AI systems first. Start with the contract:
+
+```sh
+ovecc capabilities --format json
+```
+
+It returns every command, the metrics and rules they emit (each with a
+definition), the severity vocabulary, the exit-code contract, and the output
+formats — enough to drive an end-to-end audit without reading these docs.
+
+Every command's JSON is wrapped in a stable, self-describing envelope:
+
+```json
+{
+  "schema_version": 1,
+  "tool": { "name": "ovecc", "version": "0.1.0" },
+  "command": "summary",
+  "meta": { "metrics": { "...": {} }, "rules": { "...": {} } },
+  "data": { "...": {} }
+}
+```
+
+- `schema_version` is an integer; **additive** changes never bump it, so detect
+  new fields by key presence rather than gating on the number.
+- `meta` carries metric/rule definitions so values are interpretable without the
+  docs site.
+- Output is path-normalized (repo-relative, POSIX) and **byte-identical across
+  runs** for an unchanged database.
+- Exit codes are stable: `0` ok · `1` a `--fail-on` threshold crossed · `2` usage
+  · `3` repository/config · `4` index/db · `5` parser · `6` git · `7` internal.
+
+Portions of Ovecc are adapted from [fallow](https://github.com/fallow-rs/fallow)
+(MIT); see [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).
+
+## Governance
+
+Declarative, language-neutral policy lives in `.ovecc/config.toml`, is enforced
+at index time, and is surfaced by `violations` (and the `gate` CI check):
+
+```toml
+# Forbid a module-to-module dependency.
+[[rules.boundaries]]
+name = "billing must not depend on user"
+source = "billing"
+target = "user"
+allowed = false
+severity = "high"
+
+# Ban imports by specifier pattern (exact, prefix*, *suffix, or *infix*).
+[[rules.banned_imports]]
+name = "no-deprecated-lodash"
+pattern = "lodash"
+message = "use es-toolkit instead"
+severity = "medium"
+```
+
+Silence a specific finding inline with `// ovecc-ignore` (or
+`// ovecc-ignore-next-line`, and `# ovecc-ignore` in Python) on the offending
+line; the finding is dropped at index time.
+
 ## Languages
 
-A bespoke adapter covers the JavaScript/TypeScript family; a single
-specification-driven adapter covers Python, Go, Rust, and C++. All feed the same
+The JavaScript/TypeScript family is parsed with tree-sitter and enriched by the
+pure-Rust **oxc** stack behind the parser boundary — real `tsconfig`
+paths/`exports` module resolution (`oxc_resolver`), plus per-function complexity
+and exports (`oxc_parser`/`oxc_semantic`). A single specification-driven
+tree-sitter adapter covers Python, Go, Rust, and C++. All feed the same
 language-agnostic model, so resolution, the call graph, taint, and the rules work
-across every supported language.
+across every supported language; adding a language is a new extractor behind the
+boundary, not a core change.
 
 ## Workspace layout
 

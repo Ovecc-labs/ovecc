@@ -306,9 +306,13 @@ pub enum OwnershipSource {
 }
 
 impl OwnershipSource {
-    /// Explicit (CODEOWNERS, config) vs inferred (git history, conventions).
+    /// Explicit (CODEOWNERS, repository config, declared service metadata) vs
+    /// inferred (git history, path conventions).
     pub fn is_explicit(self) -> bool {
-        todo!()
+        matches!(
+            self,
+            Self::Codeowners | Self::RepositoryConfig | Self::ServiceMetadata
+        )
     }
 }
 
@@ -415,6 +419,10 @@ pub enum FindingKind {
     PermissiveCors,
     VulnerableDependency,
     TaintedFlow,
+    // Dead code & complexity.
+    UnusedExport,
+    UnusedFile,
+    HighComplexity,
 }
 
 // ---------------------------------------------------------------------------
@@ -450,6 +458,14 @@ pub struct FileFacts {
     /// for receiver-typed dispatch resolution.
     #[serde(default)]
     pub local_types: Vec<(String, String)>,
+    /// Per-function complexity (cyclomatic + cognitive). Populated by the oxc
+    /// TS/JS extractor; empty for adapters that don't compute it.
+    #[serde(default)]
+    pub complexity: Vec<ComplexityFact>,
+    /// Names this file exports (including re-exports). Populated by the oxc
+    /// TS/JS extractor; feeds dead-code analysis.
+    #[serde(default)]
+    pub exports: Vec<ExportFact>,
 }
 
 /// A security-relevant pattern found in source, classified into a finding by
@@ -564,6 +580,48 @@ pub enum SchemaAccess {
     Read,
     Write,
     Define,
+}
+
+/// Per-function complexity metrics. Ported from fallow's `FunctionComplexity`
+/// (research/fallow/crates/types/src/extract.rs), reduced to the
+/// language-agnostic core (React-specific fields dropped).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ComplexityFact {
+    pub qualified_name: String,
+    /// 1-based start line.
+    pub line: u32,
+    /// McCabe cyclomatic complexity (1 + decision points).
+    pub cyclomatic: u16,
+    /// SonarSource cognitive complexity (structural increments + nesting penalty).
+    pub cognitive: u16,
+    pub line_count: u32,
+    /// Parameter count (excludes a TypeScript `this` parameter).
+    pub param_count: u8,
+}
+
+/// A name a file exports. `re_export` is `Some` for `export … from './src'`.
+/// Mirrors fallow's `ExportInfo` + `ReExportInfo`; feeds dead-code analysis.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExportFact {
+    /// Exported name; `"default"` for the default export, `"*"` for `export *`.
+    pub name: String,
+    /// Local binding name when it differs (`export { a as b }` → `name="b"`,
+    /// `local_name=Some("a")`).
+    pub local_name: Option<String>,
+    pub is_type_only: bool,
+    /// 1-based line of the export declaration.
+    pub line: u32,
+    /// Re-export provenance; `None` for a local `export const x` / `export fn`.
+    pub re_export: Option<ReExportFact>,
+}
+
+/// Re-export provenance for an [`ExportFact`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReExportFact {
+    /// Raw specifier re-exported from (e.g. `"./x"`), resolved later.
+    pub source_specifier: String,
+    /// Name imported from the source; `"*"` for `export * from`.
+    pub imported_name: String,
 }
 
 /// Per-file parser failure. Must not abort the index run: it is recorded and

@@ -45,3 +45,14 @@ tree-sitter-python = "0.23"
 tree-sitter-go = "0.23"
 tree-sitter-rust = "0.23"
 tree-sitter-cpp = "0.23"
+# JS/TS module resolution (tsconfig paths/baseUrl, package exports, extension
+# aliasing). Pure-Rust, filesystem-only (no network).
+oxc_resolver = "11"
+# oxc parser/AST stack for the TS/JS semantic extractor (exports + complexity).
+# Pure-Rust, offline, deterministic. Pinned to match fallow.
+oxc_allocator = "0.126"
+oxc_ast = "0.126"
+oxc_ast_visit = "0.126"
+oxc_parser = "0.126"
+oxc_span = "0.126"
+oxc_semantic = "0.126"
