@@ -96,7 +96,16 @@ pub fn analyze(input: &DeadCodeInput<'_>) -> Vec<FindingRecord> {
     let mut findings = Vec::new();
     flag_unused_exports(input, &reachable, &refs, &mut findings);
     flag_unused_files(input, &reachable, &exports_by_file, &mut findings);
+    // Sort by id, then drop any exact-id duplicates. The id carries the source
+    // location, so genuinely distinct declarations (a name exported twice in one
+    // file via TypeScript declaration merging or overloads) keep distinct ids and
+    // survive; this only removes a finding the analysis emitted twice (e.g. a
+    // duplicated export fact). Sorting first lets `dedup_by` remove ALL
+    // duplicates, not just adjacent ones, and guarantees the returned set is what
+    // gets persisted — so the `unused_exports`/`unused_files` metrics can never
+    // disagree with what `deadcode`/`violations` actually report.
     findings.sort_by(|a, b| a.id.0.cmp(&b.id.0));
+    findings.dedup_by(|a, b| a.id.0 == b.id.0);
     findings
 }
 
@@ -261,6 +270,11 @@ fn finding(
         FindingKind::UnusedExport => "unused-export",
         _ => "unused-file",
     };
+    // The line is part of the finding's identity: a single file can export the
+    // same name more than once (TypeScript declaration merging, function
+    // overloads). Without the location those distinct findings would share an id,
+    // collide on the `findings.id` primary key, and be silently dropped on write.
+    let line_str = line.to_string();
     FindingRecord {
         id: FindingId::from_parts(&[
             input.repository_id,
@@ -268,6 +282,7 @@ fn finding(
             kind_slug,
             file,
             symbol.as_deref().unwrap_or(""),
+            &line_str,
         ]),
         repository_id: RepositoryId::from_raw(input.repository_id),
         snapshot_id: input.snapshot_id.map(SnapshotId::from_raw),
@@ -295,13 +310,25 @@ mod tests {
     use super::*;
 
     fn export(name: &str) -> ExportFact {
+        export_at(name, 1)
+    }
+
+    fn export_at(name: &str, line: u32) -> ExportFact {
         ExportFact {
             name: name.to_string(),
             local_name: None,
             is_type_only: false,
-            line: 1,
+            line,
             re_export: None,
         }
+    }
+
+    fn unique_ids(findings: &[FindingRecord]) -> bool {
+        let mut ids: Vec<&str> = findings.iter().map(|f| f.id.0.as_str()).collect();
+        ids.sort_unstable();
+        let total = ids.len();
+        ids.dedup();
+        ids.len() == total
     }
 
     fn entry(paths: &[&str]) -> HashSet<String> {
@@ -375,6 +402,75 @@ mod tests {
                 && f.title.contains("orphan")),
             "{findings:?}"
         );
+    }
+
+    #[test]
+    fn same_named_exports_on_different_lines_stay_distinct() {
+        // A file exports `Widget` twice on different lines (declaration merging /
+        // overloads). Both are unused and must survive as two distinct findings —
+        // before the line entered the id they collided into one and were dropped.
+        let files = vec!["src/index.ts".to_string(), "src/widget.ts".to_string()];
+        let exports = vec![
+            // `used` keeps widget.ts reachable so the unused-export rule fires.
+            ("src/widget.ts".to_string(), export_at("used", 1)),
+            ("src/widget.ts".to_string(), export_at("Widget", 10)),
+            ("src/widget.ts".to_string(), export_at("Widget", 42)),
+        ];
+        let imports = vec![ImportEdge {
+            source_file: "src/index.ts".to_string(),
+            target_file: "src/widget.ts".to_string(),
+            imported_names: vec!["used".to_string()],
+            is_namespace: false,
+        }];
+        let input = DeadCodeInput {
+            repository_id: "r",
+            snapshot_id: None,
+            files: &files,
+            entry_points: &entry(&["src/index.ts"]),
+            exports: &exports,
+            imports: &imports,
+        };
+        let findings = analyze(&input);
+        let widgets = findings
+            .iter()
+            .filter(|f| f.kind == FindingKind::UnusedExport && f.title.contains("Widget"))
+            .count();
+        assert_eq!(widgets, 2, "both same-named exports must be reported: {findings:?}");
+        assert!(unique_ids(&findings), "finding ids must be unique: {findings:?}");
+    }
+
+    #[test]
+    fn duplicate_export_facts_collapse_to_one_finding() {
+        // Defensive: if the extractor ever emits the exact same export twice
+        // (same file, name, and line), analyze() dedups it so the persisted
+        // findings and the unused-export metric stay in lockstep.
+        let files = vec!["src/index.ts".to_string(), "src/util.ts".to_string()];
+        let exports = vec![
+            ("src/util.ts".to_string(), export_at("used", 1)),
+            ("src/util.ts".to_string(), export_at("dup", 7)),
+            ("src/util.ts".to_string(), export_at("dup", 7)),
+        ];
+        let imports = vec![ImportEdge {
+            source_file: "src/index.ts".to_string(),
+            target_file: "src/util.ts".to_string(),
+            imported_names: vec!["used".to_string()],
+            is_namespace: false,
+        }];
+        let input = DeadCodeInput {
+            repository_id: "r",
+            snapshot_id: None,
+            files: &files,
+            entry_points: &entry(&["src/index.ts"]),
+            exports: &exports,
+            imports: &imports,
+        };
+        let findings = analyze(&input);
+        let dups = findings
+            .iter()
+            .filter(|f| f.kind == FindingKind::UnusedExport && f.title.contains("dup"))
+            .count();
+        assert_eq!(dups, 1, "identical export facts collapse to one finding: {findings:?}");
+        assert!(unique_ids(&findings), "finding ids must be unique: {findings:?}");
     }
 
     #[test]

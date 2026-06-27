@@ -12,7 +12,9 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use ignore::WalkBuilder;
 use ignore::overrides::OverrideBuilder;
-use ovecc_core::config::{OveccConfig, ProjectPaths};
+use ovecc_core::config::{
+    ArchitectureConfig, ModuleMapping, ModuleStrategy, OveccConfig, ProjectPaths,
+};
 use ovecc_core::facts::{
     ChangeKind, CommitRecord, ComplexityRecord, ExportRecord, FileChangeRecord, FileFacts,
     FindingKind, ImportFactKind, ParseFailure, SourceFile,
@@ -77,7 +79,15 @@ pub fn index_repository(
     // Results keep the discovery order, so output stays deterministic.
     let processed: Vec<ProcessedFile> = source_files
         .par_iter()
-        .map(|source_file| process_file(paths, &repository_id, &cache, source_file))
+        .map(|source_file| {
+            process_file(
+                paths,
+                &repository_id,
+                &cache,
+                source_file,
+                &config.architecture,
+            )
+        })
         .collect();
     phase(&mut timings.parse_ms);
 
@@ -111,7 +121,7 @@ pub fn index_repository(
                 id: file.module_id.clone(),
                 repository_id: repository_id.clone(),
                 name: file.module_name.clone(),
-                path_prefix: infer_module_prefix(&file.path),
+                path_prefix: infer_module_prefix(&file.path, &config.architecture),
             });
 
         let imports = if parse_failed {
@@ -785,6 +795,7 @@ fn process_file(
     repository_id: &str,
     cache: &ParseCache,
     source_file: &Path,
+    architecture: &ArchitectureConfig,
 ) -> ProcessedFile {
     let unreadable = |path: String, message: String| ProcessedFile {
         file: None,
@@ -809,7 +820,7 @@ fn process_file(
         Err(error) => return unreadable(relative, format!("failed to read file: {error}")),
     };
 
-    let module_name = infer_module_name(&relative);
+    let module_name = infer_module_name(&relative, architecture);
     let file = FileRecord {
         id: stable_id("file", &[repository_id, &relative]),
         repository_id: repository_id.to_string(),
@@ -1260,32 +1271,81 @@ fn language_for_path(path: &Path) -> Option<SourceLanguage> {
     SourceLanguage::from_extension(extension)
 }
 
-fn infer_module_name(relative: &str) -> String {
-    let parts = relative.split('/').collect::<Vec<_>>();
-    match parts.as_slice() {
-        ["src", module, ..] if !module.is_empty() => normalize_module_name(module),
-        ["app", module, ..] if !module.is_empty() => normalize_module_name(module),
-        ["packages", package, ..] if !package.is_empty() => normalize_module_name(package),
-        ["apps", app, ..] if !app.is_empty() => normalize_module_name(app),
-        ["services", service, ..] if !service.is_empty() => normalize_module_name(service),
-        ["crates", crate_name, ..] if !crate_name.is_empty() => normalize_module_name(crate_name),
-        [top, ..] if parts.len() > 1 && !top.is_empty() => normalize_module_name(top),
-        _ => "root".to_string(),
+/// Directories that *contain* modules but are not themselves one — the module is
+/// what lives inside them. A leading container is skipped when naming a module so
+/// `src/billing/...` is `billing`, not `src`.
+const MODULE_CONTAINERS: &[&str] = &["src", "app", "packages", "apps", "services", "crates"];
+
+/// The explicit `[[architecture.modules]]` mapping that governs `relative`, when
+/// the `configured`/`hybrid` strategy is active. The longest matching
+/// `path_prefix` wins so the most specific rule applies; ties break on name for
+/// determinism.
+fn configured_module<'a>(
+    relative: &str,
+    architecture: &'a ArchitectureConfig,
+) -> Option<&'a ModuleMapping> {
+    if matches!(architecture.module_strategy, ModuleStrategy::Auto) {
+        return None;
     }
+    architecture
+        .modules
+        .iter()
+        .filter(|mapping| {
+            !mapping.path_prefix.is_empty() && relative.starts_with(mapping.path_prefix.as_str())
+        })
+        .max_by(|a, b| {
+            a.path_prefix
+                .len()
+                .cmp(&b.path_prefix.len())
+                .then_with(|| b.name.cmp(&a.name))
+        })
 }
 
-fn infer_module_prefix(relative: &str) -> String {
-    let parts = relative.split('/').collect::<Vec<_>>();
-    match parts.as_slice() {
-        ["src", module, ..] => format!("src/{module}"),
-        ["app", module, ..] => format!("app/{module}"),
-        ["packages", package, ..] => format!("packages/{package}"),
-        ["apps", app, ..] => format!("apps/{app}"),
-        ["services", service, ..] => format!("services/{service}"),
-        ["crates", crate_name, ..] => format!("crates/{crate_name}"),
-        [top, ..] if parts.len() > 1 => (*top).to_string(),
-        _ => ".".to_string(),
+/// The directory segments that name a module for `relative`, honoring the
+/// configured depth. Empty for a file that sits directly at the repository root.
+fn auto_module_segments(relative: &str, depth: usize) -> Vec<&str> {
+    let parts: Vec<&str> = relative.split('/').filter(|part| !part.is_empty()).collect();
+    if parts.len() < 2 {
+        return Vec::new(); // a file at the repo root has no module directory
     }
+    let dirs = &parts[..parts.len() - 1]; // drop the file name
+    let start = usize::from(MODULE_CONTAINERS.contains(&dirs[0]) && dirs.len() > 1);
+    let end = start.saturating_add(depth.max(1)).min(dirs.len());
+    dirs[start..end].to_vec()
+}
+
+/// Infers a module name from a repo-relative path. Explicit config mappings win;
+/// otherwise the first `architecture.module_depth` segments below any source
+/// container name the module (e.g. depth 2 → `vs/editor`).
+fn infer_module_name(relative: &str, architecture: &ArchitectureConfig) -> String {
+    if let Some(mapping) = configured_module(relative, architecture) {
+        return mapping.name.clone();
+    }
+    let segments = auto_module_segments(relative, architecture.module_depth);
+    if segments.is_empty() {
+        return "root".to_string();
+    }
+    segments
+        .iter()
+        .map(|segment| normalize_module_name(segment))
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// The path prefix that all files of a module share — the container plus the
+/// module's own segments, so it stays consistent with [`infer_module_name`].
+fn infer_module_prefix(relative: &str, architecture: &ArchitectureConfig) -> String {
+    if let Some(mapping) = configured_module(relative, architecture) {
+        return mapping.path_prefix.clone();
+    }
+    let parts: Vec<&str> = relative.split('/').filter(|part| !part.is_empty()).collect();
+    if parts.len() < 2 {
+        return ".".to_string();
+    }
+    let dirs = &parts[..parts.len() - 1];
+    let start = usize::from(MODULE_CONTAINERS.contains(&dirs[0]) && dirs.len() > 1);
+    let end = start.saturating_add(architecture.module_depth.max(1)).min(dirs.len());
+    dirs[..end].join("/")
 }
 
 fn normalize_module_name(raw: &str) -> String {
@@ -2259,9 +2319,70 @@ mod tests {
 
     #[test]
     fn infers_modules_from_common_layouts() {
-        assert_eq!(infer_module_name("src/billing/service.ts"), "billing");
-        assert_eq!(infer_module_name("packages/api/index.ts"), "api");
-        assert_eq!(infer_module_name("index.ts"), "root");
+        // Default depth (1) preserves the historical behavior.
+        let arch = ArchitectureConfig::default();
+        assert_eq!(infer_module_name("src/billing/service.ts", &arch), "billing");
+        assert_eq!(infer_module_name("packages/api/index.ts", &arch), "api");
+        assert_eq!(infer_module_name("index.ts", &arch), "root");
+        // A top-level non-container directory names the module after itself.
+        assert_eq!(infer_module_name("cli/src/util/command.rs", &arch), "cli");
+        // Prefix stays consistent with the name.
+        assert_eq!(infer_module_prefix("src/billing/service.ts", &arch), "src/billing");
+        assert_eq!(infer_module_prefix("index.ts", &arch), ".");
+    }
+
+    #[test]
+    fn module_depth_recovers_boundaries_in_nested_monorepos() {
+        // The VS Code case: everything lives under `src/vs`, so depth 1 collapses
+        // the repo into one `vs` module. Depth 2 recovers real boundaries.
+        let depth1 = ArchitectureConfig::default();
+        let depth2 = ArchitectureConfig { module_depth: 2, ..Default::default() };
+        assert_eq!(infer_module_name("src/vs/editor/foo.ts", &depth1), "vs");
+        assert_eq!(infer_module_name("src/vs/editor/foo.ts", &depth2), "vs/editor");
+        assert_eq!(infer_module_name("src/vs/workbench/x/y.ts", &depth2), "vs/workbench");
+        assert_eq!(infer_module_prefix("src/vs/editor/foo.ts", &depth2), "src/vs/editor");
+        // Depth never consumes the file name: a file directly under the module dir
+        // keeps the module, not the file, as the last segment.
+        assert_eq!(infer_module_name("src/vs/editor.ts", &depth2), "vs");
+        // A depth larger than the available directories is clamped, not padded.
+        let depth9 = ArchitectureConfig { module_depth: 9, ..Default::default() };
+        assert_eq!(infer_module_name("src/vs/editor/foo.ts", &depth9), "vs/editor");
+        // 0 is treated as 1.
+        let depth0 = ArchitectureConfig { module_depth: 0, ..Default::default() };
+        assert_eq!(infer_module_name("src/vs/editor/foo.ts", &depth0), "vs");
+    }
+
+    #[test]
+    fn explicit_module_mapping_overrides_inference() {
+        let arch = ArchitectureConfig {
+            module_strategy: ModuleStrategy::Hybrid,
+            modules: vec![
+                ModuleMapping {
+                    name: "Editor".to_string(),
+                    path_prefix: "src/vs/editor".to_string(),
+                    layer: None,
+                    domain: None,
+                },
+                // A shorter, less specific prefix that must lose to the one above.
+                ModuleMapping {
+                    name: "Core".to_string(),
+                    path_prefix: "src/vs".to_string(),
+                    layer: None,
+                    domain: None,
+                },
+            ],
+            ..Default::default()
+        };
+        // Longest matching prefix wins.
+        assert_eq!(infer_module_name("src/vs/editor/foo.ts", &arch), "Editor");
+        assert_eq!(infer_module_prefix("src/vs/editor/foo.ts", &arch), "src/vs/editor");
+        // Covered by the shorter prefix only.
+        assert_eq!(infer_module_name("src/vs/base/bar.ts", &arch), "Core");
+        // Unmapped file falls back to depth inference.
+        assert_eq!(infer_module_name("packages/api/x.ts", &arch), "api");
+        // `auto` strategy ignores explicit mappings entirely.
+        let auto = ArchitectureConfig { modules: arch.modules.clone(), ..Default::default() };
+        assert_eq!(infer_module_name("src/vs/editor/foo.ts", &auto), "vs");
     }
 
     #[test]
