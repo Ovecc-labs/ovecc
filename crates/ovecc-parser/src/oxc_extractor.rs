@@ -239,6 +239,41 @@ fn module_export_name(name: &ModuleExportName<'_>) -> String {
     }
 }
 
+/// The identifier a declarator binds, for `const X = ...` (not destructuring).
+fn binding_name(declarator: &VariableDeclarator<'_>) -> Option<String> {
+    declarator
+        .id
+        .get_binding_identifier()
+        .map(|id| id.name.to_string())
+}
+
+/// True when an initializer *is* a function, or wraps one in a common React
+/// higher-order call (`useCallback`, `useMemo`, `memo`, `forwardRef`,
+/// `observer`) — so `const Foo = () => {}` and `const f = useCallback(() => {})`
+/// name their frames `Foo`/`f` instead of `<anonymous>`.
+fn initializer_is_function(expr: &Expression<'_>) -> bool {
+    match expr {
+        Expression::ArrowFunctionExpression(_) | Expression::FunctionExpression(_) => true,
+        Expression::CallExpression(call) => {
+            let wraps = matches!(
+                &call.callee,
+                Expression::Identifier(id)
+                    if matches!(
+                        id.name.as_str(),
+                        "useCallback" | "useMemo" | "memo" | "forwardRef" | "observer"
+                    )
+            );
+            wraps
+                && matches!(
+                    call.arguments.first(),
+                    Some(Argument::ArrowFunctionExpression(_))
+                        | Some(Argument::FunctionExpression(_))
+                )
+        }
+        _ => false,
+    }
+}
+
 impl<'a> Visit<'a> for OxcWalk<'a> {
     // -- exports -------------------------------------------------------------
 
@@ -335,6 +370,19 @@ impl<'a> Visit<'a> for OxcWalk<'a> {
         // visit_function fires for it and consumes pending_name).
         self.pending_name = method.key.static_name().map(|name| name.to_string());
         walk::walk_method_definition(self, method);
+    }
+
+    fn visit_variable_declarator(&mut self, declarator: &VariableDeclarator<'a>) {
+        // Name a function bound to a variable: `const Foo = () => {}` reports
+        // its frame as `Foo`, not `<anonymous>` — the dominant React/TS shape
+        // for components and handlers. The name is consumed by the arrow's
+        // visit_arrow_function_expression as the walk descends into the init.
+        if let Some(init) = &declarator.init {
+            if initializer_is_function(init) {
+                self.pending_name = binding_name(declarator);
+            }
+        }
+        walk::walk_variable_declarator(self, declarator);
     }
 
     // -- complexity: decision points -----------------------------------------
@@ -478,6 +526,27 @@ mod tests {
             .re_export
             .as_ref()
             .is_some_and(|r| r.imported_name == "*")));
+    }
+
+    #[test]
+    fn names_functions_bound_to_a_variable() {
+        // The dominant React/TS shape: arrow/function bound to a const, and the
+        // common `useCallback`/`memo` higher-order wrappers. These must report
+        // the binding name, not `<anonymous>`.
+        let (_exports, complexity) = extract(
+            "const Foo = () => { if (a) { b(); } };\n\
+             const bar = useCallback(() => { while (c) {} }, []);\n\
+             function baz() {}\n\
+             serve(async () => { if (d) {} });\n",
+            SourceLanguage::TypeScript,
+        )
+        .unwrap();
+        let names: Vec<&str> = complexity.iter().map(|c| c.qualified_name.as_str()).collect();
+        assert!(names.contains(&"Foo"), "{names:?}");
+        assert!(names.contains(&"bar"), "{names:?}");
+        assert!(names.contains(&"baz"), "{names:?}");
+        // The bare arrow passed to `serve(...)` has no binding — stays anonymous.
+        assert!(names.contains(&"<anonymous>"), "{names:?}");
     }
 
     #[test]

@@ -1,4 +1,5 @@
 mod cli;
+mod mcp;
 
 use ovecc_core::error::OveccError;
 use peak_alloc::PeakAlloc;

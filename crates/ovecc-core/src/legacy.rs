@@ -165,6 +165,10 @@ pub struct IndexFailure {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SummaryReport {
     pub repository_root: String,
+    /// Volatile snapshot identity, skipped on serialize so two indexes of the
+    /// same content produce byte-identical payloads (the snapshot ref lives in
+    /// `meta`). Still populated in-memory for callers that need it.
+    #[serde(skip_serializing)]
     pub snapshot_id: Option<String>,
     pub files: usize,
     pub modules: usize,
@@ -221,6 +225,8 @@ pub struct HotspotEntry {
     /// Fraction of the module's files with low majority ownership.
     pub ownership_fragmentation: f64,
     pub violations: usize,
+    /// Total cognitive complexity of the module's functions (oxc).
+    pub complexity: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

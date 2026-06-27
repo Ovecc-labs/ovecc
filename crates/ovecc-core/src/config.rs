@@ -101,6 +101,17 @@ pub struct IndexConfig {
     /// Glob patterns added to the built-in exclusions.
     pub exclude: Vec<String>,
     pub max_file_size_bytes: Option<u64>,
+    /// Index files that look generated or vendored (minified bundles, WASM/
+    /// emscripten glue, `@generated` / `DO NOT EDIT` markers). Off by default:
+    /// such files are the dominant false-positive source in complexity,
+    /// dead-code, and security, and parsing machine-emitted blobs is wasteful.
+    pub index_generated: bool,
+    /// Flag `package.json` dependencies that no indexed file imports. Off by
+    /// default: a dependency can be used via tool config, a `scripts` entry, a
+    /// side-effect import, or a test fixture — all invisible to the import
+    /// graph — so the finding is false-positive-prone without framework-aware
+    /// resolution. Opt in when those caveats are acceptable.
+    pub detect_unused_deps: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -213,6 +224,11 @@ pub enum OutputFormat {
     Json,
     Ndjson,
     Markdown,
+    /// SARIF 2.1.0 — for GitHub code scanning and CI security dashboards.
+    Sarif,
+    /// Code Climate / GitLab Code Quality JSON — for GitLab CI merge-request
+    /// quality reports.
+    Codeclimate,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -233,9 +249,11 @@ impl std::str::FromStr for OutputFormat {
             "json" => Ok(Self::Json),
             "ndjson" => Ok(Self::Ndjson),
             "markdown" | "md" => Ok(Self::Markdown),
+            "sarif" => Ok(Self::Sarif),
+            "codeclimate" | "code-climate" | "gitlab" => Ok(Self::Codeclimate),
             other => Err(crate::error::OveccError::Usage {
                 message: format!(
-                    "unknown output format '{other}' (expected text, json, ndjson, markdown)"
+                    "unknown output format '{other}' (expected text, json, ndjson, markdown, sarif, codeclimate)"
                 ),
             }),
         }

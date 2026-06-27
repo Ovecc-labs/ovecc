@@ -72,10 +72,12 @@ ovecc query "cycles"          # actual elementary dependency cycles (A -> B -> A
 ovecc report                  # one-shot architecture report (markdown or json)
 ovecc gate                    # CI gate: fail a PR on new cycles / violations
 ovecc explain Billing         # offline, deterministic explanation
+ovecc mcp                     # MCP server over stdio: expose every command as an agent tool
 ovecc index . --exclude "vendored/**"   # built-in excludes (node_modules, .venv, ...) plus your own
 ```
 
-Every command renders as `text`, `json`, `ndjson`, or `markdown` via `--format`,
+Every command renders as `text`, `json`, `ndjson`, or `markdown` via `--format`
+(plus `sarif` for GitHub code scanning and `codeclimate` for GitLab Code Quality),
 and returns stable exit codes for CI.
 
 ## For AI agents
@@ -89,6 +91,22 @@ ovecc capabilities --format json
 It returns every command, the metrics and rules they emit (each with a
 definition), the severity vocabulary, the exit-code contract, and the output
 formats — enough to drive an end-to-end audit without reading these docs.
+
+### MCP server
+
+`ovecc mcp` runs a Model Context Protocol server over stdio, exposing the
+commands above as tools (`ovecc_summary`, `ovecc_impact`, `ovecc_deadcode`,
+`ovecc_query`, `ovecc_capabilities`, …) so a coding agent can ask *"is this
+export used?"*, *"what's the blast radius of `BillingService`?"*, or *"give me
+the context slice for this PR"* live. Each tool returns the same JSON envelope
+and takes an optional `repo` path. Register it with an MCP client, e.g.:
+
+```json
+{ "mcpServers": { "ovecc": { "command": "ovecc", "args": ["mcp"] } } }
+```
+
+Have the agent call `ovecc_capabilities` first for the full contract, and
+`ovecc_index` once before querying a repository.
 
 Every command's JSON is wrapped in a stable, self-describing envelope:
 

@@ -2,6 +2,10 @@
 /target/
 *.pdb
 
+# Prebuilt binaries — distribute via GitHub Releases, not the git history
+# (a committed 100 MB exe bloats every clone). See the release workflow.
+bin/*.exe
+
 # Local architecture database and parse cache (regenerated per run)
 .ovecc/
 

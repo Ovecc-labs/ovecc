@@ -12,8 +12,8 @@
 
 use crate::graph::NodeKind;
 use crate::id::{
-    ApiId, CallId, CommitId, DependencyId, FileChangeId, FileId, FindingId, MetricId, MigrationId,
-    ModuleId, OwnershipId, RepositoryId, SchemaObjectId, SnapshotId, SymbolId,
+    ApiId, CallId, CommitId, ComplexityId, DependencyId, ExportId, FileChangeId, FileId, FindingId,
+    MetricId, MigrationId, ModuleId, OwnershipId, RepositoryId, SchemaObjectId, SnapshotId, SymbolId,
 };
 use crate::lang::SourceLanguage;
 use chrono::{DateTime, Utc};
@@ -388,6 +388,10 @@ pub enum MetricScope {
 pub struct FindingRecord {
     pub id: FindingId,
     pub repository_id: RepositoryId,
+    /// Volatile snapshot identity: kept out of the serialized payload so two
+    /// indexes of the same content produce byte-identical output. It is still
+    /// persisted (via explicit column writes) and available in `meta`.
+    #[serde(skip_serializing)]
     pub snapshot_id: Option<SnapshotId>,
     pub kind: FindingKind,
     pub severity: Severity,
@@ -397,6 +401,9 @@ pub struct FindingRecord {
     pub title: String,
     pub description: String,
     pub evidence: Vec<Evidence>,
+    /// Wall-clock index time. Skipped on serialize for the same determinism
+    /// reason; the snapshot's time lives in `meta`.
+    #[serde(skip_serializing)]
     pub created_at: DateTime<Utc>,
 }
 
@@ -422,6 +429,7 @@ pub enum FindingKind {
     // Dead code & complexity.
     UnusedExport,
     UnusedFile,
+    UnusedDependency,
     HighComplexity,
 }
 
@@ -622,6 +630,37 @@ pub struct ReExportFact {
     pub source_specifier: String,
     /// Name imported from the source; `"*"` for `export * from`.
     pub imported_name: String,
+}
+
+/// Persisted per-function complexity, keyed by file and qualified name, so the
+/// `complexity` table can be queried like any other architecture fact.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ComplexityRecord {
+    pub id: ComplexityId,
+    pub repository_id: RepositoryId,
+    pub file_id: FileId,
+    pub qualified_name: String,
+    pub line: u32,
+    pub cyclomatic: u16,
+    pub cognitive: u16,
+    pub line_count: u32,
+    pub param_count: u8,
+}
+
+/// Persisted export, with re-export provenance flattened, so the `exports`
+/// table backs dead-code queries and public-surface inspection.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ExportRecord {
+    pub id: ExportId,
+    pub repository_id: RepositoryId,
+    pub file_id: FileId,
+    pub name: String,
+    pub line: u32,
+    pub is_type_only: bool,
+    /// Specifier a re-export forwards from (`export { x } from './y'`), else `None`.
+    pub re_export_source: Option<String>,
+    /// Name imported from that source (`"*"` for `export *`), else `None`.
+    pub re_export_name: Option<String>,
 }
 
 /// Per-file parser failure. Must not abort the index run: it is recorded and

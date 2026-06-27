@@ -155,6 +155,7 @@ pub fn compute_hotspots(
     churn: &HashMap<String, f64>,
     fragmentation: &HashMap<String, f64>,
     violations: &HashMap<String, usize>,
+    complexity: &HashMap<String, f64>,
     limit: usize,
 ) -> Vec<HotspotEntry> {
     let mut fan_in = HashMap::<String, usize>::new();
@@ -187,23 +188,29 @@ pub fn compute_hotspots(
     let fan_out_of = |m: &str| *fan_out.get(m).unwrap_or(&0) as f64;
     let coupling_of = |m: &str| fan_in_of(m) + fan_out_of(m);
     let violations_of = |m: &str| *violations.get(m).unwrap_or(&0) as f64;
+    let complexity_of = |m: &str| *complexity.get(m).unwrap_or(&0.0);
 
     let max_churn = max(&churn_of);
     let max_fan_in = max(&fan_in_of);
     let max_fan_out = max(&fan_out_of);
     let max_coupling = max(&coupling_of);
     let max_violations = max(&violations_of);
+    let max_complexity = max(&complexity_of);
 
     let mut hotspots: Vec<HotspotEntry> = modules
         .iter()
         .map(|module| {
             let frag = *fragmentation.get(module).unwrap_or(&0.0);
-            let score = (churn_of(module) / max_churn * 0.30
-                + coupling_of(module) / max_coupling * 0.25
-                + fan_in_of(module) / max_fan_in * 0.15
-                + fan_out_of(module) / max_fan_out * 0.15
-                + frag * 0.10
-                + violations_of(module) / max_violations * 0.05)
+            // Weighted, normalized debt score. Per-function complexity (oxc) now
+            // feeds it alongside churn and coupling: a module thick with complex
+            // functions is a refactoring target even when it changes rarely.
+            let score = (churn_of(module) / max_churn * 0.25
+                + coupling_of(module) / max_coupling * 0.20
+                + complexity_of(module) / max_complexity * 0.20
+                + fan_in_of(module) / max_fan_in * 0.12
+                + fan_out_of(module) / max_fan_out * 0.13
+                + frag * 0.07
+                + violations_of(module) / max_violations * 0.03)
                 * 100.0;
             HotspotEntry {
                 module: module.clone(),
@@ -214,6 +221,7 @@ pub fn compute_hotspots(
                 coupling: coupling_of(module) as usize,
                 ownership_fragmentation: frag,
                 violations: *violations.get(module).unwrap_or(&0),
+                complexity: complexity_of(module),
             }
         })
         .filter(|hotspot| hotspot.score > 0.0)
@@ -446,20 +454,31 @@ mod hotspot_tests {
         let churn = HashMap::from([("billing".to_string(), 50.0), ("user".to_string(), 5.0)]);
         let fragmentation = HashMap::from([("billing".to_string(), 0.8)]);
         let violations = HashMap::from([("billing".to_string(), 3usize)]);
+        let complexity = HashMap::from([("billing".to_string(), 120.0), ("util".to_string(), 30.0)]);
 
-        let hotspots = compute_hotspots(&modules, &deps, &churn, &fragmentation, &violations, 10);
+        let hotspots = compute_hotspots(
+            &modules,
+            &deps,
+            &churn,
+            &fragmentation,
+            &violations,
+            &complexity,
+            10,
+        );
 
-        // billing dominates churn, fan-out, fragmentation and violations, so
-        // it ranks first with the highest score.
+        // billing dominates churn, fan-out, fragmentation, violations and
+        // complexity, so it ranks first with the highest score.
         assert_eq!(hotspots[0].module, "billing");
         assert_eq!(hotspots[0].fan_out, 2);
         assert!((hotspots[0].ownership_fragmentation - 0.8).abs() < 1e-9);
         assert_eq!(hotspots[0].violations, 3);
+        assert!((hotspots[0].complexity - 120.0).abs() < 1e-9);
         let billing_score = hotspots[0].score;
         assert!(hotspots[1..].iter().all(|h| h.score < billing_score));
         // The limit is respected.
         assert_eq!(
-            compute_hotspots(&modules, &deps, &churn, &fragmentation, &violations, 1).len(),
+            compute_hotspots(&modules, &deps, &churn, &fragmentation, &violations, &complexity, 1)
+                .len(),
             1
         );
     }
