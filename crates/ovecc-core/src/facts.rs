@@ -685,3 +685,45 @@ pub struct FactBatch {
     pub migrations: Vec<MigrationRecord>,
     pub ownership: Vec<OwnershipRecord>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn severity_orders_low_to_critical_and_serializes_lowercase() {
+        assert!(Severity::Low < Severity::Medium);
+        assert!(Severity::Medium < Severity::High);
+        assert!(Severity::High < Severity::Critical);
+        assert_eq!(
+            serde_json::to_string(&Severity::Critical).unwrap(),
+            "\"critical\""
+        );
+    }
+
+    #[test]
+    fn confidence_thresholds_are_ordered_constants() {
+        assert!(Confidence::REPORT_THRESHOLD < Confidence::VIOLATION_THRESHOLD);
+        assert_eq!(Confidence::REPORT_THRESHOLD, 0.70);
+        assert_eq!(Confidence::VIOLATION_THRESHOLD, 0.85);
+    }
+
+    #[test]
+    fn ownership_source_explicit_vs_inferred() {
+        assert!(OwnershipSource::Codeowners.is_explicit());
+        assert!(OwnershipSource::RepositoryConfig.is_explicit());
+        assert!(OwnershipSource::ServiceMetadata.is_explicit());
+        assert!(!OwnershipSource::GitHistory.is_explicit());
+        assert!(!OwnershipSource::PathConvention.is_explicit());
+    }
+
+    #[test]
+    fn only_eval_and_command_exec_are_taint_sinks() {
+        use SecurityPatternKind::*;
+        assert!(DynamicEval.is_taint_sink());
+        assert!(CommandExec.is_taint_sink());
+        for k in [HardcodedSecret, WeakHash, PermissiveCors] {
+            assert!(!k.is_taint_sink());
+        }
+    }
+}

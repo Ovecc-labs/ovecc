@@ -109,3 +109,40 @@ stable_id!(
     /// `export:{repository_id}:{file_id}:{name}:{line}`
     ExportId, "export"
 );
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn typed_ids_are_deterministic_and_prefixed() {
+        let a = FileId::from_parts(&["repo", "src/a.ts"]);
+        assert_eq!(a, FileId::from_parts(&["repo", "src/a.ts"]));
+        assert!(a.as_str().starts_with("file:"));
+        assert_eq!(FileId::PREFIX, "file");
+    }
+
+    #[test]
+    fn different_id_types_never_collide_for_same_parts() {
+        // The prefix is part of the identity, so a file and a module built from
+        // identical parts get distinct ids.
+        assert_ne!(
+            FileId::from_parts(&["repo", "x"]).0,
+            ModuleId::from_parts(&["repo", "x"]).0
+        );
+    }
+
+    #[test]
+    fn from_raw_round_trips() {
+        let id = SymbolId::from_raw("symbol:abc123");
+        assert_eq!(id.as_str(), "symbol:abc123");
+    }
+
+    #[test]
+    fn distinct_parts_produce_distinct_ids() {
+        assert_ne!(
+            CommitId::from_parts(&["repo", "sha1"]),
+            CommitId::from_parts(&["repo", "sha2"])
+        );
+    }
+}

@@ -472,3 +472,61 @@ pub struct ContextSlice {
     pub drift: Vec<MetricDelta>,
     pub findings: Vec<FindingRecord>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn risk_bands_match_documented_thresholds() {
+        let band = |v| RiskScore::from_value(v).level;
+        assert_eq!(band(0), RiskLevel::Low);
+        assert_eq!(band(24), RiskLevel::Low);
+        assert_eq!(band(25), RiskLevel::Medium);
+        assert_eq!(band(49), RiskLevel::Medium);
+        assert_eq!(band(50), RiskLevel::High);
+        assert_eq!(band(74), RiskLevel::High);
+        assert_eq!(band(75), RiskLevel::Critical);
+        assert_eq!(band(10_000), RiskLevel::Critical);
+        // from_value preserves the raw value; it does not cap it.
+        assert_eq!(RiskScore::from_value(123).value, 123);
+    }
+
+    #[test]
+    fn meta_is_empty_by_default_and_not_once_populated() {
+        assert!(Meta::default().is_empty());
+        let meta = Meta {
+            docs: Some("d".into()),
+            ..Default::default()
+        };
+        assert!(!meta.is_empty());
+    }
+
+    #[test]
+    fn tool_info_default_is_ovecc_at_crate_version() {
+        let tool = ToolInfo::default();
+        assert_eq!(tool.name, "ovecc");
+        assert_eq!(tool.version, env!("CARGO_PKG_VERSION"));
+    }
+
+    #[test]
+    fn envelope_omits_empty_meta_but_keeps_it_when_populated() {
+        let data = serde_json::json!({ "k": 1 });
+
+        let env = Envelope::new("summary", &data, Meta::default());
+        let v = serde_json::to_value(&env).unwrap();
+        assert_eq!(v["schema_version"], SCHEMA_VERSION);
+        assert_eq!(v["command"], "summary");
+        assert_eq!(v["tool"]["name"], "ovecc");
+        assert_eq!(v["data"]["k"], 1);
+        assert!(v.get("meta").is_none(), "empty meta must be omitted");
+
+        let meta = Meta {
+            docs: Some("https://docs".into()),
+            ..Default::default()
+        };
+        let env = Envelope::new("summary", &data, meta);
+        let v = serde_json::to_value(&env).unwrap();
+        assert!(v.get("meta").is_some(), "populated meta must be present");
+    }
+}

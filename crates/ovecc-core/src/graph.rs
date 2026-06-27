@@ -115,3 +115,37 @@ pub struct GraphSlice {
     pub nodes: Vec<GraphNode>,
     pub edges: Vec<GraphEdge>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_impact_edges_are_the_six_documented_kinds_in_order() {
+        assert_eq!(
+            EdgeKind::default_impact_kinds(),
+            &[
+                EdgeKind::DependsOn,
+                EdgeKind::Calls,
+                EdgeKind::Reads,
+                EdgeKind::Writes,
+                EdgeKind::Exposes,
+                EdgeKind::Handles,
+            ]
+        );
+    }
+
+    #[test]
+    fn node_and_edge_kinds_serialize_as_snake_case() {
+        assert_eq!(
+            serde_json::to_string(&NodeKind::RpcMethod).unwrap(),
+            "\"rpc_method\""
+        );
+        assert_eq!(
+            serde_json::to_string(&EdgeKind::DependsOn).unwrap(),
+            "\"depends_on\""
+        );
+        let k: EdgeKind = serde_json::from_str("\"changed_by\"").unwrap();
+        assert_eq!(k, EdgeKind::ChangedBy);
+    }
+}

@@ -369,4 +369,40 @@ mod tests {
             1
         );
     }
+
+    #[test]
+    fn duplicate_edges_do_not_double_report() {
+        // The same write edge appears twice; the (source, sink, table) dedup
+        // must collapse them into a single finding.
+        let nodes = vec![
+            node("a:1", "api", "POST /customers"),
+            node("s:repo", "symbol", "CustomerRepo.insert"),
+            node("t:customers", "table", "customers"),
+        ];
+        let edges = vec![
+            edge("a:1", "s:repo", "handles"),
+            edge("s:repo", "t:customers", "writes"),
+            edge("s:repo", "t:customers", "writes"),
+        ];
+        let findings = analyze("r", None, &nodes, &edges, &[], DEFAULT_FLOW_DEPTH);
+        assert_eq!(findings.len(), 1);
+    }
+
+    #[test]
+    fn one_source_reaching_two_tables_yields_two_findings() {
+        // A handler that both writes one table and reads another is two flows.
+        let nodes = vec![
+            node("a:1", "api", "ALL /x"),
+            node("s:h", "symbol", "handle"),
+            node("t:a", "table", "accounts"),
+            node("t:b", "table", "audit"),
+        ];
+        let edges = vec![
+            edge("a:1", "s:h", "handles"),
+            edge("s:h", "t:a", "writes"),
+            edge("s:h", "t:b", "reads"),
+        ];
+        let findings = analyze("r", None, &nodes, &edges, &[], DEFAULT_FLOW_DEPTH);
+        assert_eq!(findings.len(), 2, "distinct tables are distinct flows");
+    }
 }

@@ -223,9 +223,39 @@ fn build_argv(name: &str, args: &Value) -> Option<Vec<String>> {
                 argv.push(since.into());
             }
         }
+        "ovecc_gate" => {
+            argv.push("gate".into());
+            push_base_head(&mut argv, s("base"), s("head"));
+            if let Some(fail_on) = s("fail_on") {
+                argv.push("--fail-on".into());
+                argv.push(fail_on.into());
+            }
+        }
+        "ovecc_diff" => {
+            argv.push("diff".into());
+            push_base_head(&mut argv, s("base"), s("head"));
+            if let Some(fail_on) = s("fail_on") {
+                argv.push("--fail-on".into());
+                argv.push(fail_on.into());
+            }
+        }
         _ => return None,
     }
     Some(argv)
+}
+
+/// Appends the positional `base`/`head` ref arguments shared by `gate` and
+/// `diff`. Because they are positional, passing `head` requires also passing
+/// `base`, so we backfill the CLI default (`previous`) when only `head` is set.
+fn push_base_head(argv: &mut Vec<String>, base: Option<&str>, head: Option<&str>) {
+    match (base, head) {
+        (_, Some(head)) => {
+            argv.push(base.unwrap_or("previous").to_string());
+            argv.push(head.to_string());
+        }
+        (Some(base), None) => argv.push(base.to_string()),
+        (None, None) => {}
+    }
 }
 
 /// The `tools/list` payload. Every tool takes an optional `repo`; the schemas
@@ -233,6 +263,9 @@ fn build_argv(name: &str, args: &Value) -> Option<Vec<String>> {
 fn tool_specs() -> Value {
     let repo = json!({"type": "string", "description": "Repository root path (defaults to the server's working directory)."});
     let severity = json!({"type": "string", "enum": ["low", "medium", "high", "critical"], "description": "Only findings at or above this severity."});
+    let base = json!({"type": "string", "description": "Base snapshot or Git ref to compare from (default 'previous')."});
+    let head = json!({"type": "string", "description": "Head snapshot or Git ref to compare to (default 'latest')."});
+    let fail_on = json!({"type": "string", "enum": ["any", "medium", "high"], "description": "Threshold for the fail verdict: any change, or new findings at medium/high."});
     let obj = |props: Value, required: Value| json!({"type": "object", "properties": props, "required": required});
 
     json!([
@@ -251,6 +284,8 @@ fn tool_specs() -> Value {
         {"name": "ovecc_hotspots", "description": "Technical-debt hotspot ranking: churn x coupling x ownership.", "inputSchema": obj(json!({"repo": repo, "limit": {"type": "integer", "description": "Number of hotspots to return (default 10)."}}), json!([]))},
         {"name": "ovecc_conventions", "description": "Learned repository conventions and their deviations.", "inputSchema": obj(json!({"repo": repo}), json!([]))},
         {"name": "ovecc_drift", "description": "Architecture drift over time versus a previous snapshot or Git ref.", "inputSchema": obj(json!({"repo": repo, "since": {"type": "string", "description": "Git ref or snapshot to compare against, e.g. main or v1.0.0."}}), json!([]))},
+        {"name": "ovecc_gate", "description": "CI gate: fail when a change introduces new cycles, violations, or quality regressions (security/dead-code/complexity) versus a base snapshot or Git ref. Returns a pass/fail verdict and the signals behind it.", "inputSchema": obj(json!({"repo": repo, "base": base, "head": head, "fail_on": fail_on}), json!([]))},
+        {"name": "ovecc_diff", "description": "Compare two stored architecture snapshots (or Git refs): added/removed modules and dependency edges, plus the overall diff risk score.", "inputSchema": obj(json!({"repo": repo, "base": base, "head": head, "fail_on": fail_on}), json!([]))},
         {"name": "ovecc_explain", "description": "Offline, deterministic architectural explanation of a target from its context slice.", "inputSchema": obj(json!({"repo": repo, "target": {"type": "string", "description": "Element to explain, e.g. Billing."}}), json!(["target"]))},
         {"name": "ovecc_context", "description": "Deterministic ContextSlice for a target as JSON, for feeding other tools or agents.", "inputSchema": obj(json!({"repo": repo, "target": {"type": "string", "description": "Element to slice, e.g. Billing."}}), json!(["target"]))}
     ])
@@ -279,6 +314,16 @@ mod tests {
             build_argv("ovecc_security", &json!({"severity": "high"})).unwrap(),
             vec!["security", "--severity", "high"]
         );
+        assert_eq!(
+            build_argv("ovecc_gate", &json!({"base": "main", "head": "HEAD", "fail_on": "medium"})).unwrap(),
+            vec!["gate", "main", "HEAD", "--fail-on", "medium"]
+        );
+        // base/head are positional: a `head` with no `base` backfills the default.
+        assert_eq!(
+            build_argv("ovecc_diff", &json!({"head": "HEAD"})).unwrap(),
+            vec!["diff", "previous", "HEAD"]
+        );
+        assert_eq!(build_argv("ovecc_gate", &json!({})).unwrap(), vec!["gate"]);
     }
 
     #[test]
@@ -297,8 +342,11 @@ mod tests {
 
         let listed = handle("tools/list", None, &exe).unwrap();
         let tools = listed["tools"].as_array().unwrap();
-        assert!(tools.iter().any(|t| t["name"] == "ovecc_capabilities"));
-        assert!(tools.len() >= 15);
+        let has = |name: &str| tools.iter().any(|t| t["name"] == name);
+        assert!(has("ovecc_capabilities"));
+        assert!(has("ovecc_gate"));
+        assert!(has("ovecc_diff"));
+        assert!(tools.len() >= 17);
     }
 
     #[test]

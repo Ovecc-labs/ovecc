@@ -373,3 +373,37 @@ pub fn drift_trend(
         DriftTrend::Stable
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn drift_trend_classifies_each_direction() {
+        // No change at all (coupling within ±1%) is stable.
+        assert_eq!(drift_trend(0, 0, 0, 0.0).as_str(), "stable");
+        // A new cycle, coupling growth >10%, or >10 new deps all worsen.
+        assert_eq!(drift_trend(0, 0, 1, 0.0).as_str(), "worsening");
+        assert_eq!(drift_trend(0, 0, 0, 12.0).as_str(), "worsening");
+        assert_eq!(drift_trend(0, 15, 0, 0.0).as_str(), "worsening");
+        // A removed cycle, coupling drop, or >10 fewer deps all improve.
+        assert_eq!(drift_trend(0, 0, -1, 0.0).as_str(), "improving");
+        assert_eq!(drift_trend(0, 0, 0, -12.0).as_str(), "improving");
+        assert_eq!(drift_trend(0, -15, 0, 0.0).as_str(), "improving");
+    }
+
+    #[test]
+    fn drift_trend_worsening_takes_precedence_over_improving_signals() {
+        // dep_delta -20 alone would improve, but a new cycle dominates.
+        assert_eq!(drift_trend(0, -20, 1, 0.0).as_str(), "worsening");
+    }
+
+    #[test]
+    fn drift_trend_small_or_boundary_changes_stay_stable() {
+        // Non-zero but all sub-threshold (|coupling| ≤ 10, |dep| ≤ 10) → stable.
+        assert_eq!(drift_trend(1, 2, 0, 3.0).as_str(), "stable");
+        // Thresholds are strict: exactly +10% coupling / +10 deps is not yet worsening.
+        assert_eq!(drift_trend(0, 0, 0, 10.0).as_str(), "stable");
+        assert_eq!(drift_trend(0, 10, 0, 0.0).as_str(), "stable");
+    }
+}

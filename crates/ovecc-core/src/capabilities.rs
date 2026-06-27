@@ -270,3 +270,64 @@ pub fn rule_definitions() -> BTreeMap<String, MetaRule> {
         ("audit/osv".to_string(), rule("A declared dependency matches a known OSV advisory.", "high")),
     ])
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::error::ExitCode;
+    use std::collections::HashSet;
+
+    #[test]
+    fn command_names_are_unique_and_nonempty() {
+        assert!(!COMMANDS.is_empty());
+        let mut seen = HashSet::new();
+        for c in COMMANDS {
+            assert!(seen.insert(c.name), "duplicate command name: {}", c.name);
+        }
+    }
+
+    #[test]
+    fn exit_code_table_mirrors_the_error_enum_contract() {
+        // EXIT_CODES (the machine contract) and error::ExitCode (the runtime
+        // enum) are two sources of truth for one contract; lock them together
+        // so they cannot silently drift apart.
+        assert_eq!(EXIT_CODES.len(), 8);
+        let pairs = [
+            (ExitCode::Success, "success"),
+            (ExitCode::FindingsPresent, "findings_present"),
+            (ExitCode::Usage, "usage"),
+            (ExitCode::Repository, "repository"),
+            (ExitCode::Index, "index"),
+            (ExitCode::Parser, "parser"),
+            (ExitCode::Git, "git"),
+            (ExitCode::Internal, "internal"),
+        ];
+        for (code, name) in pairs {
+            let spec = EXIT_CODES
+                .iter()
+                .find(|s| s.name == name)
+                .unwrap_or_else(|| panic!("missing exit code {name}"));
+            assert_eq!(spec.code, code.code(), "code mismatch for {name}");
+        }
+    }
+
+    #[test]
+    fn severity_vocabulary_matches_the_typed_enum() {
+        assert_eq!(SEVERITIES, &["low", "medium", "high", "critical"]);
+        // Each label must round-trip through the typed Severity enum.
+        for s in SEVERITIES {
+            let parsed: crate::facts::Severity =
+                serde_json::from_str(&format!("\"{s}\"")).unwrap();
+            assert_eq!(serde_json::to_string(&parsed).unwrap(), format!("\"{s}\""));
+        }
+    }
+
+    #[test]
+    fn manifest_carries_metrics_rules_and_formats() {
+        let caps = capabilities();
+        assert!(!caps.metrics.is_empty());
+        assert!(!caps.rules.is_empty());
+        assert!(caps.formats.contains(&"json"));
+        assert!(caps.severities.contains(&"critical"));
+    }
+}

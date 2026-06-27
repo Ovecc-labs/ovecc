@@ -483,3 +483,114 @@ mod hotspot_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod analysis_tests {
+    use super::*;
+
+    fn dep(source: &str, target: &str) -> DependencyRecord {
+        DependencyRecord {
+            id: format!("{source}->{target}"),
+            repository_id: "r".to_string(),
+            source_file_id: "f".to_string(),
+            target_file_id: None,
+            source_file_path: format!("src/{source}/x.ts"),
+            target_file_path: None,
+            source_module_id: format!("m:{source}"),
+            target_module_id: format!("m:{target}"),
+            source_module: source.to_string(),
+            target_module: target.to_string(),
+            specifier: format!("../{target}/x"),
+            dependency_kind: "static_import".to_string(),
+            is_external: false,
+            evidence_line: 1,
+        }
+    }
+
+    #[test]
+    fn instability_follows_the_formula() {
+        // No coupling => treated as maximally stable.
+        assert_eq!(instability(0, 0), 0.0);
+        // Only depended upon => stable (0.0); only depends on others => unstable (1.0).
+        assert_eq!(instability(5, 0), 0.0);
+        assert_eq!(instability(0, 5), 1.0);
+        assert!((instability(1, 3) - 0.75).abs() < 1e-9);
+    }
+
+    #[test]
+    fn local_edges_drop_external_self_and_duplicates() {
+        let mut external = dep("a", "lodash");
+        external.is_external = true;
+        let deps = vec![
+            dep("a", "b"),
+            dep("a", "b"), // duplicate, collapsed
+            dep("a", "a"), // self-module, ignored
+            external,      // external, ignored
+        ];
+        let edges = local_dependency_edges(&deps);
+        assert_eq!(
+            edges.into_iter().collect::<Vec<_>>(),
+            vec![("a".to_string(), "b".to_string())]
+        );
+    }
+
+    #[test]
+    fn scc_detects_cycles_and_ignores_acyclic_graphs() {
+        let modules = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        // a <-> b is a cycle; c hangs off acyclically.
+        let cyclic = vec![dep("a", "b"), dep("b", "a"), dep("b", "c")];
+        assert_eq!(
+            strongly_connected_modules(&modules, &cyclic),
+            vec![vec!["a".to_string(), "b".to_string()]]
+        );
+
+        let acyclic = vec![dep("a", "b"), dep("b", "c")];
+        assert!(strongly_connected_modules(&modules, &acyclic).is_empty());
+    }
+
+    #[test]
+    fn summarize_counts_cycles_and_coupling_density() {
+        let modules = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        // 3 edges forming one 3-cycle: a -> b -> c -> a.
+        let deps = vec![dep("a", "b"), dep("b", "c"), dep("c", "a")];
+        let report = summarize("/repo".to_string(), None, 9, modules, &deps, 0);
+
+        assert_eq!(report.modules, 3);
+        assert_eq!(report.dependencies, 3);
+        assert_eq!(report.circular_dependencies, 1);
+        // density = local_edges / (n * (n - 1)) = 3 / (3 * 2) = 0.5
+        assert!((report.coupling_density - 0.5).abs() < 1e-9);
+        // A cycle present => risk escalates to High (or Critical).
+        assert!(matches!(
+            report.risk_score,
+            RiskLevel::High | RiskLevel::Critical
+        ));
+    }
+
+    #[test]
+    fn impact_matches_targets_and_walks_reverse_dependencies() {
+        let modules = vec![
+            "billing".to_string(),
+            "user".to_string(),
+            "report".to_string(),
+        ];
+        // billing depends on user; report depends on billing.
+        let deps = vec![dep("billing", "user"), dep("report", "billing")];
+
+        // Downstream of `user` = everything that (transitively) depends on it.
+        let report = impact("user", ImpactDirection::Downstream, 10, &modules, &deps);
+        assert_eq!(report.matched_module.as_deref(), Some("user"));
+        assert!(report.affected_modules.contains(&"billing".to_string()));
+        assert!(report.affected_modules.contains(&"report".to_string()));
+
+        // Case-insensitive + substring matching still resolves the module.
+        let by_substring = impact("BILL", ImpactDirection::Downstream, 10, &modules, &deps);
+        assert_eq!(by_substring.matched_module.as_deref(), Some("billing"));
+
+        // Unknown target => no match, empty impact, low risk.
+        let miss = impact("nope", ImpactDirection::Both, 10, &modules, &deps);
+        assert_eq!(miss.matched_module, None);
+        assert!(miss.affected_modules.is_empty());
+        assert!(matches!(miss.risk_score, RiskLevel::Low));
+    }
+}

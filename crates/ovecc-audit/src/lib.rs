@@ -158,12 +158,49 @@ pub fn is_affected(version: &str, affected: &OsvAffected) -> bool {
         .any(|range| version_in_semver_range(&parsed, range))
 }
 
+/// Sort key for an OSV range event: its version, plus a rank so that at an
+/// equal version `introduced` (turns affection on) is applied before
+/// `fixed`/`last_affected` (turn it off). An unparseable, non-`"0"` version
+/// yields `None` and is pushed to the end, where it acts as a no-op.
+fn event_sort_key(event: &OsvEvent) -> (Option<semver::Version>, u8) {
+    if let Some(v) = &event.introduced {
+        let version = if v == "0" {
+            Some(semver::Version::new(0, 0, 0))
+        } else {
+            semver::Version::parse(v).ok()
+        };
+        return (version, 0);
+    }
+    if let Some(v) = &event.fixed {
+        return (semver::Version::parse(v).ok(), 1);
+    }
+    if let Some(v) = &event.last_affected {
+        return (semver::Version::parse(v).ok(), 1);
+    }
+    (None, 2)
+}
+
 fn version_in_semver_range(version: &semver::Version, range: &OsvRange) -> bool {
     if !range.range_type.eq_ignore_ascii_case("SEMVER") {
         return false;
     }
+    // The OSV range algorithm is a state machine over events in ascending
+    // version order. Sort first so a verdict never depends on the order events
+    // happen to appear in the source JSON.
+    let mut events: Vec<&OsvEvent> = range.events.iter().collect();
+    events.sort_by(|a, b| {
+        let (va, ra) = event_sort_key(a);
+        let (vb, rb) = event_sort_key(b);
+        match (va, vb) {
+            (Some(x), Some(y)) => x.cmp(&y).then(ra.cmp(&rb)),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => ra.cmp(&rb),
+        }
+    });
+
     let mut affected = false;
-    for event in &range.events {
+    for event in events {
         if let Some(introduced) = &event.introduced {
             // "0" denotes "from the beginning of time".
             let on = introduced == "0"
@@ -204,6 +241,11 @@ pub fn audit(
     for package in packages {
         for entry in osv {
             for affected in &entry.affected {
+                // Ecosystem is matched case-insensitively; the package name is
+                // compared exactly, which is correct for npm (registry names are
+                // lowercase). TODO(multi-ecosystem): canonicalize names per
+                // ecosystem before this check when a second one is wired — e.g.
+                // PyPI/PEP 503 (lowercase, collapse runs of -/_/. to a single -).
                 if !affected
                     .package
                     .ecosystem
@@ -371,5 +413,90 @@ mod tests {
         .unwrap();
         assert!(is_affected("1.2.3", &entry.affected[0]));
         assert!(!is_affected("1.2.4", &entry.affected[0]));
+    }
+
+    #[test]
+    fn multi_window_range_skips_the_patched_gap() {
+        // Vulnerable in [0,1.0.0) and again in [2.0.0,3.0.0): the events form
+        // two affected windows with a safe gap between them.
+        let entry: OsvEntry = serde_json::from_str(
+            r#"{"id":"MULTI","affected":[{"package":{"ecosystem":"npm","name":"p"},
+                "ranges":[{"type":"SEMVER","events":[
+                    {"introduced":"0"},{"fixed":"1.0.0"},
+                    {"introduced":"2.0.0"},{"fixed":"3.0.0"}]}]}]}"#,
+        )
+        .unwrap();
+        let a = &entry.affected[0];
+        assert!(is_affected("0.9.0", a), "first window");
+        assert!(!is_affected("1.0.0", a), "fixed");
+        assert!(!is_affected("1.5.0", a), "patched gap is safe");
+        assert!(is_affected("2.5.0", a), "re-introduced window");
+        assert!(!is_affected("3.0.0", a), "fixed again");
+    }
+
+    #[test]
+    fn last_affected_is_an_inclusive_upper_bound() {
+        let entry: OsvEntry = serde_json::from_str(
+            r#"{"id":"LA","affected":[{"package":{"ecosystem":"npm","name":"p"},
+                "ranges":[{"type":"SEMVER","events":[
+                    {"introduced":"1.0.0"},{"last_affected":"1.5.0"}]}]}]}"#,
+        )
+        .unwrap();
+        let a = &entry.affected[0];
+        assert!(!is_affected("0.9.0", a), "below introduced");
+        assert!(is_affected("1.0.0", a));
+        assert!(is_affected("1.5.0", a), "last_affected is inclusive");
+        assert!(!is_affected("1.6.0", a), "above last_affected");
+    }
+
+    #[test]
+    fn non_semver_range_type_is_ignored() {
+        // Only SEMVER ranges are evaluated; ECOSYSTEM/GIT ranges are skipped.
+        let entry: OsvEntry = serde_json::from_str(
+            r#"{"id":"EC","affected":[{"package":{"ecosystem":"npm","name":"p"},
+                "ranges":[{"type":"ECOSYSTEM","events":[
+                    {"introduced":"0"},{"fixed":"9.9.9"}]}]}]}"#,
+        )
+        .unwrap();
+        assert!(!is_affected("1.0.0", &entry.affected[0]));
+    }
+
+    #[test]
+    fn unparseable_version_never_matches_a_range() {
+        // A non-semver version can't be range-compared, so it is treated as
+        // not affected (explicit version lists are the only escape hatch).
+        assert!(!is_affected("not.a.version", &osv_lodash().affected[0]));
+    }
+
+    #[test]
+    fn events_are_sorted_so_their_order_does_not_change_the_verdict() {
+        // A single window [1.0.0, 2.0.0) with events given OUT OF ORDER. Without
+        // sorting, 2.5.0 (above the fix) would be wrongly flagged as affected.
+        let entry: OsvEntry = serde_json::from_str(
+            r#"{"id":"ORD","affected":[{"package":{"ecosystem":"npm","name":"p"},
+                "ranges":[{"type":"SEMVER","events":[
+                    {"fixed":"2.0.0"},{"introduced":"1.0.0"}]}]}]}"#,
+        )
+        .unwrap();
+        let a = &entry.affected[0];
+        assert!(!is_affected("0.9.0", a), "below window");
+        assert!(is_affected("1.5.0", a), "inside window");
+        assert!(
+            !is_affected("2.5.0", a),
+            "above the fix must stay safe regardless of event order"
+        );
+    }
+
+    #[test]
+    fn audit_matches_ecosystem_case_insensitively() {
+        let packages = vec![Package {
+            ecosystem: "NPM".into(),
+            name: "lodash".into(),
+            version: "4.17.20".into(),
+            manifest_path: "package-lock.json".into(),
+            is_direct: true,
+        }];
+        let findings = audit("repo:test", None, &packages, &[osv_lodash()]);
+        assert_eq!(findings.len(), 1, "NPM should match npm advisory");
     }
 }
