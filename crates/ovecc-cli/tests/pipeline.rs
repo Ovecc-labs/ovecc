@@ -203,6 +203,19 @@ fn summary_json_is_byte_identical_across_runs() {
             .expect("run ovecc summary")
     };
     let first = run_summary();
+    // Re-index (a fresh snapshot with a new id and wall-clock time) and read
+    // again: the payload must depend only on the analyzed content, not on the
+    // volatile snapshot identity — the stronger cross-index determinism that
+    // lets large-scale runs diff outputs without normalizing.
+    let reindexed = Command::new(bin)
+        .args(["--repo", &repo, "index"])
+        .output()
+        .expect("re-run ovecc index");
+    assert!(
+        reindexed.status.success(),
+        "re-index failed: {}",
+        String::from_utf8_lossy(&reindexed.stderr)
+    );
     let second = run_summary();
     assert!(
         first.status.success(),

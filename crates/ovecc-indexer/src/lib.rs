@@ -14,10 +14,10 @@ use ignore::WalkBuilder;
 use ignore::overrides::OverrideBuilder;
 use ovecc_core::config::{OveccConfig, ProjectPaths};
 use ovecc_core::facts::{
-    ChangeKind, CommitRecord, FileChangeRecord, FileFacts, FindingKind, ImportFactKind,
-    ParseFailure, SourceFile,
+    ChangeKind, CommitRecord, ComplexityRecord, ExportRecord, FileChangeRecord, FileFacts,
+    FindingKind, ImportFactKind, ParseFailure, SourceFile,
 };
-use ovecc_core::id::{CommitId, FileChangeId, RepositoryId};
+use ovecc_core::id::{CommitId, ComplexityId, ExportId, FileChangeId, FileId, RepositoryId};
 use ovecc_core::legacy::{
     DependencyRecord, FileRecord, ImportFact, ImportKind, IndexFailure, IndexReport, ModuleRecord,
     SourceLanguage,
@@ -38,7 +38,6 @@ const SOURCE_EXTENSIONS: &[&str] = &[
     // C/C++ sources and headers (the C++ grammar covers C declarations).
     "cpp", "cc", "cxx", "c++", "hpp", "hh", "hxx", "h++", "h", "c", "cu", "cuh",
 ];
-const RESOLUTION_EXTENSIONS: &[&str] = &["ts", "tsx", "js", "jsx", "mjs", "cjs"];
 
 /// `(variable, type)` bindings; older entries
 /// miss and re-parse.
@@ -144,12 +143,29 @@ pub fn index_repository(
 
     // Code-fact resolution: build per-file import bindings, then resolve
     // grammar-level facts into typed records with a linked call graph.
+    // Bindings reuse the already-resolved dependency edges (oxc_resolver), so
+    // calls through aliased (`@/x`) and monorepo (`@scope/pkg`) imports link,
+    // not just relative ones.
+    let resolved_targets: HashMap<(String, String), String> = dependencies
+        .iter()
+        .filter(|dependency| !dependency.is_external)
+        .filter_map(|dependency| {
+            let target = dependency.target_file_path.clone()?;
+            Some((
+                (
+                    dependency.source_file_path.clone(),
+                    dependency.specifier.clone(),
+                ),
+                target,
+            ))
+        })
+        .collect();
     let bindings_by_path: HashMap<String, Vec<ImportBinding>> = files
         .iter()
         .map(|file| {
             let bindings = file_facts
                 .get(&file.path)
-                .map(|facts| build_import_bindings(paths, file, facts, &file_by_path))
+                .map(|facts| build_import_bindings(file, facts, &resolved_targets))
                 .unwrap_or_default();
             (file.path.clone(), bindings)
         })
@@ -278,11 +294,14 @@ pub fn index_repository(
     // Complexity (oxc cyclomatic + cognitive) → repo metrics + HighComplexity
     // findings for functions over the maintainability thresholds.
     let (mut max_cyclomatic, mut max_cognitive, mut function_count) = (0u16, 0u16, 0usize);
+    let mut total_cognitive: u64 = 0;
+    let mut high_complexity_functions: usize = 0;
     for (path, facts) in &file_facts {
         for complexity in &facts.complexity {
             function_count += 1;
             max_cyclomatic = max_cyclomatic.max(complexity.cyclomatic);
             max_cognitive = max_cognitive.max(complexity.cognitive);
+            total_cognitive += complexity.cognitive as u64;
             let severity = if complexity.cognitive >= 25 || complexity.cyclomatic >= 20 {
                 ovecc_core::facts::Severity::High
             } else if complexity.cognitive >= 15 || complexity.cyclomatic >= 10 {
@@ -290,6 +309,7 @@ pub fn index_repository(
             } else {
                 continue;
             };
+            high_complexity_functions += 1;
             findings.push(ovecc_core::facts::FindingRecord {
                 id: ovecc_core::id::FindingId::from_parts(&[
                     &repository_id,
@@ -332,6 +352,11 @@ pub fn index_repository(
     metrics.push(("functions".to_string(), function_count as f64));
     metrics.push(("max_cyclomatic".to_string(), max_cyclomatic as f64));
     metrics.push(("max_cognitive".to_string(), max_cognitive as f64));
+    metrics.push(("total_cognitive".to_string(), total_cognitive as f64));
+    metrics.push((
+        "high_complexity_functions".to_string(),
+        high_complexity_functions as f64,
+    ));
 
     // Dead-code analysis (unused exports/files) over the in-memory facts: oxc
     // exports + resolved internal import edges (carrying the imported names) +
@@ -373,16 +398,73 @@ pub fn index_repository(
             })
         })
         .collect();
-    findings.extend(ovecc_rules::deadcode::analyze(
-        &ovecc_rules::deadcode::DeadCodeInput {
-            repository_id: &repository_id,
-            snapshot_id: Some(&snapshot_id),
-            files: &all_files,
-            entry_points: &entry_points,
-            exports: &export_facts,
-            imports: &import_edges,
-        },
-    ));
+    let deadcode_findings = ovecc_rules::deadcode::analyze(&ovecc_rules::deadcode::DeadCodeInput {
+        repository_id: &repository_id,
+        snapshot_id: Some(&snapshot_id),
+        files: &all_files,
+        entry_points: &entry_points,
+        exports: &export_facts,
+        imports: &import_edges,
+    });
+    // Persist aggregate counts on the snapshot so `diff`/`drift` can trend them
+    // ("dead code grew this quarter").
+    let unused_exports = deadcode_findings
+        .iter()
+        .filter(|finding| finding.kind == FindingKind::UnusedExport)
+        .count();
+    let unused_files = deadcode_findings
+        .iter()
+        .filter(|finding| finding.kind == FindingKind::UnusedFile)
+        .count();
+    metrics.push(("unused_exports".to_string(), unused_exports as f64));
+    metrics.push(("unused_files".to_string(), unused_files as f64));
+    findings.extend(deadcode_findings);
+
+    // Unused dependencies: packages declared in a `package.json` `dependencies`
+    // map but never imported by an indexed file. Opt-in (`detect_unused_deps`):
+    // real-repo measurement showed a high false-positive rate — config files,
+    // `scripts` entries, side-effect imports, and test fixtures use a package
+    // without an import the graph can see — so it is off by default.
+    if config.index.detect_unused_deps {
+        // Any bare-specifier import counts as using the package — including
+        // workspace packages (`@scope/pkg`) that resolve to an internal file
+        // (`is_external == false`), so monorepo packages are not falsely
+        // flagged. `external_package_root` drops relative imports and built-ins.
+        let imported_roots: HashSet<String> = dependencies
+            .iter()
+            .filter_map(|dependency| external_package_root(&dependency.specifier))
+            .collect();
+        let unused_dep_findings =
+            detect_unused_dependencies(&paths.root, &repository_id, &snapshot_id, &imported_roots);
+        metrics.push((
+            "unused_dependencies".to_string(),
+            unused_dep_findings.len() as f64,
+        ));
+        findings.extend(unused_dep_findings);
+    }
+
+    // Security findings in test, fixture, and example files are usually test
+    // data or deliberate test scaffolding (fake secrets, an `eval` under test,
+    // a weak hash in a vector), not production risk — the canonical
+    // secret/SAST false positive. Down-rank them to Low so they stay visible in
+    // `security` but do not trip a high-severity gate. Down-ranked, not dropped:
+    // a real issue committed to a test file is still reported.
+    for finding in &mut findings {
+        let is_security = matches!(
+            finding.kind,
+            FindingKind::HardcodedSecret
+                | FindingKind::InsecurePattern
+                | FindingKind::WeakCrypto
+        );
+        if is_security
+            && finding.severity != ovecc_core::facts::Severity::Low
+            && finding.evidence.iter().any(|evidence| {
+                is_test_file(&evidence.file_path) || is_standalone_entry(&evidence.file_path)
+            })
+        {
+            finding.severity = ovecc_core::facts::Severity::Low;
+        }
+    }
 
     // Drop findings explicitly suppressed by an inline `// ovecc-ignore`.
     let suppressions: HashMap<String, std::collections::HashSet<u32>> = file_facts
@@ -463,12 +545,59 @@ pub fn index_repository(
             ),
         })
         .collect();
+    // First-class code-health facts (oxc): normalize per-function complexity and
+    // per-file exports into persistable records keyed by file id.
+    let mut complexity_records: Vec<ComplexityRecord> = Vec::new();
+    let mut export_records: Vec<ExportRecord> = Vec::new();
+    for (path, facts) in &file_facts {
+        let Some(file) = file_by_path.get(path) else {
+            continue;
+        };
+        let file_id = &file.id;
+        for complexity in &facts.complexity {
+            complexity_records.push(ComplexityRecord {
+                id: ComplexityId::from_parts(&[
+                    &repository_id,
+                    file_id,
+                    &complexity.qualified_name,
+                    &complexity.line.to_string(),
+                ]),
+                repository_id: RepositoryId::from_raw(&repository_id),
+                file_id: FileId::from_raw(file_id.clone()),
+                qualified_name: complexity.qualified_name.clone(),
+                line: complexity.line,
+                cyclomatic: complexity.cyclomatic,
+                cognitive: complexity.cognitive,
+                line_count: complexity.line_count,
+                param_count: complexity.param_count,
+            });
+        }
+        for export in &facts.exports {
+            export_records.push(ExportRecord {
+                id: ExportId::from_parts(&[
+                    &repository_id,
+                    file_id,
+                    &export.name,
+                    &export.line.to_string(),
+                ]),
+                repository_id: RepositoryId::from_raw(&repository_id),
+                file_id: FileId::from_raw(file_id.clone()),
+                name: export.name.clone(),
+                line: export.line,
+                is_type_only: export.is_type_only,
+                re_export_source: export.re_export.as_ref().map(|r| r.source_specifier.clone()),
+                re_export_name: export.re_export.as_ref().map(|r| r.imported_name.clone()),
+            });
+        }
+    }
     let code = ResolvedCode {
         symbols: &resolved.symbols,
         calls: &resolved.calls,
         apis: &resolved.apis,
         schema_objects: &resolved.schema_objects,
         schema_edges: &schema_edges,
+        complexity: &complexity_records,
+        exports: &export_records,
     };
     phase(&mut timings.analyze_ms);
     store.sync_current_index(
@@ -799,25 +928,23 @@ fn legacy_imports(facts: &FileFacts) -> Vec<ImportFact> {
 /// each relative import to a known file and pairing it with its imported
 /// names. Feeds cross-file callee resolution.
 fn build_import_bindings(
-    paths: &ProjectPaths,
     file: &FileRecord,
     facts: &FileFacts,
-    file_by_path: &HashMap<String, FileRecord>,
+    resolved_targets: &HashMap<(String, String), String>,
 ) -> Vec<ImportBinding> {
     let mut bindings = Vec::new();
     for import in &facts.imports {
-        if !is_relative_specifier(&import.specifier) {
-            continue;
-        }
-        let Some(target) =
-            resolve_relative_import(&paths.root, &file.path, &import.specifier, file_by_path)
+        // Use the dependency graph's resolution (oxc_resolver), which already
+        // handled relative, alias, and monorepo specifiers alike.
+        let Some(target_path) =
+            resolved_targets.get(&(file.path.clone(), import.specifier.clone()))
         else {
             continue;
         };
         for name in &import.imported_names {
             bindings.push(ImportBinding {
                 name: name.clone(),
-                target_path: target.path.clone(),
+                target_path: target_path.clone(),
             });
         }
     }
@@ -1027,6 +1154,10 @@ fn discover_source_files(root: &Path, config: &OveccConfig) -> Result<Vec<PathBu
         {
             continue;
         }
+        // Skip generated / vendored files unless explicitly opted in.
+        if !config.index.index_generated && looks_generated(path) {
+            continue;
+        }
         files.push(path.to_path_buf());
     }
 
@@ -1068,6 +1199,51 @@ pub fn is_excluded_component(name: &str) -> bool {
         | "target" | "vendor" | "dist" | "build" | "coverage" | ".gradle"
         | ".cache" | ".idea" | ".vscode"
     )
+}
+
+/// Heuristic detection of generated / vendored source we should not treat as
+/// first-class code: minified bundles, WASM/emscripten glue, and files that
+/// announce themselves as generated. These are the dominant false-positive
+/// source in complexity, dead-code, and security on real repositories, and
+/// parsing machine-emitted blobs is wasteful. Deliberately conservative: it
+/// keys off unambiguous signals (names, head markers, minification), never file
+/// size alone, and reads only the head so a marker deep in a real file or a
+/// mid-file `@ts-nocheck` never triggers.
+fn looks_generated(path: &Path) -> bool {
+    if let Some(name) = path.file_name().and_then(|value| value.to_str()) {
+        let lower = name.to_ascii_lowercase();
+        if lower.contains(".min.") || lower.contains("-wasm.") || lower.contains(".wasm.") {
+            return true;
+        }
+    }
+    let Ok(file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut head = [0u8; 8192];
+    let read = std::io::Read::read(&mut std::io::BufReader::new(file), &mut head).unwrap_or(0);
+    if read == 0 {
+        return false;
+    }
+    let text = String::from_utf8_lossy(&head[..read]);
+    // Minified: a single very long line in the head (bundlers, base64 blobs).
+    if text.split('\n').any(|line| line.len() > 5000) {
+        return true;
+    }
+    let lower = text.to_ascii_lowercase();
+    const MARKERS: [&str; 6] = [
+        "@generated",
+        "do not edit",
+        "code generated",
+        "auto-generated",
+        "autogenerated",
+        "automatically generated",
+    ];
+    if MARKERS.iter().any(|marker| lower.contains(marker)) {
+        return true;
+    }
+    // Whole-file opt-out combo emscripten/codegen emit and that hand-maintained
+    // code virtually never carries.
+    lower.contains("@ts-nocheck") && lower.contains("eslint-disable")
 }
 
 fn should_skip_path(root: &Path, path: &Path) -> bool {
@@ -1363,39 +1539,6 @@ fn repo_relative_path(root: &Path, abs: &Path) -> Option<String> {
     Some(abs_norm[root_norm.len()..].trim_start_matches('/').to_string())
 }
 
-fn is_relative_specifier(specifier: &str) -> bool {
-    specifier.starts_with("./") || specifier.starts_with("../")
-}
-
-fn resolve_relative_import(
-    root: &Path,
-    source_relative_path: &str,
-    specifier: &str,
-    file_by_path: &HashMap<String, FileRecord>,
-) -> Option<FileRecord> {
-    let source_parent = Path::new(source_relative_path)
-        .parent()
-        .unwrap_or_else(|| Path::new(""));
-    let base = root.join(source_parent).join(specifier);
-    let mut candidates = Vec::new();
-    candidates.push(base.clone());
-
-    if base.extension().is_none() {
-        for extension in RESOLUTION_EXTENSIONS {
-            candidates.push(base.with_extension(extension));
-        }
-        for extension in RESOLUTION_EXTENSIONS {
-            candidates.push(base.join(format!("index.{extension}")));
-        }
-    }
-
-    candidates.into_iter().find_map(|candidate| {
-        relative_path(root, &candidate)
-            .ok()
-            .and_then(|relative| file_by_path.get(&relative).cloned())
-    })
-}
-
 // --- non-JS import resolution -------------------------------------
 
 /// Maps every '/'-delimited tail of each indexed file path back to that file,
@@ -1655,38 +1798,246 @@ fn external_module_name(specifier: &str) -> String {
     format!("external:{package}")
 }
 
-/// Entry points anchoring dead-code reachability: package.json
-/// main/module/types (resolved to indexed files), the conventional `src/index`
-/// / `src/main` / root `index` / `main`, and all test/spec files. Ported from
-/// fallow's entry-point detection (crates/core/src/discover/entry_points.rs).
+/// Entry points anchoring dead-code reachability. The public surface a tool can
+/// never see as "imported" is declared in package manifests and framework
+/// conventions, so seeding it well is what separates real dead code from a tree
+/// that merely looks unreferenced. We seed from:
+///
+/// - **every `package.json` in the tree** (monorepo-aware), resolving `main`,
+///   `module`, `types`/`typings`, the `exports` map (the modern public API), and
+///   `bin` to indexed source — each relative to its own package directory;
+/// - **framework entry files** the runtime loads rather than `import`s (Next.js
+///   `app`/`pages` routes, `middleware`);
+/// - the conventional root / `src` `index`/`main`, and all test/spec files.
+///
+/// Modelled on knip's resolver and fallow's entry-point detection. Biased toward
+/// precision: an over-credited entry only costs a missed finding, while a missed
+/// entry floods the report with false "unreachable file" hits.
 fn detect_entry_points(root: &Path, files: &[FileRecord]) -> HashSet<String> {
     let mut entries = HashSet::new();
     let file_paths: HashSet<&str> = files.iter().map(|file| file.path.as_str()).collect();
 
-    if let Ok(content) = std::fs::read_to_string(root.join("package.json"))
-        && let Ok(package) = serde_json::from_str::<serde_json::Value>(&content)
-    {
-        for key in ["main", "module", "types", "typings"] {
-            if let Some(spec) = package.get(key).and_then(|value| value.as_str())
-                && let Some(resolved) = resolve_entry_spec(spec, &file_paths)
-            {
+    for (dir, manifest) in find_package_manifests(root) {
+        for spec in manifest_entry_specs(&manifest) {
+            if let Some(resolved) = resolve_entry_spec(&dir, &spec, &file_paths) {
                 entries.insert(resolved);
             }
         }
     }
     for file in files {
-        if is_default_entry(&file.path) || is_test_file(&file.path) {
+        if is_default_entry(&file.path)
+            || is_test_file(&file.path)
+            || is_framework_entry(&file.path)
+            || is_standalone_entry(&file.path)
+        {
             entries.insert(file.path.clone());
         }
     }
     entries
 }
 
-/// Resolves a package.json entry spec (e.g. `"./dist/index.js"`) to an indexed
-/// source file, mapping `dist/`→`src/` and trying source extensions / index.
-fn resolve_entry_spec(spec: &str, file_paths: &HashSet<&str>) -> Option<String> {
-    let cleaned = spec.trim_start_matches("./");
-    for base in [cleaned.to_string(), cleaned.replacen("dist/", "src/", 1)] {
+/// True for files under conventional standalone directories — examples,
+/// templates, fixtures, demos, playgrounds — that ship as copyable or runnable
+/// code and are intentionally not imported by a package's own entry points.
+/// Treating them as entries keeps both them and what they import reachable.
+fn is_standalone_entry(path: &str) -> bool {
+    const DIRS: [&str; 12] = [
+        "examples/",
+        "example/",
+        "templates/",
+        "template/",
+        "fixtures/",
+        "__fixtures__/",
+        "demo/",
+        "demos/",
+        "playground/",
+        "benches/", // Rust benchmark targets (run, not imported)
+        "benchmarks/",
+        "bench/",
+    ];
+    DIRS.iter()
+        .any(|dir| path.starts_with(dir) || path.contains(&format!("/{dir}")))
+}
+
+/// Normalizes a bare import specifier to its package root: `lodash/fp` →
+/// `lodash`, `@scope/pkg/sub` → `@scope/pkg`. Returns `None` for relative
+/// imports and Node built-ins (`node:fs`, `fs`), which are never npm deps.
+fn external_package_root(specifier: &str) -> Option<String> {
+    if specifier.starts_with('.') || specifier.starts_with('/') || specifier.starts_with("node:") {
+        return None;
+    }
+    const BUILTINS: [&str; 24] = [
+        "fs", "path", "os", "http", "https", "url", "util", "stream", "events", "crypto", "child_process",
+        "process", "buffer", "assert", "zlib", "net", "tls", "dns", "querystring", "readline", "cluster",
+        "worker_threads", "perf_hooks", "module",
+    ];
+    let root = if let Some(rest) = specifier.strip_prefix('@') {
+        let mut parts = rest.splitn(3, '/');
+        let scope = parts.next()?;
+        let name = parts.next()?;
+        format!("@{scope}/{name}")
+    } else {
+        specifier.split('/').next()?.to_string()
+    };
+    if BUILTINS.contains(&root.as_str()) {
+        return None;
+    }
+    Some(root)
+}
+
+/// Flags packages declared in a `package.json` `dependencies` map that no
+/// indexed file imports. Conservative: production deps only (not `devDeps`),
+/// `@types/*` excluded (ambient), one finding per (manifest, package).
+fn detect_unused_dependencies(
+    root: &Path,
+    repository_id: &str,
+    snapshot_id: &str,
+    imported_roots: &HashSet<String>,
+) -> Vec<ovecc_core::facts::FindingRecord> {
+    let mut findings = Vec::new();
+    for (dir, manifest) in find_package_manifests(root) {
+        let Some(deps) = manifest.get("dependencies").and_then(|value| value.as_object()) else {
+            continue;
+        };
+        let manifest_path = format!("{dir}package.json");
+        for name in deps.keys() {
+            if name.starts_with("@types/") || imported_roots.contains(name.as_str()) {
+                continue;
+            }
+            findings.push(ovecc_core::facts::FindingRecord {
+                id: ovecc_core::id::FindingId::from_parts(&[
+                    repository_id,
+                    "deadcode",
+                    "unused-dependency",
+                    &manifest_path,
+                    name,
+                ]),
+                repository_id: RepositoryId::from_raw(repository_id),
+                snapshot_id: Some(ovecc_core::id::SnapshotId::from_raw(snapshot_id)),
+                kind: FindingKind::UnusedDependency,
+                severity: ovecc_core::facts::Severity::Low,
+                rule_name: Some("unused-dependency".to_string()),
+                target: None,
+                title: format!("Unused dependency: {name}"),
+                description: format!(
+                    "'{name}' is declared in {manifest_path} but never imported by an indexed \
+                     file. Verify it is not used via config, CLI, or dynamic import before removing."
+                ),
+                evidence: vec![ovecc_core::facts::Evidence {
+                    file_path: manifest_path.clone(),
+                    line: Some(1),
+                    symbol: Some(name.clone()),
+                    detail: None,
+                }],
+                created_at: chrono::Utc::now(),
+            });
+        }
+    }
+    findings
+}
+
+/// Locates every `package.json` in the tree (skipping the built-in excluded
+/// dirs, so no `node_modules`), returning each one's repo-relative directory
+/// (POSIX, trailing `/`, empty for root) and parsed contents. Shallow-bounded:
+/// workspace manifests live near the top (`packages/*`, `apps/*`).
+fn find_package_manifests(root: &Path) -> Vec<(String, serde_json::Value)> {
+    let mut manifests = Vec::new();
+    let mut builder = WalkBuilder::new(root);
+    // Don't honour `.gitignore` here: a generated-but-ignored manifest still
+    // declares the real public surface, and we already prune dependency/build
+    // dirs via `is_excluded_component`. (The git-aware walker also skips some
+    // tracked manifests on large trees.)
+    builder
+        .hidden(false)
+        .git_ignore(false)
+        .git_exclude(false)
+        .max_depth(Some(6));
+    builder.filter_entry(|entry| {
+        entry.depth() == 0
+            || entry
+                .file_name()
+                .to_str()
+                .map(|name| !is_excluded_component(name))
+                .unwrap_or(true)
+    });
+    for entry in builder.build().flatten() {
+        if entry.file_name() != "package.json" || !entry.path().is_file() {
+            continue;
+        }
+        let Ok(content) = std::fs::read_to_string(entry.path()) else {
+            continue;
+        };
+        let Ok(manifest) = serde_json::from_str::<serde_json::Value>(content.trim_start_matches('\u{feff}')) else {
+            continue;
+        };
+        let dir = entry
+            .path()
+            .parent()
+            .and_then(|parent| parent.strip_prefix(root).ok())
+            .map(|relative| {
+                let posix = relative.to_string_lossy().replace('\\', "/");
+                if posix.is_empty() {
+                    posix
+                } else {
+                    format!("{posix}/")
+                }
+            })
+            .unwrap_or_default();
+        manifests.push((dir, manifest));
+    }
+    manifests
+}
+
+/// Collects the entry specs a manifest declares: `main`/`module`/`types`/
+/// `typings`, every path leaf of the `exports` map, and `bin`.
+fn manifest_entry_specs(manifest: &serde_json::Value) -> Vec<String> {
+    let mut specs = Vec::new();
+    for key in ["main", "module", "types", "typings"] {
+        if let Some(spec) = manifest.get(key).and_then(|value| value.as_str()) {
+            specs.push(spec.to_string());
+        }
+    }
+    if let Some(exports) = manifest.get("exports") {
+        collect_relative_paths(exports, &mut specs);
+    }
+    if let Some(bin) = manifest.get("bin") {
+        collect_relative_paths(bin, &mut specs);
+    }
+    specs
+}
+
+/// Recursively gathers relative-path string leaves (`"./..."`) from an `exports`
+/// or `bin` value, descending condition maps, subpath maps, and arrays.
+fn collect_relative_paths(value: &serde_json::Value, out: &mut Vec<String>) {
+    match value {
+        serde_json::Value::String(string) if string.starts_with('.') => out.push(string.clone()),
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_relative_paths(item, out);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for nested in map.values() {
+                collect_relative_paths(nested, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Resolves a manifest entry spec (e.g. `"./dist/index.js"`) declared in package
+/// directory `dir` to an indexed source file, mapping common build-output dirs
+/// (`dist`, `build`, `lib`, `es`, `esm`, `out`) back to `src` and trying source
+/// extensions / an `index` file.
+fn resolve_entry_spec(dir: &str, spec: &str, file_paths: &HashSet<&str>) -> Option<String> {
+    let cleaned = format!("{dir}{}", spec.trim_start_matches("./"));
+    let mut bases = vec![cleaned.clone()];
+    for build_dir in ["dist/", "build/", "lib/", "es/", "esm/", "out/"] {
+        if cleaned.contains(build_dir) {
+            bases.push(cleaned.replacen(build_dir, "src/", 1));
+        }
+    }
+    for base in bases {
         if file_paths.contains(base.as_str()) {
             return Some(base);
         }
@@ -1716,16 +2067,59 @@ fn is_default_entry(path: &str) -> bool {
     depth == 0 || (path.starts_with("src/") && depth == 1)
 }
 
-/// True for test/spec/mock files; their imports keep targets reachable.
+/// True for files a framework loads by convention rather than by `import`, which
+/// would otherwise look unreachable. Covers the Next.js App Router
+/// (`app/**/{page,layout,route,...}`), the Pages Router (`pages/**`), and
+/// `middleware`. The `app`/`pages` segment may sit under a monorepo package
+/// (`apps/web/app/...`).
+fn is_framework_entry(path: &str) -> bool {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    let stem = name.split('.').next().unwrap_or(name);
+    let is_route_segment = |segment: &str| {
+        path.starts_with(&format!("{segment}/")) || path.contains(&format!("/{segment}/"))
+    };
+    if is_route_segment("app")
+        && matches!(
+            stem,
+            "page" | "layout" | "route" | "loading" | "error" | "template" | "default"
+                | "not-found" | "global-error" | "sitemap" | "robots" | "opengraph-image"
+        )
+    {
+        return true;
+    }
+    if is_route_segment("pages") {
+        return true;
+    }
+    matches!(name, "middleware.ts" | "middleware.js" | "middleware.tsx")
+}
+
+/// True for test/spec/mock files; their imports keep targets reachable. Covers
+/// the `__tests__`/`__mocks__` layout, `.test`/`.spec` files, and the tsd
+/// type-test conventions (`test-d/`, `type-tests/`, `*.test-d.ts`).
 fn is_test_file(path: &str) -> bool {
-    if path.contains("/__tests__/")
-        || path.contains("/__mocks__/")
-        || path.starts_with("__tests__/")
+    const TEST_DIRS: [&str; 7] = [
+        "__tests__/",
+        "__mocks__/",
+        "test-d/",
+        "type-tests/",
+        "type-test/",
+        "tests/", // Rust/Go/Python integration tests
+        "test/",
+    ];
+    if TEST_DIRS
+        .iter()
+        .any(|dir| path.starts_with(dir) || path.contains(&format!("/{dir}")))
     {
         return true;
     }
     let name = path.rsplit('/').next().unwrap_or(path);
-    name.contains(".test.") || name.contains(".spec.")
+    name.contains(".test.")
+        || name.contains(".spec.")
+        || name.ends_with(".test-d.ts")
+        || name.ends_with("_test.go") // Go
+        || name.ends_with("_test.py") // Python
+        || name.ends_with("_test.rs") // Rust
+        || name.starts_with("test_") // Python / pytest
 }
 
 #[cfg(test)]
@@ -1733,10 +2127,180 @@ mod tests {
     use super::*;
 
     #[test]
+    fn resolves_manifest_entries_for_monorepo_and_exports_map() {
+        let files: HashSet<&str> = [
+            "packages/zod/src/index.ts",
+            "packages/zod/src/v4/index.ts",
+            "apps/cli/src/main.ts",
+        ]
+        .into_iter()
+        .collect();
+        // exports points at the build output; we map dist/ -> src/ and add ext.
+        assert_eq!(
+            resolve_entry_spec("packages/zod/", "./dist/index.js", &files).as_deref(),
+            Some("packages/zod/src/index.ts")
+        );
+        // subpath export, same package.
+        assert_eq!(
+            resolve_entry_spec("packages/zod/", "./dist/v4/index.js", &files).as_deref(),
+            Some("packages/zod/src/v4/index.ts")
+        );
+        // bin entry relative to its package dir.
+        assert_eq!(
+            resolve_entry_spec("apps/cli/", "./src/main.ts", &files).as_deref(),
+            Some("apps/cli/src/main.ts")
+        );
+        // a spec that resolves to nothing indexed.
+        assert!(resolve_entry_spec("packages/zod/", "./dist/missing.js", &files).is_none());
+    }
+
+    #[test]
+    fn collects_entry_specs_from_exports_and_bin() {
+        let manifest = serde_json::json!({
+            "main": "./dist/index.js",
+            "exports": {
+                ".": { "import": "./dist/index.js", "types": "./dist/index.d.ts" },
+                "./feature": "./dist/feature.js"
+            },
+            "bin": { "mycli": "./dist/cli.js" }
+        });
+        let specs = manifest_entry_specs(&manifest);
+        assert!(specs.contains(&"./dist/index.js".to_string()));
+        assert!(specs.contains(&"./dist/feature.js".to_string()));
+        assert!(specs.contains(&"./dist/cli.js".to_string()));
+        assert!(specs.contains(&"./dist/index.d.ts".to_string()));
+    }
+
+    #[test]
+    fn recognizes_framework_entry_files() {
+        assert!(is_framework_entry("app/dashboard/page.tsx"));
+        assert!(is_framework_entry("apps/web/app/layout.tsx"));
+        assert!(is_framework_entry("src/pages/about.tsx"));
+        assert!(is_framework_entry("middleware.ts"));
+        // a regular component under app/ that is not a route file is not an entry.
+        assert!(!is_framework_entry("app/components/button.tsx"));
+        assert!(!is_framework_entry("src/lib/helpers.ts"));
+    }
+
+    #[test]
+    fn detects_monorepo_subpath_export_entries_from_disk() {
+        use ovecc_core::legacy::SourceLanguage;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("packages/foo/src/sub")).unwrap();
+        // exports map with a custom "source" condition pointing straight at src,
+        // exactly like zod's `@zod/source`.
+        std::fs::write(
+            root.join("packages/foo/package.json"),
+            r#"{ "name": "foo", "version": "1.0.0",
+                "exports": {
+                    ".": { "source": "./src/index.ts", "import": "./dist/index.js" },
+                    "./sub": { "source": "./src/sub/index.ts", "import": "./dist/sub/index.js" }
+                } }"#,
+        )
+        .unwrap();
+        let file = |path: &str| FileRecord {
+            id: String::new(),
+            repository_id: String::new(),
+            path: path.to_string(),
+            absolute_path: root.join(path),
+            language: SourceLanguage::TypeScript,
+            content_hash: String::new(),
+            size_bytes: 0,
+            module_id: String::new(),
+            module_name: String::new(),
+        };
+        let files = vec![
+            file("packages/foo/src/index.ts"),
+            file("packages/foo/src/sub/index.ts"),
+        ];
+        let entries = detect_entry_points(root, &files);
+        assert!(
+            entries.contains("packages/foo/src/index.ts"),
+            "main subpath export must be an entry: {entries:?}"
+        );
+        assert!(
+            entries.contains("packages/foo/src/sub/index.ts"),
+            "./sub subpath export must be an entry: {entries:?}"
+        );
+    }
+
+    #[test]
+    fn normalizes_external_package_roots() {
+        assert_eq!(external_package_root("lodash").as_deref(), Some("lodash"));
+        assert_eq!(external_package_root("lodash/fp").as_deref(), Some("lodash"));
+        assert_eq!(
+            external_package_root("@scope/pkg/sub").as_deref(),
+            Some("@scope/pkg")
+        );
+        assert_eq!(external_package_root("@scope/pkg").as_deref(), Some("@scope/pkg"));
+        // Relative imports and Node built-ins are not npm dependencies.
+        assert_eq!(external_package_root("./local"), None);
+        assert_eq!(external_package_root("../up"), None);
+        assert_eq!(external_package_root("node:fs"), None);
+        assert_eq!(external_package_root("fs"), None);
+        assert_eq!(external_package_root("path"), None);
+    }
+
+    #[test]
+    fn recognizes_typetest_and_standalone_entries() {
+        // tsd type-tests are a test convention, not dead code.
+        assert!(is_test_file("test-d/absolute.ts"));
+        assert!(is_test_file("source/test-d/internal/foo.ts"));
+        assert!(is_test_file("types/string.test-d.ts"));
+        // standalone copyable/runnable code.
+        assert!(is_standalone_entry("templates/start-app/index.ts"));
+        assert!(is_standalone_entry("examples/with-script/utils.ts"));
+        assert!(is_standalone_entry("packages/x/__fixtures__/sample.ts"));
+        // ordinary source is neither.
+        assert!(!is_test_file("src/index.ts"));
+        assert!(!is_standalone_entry("src/lib/templates.ts"));
+    }
+
+    #[test]
     fn infers_modules_from_common_layouts() {
         assert_eq!(infer_module_name("src/billing/service.ts"), "billing");
         assert_eq!(infer_module_name("packages/api/index.ts"), "api");
         assert_eq!(infer_module_name("index.ts"), "root");
+    }
+
+    #[test]
+    fn detects_generated_and_vendored_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let write = |name: &str, body: &str| {
+            let p = dir.path().join(name);
+            std::fs::write(&p, body).unwrap();
+            p
+        };
+        // Name-based: minified bundles and wasm glue.
+        assert!(looks_generated(&write("bundle.min.js", "export const x = 1;\n")));
+        assert!(looks_generated(&write("woff2-wasm.ts", "export default 1;\n")));
+        // Head markers.
+        assert!(looks_generated(&write(
+            "client.ts",
+            "// Code generated by protoc. DO NOT EDIT.\nexport const x = 1;\n"
+        )));
+        assert!(looks_generated(&write(
+            "schema.ts",
+            "/** @generated */\nexport type T = number;\n"
+        )));
+        // Minified content even without a telltale name.
+        let long = format!("const data = \"{}\";\n", "A".repeat(6000));
+        assert!(looks_generated(&write("blob.ts", &long)));
+        // Whole-file opt-out combo (emscripten bindings).
+        assert!(looks_generated(&write(
+            "bindings.ts",
+            "/* eslint-disable */\n// @ts-nocheck\nexport function f() {}\n"
+        )));
+        // Hand-written code is not flagged, including a lone `@ts-nocheck`.
+        assert!(!looks_generated(&write(
+            "service.ts",
+            "export function getUser(id: string): string {\n  return id;\n}\n"
+        )));
+        assert!(!looks_generated(&write(
+            "legacy.ts",
+            "// @ts-nocheck\nexport const x = 1;\n"
+        )));
     }
 
     #[test]
@@ -2001,6 +2565,18 @@ export function createInvoice(id: string): string {
             1,
             "createInvoice reads the invoices table (reads edge)"
         );
+        // Code-health facts are persisted as first-class rows (v4 schema): a
+        // complexity row per function and an exports row per exported name.
+        let complexity_rows = store.count_rows("complexity", &repository_id).unwrap();
+        let export_rows = store.count_rows("exports", &repository_id).unwrap();
+        assert!(
+            complexity_rows >= 2,
+            "getUser and createInvoice must each get a complexity row: {complexity_rows}"
+        );
+        assert!(
+            export_rows >= 2,
+            "getUser and createInvoice are both exported: {export_rows}"
+        );
         drop(store);
 
         // Re-indexing the unchanged repository must not error (the persistence
@@ -2021,6 +2597,17 @@ export function createInvoice(id: string): string {
             store.count_edges(&repository_id, "declares").unwrap(),
             first.symbols,
             "re-index must not duplicate graph edges"
+        );
+        // Full-replace persistence keeps the code-health row counts stable.
+        assert_eq!(
+            store.count_rows("complexity", &repository_id).unwrap(),
+            complexity_rows,
+            "re-index must not duplicate complexity rows"
+        );
+        assert_eq!(
+            store.count_rows("exports", &repository_id).unwrap(),
+            export_rows,
+            "re-index must not duplicate exports rows"
         );
     }
 }

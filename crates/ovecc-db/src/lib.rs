@@ -10,8 +10,8 @@ use anyhow::{Context, Result, anyhow};
 use chrono::Utc;
 use duckdb::{Connection, Transaction, params};
 use ovecc_core::facts::{
-    ApiRecord, CallRecord, CommitRecord, Evidence, FileChangeRecord, FindingKind, FindingRecord,
-    SchemaObjectRecord, Severity, SymbolRecord,
+    ApiRecord, CallRecord, CommitRecord, ComplexityRecord, Evidence, ExportRecord, FileChangeRecord,
+    FindingKind, FindingRecord, SchemaObjectRecord, Severity, SymbolRecord,
 };
 use ovecc_core::id::{FindingId, RepositoryId, SnapshotId};
 use ovecc_core::legacy::{
@@ -33,6 +33,10 @@ pub struct ResolvedCode<'a> {
     pub schema_objects: &'a [SchemaObjectRecord],
     /// `reads`/`writes` access edges (accessor symbol → table).
     pub schema_edges: &'a [SchemaEdge],
+    /// Per-function complexity (oxc), persisted to the `complexity` table.
+    pub complexity: &'a [ComplexityRecord],
+    /// Per-file exports (oxc), persisted to the `exports` table.
+    pub exports: &'a [ExportRecord],
 }
 
 /// A dependency row for the OSV audit inventory.
@@ -453,6 +457,36 @@ const MIGRATION_V3_PACKAGES: &str = r#"
             CREATE INDEX IF NOT EXISTS idx_packages_repo ON packages (repository_id);
             "#;
 
+/// First-class per-function complexity and per-file exports, so they are
+/// queryable as data (not just transient findings) and back dead-code and
+/// code-health inspection over the architecture database.
+const MIGRATION_V4_CODE_HEALTH: &str = r#"
+            CREATE TABLE IF NOT EXISTS complexity (
+                id TEXT PRIMARY KEY,
+                repository_id TEXT NOT NULL,
+                file_id TEXT NOT NULL,
+                qualified_name TEXT NOT NULL,
+                line INTEGER NOT NULL,
+                cyclomatic INTEGER NOT NULL,
+                cognitive INTEGER NOT NULL,
+                line_count INTEGER NOT NULL,
+                param_count INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_complexity_repo ON complexity (repository_id);
+
+            CREATE TABLE IF NOT EXISTS exports (
+                id TEXT PRIMARY KEY,
+                repository_id TEXT NOT NULL,
+                file_id TEXT NOT NULL,
+                name TEXT NOT NULL,
+                line INTEGER NOT NULL,
+                is_type_only BOOLEAN NOT NULL,
+                re_export_source TEXT,
+                re_export_name TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_exports_repo ON exports (repository_id);
+            "#;
+
 const SCHEMA_MIGRATIONS: &[SchemaMigration] = &[
     SchemaMigration {
         version: 1,
@@ -468,6 +502,11 @@ const SCHEMA_MIGRATIONS: &[SchemaMigration] = &[
         version: 3,
         name: "packages",
         sql: MIGRATION_V3_PACKAGES,
+    },
+    SchemaMigration {
+        version: 4,
+        name: "code_health",
+        sql: MIGRATION_V4_CODE_HEALTH,
     },
 ];
 
@@ -574,6 +613,14 @@ impl ArchitectureStore {
         let now = Utc::now().to_rfc3339();
         let mut stats = SyncStats::default();
         let tx = self.conn.transaction()?;
+
+        let prof = std::env::var_os("OVECC_PERSIST_PROFILE").is_some();
+        let prof_t0 = std::time::Instant::now();
+        let mark = |label: &str| {
+            if prof {
+                eprintln!("[persist] {label:<14} +{} ms", prof_t0.elapsed().as_millis());
+            }
+        };
 
         // Repository upsert: created_at survives re-indexing.
         let updated = tx.execute(
@@ -734,34 +781,18 @@ impl ArchitectureStore {
             }
         }
 
-        // ---- inserts: prepared statements reused within the transaction ----
+        // ---- inserts ----
+        // New rows go through the columnar appender rather than per-row prepared
+        // statements: on large repos the `dependencies`/`files` inserts (tens to
+        // hundreds of thousands of rows, each a round-trip) were the dominant
+        // persist cost. Each table gets its own scoped appender; ids are
+        // deduplicated first because the appender fails silently on a duplicate
+        // primary key. Updated files keep the prepared-statement path — a small
+        // set, and a re-insert rather than an append.
         {
-            let mut insert_module = tx.prepare(
-                "INSERT INTO modules (id, repository_id, name, path_prefix, module_kind, detected_layer, detected_domain)
-                 VALUES (?, ?, ?, ?, ?, ?, ?)",
-            )?;
-            let mut insert_file = tx.prepare(
-                "INSERT INTO files (id, repository_id, path, language, content_hash, size_bytes, module_id, module_name, last_indexed_at)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            )?;
-            let mut insert_dependency = tx.prepare(
-                "INSERT INTO dependencies (
-                    id, repository_id, source_file_id, target_file_id, source_file_path, target_file_path,
-                    source_module_id, target_module_id, source_module, target_module, specifier,
-                    dependency_kind, is_external, evidence_line, created_at
-                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            )?;
-            let mut insert_node = tx.prepare(
-                "INSERT INTO graph_nodes (id, repository_id, node_kind, label, properties_json)
-                 VALUES (?, ?, ?, ?, ?)",
-            )?;
-            let mut insert_edge = tx.prepare(
-                "INSERT INTO graph_edges (id, repository_id, source_id, target_id, edge_kind, weight, evidence_json)
-                 VALUES (?, ?, ?, ?, ?, ?, ?)",
-            )?;
-
+            let mut modules = tx.appender("modules")?;
             for module in &modules_to_add {
-                insert_module.execute(params![
+                modules.append_row(params![
                     module.id,
                     module.repository_id,
                     module.name,
@@ -770,18 +801,13 @@ impl ArchitectureStore {
                     Option::<String>::None,
                     Option::<String>::None
                 ])?;
-                insert_node.execute(params![
-                    module.id,
-                    repository_id,
-                    "module",
-                    module.name,
-                    "{}"
-                ])?;
                 stats.modules_added += 1;
             }
-
-            let mut write_file = |file: &FileRecord| -> Result<()> {
-                insert_file.execute(params![
+        }
+        {
+            let mut files = tx.appender("files")?;
+            for file in &files_to_add {
+                files.append_row(params![
                     file.id,
                     file.repository_id,
                     file.path,
@@ -792,39 +818,17 @@ impl ArchitectureStore {
                     file.module_name,
                     now
                 ])?;
-                Ok(())
-            };
-            for file in &files_to_add {
-                write_file(file)?;
-                insert_node.execute(params![file.id, repository_id, "file", file.path, "{}"])?;
-                insert_edge.execute(params![
-                    contains_edge_id(repository_id, &file.module_id, &file.id),
-                    repository_id,
-                    file.module_id,
-                    file.id,
-                    "contains",
-                    1.0_f64,
-                    "{}"
-                ])?;
                 stats.files_added += 1;
             }
-            for (file, old_module_id) in &files_to_update {
-                write_file(file)?;
-                if *old_module_id != file.module_id {
-                    insert_edge.execute(params![
-                        contains_edge_id(repository_id, &file.module_id, &file.id),
-                        repository_id,
-                        file.module_id,
-                        file.id,
-                        "contains",
-                        1.0_f64,
-                        "{}"
-                    ])?;
-                }
-            }
-
+        }
+        {
+            let mut deps = tx.appender("dependencies")?;
+            let mut seen = HashSet::new();
             for dependency in &dependencies_to_add {
-                insert_dependency.execute(params![
+                if !seen.insert(dependency.id.as_str()) {
+                    continue;
+                }
+                deps.append_row(params![
                     dependency.id,
                     dependency.repository_id,
                     dependency.source_file_id,
@@ -838,16 +842,51 @@ impl ArchitectureStore {
                     dependency.specifier,
                     dependency.dependency_kind,
                     dependency.is_external,
-                    dependency.evidence_line as i64,
+                    dependency.evidence_line as i32,
                     now
                 ])?;
-                insert_edge.execute(params![
-                    depends_on_edge_id(
-                        repository_id,
-                        &dependency.source_module_id,
-                        &dependency.target_module_id,
-                        &dependency.id
-                    ),
+                stats.dependencies_added += 1;
+            }
+        }
+        {
+            let mut nodes = tx.appender("graph_nodes")?;
+            for module in &modules_to_add {
+                nodes.append_row(params![module.id, repository_id, "module", module.name, "{}"])?;
+            }
+            for file in &files_to_add {
+                nodes.append_row(params![file.id, repository_id, "file", file.path, "{}"])?;
+            }
+        }
+        {
+            let mut edges = tx.appender("graph_edges")?;
+            let mut seen = HashSet::new();
+            for file in &files_to_add {
+                let edge_id = contains_edge_id(repository_id, &file.module_id, &file.id);
+                if !seen.insert(edge_id.clone()) {
+                    continue;
+                }
+                edges.append_row(params![
+                    edge_id,
+                    repository_id,
+                    file.module_id,
+                    file.id,
+                    "contains",
+                    1.0_f64,
+                    "{}"
+                ])?;
+            }
+            for dependency in &dependencies_to_add {
+                let edge_id = depends_on_edge_id(
+                    repository_id,
+                    &dependency.source_module_id,
+                    &dependency.target_module_id,
+                    &dependency.id,
+                );
+                if !seen.insert(edge_id.clone()) {
+                    continue;
+                }
+                edges.append_row(params![
+                    edge_id,
                     repository_id,
                     dependency.source_module_id,
                     dependency.target_module_id,
@@ -858,10 +897,47 @@ impl ArchitectureStore {
                         dependency.source_file_path, dependency.evidence_line, dependency.specifier
                     )
                 ])?;
-                stats.dependencies_added += 1;
+            }
+        }
+        // Updated files: re-insert the row and re-link the module edge when the
+        // module changed. Prepared statements, scoped after the appenders so the
+        // connection is free.
+        {
+            let mut insert_file = tx.prepare(
+                "INSERT INTO files (id, repository_id, path, language, content_hash, size_bytes, module_id, module_name, last_indexed_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )?;
+            let mut insert_edge = tx.prepare(
+                "INSERT INTO graph_edges (id, repository_id, source_id, target_id, edge_kind, weight, evidence_json)
+                 VALUES (?, ?, ?, ?, ?, ?, ?)",
+            )?;
+            for (file, old_module_id) in &files_to_update {
+                insert_file.execute(params![
+                    file.id,
+                    file.repository_id,
+                    file.path,
+                    file.language.as_str(),
+                    file.content_hash,
+                    file.size_bytes as i64,
+                    file.module_id,
+                    file.module_name,
+                    now
+                ])?;
+                if *old_module_id != file.module_id {
+                    insert_edge.execute(params![
+                        contains_edge_id(repository_id, &file.module_id, &file.id),
+                        repository_id,
+                        file.module_id,
+                        file.id,
+                        "contains",
+                        1.0_f64,
+                        "{}"
+                    ])?;
+                }
             }
         }
 
+        mark("graph+rows");
         // ---- code-level facts: symbols, calls, APIs, schema objects ----
         // Diffed by stable ID like the module-level tables. Unchanged files
         // keep identical IDs (same content → same spans), so re-indexing them
@@ -1217,6 +1293,61 @@ impl ArchitectureStore {
             }
         }
 
+        mark("code-facts");
+        // ---- code-health facts: per-function complexity and per-file exports.
+        // These are derived current-state, recomputed every run, so a full
+        // replace per repository is simpler than a differential sync. `line`
+        // columns are INTEGER, hence the i32 casts. Ids are deduplicated before
+        // the appender, which would otherwise fail silently on a duplicate PK.
+        tx.execute(
+            "DELETE FROM complexity WHERE repository_id = ?",
+            params![repository_id],
+        )?;
+        tx.execute(
+            "DELETE FROM exports WHERE repository_id = ?",
+            params![repository_id],
+        )?;
+        {
+            let mut seen = HashSet::new();
+            let mut appender = tx.appender("complexity")?;
+            for record in code.complexity {
+                if !seen.insert(record.id.as_str()) {
+                    continue;
+                }
+                appender.append_row(params![
+                    record.id.as_str(),
+                    record.repository_id.as_str(),
+                    record.file_id.as_str(),
+                    record.qualified_name,
+                    record.line as i32,
+                    record.cyclomatic as i32,
+                    record.cognitive as i32,
+                    record.line_count as i32,
+                    record.param_count as i32,
+                ])?;
+            }
+        }
+        {
+            let mut seen = HashSet::new();
+            let mut appender = tx.appender("exports")?;
+            for record in code.exports {
+                if !seen.insert(record.id.as_str()) {
+                    continue;
+                }
+                appender.append_row(params![
+                    record.id.as_str(),
+                    record.repository_id.as_str(),
+                    record.file_id.as_str(),
+                    record.name,
+                    record.line as i32,
+                    record.is_type_only,
+                    record.re_export_source.as_deref(),
+                    record.re_export_name.as_deref(),
+                ])?;
+            }
+        }
+
+        mark("v4-health");
         // ---- snapshot rows (append-only; bulk via the DuckDB appender) ----
         let circular_dependencies = metrics
             .iter()
@@ -1263,7 +1394,9 @@ impl ArchitectureStore {
             }
         }
 
+        mark("snapshot");
         tx.commit()?;
+        mark("commit");
         Ok(stats)
     }
 
@@ -1587,6 +1720,23 @@ impl ArchitectureStore {
 
     /// `path → module` for every indexed file, to attribute per-file metrics
     /// (ownership, churn) to modules.
+    /// Total cognitive complexity per module, aggregated from the per-function
+    /// `complexity` table (oxc). Feeds the hotspot debt score so a module heavy
+    /// with complex functions ranks higher even with low churn/coupling.
+    pub fn module_complexity(&self, repository_id: &str) -> Result<Vec<(String, f64)>> {
+        let mut statement = self.conn.prepare(
+            "SELECT f.module_name, SUM(c.cognitive)::BIGINT
+             FROM complexity c
+             JOIN files f ON c.file_id = f.id AND c.repository_id = f.repository_id
+             WHERE c.repository_id = ?
+             GROUP BY f.module_name",
+        )?;
+        let rows = statement.query_map(params![repository_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as f64))
+        })?;
+        collect_rows(rows)
+    }
+
     pub fn file_modules(&self, repository_id: &str) -> Result<Vec<(String, String)>> {
         let mut statement = self
             .conn
@@ -1749,6 +1899,15 @@ impl ArchitectureStore {
             "calls",
             "apis",
             "tables",
+            // Code-health and dead-code aggregates (oxc): trend complexity creep
+            // and dead-code growth over time.
+            "functions",
+            "max_cyclomatic",
+            "max_cognitive",
+            "total_cognitive",
+            "high_complexity_functions",
+            "unused_exports",
+            "unused_files",
         ];
         let metric_deltas = TRACKED
             .iter()
@@ -1932,8 +2091,8 @@ mod tests {
 
         let version = store.migrate_to_latest().unwrap();
 
-        assert_eq!(version, 3);
-        assert_eq!(store.schema_version().unwrap(), Some(3));
+        assert_eq!(version, 4);
+        assert_eq!(store.schema_version().unwrap(), Some(4));
         for table in [
             "repositories",
             "files",
@@ -1953,6 +2112,8 @@ mod tests {
             "metrics",
             "findings",
             "packages",
+            "complexity",
+            "exports",
         ] {
             assert!(table_exists(&store, table), "missing table {table}");
         }
@@ -1964,12 +2125,12 @@ mod tests {
         store.migrate_to_latest().unwrap();
         store.migrate_to_latest().unwrap();
 
-        assert_eq!(store.schema_version().unwrap(), Some(3));
+        assert_eq!(store.schema_version().unwrap(), Some(4));
         let applied: i64 = store
             .conn
             .query_row("SELECT count(*) FROM ovecc_schema", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(applied, 3, "each migration must be recorded exactly once");
+        assert_eq!(applied, 4, "each migration must be recorded exactly once");
     }
 
     use ovecc_core::legacy::SourceLanguage;
@@ -2082,6 +2243,8 @@ mod tests {
             apis: &[],
             schema_objects: &[],
             schema_edges: &[],
+            complexity: &[],
+            exports: &[],
         };
 
         store
@@ -2220,9 +2383,11 @@ mod tests {
 
         let version = store.migrate_to_latest().unwrap();
 
-        assert_eq!(version, 3);
+        assert_eq!(version, 4);
         assert!(table_exists(&store, "findings"));
         assert!(table_exists(&store, "packages"));
+        assert!(table_exists(&store, "complexity"));
+        assert!(table_exists(&store, "exports"));
     }
 
     #[test]

@@ -22,8 +22,8 @@
 
 use crate::security;
 use ovecc_core::facts::{
-    ApiFact, ApiKind, CallFact, CallKind, FileFacts, ImportFact, ImportFactKind, ParseFailure,
-    SecurityPatternFact, SecurityPatternKind, SourceFile, Span, SymbolFact, SymbolKind,
+    ApiFact, ApiKind, CallFact, CallKind, ComplexityFact, FileFacts, ImportFact, ImportFactKind,
+    ParseFailure, SecurityPatternFact, SecurityPatternKind, SourceFile, Span, SymbolFact, SymbolKind,
 };
 use ovecc_core::lang::SourceLanguage;
 use ovecc_core::traits::LanguageAdapter;
@@ -138,6 +138,7 @@ struct Walk<'a> {
     local_types: Vec<(String, String)>,
     security: Vec<SecurityPatternFact>,
     apis: Vec<ApiFact>,
+    complexity: Vec<ComplexityFact>,
     suppressed: Vec<u32>,
 }
 
@@ -154,6 +155,7 @@ impl<'a> Walk<'a> {
             local_types: Vec::new(),
             security: Vec::new(),
             apis: Vec::new(),
+            complexity: Vec::new(),
             suppressed: Vec::new(),
         }
     }
@@ -183,8 +185,26 @@ impl<'a> Walk<'a> {
                 .then_with(|| (a.kind as u8).cmp(&(b.kind as u8)))
         });
         self.apis.sort_by_key(|a| a.line);
+        self.complexity.sort_by_key(|c| c.line);
         self.suppressed.sort_unstable();
         self.suppressed.dedup();
+        // Rust's `Command::new` is ambiguous: `std::process::Command` executes an
+        // OS command, but `clap::Command` (and many other crates) just build a
+        // value. Without an import of `std::process::Command`, drop the
+        // command-exec pattern — it is far more often a benign builder (clap
+        // alone produced 1400+ false positives in large-scale testing).
+        if self.language == SourceLanguage::Rust {
+            let uses_process_command = self.imports.iter().any(|import| {
+                import.specifier.contains("process::Command")
+                    || import.specifier.contains("process::{")
+            });
+            if !uses_process_command {
+                self.security.retain(|pattern| {
+                    !(pattern.kind == SecurityPatternKind::CommandExec
+                        && pattern.detail.as_deref() == Some("Command::new"))
+                });
+            }
+        }
         FileFacts {
             symbols: self.symbols,
             imports: self.imports,
@@ -192,6 +212,7 @@ impl<'a> Walk<'a> {
             local_types: self.local_types,
             security_patterns: self.security,
             apis: self.apis,
+            complexity: self.complexity,
             suppressed_lines: self.suppressed,
             ..FileFacts::default()
         }
@@ -263,6 +284,7 @@ impl<'a> Walk<'a> {
         };
         let short = last_segment(&name).to_string();
         self.push_symbol(node, short.clone(), qualified.clone(), kind);
+        self.record_complexity(node, &qualified);
         self.frames.push(Frame {
             name: short,
             methods_here: false,
@@ -271,6 +293,66 @@ impl<'a> Walk<'a> {
         self.visit_children(node);
         self.callables.pop();
         self.frames.pop();
+    }
+
+    // -- complexity --------------------------------------------------------
+
+    /// Records cyclomatic + cognitive complexity for a callable by walking its
+    /// body: cyclomatic counts decision points, cognitive weights them by
+    /// control-flow nesting depth. Nested callables are skipped — each gets its
+    /// own fact. A sensible cross-language approximation, consistent with the
+    /// oxc TS extractor's values rather than SonarSource-exact.
+    fn record_complexity(&mut self, node: Node<'a>, qualified: &str) {
+        let span = span_of(node);
+        let mut cyclomatic: u32 = 1;
+        let mut cognitive: u32 = 0;
+        self.walk_complexity(node, 0, &mut cyclomatic, &mut cognitive);
+        self.complexity.push(ComplexityFact {
+            qualified_name: qualified.to_string(),
+            line: span.start_line,
+            cyclomatic: cyclomatic.min(u16::MAX as u32) as u16,
+            cognitive: cognitive.min(u16::MAX as u32) as u16,
+            line_count: span.end_line.saturating_sub(span.start_line) + 1,
+            param_count: self.count_params(node),
+        });
+    }
+
+    fn walk_complexity(&self, node: Node<'a>, depth: u32, cyclo: &mut u32, cog: &mut u32) {
+        let mut cursor = node.walk();
+        let children: Vec<Node<'a>> = node.children(&mut cursor).collect();
+        drop(cursor);
+        for child in children {
+            // A nested function/closure carries its own complexity fact.
+            if matches!(self.role(child), Role::Callable) {
+                continue;
+            }
+            let kind = child.kind();
+            if decision_node(self.language, kind) {
+                *cyclo += 1;
+            }
+            if is_logical_operator(child, self.source) {
+                *cyclo += 1;
+                *cog += 1;
+            }
+            if nesting_node(self.language, kind) {
+                *cog += 1 + depth;
+                self.walk_complexity(child, depth + 1, cyclo, cog);
+            } else {
+                self.walk_complexity(child, depth, cyclo, cog);
+            }
+        }
+    }
+
+    fn count_params(&self, node: Node<'a>) -> u8 {
+        let Some(params) = node.child_by_field_name("parameters") else {
+            return 0;
+        };
+        let mut cursor = params.walk();
+        let count = params
+            .named_children(&mut cursor)
+            .filter(|child| child.kind() != "comment")
+            .count();
+        count.min(u8::MAX as usize) as u8
     }
 
     fn visit_type(&mut self, node: Node<'a>, kind: SymbolKind) {
@@ -1145,6 +1227,80 @@ fn is_comment(kind: &str) -> bool {
     matches!(kind, "comment" | "line_comment" | "block_comment")
 }
 
+/// Decision-point node kinds for cyclomatic complexity (each adds one path),
+/// per grammar. Boolean operators are counted separately by
+/// [`is_logical_operator`]; nesting structures are also decisions and appear
+/// here too.
+fn decision_node(language: SourceLanguage, kind: &str) -> bool {
+    match language {
+        SourceLanguage::Python => matches!(
+            kind,
+            "if_statement" | "elif_clause" | "for_statement" | "while_statement"
+                | "except_clause" | "conditional_expression" | "case_clause"
+        ),
+        SourceLanguage::Go => matches!(
+            kind,
+            "if_statement" | "for_statement" | "expression_case" | "type_case"
+                | "communication_case"
+        ),
+        SourceLanguage::Rust => matches!(
+            kind,
+            "if_expression" | "while_expression" | "for_expression" | "loop_expression"
+                | "match_arm" | "try_expression"
+        ),
+        SourceLanguage::Cpp => matches!(
+            kind,
+            "if_statement" | "for_statement" | "while_statement" | "do_statement"
+                | "case_statement" | "catch_clause" | "conditional_expression"
+                | "for_range_loop"
+        ),
+        _ => false,
+    }
+}
+
+/// Control-flow node kinds that increase cognitive nesting depth (and add
+/// `1 + depth` to the cognitive score), per grammar.
+fn nesting_node(language: SourceLanguage, kind: &str) -> bool {
+    match language {
+        SourceLanguage::Python => matches!(
+            kind,
+            "if_statement" | "for_statement" | "while_statement" | "conditional_expression"
+                | "match_statement" | "except_clause"
+        ),
+        SourceLanguage::Go => matches!(
+            kind,
+            "if_statement" | "for_statement" | "expression_switch_statement"
+                | "type_switch_statement" | "select_statement"
+        ),
+        SourceLanguage::Rust => matches!(
+            kind,
+            "if_expression" | "while_expression" | "for_expression" | "loop_expression"
+                | "match_expression"
+        ),
+        SourceLanguage::Cpp => matches!(
+            kind,
+            "if_statement" | "for_statement" | "while_statement" | "do_statement"
+                | "switch_statement" | "try_statement" | "conditional_expression"
+                | "for_range_loop"
+        ),
+        _ => false,
+    }
+}
+
+/// True for a short-circuiting boolean operator (`&&`/`||`, or Python's
+/// `and`/`or` `boolean_operator` node) — each adds a path and a cognitive point.
+fn is_logical_operator(node: Node<'_>, source: &[u8]) -> bool {
+    match node.kind() {
+        "boolean_operator" => true, // Python `and`/`or`
+        "binary_expression" | "logical_expression" => node
+            .child_by_field_name("operator")
+            .and_then(|op| node_text(op, source))
+            .map(|op| op == "&&" || op == "||")
+            .unwrap_or(false),
+        _ => false,
+    }
+}
+
 /// String-literal node kinds across the supported grammars (for secret scans).
 fn is_string_literal(kind: &str) -> bool {
     matches!(
@@ -1177,6 +1333,59 @@ mod tests {
             .iter()
             .map(|s| format!("{}:{}", s.qualified_name, kind_tag(s.kind)))
             .collect()
+    }
+
+    fn complexity_of<'b>(facts: &'b FileFacts, name: &str) -> &'b ComplexityFact {
+        facts
+            .complexity
+            .iter()
+            .find(|c| c.qualified_name == name || c.qualified_name.ends_with(name))
+            .unwrap_or_else(|| panic!("no complexity for {name}: {:?}", facts.complexity))
+    }
+
+    #[test]
+    fn python_complexity_counts_branches_and_nesting() {
+        let facts = extract(
+            SourceLanguage::Python,
+            "def simple(x):\n    return x\n\n\
+             def branchy(x):\n    if x and x > 0:\n        for i in range(x):\n            \
+             if i % 2 == 0:\n                print(i)\n    return x\n",
+        );
+        let simple = complexity_of(&facts, "simple");
+        assert_eq!(simple.cyclomatic, 1, "{simple:?}");
+        assert_eq!(simple.cognitive, 0, "{simple:?}");
+        assert_eq!(simple.param_count, 1);
+        let branchy = complexity_of(&facts, "branchy");
+        assert!(branchy.cyclomatic >= 4, "{branchy:?}");
+        assert!(branchy.cognitive >= 5, "deep nesting must weigh: {branchy:?}");
+    }
+
+    #[test]
+    fn rust_complexity_counts_branches_and_nesting() {
+        let facts = extract(
+            SourceLanguage::Rust,
+            "fn simple(x: i32) -> i32 { x }\n\
+             fn branchy(x: i32) -> i32 {\n    if x > 0 && x < 10 {\n        for i in 0..x {\n            \
+             match i { 0 => {}, _ => {} }\n        }\n    }\n    x\n}\n",
+        );
+        assert_eq!(complexity_of(&facts, "simple").cyclomatic, 1);
+        let branchy = complexity_of(&facts, "branchy");
+        assert!(branchy.cyclomatic >= 4, "{branchy:?}");
+        assert!(branchy.cognitive >= 4, "{branchy:?}");
+    }
+
+    #[test]
+    fn go_complexity_counts_branches_and_nesting() {
+        let facts = extract(
+            SourceLanguage::Go,
+            "package main\nfunc simple(x int) int { return x }\n\
+             func branchy(x int) int {\n    if x > 0 && x < 10 {\n        for i := 0; i < x; i++ {\n            \
+             switch i {\n            case 0:\n            default:\n            }\n        }\n    }\n    return x\n}\n",
+        );
+        assert_eq!(complexity_of(&facts, "simple").cyclomatic, 1);
+        let branchy = complexity_of(&facts, "branchy");
+        assert!(branchy.cyclomatic >= 3, "{branchy:?}");
+        assert!(branchy.cognitive >= 3, "{branchy:?}");
     }
 
     fn kind_tag(kind: SymbolKind) -> &'static str {
@@ -1493,6 +1702,28 @@ fn run(arg: &str) {
         assert!(
             security_kinds(&facts).contains(&SecurityPatternKind::CommandExec),
             "{:?}",
+            facts.security_patterns
+        );
+    }
+
+    #[test]
+    fn rust_command_new_without_process_import_is_not_command_exec() {
+        // `clap::Command::new` builds a CLI definition, not an OS command. Without
+        // an `std::process::Command` import it must not be flagged (clap alone
+        // produced 1400+ false positives before this filter).
+        let facts = extract(
+            SourceLanguage::Rust,
+            r#"
+use clap::Command;
+
+fn build() -> Command {
+    Command::new("myapp").arg("input")
+}
+"#,
+        );
+        assert!(
+            !security_kinds(&facts).contains(&SecurityPatternKind::CommandExec),
+            "clap Command::new must not be a command-exec sink: {:?}",
             facts.security_patterns
         );
     }

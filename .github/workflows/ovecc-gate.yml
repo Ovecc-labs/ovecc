@@ -1,0 +1,61 @@
+# Ovecc architecture gate.
+#
+# On every pull request: index the base branch and the PR head, fail the check
+# when the change introduces new high-severity findings (new cycles, dead code,
+# complexity regressions, security issues), and upload the findings as SARIF so
+# they appear inline in the PR's "Files changed" via GitHub code scanning.
+#
+# Opt-in: drop this file into a repository's .github/workflows/ to enforce
+# architecture quality on PRs. Building from source is cached; once Ovecc ships
+# release binaries, replace the build step with a download for a faster check.
+
+name: Ovecc Architecture Gate
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+  # Required to upload SARIF to code scanning.
+  security-events: write
+
+jobs:
+  ovecc-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (full history for the base ref)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build ovecc
+        run: cargo build --release --bin ovecc
+
+      - name: Index the base ref
+        run: |
+          git checkout --quiet ${{ github.event.pull_request.base.sha }}
+          ./target/release/ovecc index .
+          git checkout --quiet ${{ github.sha }}
+
+      - name: Index the PR head
+        run: ./target/release/ovecc index .
+
+      - name: Export findings as SARIF
+        if: always()
+        run: ./target/release/ovecc violations --format sarif > ovecc.sarif
+
+      - name: Upload SARIF to code scanning
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: ovecc.sarif
+          category: ovecc
+
+      - name: Gate — fail on new high-severity regressions
+        run: ./target/release/ovecc gate --fail-on high

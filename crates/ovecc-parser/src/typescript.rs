@@ -216,6 +216,12 @@ impl<'a> Extractor<'a> {
     fn visit(&mut self, node: Node<'_>, exported: bool) {
         match node.kind() {
             "export_statement" => {
+                // A re-export `export { x } from './y'` / `export * from './y'`
+                // depends on './y' and forwards usage to it. Record it as an
+                // import edge so reachability and dead-code follow barrel chains.
+                if node.child_by_field_name("source").is_some() {
+                    self.extract_reexport(node);
+                }
                 // Mark direct declaration children as exported (public).
                 let mut cursor = node.walk();
                 for child in node.children(&mut cursor) {
@@ -303,11 +309,30 @@ impl<'a> Extractor<'a> {
         });
     }
 
+    /// Records a re-export (`export ... from '...'`) as a forwarding import.
+    /// `export *` carries no names, so it becomes a namespace edge that credits
+    /// every export of the target.
+    fn extract_reexport(&mut self, node: Node<'_>) {
+        let Some(source_node) = node.child_by_field_name("source") else {
+            return;
+        };
+        let Some(specifier) = string_literal_value(self.text(source_node)) else {
+            return;
+        };
+        self.imports.push(ImportFact {
+            specifier,
+            line: self.line(node),
+            kind: ImportFactKind::ReExport,
+            imported_names: self.collect_imported_names(node),
+        });
+    }
+
     fn collect_imported_names(&self, node: Node<'_>) -> Vec<String> {
         let mut names = Vec::new();
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {
-            if child.kind() != "import_clause" {
+            // `import_clause` for imports, `export_clause` for `export { x } from`.
+            if !matches!(child.kind(), "import_clause" | "export_clause") {
                 continue;
             }
             collect_descendant_names(child, self.source, &mut names);
@@ -853,6 +878,19 @@ fn collect_descendant_names(node: Node<'_>, source: &[u8], names: &mut Vec<Strin
             }
             return;
         }
+        "export_specifier" => {
+            // For `export { a as b } from './x'`, credit the name in the source
+            // module (`a`), not the re-exported alias (`b`).
+            let target = node
+                .child_by_field_name("name")
+                .or_else(|| node.child_by_field_name("alias"));
+            if let Some(target) = target
+                && let Ok(text) = target.utf8_text(source)
+            {
+                names.push(text.to_string());
+            }
+            return;
+        }
         _ => {}
     }
     let mut cursor = node.walk();
@@ -1083,6 +1121,35 @@ const d = require("./legacy");
             .find(|i| i.specifier == "./legacy")
             .unwrap();
         assert_eq!(legacy.kind, ImportFactKind::Require);
+    }
+
+    #[test]
+    fn re_exports_become_import_edges() {
+        // Re-exports are dependencies on their source, forwarding usage — the
+        // edges dead-code reachability follows through barrel chains.
+        let facts = extract(
+            "export { deep, a as b } from './feature';\nexport * from './all';\n",
+            SourceLanguage::TypeScript,
+        );
+        let named = facts
+            .imports
+            .iter()
+            .find(|i| i.specifier == "./feature")
+            .expect("named re-export edge");
+        assert_eq!(named.kind, ImportFactKind::ReExport);
+        // The name credited is the source name `a`, not the alias `b`.
+        assert!(named.imported_names.contains(&"deep".to_string()));
+        assert!(named.imported_names.contains(&"a".to_string()));
+        assert!(!named.imported_names.contains(&"b".to_string()));
+
+        let star = facts
+            .imports
+            .iter()
+            .find(|i| i.specifier == "./all")
+            .expect("star re-export edge");
+        assert_eq!(star.kind, ImportFactKind::ReExport);
+        // `export *` carries no names → a namespace edge that credits all.
+        assert!(star.imported_names.is_empty());
     }
 
     #[test]

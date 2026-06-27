@@ -184,7 +184,7 @@ pub const EXIT_CODES: &[ExitCodeSpec] = &[
 ];
 
 /// Output formats every analysis command supports.
-pub const FORMATS: &[&str] = &["text", "json", "ndjson", "markdown"];
+pub const FORMATS: &[&str] = &["text", "json", "ndjson", "markdown", "sarif", "codeclimate"];
 
 /// Severity vocabulary shared by rules, findings, and risk mapping.
 pub const SEVERITIES: &[&str] = &["low", "medium", "high", "critical"];

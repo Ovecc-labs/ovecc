@@ -101,3 +101,11 @@ stable_id!(
     /// `finding:{repository_id}:{kind}:{target_id}:{evidence_hash}`
     FindingId, "finding"
 );
+stable_id!(
+    /// `complexity:{repository_id}:{file_id}:{qualified_name}:{line}`
+    ComplexityId, "complexity"
+);
+stable_id!(
+    /// `export:{repository_id}:{file_id}:{name}:{line}`
+    ExportId, "export"
+);

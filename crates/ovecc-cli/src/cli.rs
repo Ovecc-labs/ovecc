@@ -89,6 +89,8 @@ pub enum FormatArg {
     Json,
     Ndjson,
     Markdown,
+    Sarif,
+    Codeclimate,
 }
 
 impl From<FormatArg> for OutputFormat {
@@ -98,6 +100,8 @@ impl From<FormatArg> for OutputFormat {
             FormatArg::Json => OutputFormat::Json,
             FormatArg::Ndjson => OutputFormat::Ndjson,
             FormatArg::Markdown => OutputFormat::Markdown,
+            FormatArg::Sarif => OutputFormat::Sarif,
+            FormatArg::Codeclimate => OutputFormat::Codeclimate,
         }
     }
 }
@@ -270,6 +274,9 @@ pub enum Command {
         #[arg(long, value_enum)]
         fail_on: Option<FailOn>,
     },
+    /// Run an MCP (Model Context Protocol) server over stdio, exposing Ovecc's
+    /// commands as tools for coding agents. Reads/writes JSON-RPC on stdin/stdout.
+    Mcp,
 }
 
 #[derive(Debug, Subcommand)]
@@ -559,7 +566,9 @@ pub fn run() -> Result<u8> {
                 .filter(|finding| {
                     matches!(
                         finding.kind,
-                        FindingKind::UnusedExport | FindingKind::UnusedFile
+                        FindingKind::UnusedExport
+                            | FindingKind::UnusedFile
+                            | FindingKind::UnusedDependency
                     )
                 })
                 .collect();
@@ -572,11 +581,16 @@ pub fn run() -> Result<u8> {
                     .iter()
                     .filter(|f| f.kind == FindingKind::UnusedFile)
                     .count(),
+                unused_dependencies: findings
+                    .iter()
+                    .filter(|f| f.kind == FindingKind::UnusedDependency)
+                    .count(),
                 findings,
             };
             render_deadcode(&report, config.output.default_format)?;
             Ok(findings_exit(&report.findings, fail_on))
         }
+        Command::Mcp => crate::mcp::serve(),
     };
 
     if stats {
@@ -848,7 +862,7 @@ fn build_context_slice(
 
 fn render_conventions(report: &ConventionsReport, format: OutputFormat) -> Result<()> {
     match format {
-        OutputFormat::Json => emit_json("conventions", report, meta_for("conventions"))?,
+        OutputFormat::Json | OutputFormat::Sarif | OutputFormat::Codeclimate => emit_json("conventions", report, meta_for("conventions"))?,
         OutputFormat::Ndjson => {
             emit_ndjson_meta("conventions", &meta_for("conventions"))?;
             for convention in &report.conventions {
@@ -968,6 +982,10 @@ fn load_hotspots(paths: &ProjectPaths, limit: usize) -> Result<HotspotsReport> {
         }
     }
 
+    // Per-module cognitive complexity (oxc), aggregated from the v4 table.
+    let complexity: HashMap<String, f64> =
+        store.module_complexity(&repository_id)?.into_iter().collect();
+
     Ok(HotspotsReport {
         hotspots: graph::compute_hotspots(
             &modules,
@@ -975,6 +993,7 @@ fn load_hotspots(paths: &ProjectPaths, limit: usize) -> Result<HotspotsReport> {
             &churn,
             &fragmentation,
             &violations,
+            &complexity,
             limit,
         ),
         has_git_history,
@@ -983,7 +1002,7 @@ fn load_hotspots(paths: &ProjectPaths, limit: usize) -> Result<HotspotsReport> {
 
 fn render_hotspots(report: &HotspotsReport, format: OutputFormat) -> Result<()> {
     match format {
-        OutputFormat::Json => emit_json("hotspots", report, meta_for("hotspots"))?,
+        OutputFormat::Json | OutputFormat::Sarif | OutputFormat::Codeclimate => emit_json("hotspots", report, meta_for("hotspots"))?,
         OutputFormat::Ndjson => {
             emit_ndjson_meta("hotspots", &meta_for("hotspots"))?;
             for hotspot in &report.hotspots {
@@ -1049,6 +1068,7 @@ fn render_hotspots(report: &HotspotsReport, format: OutputFormat) -> Result<()> 
                     "   Coupling: {} (fan-in {}, fan-out {})",
                     hotspot.coupling, hotspot.fan_in, hotspot.fan_out
                 );
+                println!("   Complexity: {:.0} (cognitive)", hotspot.complexity);
                 println!("   Violations: {}", hotspot.violations);
             }
             if report.hotspots.is_empty() {
@@ -1121,7 +1141,120 @@ fn render_violations(findings: &[FindingRecord], format: OutputFormat) -> Result
                 }
             }
         }
+        OutputFormat::Sarif => emit_sarif(findings)?,
+        OutputFormat::Codeclimate => emit_codeclimate(findings)?,
     }
+    Ok(())
+}
+
+/// Serializes findings as SARIF 2.1.0 so `ovecc violations`/`security` output
+/// flows into GitHub code scanning and CI security dashboards.
+fn emit_sarif(findings: &[FindingRecord]) -> Result<()> {
+    use std::collections::BTreeMap;
+
+    // One SARIF rule per distinct rule name, with its description.
+    let mut rules: BTreeMap<String, String> = BTreeMap::new();
+    for finding in findings {
+        let rule_id = finding.rule_name.clone().unwrap_or_else(|| format!("{:?}", finding.kind));
+        rules.entry(rule_id).or_insert_with(|| finding.title.clone());
+    }
+    let rule_list: Vec<serde_json::Value> = rules
+        .iter()
+        .map(|(id, desc)| {
+            serde_json::json!({ "id": id, "shortDescription": { "text": desc } })
+        })
+        .collect();
+
+    let results: Vec<serde_json::Value> = findings
+        .iter()
+        .map(|finding| {
+            let rule_id = finding
+                .rule_name
+                .clone()
+                .unwrap_or_else(|| format!("{:?}", finding.kind));
+            let level = match finding.severity {
+                Severity::Critical | Severity::High => "error",
+                Severity::Medium => "warning",
+                Severity::Low => "note",
+            };
+            let locations: Vec<serde_json::Value> = finding
+                .evidence
+                .iter()
+                .map(|evidence| {
+                    let mut region = serde_json::Map::new();
+                    if let Some(line) = evidence.line {
+                        region.insert("startLine".to_string(), serde_json::json!(line.max(1)));
+                    }
+                    serde_json::json!({
+                        "physicalLocation": {
+                            "artifactLocation": { "uri": evidence.file_path },
+                            "region": region,
+                        }
+                    })
+                })
+                .collect();
+            serde_json::json!({
+                "ruleId": rule_id,
+                "level": level,
+                "message": { "text": finding.description },
+                "locations": locations,
+            })
+        })
+        .collect();
+
+    let sarif = serde_json::json!({
+        "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+        "version": "2.1.0",
+        "runs": [{
+            "tool": {
+                "driver": {
+                    "name": "ovecc",
+                    "version": env!("CARGO_PKG_VERSION"),
+                    "informationUri": "https://github.com/gitvonBS/ovecc",
+                    "rules": rule_list,
+                }
+            },
+            "results": results,
+        }],
+    });
+    println!("{}", serde_json::to_string_pretty(&sarif)?);
+    Ok(())
+}
+
+/// Serializes findings as Code Climate / GitLab Code Quality JSON, so
+/// `ovecc violations` flows into GitLab merge-request quality reports.
+fn emit_codeclimate(findings: &[FindingRecord]) -> Result<()> {
+    let issues: Vec<serde_json::Value> = findings
+        .iter()
+        .map(|finding| {
+            let check_name = finding
+                .rule_name
+                .clone()
+                .unwrap_or_else(|| format!("{:?}", finding.kind));
+            let severity = match finding.severity {
+                Severity::Critical => "blocker",
+                Severity::High => "critical",
+                Severity::Medium => "major",
+                Severity::Low => "minor",
+            };
+            let evidence = finding.evidence.first();
+            let path = evidence
+                .map(|e| e.file_path.clone())
+                .unwrap_or_else(|| "<unknown>".to_string());
+            let line = evidence.and_then(|e| e.line).unwrap_or(1).max(1);
+            serde_json::json!({
+                "type": "issue",
+                "check_name": check_name,
+                "description": finding.title,
+                // Stable across runs (derived from the finding's identity), as
+                // GitLab expects to diff fingerprints between pipelines.
+                "fingerprint": finding.id.as_str(),
+                "severity": severity,
+                "location": { "path": path, "lines": { "begin": line } },
+            })
+        })
+        .collect();
+    println!("{}", serde_json::to_string_pretty(&issues)?);
     Ok(())
 }
 
@@ -1145,7 +1278,7 @@ fn format_evidence(evidence: &ovecc_core::facts::Evidence) -> String {
 fn render_capabilities(format: OutputFormat) -> Result<()> {
     let caps = capabilities::capabilities();
     match format {
-        OutputFormat::Json | OutputFormat::Ndjson => {
+        OutputFormat::Json | OutputFormat::Ndjson | OutputFormat::Sarif | OutputFormat::Codeclimate => {
             emit_json("capabilities", &caps, Meta::default())?
         }
         OutputFormat::Markdown => {
@@ -1239,7 +1372,7 @@ fn build_security_report(all: &[FindingRecord], min_severity: Option<Severity>) 
 
 fn render_security(report: &SecurityReport, format: OutputFormat) -> Result<()> {
     match format {
-        OutputFormat::Json => emit_json("security", report, meta_for("security"))?,
+        OutputFormat::Json | OutputFormat::Sarif | OutputFormat::Codeclimate => emit_json("security", report, meta_for("security"))?,
         OutputFormat::Ndjson => {
             emit_ndjson_meta("security", &meta_for("security"))?;
             for finding in &report.findings {
@@ -1304,7 +1437,7 @@ struct AuditReport {
 
 fn render_audit(report: &AuditReport, format: OutputFormat) -> Result<()> {
     match format {
-        OutputFormat::Json => emit_json("audit", report, meta_for("audit"))?,
+        OutputFormat::Json | OutputFormat::Sarif | OutputFormat::Codeclimate => emit_json("audit", report, meta_for("audit"))?,
         OutputFormat::Ndjson => {
             emit_ndjson_meta("audit", &meta_for("audit"))?;
             for finding in &report.findings {
@@ -1397,8 +1530,29 @@ fn build_gate_report(
             signals.push(format!("{new_dependencies} new dependency edge(s)"));
         }
     }
+    // Quality regressions: any increase in a security/dead-code/complexity
+    // metric fails the gate regardless of --fail-on, because a PR that adds a
+    // vulnerability, dead code, or complexity is the case this gate exists for.
+    const REGRESSION_METRICS: &[(&str, &str)] = &[
+        ("security_findings", "security finding"),
+        ("unused_exports", "unused export"),
+        ("unused_files", "unused file"),
+        ("high_complexity_functions", "high-complexity function"),
+        ("boundary_violations", "boundary violation"),
+    ];
+    let mut quality_regressed = false;
+    for delta in &drift.metric_deltas {
+        for (metric, label) in REGRESSION_METRICS {
+            if delta.metric == *metric && delta.head > delta.base {
+                let added = (delta.head - delta.base) as i64;
+                signals.push(format!("{added} new {label}(s)"));
+                quality_regressed = true;
+            }
+        }
+    }
     let failed = new_cycles > 0
         || risk_fail
+        || quality_regressed
         || (matches!(fail_on, FailOn::Any) && (new_modules > 0 || new_dependencies > 0));
 
     Ok(GateReport {
@@ -1415,7 +1569,7 @@ fn build_gate_report(
 
 fn render_gate(report: &GateReport, format: OutputFormat) -> Result<()> {
     match format {
-        OutputFormat::Json | OutputFormat::Ndjson => emit_json("gate", report, meta_for("gate"))?,
+        OutputFormat::Json | OutputFormat::Ndjson | OutputFormat::Sarif | OutputFormat::Codeclimate => emit_json("gate", report, meta_for("gate"))?,
         OutputFormat::Markdown => {
             println!("# CI gate: {}", report.verdict.to_uppercase());
             println!();
@@ -1591,7 +1745,7 @@ struct DupesReport {
 fn render_dupes(report: &DupesReport, format: OutputFormat) -> Result<()> {
     let plural = |n: usize| if n == 1 { "y" } else { "ies" };
     match format {
-        OutputFormat::Json => emit_json("dupes", report, meta_for("dupes"))?,
+        OutputFormat::Json | OutputFormat::Sarif | OutputFormat::Codeclimate => emit_json("dupes", report, meta_for("dupes"))?,
         OutputFormat::Ndjson => {
             emit_ndjson_meta("dupes", &meta_for("dupes"))?;
             for family in &report.families {
@@ -1673,7 +1827,7 @@ struct HealthReport {
 
 fn render_health(report: &HealthReport, format: OutputFormat) -> Result<()> {
     match format {
-        OutputFormat::Json => emit_json("health", report, meta_for("health"))?,
+        OutputFormat::Json | OutputFormat::Sarif | OutputFormat::Codeclimate => emit_json("health", report, meta_for("health"))?,
         OutputFormat::Ndjson => {
             emit_ndjson_meta("health", &meta_for("health"))?;
             for finding in &report.findings {
@@ -1727,12 +1881,13 @@ fn render_health(report: &HealthReport, format: OutputFormat) -> Result<()> {
 struct DeadcodeReport {
     unused_exports: usize,
     unused_files: usize,
+    unused_dependencies: usize,
     findings: Vec<FindingRecord>,
 }
 
 fn render_deadcode(report: &DeadcodeReport, format: OutputFormat) -> Result<()> {
     match format {
-        OutputFormat::Json => emit_json("deadcode", report, meta_for("deadcode"))?,
+        OutputFormat::Json | OutputFormat::Sarif | OutputFormat::Codeclimate => emit_json("deadcode", report, meta_for("deadcode"))?,
         OutputFormat::Ndjson => {
             emit_ndjson_meta("deadcode", &meta_for("deadcode"))?;
             for finding in &report.findings {
@@ -1741,8 +1896,8 @@ fn render_deadcode(report: &DeadcodeReport, format: OutputFormat) -> Result<()> 
         }
         OutputFormat::Markdown => {
             println!(
-                "# Dead code ({} unused export(s), {} unused file(s))",
-                report.unused_exports, report.unused_files
+                "# Dead code ({} unused export(s), {} unused file(s), {} unused dependency(ies))",
+                report.unused_exports, report.unused_files, report.unused_dependencies
             );
             println!();
             if report.findings.is_empty() {
@@ -1759,8 +1914,8 @@ fn render_deadcode(report: &DeadcodeReport, format: OutputFormat) -> Result<()> 
         }
         OutputFormat::Text => {
             println!(
-                "Dead code: {} unused export(s), {} unused file(s)",
-                report.unused_exports, report.unused_files
+                "Dead code: {} unused export(s), {} unused file(s), {} unused dependency(ies)",
+                report.unused_exports, report.unused_files, report.unused_dependencies
             );
             for finding in &report.findings {
                 println!();
@@ -1939,7 +2094,7 @@ fn ndjson_header<T: serde::Serialize>(kind: &str, payload: &T, drop: &[&str]) ->
 
 fn render_index_report(report: &IndexReport, format: OutputFormat) -> Result<()> {
     match format {
-        OutputFormat::Json => emit_json("index", report, meta_for("index"))?,
+        OutputFormat::Json | OutputFormat::Sarif | OutputFormat::Codeclimate => emit_json("index", report, meta_for("index"))?,
         OutputFormat::Ndjson => {
             emit_ndjson_meta("index", &meta_for("index"))?;
             println!("{}", ndjson_line("index", report)?);
@@ -2000,7 +2155,7 @@ fn render_index_report(report: &IndexReport, format: OutputFormat) -> Result<()>
 
 fn render_summary_report(report: &SummaryReport, format: OutputFormat) -> Result<()> {
     match format {
-        OutputFormat::Json => emit_json("summary", report, meta_for("summary"))?,
+        OutputFormat::Json | OutputFormat::Sarif | OutputFormat::Codeclimate => emit_json("summary", report, meta_for("summary"))?,
         OutputFormat::Ndjson => {
             emit_ndjson_meta("summary", &meta_for("summary"))?;
             println!("{}", ndjson_header("summary", report, &["hotspots"])?);
@@ -2080,7 +2235,7 @@ fn render_summary_report(report: &SummaryReport, format: OutputFormat) -> Result
 fn render_blast(target: &str, result: Option<&BlastResult>, format: OutputFormat) -> Result<()> {
     let Some(result) = result else {
         match format {
-            OutputFormat::Json => emit_json(
+            OutputFormat::Json | OutputFormat::Sarif | OutputFormat::Codeclimate => emit_json(
                 "impact",
                 &serde_json::json!({"target": target, "matched": false}),
                 meta_for("impact"),
@@ -2108,7 +2263,7 @@ fn render_blast(target: &str, result: Option<&BlastResult>, format: OutputFormat
     };
 
     match format {
-        OutputFormat::Json => emit_json("impact", result, meta_for("impact"))?,
+        OutputFormat::Json | OutputFormat::Sarif | OutputFormat::Codeclimate => emit_json("impact", result, meta_for("impact"))?,
         OutputFormat::Ndjson => {
             emit_ndjson_meta("impact", &meta_for("impact"))?;
             println!(
@@ -2164,7 +2319,7 @@ fn render_blast(target: &str, result: Option<&BlastResult>, format: OutputFormat
 
 fn render_diff_report(report: &DiffReport, format: OutputFormat) -> Result<()> {
     match format {
-        OutputFormat::Json => emit_json("diff", report, meta_for("diff"))?,
+        OutputFormat::Json | OutputFormat::Sarif | OutputFormat::Codeclimate => emit_json("diff", report, meta_for("diff"))?,
         OutputFormat::Ndjson => {
             emit_ndjson_meta("diff", &meta_for("diff"))?;
             println!(
@@ -2247,7 +2402,7 @@ fn render_diff_report(report: &DiffReport, format: OutputFormat) -> Result<()> {
 
 fn render_drift_report(report: &DriftReport, format: OutputFormat) -> Result<()> {
     match format {
-        OutputFormat::Json => emit_json("drift", report, meta_for("drift"))?,
+        OutputFormat::Json | OutputFormat::Sarif | OutputFormat::Codeclimate => emit_json("drift", report, meta_for("drift"))?,
         OutputFormat::Ndjson => {
             emit_ndjson_meta("drift", &meta_for("drift"))?;
             println!("{}", ndjson_line("drift", report)?);
