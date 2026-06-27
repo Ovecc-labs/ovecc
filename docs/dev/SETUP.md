@@ -93,6 +93,8 @@ cargo test --workspace
 
 The binary is `ovecc` (from `crates/ovecc-cli`).
 
+> **Next:** to expose Ovecc to a coding agent over MCP, see [MCP.md](./MCP.md).
+
 ---
 
 ## Notes & troubleshooting
