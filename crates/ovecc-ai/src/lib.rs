@@ -329,4 +329,47 @@ mod tests {
         let b = DeterministicExplainer.explain(&slice).unwrap();
         assert_eq!(a, b);
     }
+
+    #[test]
+    fn explains_entry_point_role() {
+        // Depends on others but nothing depends on it → entry point.
+        let slice = ContextSlice {
+            target: "Cli".to_string(),
+            dependencies: vec!["Parser".to_string()],
+            ..ContextSlice::default()
+        };
+        let text = DeterministicExplainer.explain(&slice).unwrap();
+        assert!(text.contains("entry point"), "{text}");
+        assert!(text.contains("stay local"), "{text}");
+    }
+
+    #[test]
+    fn explains_foundational_role() {
+        // Others depend on it but it has no dependencies → foundational.
+        let slice = ContextSlice {
+            target: "Core".to_string(),
+            reverse_dependencies: vec!["A".to_string(), "B".to_string()],
+            ..ContextSlice::default()
+        };
+        let text = DeterministicExplainer.explain(&slice).unwrap();
+        assert!(text.contains("foundational"), "{text}");
+        assert!(text.contains("ripple outward"), "{text}");
+    }
+
+    #[test]
+    fn change_impact_omits_external_call_paths() {
+        let slice = ContextSlice {
+            target: "Svc".to_string(),
+            reverse_dependencies: vec!["X".to_string()],
+            call_paths: vec![
+                vec!["X".to_string(), "Svc".to_string()],
+                vec!["external:lodash".to_string(), "Svc".to_string()],
+            ],
+            ..ContextSlice::default()
+        };
+        let text = DeterministicExplainer.explain(&slice).unwrap();
+        // The internal path is shown; the path through an external node is filtered.
+        assert!(text.contains("X -> Svc"), "{text}");
+        assert!(!text.contains("external:lodash"), "{text}");
+    }
 }

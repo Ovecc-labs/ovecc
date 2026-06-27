@@ -75,3 +75,48 @@ impl OveccError {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exit_codes_have_stable_numeric_values() {
+        assert_eq!(ExitCode::Success.code(), 0);
+        assert_eq!(ExitCode::FindingsPresent.code(), 1);
+        assert_eq!(ExitCode::Usage.code(), 2);
+        assert_eq!(ExitCode::Repository.code(), 3);
+        assert_eq!(ExitCode::Index.code(), 4);
+        assert_eq!(ExitCode::Parser.code(), 5);
+        assert_eq!(ExitCode::Git.code(), 6);
+        assert_eq!(ExitCode::Internal.code(), 7);
+    }
+
+    #[test]
+    fn every_error_variant_maps_to_its_exit_code() {
+        assert_eq!(
+            OveccError::Usage { message: "x".into() }.exit_code(),
+            ExitCode::Usage
+        );
+        assert_eq!(
+            OveccError::Repository { message: "x".into() }.exit_code(),
+            ExitCode::Repository
+        );
+        assert_eq!(
+            OveccError::Index { message: "x".into(), source: None }.exit_code(),
+            ExitCode::Index
+        );
+        assert_eq!(
+            OveccError::Parser { path: "a.ts".into(), message: "x".into() }.exit_code(),
+            ExitCode::Parser
+        );
+        assert_eq!(
+            OveccError::Git { message: "x".into(), source: None }.exit_code(),
+            ExitCode::Git
+        );
+        assert_eq!(
+            OveccError::Internal { message: "x".into() }.exit_code(),
+            ExitCode::Internal
+        );
+    }
+}

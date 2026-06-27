@@ -68,10 +68,60 @@ fn hex_prefix(bytes: &[u8], chars: usize) -> String {
         .collect()
 }
 
+/// Maps a 4-bit nibble to its lowercase hex digit. Masks to the low nibble so
+/// the function is total (callers already pass `byte >> 4` / `byte & 0x0f`).
 fn hex_char(nibble: u8) -> char {
-    match nibble {
-        0..=9 => (b'0' + nibble) as char,
-        10..=15 => (b'a' + nibble - 10) as char,
-        _ => unreachable!(),
+    b"0123456789abcdef"[(nibble & 0x0f) as usize] as char
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn normalize_strips_windows_verbatim_and_unc_prefixes() {
+        // `\\?\C:\...` must never leak into ids/reports as `//?/C:/...`.
+        assert_eq!(
+            normalize_path(Path::new(r"\\?\C:\Users\dev\app")),
+            "C:/Users/dev/app"
+        );
+        // `\\?\UNC\server\share` denotes the network path `\\server\share`.
+        assert_eq!(
+            normalize_path(Path::new(r"\\?\UNC\server\share\file.ts")),
+            "//server/share/file.ts"
+        );
+        // A plain path just gets forward slashes.
+        assert_eq!(
+            normalize_path(Path::new(r"src\billing\service.ts")),
+            "src/billing/service.ts"
+        );
+    }
+
+    #[test]
+    fn relative_path_is_root_relative_or_errors_outside() {
+        let root = Path::new("/repo");
+        assert_eq!(
+            relative_path(root, Path::new("/repo/src/a.ts")).unwrap(),
+            "src/a.ts"
+        );
+        assert!(relative_path(root, Path::new("/elsewhere/a.ts")).is_err());
+    }
+
+    #[test]
+    fn stable_id_is_deterministic_prefixed_and_collision_resistant() {
+        let a = stable_id("file", &["repo", "src/a.ts"]);
+        assert_eq!(a, stable_id("file", &["repo", "src/a.ts"]));
+        assert!(a.starts_with("file:"));
+        // NUL-separation: ["ab","c"] must not collide with ["a","bc"].
+        assert_ne!(stable_id("x", &["ab", "c"]), stable_id("x", &["a", "bc"]));
+    }
+
+    #[test]
+    fn hashes_have_expected_widths_and_vary_with_input() {
+        assert_eq!(hash_bytes(b"hello").len(), 64);
+        assert_ne!(hash_bytes(b"hello"), hash_bytes(b"world"));
+        assert_eq!(short_hash("repo-root", 12).len(), 12);
+        assert!(hash_bytes(b"x").chars().all(|c| c.is_ascii_hexdigit()));
     }
 }
