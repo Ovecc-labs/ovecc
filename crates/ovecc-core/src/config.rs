@@ -114,14 +114,40 @@ pub struct IndexConfig {
     pub detect_unused_deps: bool,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ArchitectureConfig {
     pub module_strategy: ModuleStrategy,
+    /// How many path segments below a recognized source container (`src/`,
+    /// `packages/`, `apps/`, ...) define a module. `1` (the default) groups
+    /// `src/<name>/...` as `<name>`. Raise it for monorepos that nest the whole
+    /// tree under one directory — e.g. VS Code keeps everything under `src/vs`,
+    /// so depth `1` collapses the repo into a single `vs` module; depth `2`
+    /// recovers real boundaries (`vs/editor`, `vs/workbench`, `vs/platform`).
+    /// Values below `1` are treated as `1`.
+    #[serde(default = "default_module_depth")]
+    pub module_depth: usize,
     /// e.g. `["CODEOWNERS", ".github/CODEOWNERS"]`.
     pub ownership_sources: Vec<String>,
     /// Explicit module mapping, used when strategy is not pure `auto`.
     pub modules: Vec<ModuleMapping>,
+}
+
+/// Default module-inference depth: one segment below the source container,
+/// preserving the historical `src/<name>` → `<name>` behavior.
+fn default_module_depth() -> usize {
+    1
+}
+
+impl Default for ArchitectureConfig {
+    fn default() -> Self {
+        Self {
+            module_strategy: ModuleStrategy::default(),
+            module_depth: default_module_depth(),
+            ownership_sources: Vec::new(),
+            modules: Vec::new(),
+        }
+    }
 }
 
 /// Should module boundaries be inferred, configured, or both?
@@ -356,6 +382,30 @@ mod tests {
         assert!(config.rules.enable_layer_rules);
         assert!(config.rules.enable_domain_rules);
         assert_eq!(config.output.default_format, OutputFormat::Text);
+    }
+
+    #[test]
+    fn module_depth_defaults_to_one_and_parses_from_config() {
+        assert_eq!(OveccConfig::default().architecture.module_depth, 1);
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".ovecc")).unwrap();
+        std::fs::write(
+            dir.path().join(".ovecc").join("config.toml"),
+            "[architecture]\nmodule_depth = 2\n",
+        )
+        .unwrap();
+        let config = OveccConfig::load(dir.path(), &ConfigOverrides::default()).unwrap();
+        assert_eq!(config.architecture.module_depth, 2);
+
+        // An [architecture] section that omits module_depth still yields the default.
+        std::fs::write(
+            dir.path().join(".ovecc").join("config.toml"),
+            "[architecture]\nmodule_strategy = \"auto\"\n",
+        )
+        .unwrap();
+        let config = OveccConfig::load(dir.path(), &ConfigOverrides::default()).unwrap();
+        assert_eq!(config.architecture.module_depth, 1);
     }
 
     #[test]
