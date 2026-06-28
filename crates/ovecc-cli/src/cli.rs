@@ -10,13 +10,21 @@ use ovecc_core::legacy::{
     IndexReport, RiskLevel, SummaryReport,
 };
 use ovecc_core::query::{Query, TargetSelector};
-use ovecc_core::report::{ContextSlice, Envelope, Meta, ToolInfo};
+use ovecc_core::report::{ChangedFiles, ContextSlice, Envelope, Meta, ToolInfo};
 use ovecc_core::traits::ExplanationProvider;
 use ovecc_db::ArchitectureStore;
 use ovecc_graph as graph;
 use ovecc_graph::blast::{self, BlastEdge, BlastNode, BlastResult};
 use ovecc_indexer::index_repository;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Set by the global `--no-meta` flag. When true, [`meta_for`] returns an empty
+/// `Meta`, so the self-describing metric/rule dictionaries are omitted from every
+/// command's JSON. The MCP server sets this on every tool call: the agent reads
+/// the dictionaries once via `capabilities`, so repeating them on every result
+/// only inflates tokens (roughly halving MCP tool-result size in practice).
+static SUPPRESS_META: AtomicBool = AtomicBool::new(false);
 
 /// Prints `data` wrapped in the stable, self-describing JSON envelope
 /// (schema_version + tool + command + meta). The `data` payload is
@@ -45,16 +53,27 @@ fn emit_ndjson_meta(command: &str, meta: &Meta) -> Result<()> {
 /// metric and/or rule dictionaries relevant to it, so an agent can interpret the
 /// payload without the docs site. Static and therefore deterministic.
 fn meta_for(command: &str) -> Meta {
+    if SUPPRESS_META.load(Ordering::Relaxed) {
+        return Meta::default();
+    }
     let mut meta = Meta::default();
     if matches!(
         command,
-        "summary" | "report" | "drift" | "diff" | "hotspots" | "index" | "health"
+        "summary" | "report" | "drift" | "diff" | "hotspots" | "index" | "health" | "review"
     ) {
         meta.metrics = capabilities::metric_definitions();
     }
     if matches!(
         command,
-        "violations" | "security" | "audit" | "gate" | "report" | "summary" | "health" | "deadcode"
+        "violations"
+            | "security"
+            | "audit"
+            | "gate"
+            | "report"
+            | "summary"
+            | "health"
+            | "deadcode"
+            | "review"
     ) {
         meta.rules = capabilities::rule_definitions();
     }
@@ -76,6 +95,13 @@ pub struct Cli {
     /// For `index`, also shows the per-phase breakdown.
     #[arg(long, global = true)]
     stats: bool,
+
+    /// Omit the self-describing `meta` block (metric/rule definitions) from JSON
+    /// output. The `capabilities` command still carries the full contract; agents
+    /// read it once, so repeating it on every result is redundant. The MCP server
+    /// sets this automatically to keep tool results small.
+    #[arg(long, global = true)]
+    no_meta: bool,
 
     #[command(subcommand)]
     command: Command,
@@ -274,6 +300,20 @@ pub enum Command {
         #[arg(long, value_enum)]
         fail_on: Option<FailOn>,
     },
+    /// Review what a change introduced: the NAMED new defects between a base and
+    /// a head snapshot — new findings (security / dead code / complexity), new
+    /// dependency cycles WITH their file-level witness edges, and the
+    /// duplications the change added — in one deterministic call. The
+    /// change-scoped companion to `gate`, which reports only counts.
+    Review {
+        #[arg(default_value = "previous")]
+        base: String,
+        #[arg(default_value = "latest")]
+        head: String,
+        /// Exit with code 1 when the change crosses this threshold (CI check).
+        #[arg(long, value_enum, default_value_t = FailOn::Any)]
+        fail_on: FailOn,
+    },
     /// Run an MCP (Model Context Protocol) server over stdio, exposing Ovecc's
     /// commands as tools for coding agents. Reads/writes JSON-RPC on stdin/stdout.
     Mcp,
@@ -310,6 +350,9 @@ pub fn run() -> Result<u8> {
     let cli = Cli::parse();
     let format_override = cli.format;
     let stats = cli.stats;
+    if cli.no_meta {
+        SUPPRESS_META.store(true, Ordering::Relaxed);
+    }
     let started = std::time::Instant::now();
 
     let outcome = match cli.command {
@@ -589,6 +632,21 @@ pub fn run() -> Result<u8> {
             };
             render_deadcode(&report, config.output.default_format)?;
             Ok(findings_exit(&report.findings, fail_on))
+        }
+        Command::Review {
+            base,
+            head,
+            fail_on,
+        } => {
+            let paths = ProjectPaths::resolve(cli.repo.unwrap_or_else(|| PathBuf::from(".")))?;
+            let config = load_config(&paths, format_override)?;
+            let store = open_store(&paths)?;
+            let base = resolve_ref(&paths.root, &base);
+            let head = resolve_ref(&paths.root, &head);
+            let report = build_review_report(&paths, &config, &store, &base, &head, fail_on)?;
+            let failed = report.verdict == "fail";
+            render_review(&report, config.output.default_format)?;
+            Ok(u8::from(failed))
         }
         Command::Mcp => crate::mcp::serve(),
     };
@@ -1603,6 +1661,421 @@ fn render_gate(report: &GateReport, format: OutputFormat) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
+// ovecc review (change-scoped, named new defects)
+// ---------------------------------------------------------------------------
+
+/// The named defects a change introduced between two snapshots: the actionable,
+/// change-scoped report that `gate` (counts only) cannot give.
+#[derive(serde::Serialize)]
+struct ReviewReport {
+    base: String,
+    head: String,
+    /// `"pass"` or `"fail"` against `--fail-on`.
+    verdict: String,
+    /// Calibrated risk band: Low/Medium/High/Critical.
+    risk: String,
+    /// Human-readable reasons behind the verdict — the explanation `gate` lacks.
+    rationale: Vec<String>,
+    summary: ReviewSummary,
+    /// Each new finding is a full, named record with file:line evidence.
+    new_findings: Vec<FindingRecord>,
+    /// New dependency cycles, each carrying the file-level witness edges that
+    /// form it (so a consumer never has to guess — and mis-guess — the edges).
+    new_cycles: Vec<graph::cycles::CycleWitness>,
+    /// Clone families the change introduced (scoped to touched files), so new
+    /// duplication is not buried under pre-existing repo-wide clones.
+    new_duplications: Vec<graph::dupes::CloneFamily>,
+    changed_files: ChangedFiles,
+}
+
+#[derive(serde::Serialize)]
+struct ReviewSummary {
+    files_added: usize,
+    files_modified: usize,
+    new_findings: usize,
+    new_security: usize,
+    new_dead_code: usize,
+    new_complexity: usize,
+    new_cycles: usize,
+    new_duplications: usize,
+    /// Findings present in base but gone in head — credit for fixes.
+    resolved_findings: usize,
+}
+
+/// Assembles the change review from the snapshot-diff primitives in `ovecc-db`
+/// (named finding diff, changed files) and the graph analyses (cycle witnesses,
+/// change-scoped duplication). Head cycle/duplication evidence is drawn from the
+/// current index, so this is most precise when `head` is `latest` (the gate
+/// workflow: index base, apply change, index, review).
+fn build_review_report(
+    paths: &ProjectPaths,
+    config: &OveccConfig,
+    store: &ArchitectureStore,
+    base: &str,
+    head: &str,
+    fail_on: FailOn,
+) -> Result<ReviewReport> {
+    let repository_id = paths.repository_id().0;
+
+    let base_snapshot = store
+        .resolve_snapshot(&repository_id, base)?
+        .ok_or_else(|| OveccError::Index {
+            message: format!(
+                "could not resolve base snapshot '{base}'; index the repository at \
+                 least twice (a baseline, then again after the change) so there is a \
+                 base to compare against"
+            ),
+            source: None,
+        })?;
+    let head_snapshot = store
+        .resolve_snapshot(&repository_id, head)?
+        .ok_or_else(|| OveccError::Index {
+            message: format!("could not resolve head snapshot '{head}'; run 'ovecc index' first"),
+            source: None,
+        })?;
+
+    // 1. Named new/resolved findings (security, dead code, complexity, ...).
+    //    Cycles are surfaced richly (with witness edges) in `new_cycles` below,
+    //    so the plain CircularDependency findings are dropped here to avoid
+    //    double-reporting the same cycle.
+    let finding_diff = store.finding_diff(&repository_id, &base_snapshot.id, &head_snapshot.id)?;
+    let new_findings: Vec<FindingRecord> = finding_diff
+        .new
+        .into_iter()
+        .filter(|finding| finding.kind != FindingKind::CircularDependency)
+        .collect();
+
+    // 2. The files the change touched (for scoping duplication).
+    let changed_files = store.changed_files(&repository_id, &base_snapshot.id, &head_snapshot.id)?;
+
+    // 3. New dependency cycles WITH witness edges. Head cycles come from the
+    //    current graph (file-level, so witnesses carry file:line); a cycle is
+    //    new when its module set is not already a cycle in the base snapshot.
+    let head_modules = store.current_modules(&repository_id)?;
+    let head_dependencies = store.current_dependencies(&repository_id)?;
+    let base_cycles: std::collections::HashSet<Vec<String>> = graph::cycles::module_cycles(
+        &store.snapshot_module_names(&base_snapshot.id)?,
+        &store.snapshot_module_edges(&base_snapshot.id)?,
+    )
+    .into_iter()
+    .collect();
+    let new_cycles: Vec<graph::cycles::CycleWitness> =
+        graph::cycles::elementary_cycles_with_witness(&head_modules, &head_dependencies)
+            .into_iter()
+            .filter(|cycle| !base_cycles.contains(&cycle.modules))
+            .collect();
+
+    // 4. Duplications the change introduced: clone families with at least one
+    //    region in a touched file, so pre-existing clones elsewhere do not drown
+    //    out what THIS change added. (Scanning is still repo-wide — that is how a
+    //    new block is matched against an existing utility — only the output is
+    //    scoped.)
+    let touched: std::collections::HashSet<&str> =
+        changed_files.touched().map(String::as_str).collect();
+    let new_duplications: Vec<graph::dupes::CloneFamily> = if touched.is_empty() {
+        Vec::new()
+    } else {
+        ovecc_indexer::collect_file_tokens(paths, config)
+            .map(|files| graph::dupes::detect(&files, 50, 5, true))
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|family| {
+                family
+                    .instances
+                    .iter()
+                    .any(|instance| touched.contains(instance.path.as_str()))
+            })
+            .collect()
+    };
+
+    // Category counts over the new findings.
+    let count_kinds = |kinds: &[FindingKind]| {
+        new_findings
+            .iter()
+            .filter(|finding| kinds.contains(&finding.kind))
+            .count()
+    };
+    let new_security = count_kinds(&[
+        FindingKind::HardcodedSecret,
+        FindingKind::InsecurePattern,
+        FindingKind::WeakCrypto,
+        FindingKind::PermissiveCors,
+        FindingKind::VulnerableDependency,
+        FindingKind::TaintedFlow,
+    ]);
+    let new_dead_code = count_kinds(&[
+        FindingKind::UnusedExport,
+        FindingKind::UnusedFile,
+        FindingKind::UnusedDependency,
+    ]);
+    let new_complexity = count_kinds(&[FindingKind::HighComplexity]);
+    let max_new_severity = new_findings.iter().map(|finding| finding.severity).max();
+
+    let failed = review_crosses_threshold(
+        fail_on,
+        &new_findings,
+        &new_cycles,
+        &new_duplications,
+        max_new_severity,
+    );
+    let risk = review_risk(max_new_severity, &new_cycles, &new_duplications);
+    let rationale = review_rationale(
+        &new_cycles,
+        new_security,
+        new_complexity,
+        new_dead_code,
+        &new_duplications,
+    );
+
+    Ok(ReviewReport {
+        base: base_snapshot.id,
+        head: head_snapshot.id,
+        verdict: if failed { "fail" } else { "pass" }.to_string(),
+        risk: risk.as_str().to_string(),
+        rationale,
+        summary: ReviewSummary {
+            files_added: changed_files.added.len(),
+            files_modified: changed_files.modified.len(),
+            new_findings: new_findings.len(),
+            new_security,
+            new_dead_code,
+            new_complexity,
+            new_cycles: new_cycles.len(),
+            new_duplications: new_duplications.len(),
+            resolved_findings: finding_diff.resolved.len(),
+        },
+        new_findings,
+        new_cycles,
+        new_duplications,
+        changed_files,
+    })
+}
+
+/// Whether the change fails the gate at `fail_on`. A new cycle always fails (it
+/// is an architectural regression); findings fail by severity; duplication only
+/// counts under `any`.
+fn review_crosses_threshold(
+    fail_on: FailOn,
+    new_findings: &[FindingRecord],
+    new_cycles: &[graph::cycles::CycleWitness],
+    new_duplications: &[graph::dupes::CloneFamily],
+    max_new_severity: Option<Severity>,
+) -> bool {
+    match fail_on {
+        FailOn::Any => {
+            !new_findings.is_empty() || !new_cycles.is_empty() || !new_duplications.is_empty()
+        }
+        FailOn::Medium => {
+            !new_cycles.is_empty() || max_new_severity >= Some(Severity::Medium)
+        }
+        FailOn::High => !new_cycles.is_empty() || max_new_severity >= Some(Severity::High),
+    }
+}
+
+fn review_risk(
+    max_new_severity: Option<Severity>,
+    new_cycles: &[graph::cycles::CycleWitness],
+    new_duplications: &[graph::dupes::CloneFamily],
+) -> RiskLevel {
+    if max_new_severity == Some(Severity::Critical) {
+        RiskLevel::Critical
+    } else if !new_cycles.is_empty() || max_new_severity == Some(Severity::High) {
+        RiskLevel::High
+    } else if max_new_severity == Some(Severity::Medium) || !new_duplications.is_empty() {
+        RiskLevel::Medium
+    } else {
+        RiskLevel::Low
+    }
+}
+
+fn review_rationale(
+    new_cycles: &[graph::cycles::CycleWitness],
+    new_security: usize,
+    new_complexity: usize,
+    new_dead_code: usize,
+    new_duplications: &[graph::dupes::CloneFamily],
+) -> Vec<String> {
+    let mut rationale = Vec::new();
+    if !new_cycles.is_empty() {
+        let names: Vec<String> = new_cycles
+            .iter()
+            .map(|cycle| cycle.modules.join(" ↔ "))
+            .collect();
+        rationale.push(format!(
+            "{} new dependency cycle(s): {}",
+            new_cycles.len(),
+            names.join("; ")
+        ));
+    }
+    if new_security > 0 {
+        rationale.push(format!("{new_security} new security finding(s)"));
+    }
+    if new_complexity > 0 {
+        rationale.push(format!(
+            "{new_complexity} new high-complexity function(s)"
+        ));
+    }
+    if new_dead_code > 0 {
+        rationale.push(format!("{new_dead_code} new dead-code finding(s)"));
+    }
+    if !new_duplications.is_empty() {
+        rationale.push(format!("{} new duplication(s)", new_duplications.len()));
+    }
+    if rationale.is_empty() {
+        rationale.push("no new defects introduced by this change".to_string());
+    }
+    rationale
+}
+
+fn render_review(report: &ReviewReport, format: OutputFormat) -> Result<()> {
+    match format {
+        OutputFormat::Json | OutputFormat::Sarif | OutputFormat::Codeclimate => {
+            emit_json("review", report, meta_for("review"))?
+        }
+        OutputFormat::Ndjson => {
+            emit_ndjson_meta("review", &meta_for("review"))?;
+            println!("{}", ndjson_line("review_summary", &report.summary)?);
+            for finding in &report.new_findings {
+                println!("{}", ndjson_line("new_finding", finding)?);
+            }
+            for cycle in &report.new_cycles {
+                println!("{}", ndjson_line("new_cycle", cycle)?);
+            }
+            for family in &report.new_duplications {
+                println!("{}", ndjson_line("new_duplication", family)?);
+            }
+        }
+        OutputFormat::Markdown => {
+            println!("# Change review: {}", report.verdict.to_uppercase());
+            println!();
+            println!("- Base: `{}`", report.base);
+            println!("- Head: `{}`", report.head);
+            println!("- Risk: **{}**", report.risk);
+            println!(
+                "- Files: +{} added, ~{} modified",
+                report.summary.files_added, report.summary.files_modified
+            );
+            for reason in &report.rationale {
+                println!("- {reason}");
+            }
+
+            println!();
+            println!("## New dependency cycles ({})", report.new_cycles.len());
+            if report.new_cycles.is_empty() {
+                println!("_None._");
+            }
+            for cycle in &report.new_cycles {
+                println!();
+                println!("### {}", cycle.modules.join(" ↔ "));
+                for edge in &cycle.edges {
+                    let target = edge.to_file.as_deref().unwrap_or(edge.to_module.as_str());
+                    println!(
+                        "- `{}:{}` imports `{}` → `{}`",
+                        edge.from_file, edge.line, edge.specifier, target
+                    );
+                }
+            }
+
+            println!();
+            println!("## New findings ({})", report.new_findings.len());
+            if report.new_findings.is_empty() {
+                println!("_None._");
+            }
+            for finding in &report.new_findings {
+                let rule = finding.rule_name.as_deref().unwrap_or("-");
+                println!(
+                    "- **[{:?}] {:?}**{} — {} _(rule `{}`)_",
+                    finding.severity,
+                    finding.kind,
+                    first_evidence(finding),
+                    finding.title,
+                    rule
+                );
+            }
+
+            println!();
+            println!(
+                "## New duplications ({})",
+                report.new_duplications.len()
+            );
+            if report.new_duplications.is_empty() {
+                println!("_None._");
+            }
+            for (rank, family) in report.new_duplications.iter().enumerate() {
+                println!();
+                println!(
+                    "### Clone {} ({} tokens, {} lines, {} copies)",
+                    rank + 1,
+                    family.token_length,
+                    family.line_span,
+                    family.instances.len()
+                );
+                for instance in &family.instances {
+                    println!(
+                        "- `{}:{}-{}`",
+                        instance.path, instance.start_line, instance.end_line
+                    );
+                }
+            }
+        }
+        OutputFormat::Text => {
+            println!(
+                "Review: {} (risk {}) {} -> {}",
+                report.verdict, report.risk, report.base, report.head
+            );
+            for reason in &report.rationale {
+                println!("  - {reason}");
+            }
+            if !report.new_cycles.is_empty() {
+                println!("New cycles:");
+                for cycle in &report.new_cycles {
+                    println!("  {}", cycle.modules.join(" <-> "));
+                    for edge in &cycle.edges {
+                        println!(
+                            "    {}:{} imports {} -> {}",
+                            edge.from_file,
+                            edge.line,
+                            edge.specifier,
+                            edge.to_file.as_deref().unwrap_or(edge.to_module.as_str())
+                        );
+                    }
+                }
+            }
+            if !report.new_findings.is_empty() {
+                println!("New findings:");
+                for finding in &report.new_findings {
+                    println!(
+                        "  [{:?}] {:?}{} {}",
+                        finding.severity,
+                        finding.kind,
+                        first_evidence(finding),
+                        finding.title
+                    );
+                }
+            }
+            if !report.new_duplications.is_empty() {
+                println!("New duplications:");
+                for family in &report.new_duplications {
+                    println!(
+                        "  {} tokens / {} lines / {} copies",
+                        family.token_length,
+                        family.line_span,
+                        family.instances.len()
+                    );
+                    for instance in &family.instances {
+                        println!(
+                            "    {}:{}-{}",
+                            instance.path, instance.start_line, instance.end_line
+                        );
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // ovecc report (one-shot composite)
 // ---------------------------------------------------------------------------
 
@@ -2504,5 +2977,85 @@ fn print_markdown_dependencies(label: &str, dependencies: &[DependencyEdge]) {
             "- `{} -> {}` ({})",
             dependency.source_module, dependency.target_module, dependency.specifier
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cycle(a: &str, b: &str) -> graph::cycles::CycleWitness {
+        graph::cycles::CycleWitness {
+            modules: vec![a.to_string(), b.to_string()],
+            edges: Vec::new(),
+        }
+    }
+
+    fn clone_family() -> graph::dupes::CloneFamily {
+        graph::dupes::CloneFamily {
+            token_length: 60,
+            line_span: 8,
+            instances: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn no_meta_flag_suppresses_the_meta_block() {
+        // Default: a command that carries metric/rule dictionaries has meta.
+        SUPPRESS_META.store(false, Ordering::Relaxed);
+        assert!(!meta_for("summary").is_empty());
+        // Suppressed: every command's meta collapses to empty (so the envelope
+        // omits it), while `capabilities` output is unaffected (it never uses
+        // meta_for — the contract lives in its `data`).
+        SUPPRESS_META.store(true, Ordering::Relaxed);
+        assert!(meta_for("summary").is_empty());
+        assert!(meta_for("review").is_empty());
+        SUPPRESS_META.store(false, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn review_verdict_respects_fail_on_threshold() {
+        // Nothing new → pass at any threshold.
+        assert!(!review_crosses_threshold(FailOn::Any, &[], &[], &[], None));
+        // A new cycle is an architectural regression: it fails at every level.
+        assert!(review_crosses_threshold(FailOn::Any, &[], &[cycle("a", "b")], &[], None));
+        assert!(review_crosses_threshold(FailOn::High, &[], &[cycle("a", "b")], &[], None));
+        // Under `any`, a lone new duplication fails; under medium/high it does not.
+        assert!(review_crosses_threshold(FailOn::Any, &[], &[], &[clone_family()], None));
+        assert!(!review_crosses_threshold(FailOn::Medium, &[], &[], &[clone_family()], None));
+        // Findings gate by severity.
+        assert!(!review_crosses_threshold(FailOn::High, &[], &[], &[], Some(Severity::Medium)));
+        assert!(review_crosses_threshold(FailOn::High, &[], &[], &[], Some(Severity::High)));
+        assert!(review_crosses_threshold(FailOn::Medium, &[], &[], &[], Some(Severity::Medium)));
+    }
+
+    #[test]
+    fn review_risk_band_reflects_worst_signal() {
+        assert_eq!(review_risk(None, &[], &[]).as_str(), "Low");
+        assert_eq!(review_risk(Some(Severity::Medium), &[], &[]).as_str(), "Medium");
+        // A new duplication alone lifts risk to Medium.
+        assert_eq!(review_risk(None, &[], &[clone_family()]).as_str(), "Medium");
+        // A new cycle (or a High finding) is High.
+        assert_eq!(review_risk(None, &[cycle("a", "b")], &[]).as_str(), "High");
+        assert_eq!(review_risk(Some(Severity::High), &[], &[]).as_str(), "High");
+        // A Critical finding dominates everything.
+        assert_eq!(
+            review_risk(Some(Severity::Critical), &[cycle("a", "b")], &[]).as_str(),
+            "Critical"
+        );
+    }
+
+    #[test]
+    fn review_rationale_is_empty_message_when_clean() {
+        let rationale = review_rationale(&[], 0, 0, 0, &[]);
+        assert_eq!(rationale.len(), 1);
+        assert!(rationale[0].contains("no new defects"));
+        // Populated signals are each spelled out for the verdict explanation.
+        let rationale = review_rationale(&[cycle("alpha", "beta")], 2, 1, 3, &[clone_family()]);
+        assert!(rationale.iter().any(|r| r.contains("alpha ↔ beta")));
+        assert!(rationale.iter().any(|r| r.contains("2 new security")));
+        assert!(rationale.iter().any(|r| r.contains("1 new high-complexity")));
+        assert!(rationale.iter().any(|r| r.contains("3 new dead-code")));
+        assert!(rationale.iter().any(|r| r.contains("1 new duplication")));
     }
 }

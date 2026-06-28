@@ -42,6 +42,27 @@ struct ModuleAdjacency {
 
 impl ModuleAdjacency {
     fn build(modules: &[String], dependencies: &[DependencyRecord]) -> Self {
+        Self::from_module_edges(
+            modules,
+            dependencies
+                .iter()
+                .filter(|dependency| !dependency.is_external)
+                .map(|dependency| {
+                    (
+                        dependency.source_module.clone(),
+                        dependency.target_module.clone(),
+                    )
+                }),
+        )
+    }
+
+    /// Builds the adjacency from already-collapsed module→module edges (no
+    /// file-level facts). External edges must be filtered by the caller; self
+    /// edges and duplicates are dropped here, matching [`build`].
+    fn from_module_edges(
+        modules: &[String],
+        edges: impl IntoIterator<Item = (String, String)>,
+    ) -> Self {
         let names: Vec<String> = modules.to_vec();
         let index: HashMap<&str, usize> = names
             .iter()
@@ -50,13 +71,13 @@ impl ModuleAdjacency {
             .collect();
         let mut succ: Vec<Vec<usize>> = vec![Vec::new(); names.len()];
         let mut seen: Vec<HashSet<usize>> = vec![HashSet::new(); names.len()];
-        for dependency in dependencies {
-            if dependency.is_external || dependency.source_module == dependency.target_module {
+        for (source_module, target_module) in edges {
+            if source_module == target_module {
                 continue;
             }
             let (Some(&source), Some(&target)) = (
-                index.get(dependency.source_module.as_str()),
-                index.get(dependency.target_module.as_str()),
+                index.get(source_module.as_str()),
+                index.get(target_module.as_str()),
             ) else {
                 continue;
             };
@@ -68,6 +89,32 @@ impl ModuleAdjacency {
     }
 }
 
+/// A concrete file-level import edge that participates in a module cycle — the
+/// witness an auditor needs to actually cut the loop. `to_file` is `None` when
+/// the dependency resolved to a module without a concrete target file.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct WitnessEdge {
+    pub from_module: String,
+    pub to_module: String,
+    pub from_file: String,
+    pub to_file: Option<String>,
+    pub specifier: String,
+    pub line: usize,
+}
+
+/// An elementary module cycle together with the file-level import edges that
+/// form it. This upgrades "modules A and B form a cycle" to "src/a/x.ts:12
+/// imports ../b/y, and src/b/z.ts:8 imports ../a/w" — directly fixable, and
+/// it stops a consumer from having to guess (and mis-guess) the edges.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct CycleWitness {
+    /// Canonical module path of the cycle (same form as [`elementary_cycles`]).
+    pub modules: Vec<String>,
+    /// One representative file-level edge per consecutive module hop, in cycle
+    /// order. May be shorter than `modules` if an edge has no in-repo witness.
+    pub edges: Vec<WitnessEdge>,
+}
+
 /// Enumerates the elementary dependency cycles among `modules` as ordered
 /// module-name paths (e.g. `["billing", "tasks"]` for `billing -> tasks ->
 /// billing`). Shortest-first, canonicalized, deduplicated, and deterministic.
@@ -75,8 +122,92 @@ pub fn elementary_cycles(
     modules: &[String],
     dependencies: &[DependencyRecord],
 ) -> Vec<Vec<String>> {
-    let adjacency = ModuleAdjacency::build(modules, dependencies);
-    let sccs = strongly_connected(&adjacency);
+    cycles_from_adjacency(&ModuleAdjacency::build(modules, dependencies))
+}
+
+/// Like [`elementary_cycles`] but over already-collapsed module→module edges
+/// (no file-level facts). Lets a caller (e.g. snapshot drift) enumerate the
+/// cycle set of a past snapshot, whose stored edges are module-level only.
+pub fn module_cycles(modules: &[String], edges: &[(String, String)]) -> Vec<Vec<String>> {
+    cycles_from_adjacency(&ModuleAdjacency::from_module_edges(
+        modules,
+        edges.iter().cloned(),
+    ))
+}
+
+/// Enumerates the elementary cycles and attaches the file-level import edges
+/// that witness each one (see [`CycleWitness`]). The witness is drawn from
+/// `dependencies`, so callers pass the *current/head* graph to get concrete
+/// `file:line` evidence; cycle membership itself is identical to
+/// [`elementary_cycles`].
+pub fn elementary_cycles_with_witness(
+    modules: &[String],
+    dependencies: &[DependencyRecord],
+) -> Vec<CycleWitness> {
+    let representatives = representative_edges(dependencies);
+    elementary_cycles(modules, dependencies)
+        .into_iter()
+        .map(|cycle| {
+            let len = cycle.len();
+            let edges = (0..len)
+                .filter_map(|i| {
+                    let from = &cycle[i];
+                    let to = &cycle[(i + 1) % len];
+                    representatives
+                        .get(&(from.as_str(), to.as_str()))
+                        .map(|dependency| WitnessEdge {
+                            from_module: from.clone(),
+                            to_module: to.clone(),
+                            from_file: dependency.source_file_path.clone(),
+                            to_file: dependency.target_file_path.clone(),
+                            specifier: dependency.specifier.clone(),
+                            line: dependency.evidence_line,
+                        })
+                })
+                .collect();
+            CycleWitness {
+                modules: cycle,
+                edges,
+            }
+        })
+        .collect()
+}
+
+/// The representative in-repo file edge for each `(source_module, target_module)`
+/// pair: the deterministic first one, ordered by source path, then line, then
+/// specifier, so the witness is stable across runs.
+fn representative_edges(
+    dependencies: &[DependencyRecord],
+) -> HashMap<(&str, &str), &DependencyRecord> {
+    let key_of = |dependency: &DependencyRecord| {
+        (
+            dependency.source_file_path.clone(),
+            dependency.evidence_line,
+            dependency.specifier.clone(),
+        )
+    };
+    let mut best: HashMap<(&str, &str), &DependencyRecord> = HashMap::new();
+    for dependency in dependencies {
+        if dependency.is_external || dependency.source_module == dependency.target_module {
+            continue;
+        }
+        let module_key = (
+            dependency.source_module.as_str(),
+            dependency.target_module.as_str(),
+        );
+        match best.get(&module_key) {
+            Some(existing) if key_of(existing) <= key_of(dependency) => {}
+            _ => {
+                best.insert(module_key, dependency);
+            }
+        }
+    }
+    best
+}
+
+/// Shared SCC + elementary-cycle enumeration over a prebuilt adjacency.
+fn cycles_from_adjacency(adjacency: &ModuleAdjacency) -> Vec<Vec<String>> {
+    let sccs = strongly_connected(adjacency);
 
     let mut seen: HashSet<Vec<usize>> = HashSet::new();
     let mut cycles: Vec<Vec<usize>> = Vec::new();
@@ -92,7 +223,7 @@ pub fn elementary_cycles(
             }
             continue;
         }
-        for cycle in enumerate_scc_cycles(scc, &adjacency) {
+        for cycle in enumerate_scc_cycles(scc, adjacency) {
             if seen.insert(cycle.clone()) {
                 cycles.push(cycle);
             }
@@ -382,6 +513,86 @@ mod tests {
         let mods = modules(&["a", "b", "c"]);
         let deps = vec![dep("a", "b"), dep("b", "c"), dep("c", "a")];
         assert_eq!(elementary_cycles(&mods, &deps), elementary_cycles(&mods, &deps));
+    }
+
+    #[test]
+    fn witness_attaches_file_level_edges_to_a_two_cycle() {
+        // alpha/x imports ../beta/y ; beta/z imports ../alpha/w → alpha<->beta.
+        let mods = modules(&["alpha", "beta"]);
+        let mut a_to_b = dep("alpha", "beta");
+        a_to_b.source_file_path = "src/alpha/x.ts".to_string();
+        a_to_b.target_file_path = Some("src/beta/y.ts".to_string());
+        a_to_b.specifier = "../beta/y".to_string();
+        a_to_b.evidence_line = 12;
+        let mut b_to_a = dep("beta", "alpha");
+        b_to_a.source_file_path = "src/beta/z.ts".to_string();
+        b_to_a.target_file_path = Some("src/alpha/w.ts".to_string());
+        b_to_a.specifier = "../alpha/w".to_string();
+        b_to_a.evidence_line = 8;
+
+        let witnessed = elementary_cycles_with_witness(&mods, &[a_to_b, b_to_a]);
+        assert_eq!(witnessed.len(), 1);
+        let cycle = &witnessed[0];
+        assert_eq!(cycle.modules, vec!["alpha".to_string(), "beta".to_string()]);
+        // Both hops are witnessed with concrete file:line evidence.
+        assert_eq!(cycle.edges.len(), 2);
+        let ab = cycle
+            .edges
+            .iter()
+            .find(|e| e.from_module == "alpha")
+            .expect("alpha->beta edge");
+        assert_eq!(ab.from_file, "src/alpha/x.ts");
+        assert_eq!(ab.to_file.as_deref(), Some("src/beta/y.ts"));
+        assert_eq!(ab.line, 12);
+        let ba = cycle
+            .edges
+            .iter()
+            .find(|e| e.from_module == "beta")
+            .expect("beta->alpha edge");
+        assert_eq!(ba.from_file, "src/beta/z.ts");
+        assert_eq!(ba.line, 8);
+    }
+
+    #[test]
+    fn witness_picks_a_deterministic_representative_edge() {
+        // Two alpha->beta edges; the witness must pick the lexicographically
+        // first (by path, then line), regardless of input order.
+        let mods = modules(&["alpha", "beta"]);
+        let mut early = dep("alpha", "beta");
+        early.source_file_path = "src/alpha/a.ts".to_string();
+        early.evidence_line = 3;
+        let mut late = dep("alpha", "beta");
+        late.source_file_path = "src/alpha/z.ts".to_string();
+        late.evidence_line = 99;
+        let back = dep("beta", "alpha");
+
+        let one = elementary_cycles_with_witness(&mods, &[late.clone(), early.clone(), back.clone()]);
+        let two = elementary_cycles_with_witness(&mods, &[early, late, back]);
+        let edge_of = |w: &[CycleWitness]| {
+            w[0].edges
+                .iter()
+                .find(|e| e.from_module == "alpha")
+                .unwrap()
+                .from_file
+                .clone()
+        };
+        assert_eq!(edge_of(&one), "src/alpha/a.ts");
+        assert_eq!(edge_of(&one), edge_of(&two), "order-independent");
+    }
+
+    #[test]
+    fn module_cycles_matches_elementary_cycles_over_collapsed_edges() {
+        let mods = modules(&["a", "b", "c"]);
+        let deps = vec![dep("a", "b"), dep("b", "c"), dep("c", "a")];
+        let from_deps = elementary_cycles(&mods, &deps);
+        let edges: Vec<(String, String)> = deps
+            .iter()
+            .map(|d| (d.source_module.clone(), d.target_module.clone()))
+            .collect();
+        let from_edges = module_cycles(&mods, &edges);
+        assert_eq!(from_deps, from_edges);
+        assert_eq!(from_edges.len(), 1);
+        assert_eq!(from_edges[0].len(), 3);
     }
 
     #[test]

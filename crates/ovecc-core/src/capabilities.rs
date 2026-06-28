@@ -141,6 +141,13 @@ pub const COMMANDS: &[CommandSpec] = &[
         read_only: true,
     },
     CommandSpec {
+        name: "review",
+        summary: "Review what a change introduced: the NAMED new defects between two snapshots (the actionable companion to gate, which reports only counts).",
+        key_params: &["base", "head", "--fail-on medium|high|any"],
+        output: "New findings (with file:line), new dependency cycles WITH their import witness edges, change-scoped duplications, a verdict, and a rationale.",
+        read_only: true,
+    },
+    CommandSpec {
         name: "report",
         summary: "Produce a one-shot architecture report stitching summary, cycles, violations, security, and hotspots.",
         key_params: &["--format markdown|json"],

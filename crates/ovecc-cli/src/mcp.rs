@@ -109,11 +109,16 @@ fn call_tool(name: &str, arguments: &Value, exe: &Path) -> Value {
         .unwrap_or(".")
         .to_string();
 
+    // `--no-meta`: the agent reads the metric/rule dictionaries once via
+    // ovecc_capabilities, so repeating them on every tool result only inflates
+    // tokens. `capabilities` itself carries the full contract in `data`,
+    // unaffected by this flag.
     let mut argv = vec![
         "--repo".to_string(),
         repo,
         "--format".to_string(),
         "json".to_string(),
+        "--no-meta".to_string(),
     ];
     argv.extend(sub_argv);
 
@@ -239,6 +244,14 @@ fn build_argv(name: &str, args: &Value) -> Option<Vec<String>> {
                 argv.push(fail_on.into());
             }
         }
+        "ovecc_review" => {
+            argv.push("review".into());
+            push_base_head(&mut argv, s("base"), s("head"));
+            if let Some(fail_on) = s("fail_on") {
+                argv.push("--fail-on".into());
+                argv.push(fail_on.into());
+            }
+        }
         _ => return None,
     }
     Some(argv)
@@ -284,7 +297,8 @@ fn tool_specs() -> Value {
         {"name": "ovecc_hotspots", "description": "Technical-debt hotspot ranking: churn x coupling x ownership.", "inputSchema": obj(json!({"repo": repo, "limit": {"type": "integer", "description": "Number of hotspots to return (default 10)."}}), json!([]))},
         {"name": "ovecc_conventions", "description": "Learned repository conventions and their deviations.", "inputSchema": obj(json!({"repo": repo}), json!([]))},
         {"name": "ovecc_drift", "description": "Architecture drift over time versus a previous snapshot or Git ref.", "inputSchema": obj(json!({"repo": repo, "since": {"type": "string", "description": "Git ref or snapshot to compare against, e.g. main or v1.0.0."}}), json!([]))},
-        {"name": "ovecc_gate", "description": "CI gate: fail when a change introduces new cycles, violations, or quality regressions (security/dead-code/complexity) versus a base snapshot or Git ref. Returns a pass/fail verdict and the signals behind it.", "inputSchema": obj(json!({"repo": repo, "base": base, "head": head, "fail_on": fail_on}), json!([]))},
+        {"name": "ovecc_review", "description": "Change review (lead with this for PR review): the NAMED new defects a change introduced between base and head — new findings (security/dead-code/complexity) with file:line, new dependency cycles WITH their concrete import witness edges, and the duplications the change added (scoped to touched files). One deterministic call; the actionable companion to ovecc_gate, which reports only counts.", "inputSchema": obj(json!({"repo": repo, "base": base, "head": head, "fail_on": fail_on}), json!([]))},
+        {"name": "ovecc_gate", "description": "CI gate: fail when a change introduces new cycles, violations, or quality regressions (security/dead-code/complexity) versus a base snapshot or Git ref. Returns a pass/fail verdict and the signals behind it. For the named defects behind the verdict, use ovecc_review.", "inputSchema": obj(json!({"repo": repo, "base": base, "head": head, "fail_on": fail_on}), json!([]))},
         {"name": "ovecc_diff", "description": "Compare two stored architecture snapshots (or Git refs): added/removed modules and dependency edges, plus the overall diff risk score.", "inputSchema": obj(json!({"repo": repo, "base": base, "head": head, "fail_on": fail_on}), json!([]))},
         {"name": "ovecc_explain", "description": "Offline, deterministic architectural explanation of a target from its context slice.", "inputSchema": obj(json!({"repo": repo, "target": {"type": "string", "description": "Element to explain, e.g. Billing."}}), json!(["target"]))},
         {"name": "ovecc_context", "description": "Deterministic ContextSlice for a target as JSON, for feeding other tools or agents.", "inputSchema": obj(json!({"repo": repo, "target": {"type": "string", "description": "Element to slice, e.g. Billing."}}), json!(["target"]))}
@@ -324,6 +338,11 @@ mod tests {
             vec!["diff", "previous", "HEAD"]
         );
         assert_eq!(build_argv("ovecc_gate", &json!({})).unwrap(), vec!["gate"]);
+        assert_eq!(
+            build_argv("ovecc_review", &json!({"base": "main", "fail_on": "any"})).unwrap(),
+            vec!["review", "main", "--fail-on", "any"]
+        );
+        assert_eq!(build_argv("ovecc_review", &json!({})).unwrap(), vec!["review"]);
     }
 
     #[test]
@@ -346,7 +365,8 @@ mod tests {
         assert!(has("ovecc_capabilities"));
         assert!(has("ovecc_gate"));
         assert!(has("ovecc_diff"));
-        assert!(tools.len() >= 17);
+        assert!(has("ovecc_review"));
+        assert!(tools.len() >= 18);
     }
 
     #[test]

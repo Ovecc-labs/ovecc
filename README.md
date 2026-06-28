@@ -71,6 +71,7 @@ ovecc deadcode                # unused exports + unreachable files (oxc + reacha
 ovecc query "cycles"          # actual elementary dependency cycles (A -> B -> A)
 ovecc report                  # one-shot architecture report (markdown or json)
 ovecc gate                    # CI gate: fail a PR on new cycles / violations
+ovecc review                  # the NAMED new defects a change introduced (file:line + cycle witnesses)
 ovecc explain Billing         # offline, deterministic explanation
 ovecc mcp                     # MCP server over stdio: expose every command as an agent tool
 ovecc index . --exclude "vendored/**"   # built-in excludes (node_modules, .venv, ...) plus your own

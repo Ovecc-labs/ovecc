@@ -455,6 +455,40 @@ pub struct IndexTimings {
 }
 
 // ---------------------------------------------------------------------------
+// ovecc review (change-scoped, named new defects)
+// ---------------------------------------------------------------------------
+
+/// Files that changed between two snapshots, classified by content hash. Lets
+/// the change review scope analyses (e.g. duplication) to what a change touched.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChangedFiles {
+    /// Present in head, absent in base.
+    pub added: Vec<String>,
+    /// Present in both, different content hash.
+    pub modified: Vec<String>,
+    /// Present in base, absent in head.
+    pub removed: Vec<String>,
+}
+
+impl ChangedFiles {
+    /// Paths that are new or edited in head (added ∪ modified) — the surface a
+    /// change introduced, against which new findings/clones are attributed.
+    pub fn touched(&self) -> impl Iterator<Item = &String> {
+        self.added.iter().chain(self.modified.iter())
+    }
+}
+
+/// The findings a change introduced (`new`) or removed (`resolved`), computed
+/// as a set-difference of two snapshots' retained findings by stable content
+/// identity. Each entry is a full, named [`FindingRecord`] with file:line
+/// evidence — not a count.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct FindingDiff {
+    pub new: Vec<FindingRecord>,
+    pub resolved: Vec<FindingRecord>,
+}
+
+// ---------------------------------------------------------------------------
 // ovecc export context / explain
 // ---------------------------------------------------------------------------
 
