@@ -555,7 +555,8 @@ pub fn run() -> Result<u8> {
             let store = open_store(&paths)?;
             let base = resolve_ref(&paths.root, &base);
             let head = resolve_ref(&paths.root, &head);
-            let report = build_gate_report(&store, &paths.repository_id().0, &base, &head, fail_on)?;
+            let report =
+                build_gate_report(&store, &paths.repository_id().0, &base, &head, fail_on)?;
             let failed = report.verdict == "fail";
             render_gate(&report, config.output.default_format)?;
             Ok(u8::from(failed))
@@ -591,7 +592,11 @@ pub fn run() -> Result<u8> {
                 .into_iter()
                 .filter(|finding| finding.kind == FindingKind::HighComplexity)
                 .collect();
-            findings.sort_by(|a, b| b.severity.cmp(&a.severity).then_with(|| a.title.cmp(&b.title)));
+            findings.sort_by(|a, b| {
+                b.severity
+                    .cmp(&a.severity)
+                    .then_with(|| a.title.cmp(&b.title))
+            });
             let report = HealthReport {
                 high_complexity_functions: findings.len(),
                 findings,
@@ -920,7 +925,9 @@ fn build_context_slice(
 
 fn render_conventions(report: &ConventionsReport, format: OutputFormat) -> Result<()> {
     match format {
-        OutputFormat::Json | OutputFormat::Sarif | OutputFormat::Codeclimate => emit_json("conventions", report, meta_for("conventions"))?,
+        OutputFormat::Json | OutputFormat::Sarif | OutputFormat::Codeclimate => {
+            emit_json("conventions", report, meta_for("conventions"))?
+        }
         OutputFormat::Ndjson => {
             emit_ndjson_meta("conventions", &meta_for("conventions"))?;
             for convention in &report.conventions {
@@ -1041,8 +1048,10 @@ fn load_hotspots(paths: &ProjectPaths, limit: usize) -> Result<HotspotsReport> {
     }
 
     // Per-module cognitive complexity (oxc), aggregated from the v4 table.
-    let complexity: HashMap<String, f64> =
-        store.module_complexity(&repository_id)?.into_iter().collect();
+    let complexity: HashMap<String, f64> = store
+        .module_complexity(&repository_id)?
+        .into_iter()
+        .collect();
 
     Ok(HotspotsReport {
         hotspots: graph::compute_hotspots(
@@ -1060,7 +1069,9 @@ fn load_hotspots(paths: &ProjectPaths, limit: usize) -> Result<HotspotsReport> {
 
 fn render_hotspots(report: &HotspotsReport, format: OutputFormat) -> Result<()> {
     match format {
-        OutputFormat::Json | OutputFormat::Sarif | OutputFormat::Codeclimate => emit_json("hotspots", report, meta_for("hotspots"))?,
+        OutputFormat::Json | OutputFormat::Sarif | OutputFormat::Codeclimate => {
+            emit_json("hotspots", report, meta_for("hotspots"))?
+        }
         OutputFormat::Ndjson => {
             emit_ndjson_meta("hotspots", &meta_for("hotspots"))?;
             for hotspot in &report.hotspots {
@@ -1213,14 +1224,17 @@ fn emit_sarif(findings: &[FindingRecord]) -> Result<()> {
     // One SARIF rule per distinct rule name, with its description.
     let mut rules: BTreeMap<String, String> = BTreeMap::new();
     for finding in findings {
-        let rule_id = finding.rule_name.clone().unwrap_or_else(|| format!("{:?}", finding.kind));
-        rules.entry(rule_id).or_insert_with(|| finding.title.clone());
+        let rule_id = finding
+            .rule_name
+            .clone()
+            .unwrap_or_else(|| format!("{:?}", finding.kind));
+        rules
+            .entry(rule_id)
+            .or_insert_with(|| finding.title.clone());
     }
     let rule_list: Vec<serde_json::Value> = rules
         .iter()
-        .map(|(id, desc)| {
-            serde_json::json!({ "id": id, "shortDescription": { "text": desc } })
-        })
+        .map(|(id, desc)| serde_json::json!({ "id": id, "shortDescription": { "text": desc } }))
         .collect();
 
     let results: Vec<serde_json::Value> = findings
@@ -1336,9 +1350,10 @@ fn format_evidence(evidence: &ovecc_core::facts::Evidence) -> String {
 fn render_capabilities(format: OutputFormat) -> Result<()> {
     let caps = capabilities::capabilities();
     match format {
-        OutputFormat::Json | OutputFormat::Ndjson | OutputFormat::Sarif | OutputFormat::Codeclimate => {
-            emit_json("capabilities", &caps, Meta::default())?
-        }
+        OutputFormat::Json
+        | OutputFormat::Ndjson
+        | OutputFormat::Sarif
+        | OutputFormat::Codeclimate => emit_json("capabilities", &caps, Meta::default())?,
         OutputFormat::Markdown => {
             println!("# Ovecc capabilities");
             println!();
@@ -1347,7 +1362,11 @@ fn render_capabilities(format: OutputFormat) -> Result<()> {
             println!("## Commands");
             println!();
             for command in caps.commands {
-                let ro = if command.read_only { " _(read-only)_" } else { "" };
+                let ro = if command.read_only {
+                    " _(read-only)_"
+                } else {
+                    ""
+                };
                 println!("- **{}** — {}{ro}", command.name, command.summary);
             }
             println!();
@@ -1430,7 +1449,9 @@ fn build_security_report(all: &[FindingRecord], min_severity: Option<Severity>) 
 
 fn render_security(report: &SecurityReport, format: OutputFormat) -> Result<()> {
     match format {
-        OutputFormat::Json | OutputFormat::Sarif | OutputFormat::Codeclimate => emit_json("security", report, meta_for("security"))?,
+        OutputFormat::Json | OutputFormat::Sarif | OutputFormat::Codeclimate => {
+            emit_json("security", report, meta_for("security"))?
+        }
         OutputFormat::Ndjson => {
             emit_ndjson_meta("security", &meta_for("security"))?;
             for finding in &report.findings {
@@ -1441,7 +1462,10 @@ fn render_security(report: &SecurityReport, format: OutputFormat) -> Result<()> 
             println!("# Security ({} finding(s))", report.total);
             println!();
             println!("- Hardcoded secrets: {}", report.secrets);
-            println!("- Insecure patterns (eval/exec): {}", report.insecure_patterns);
+            println!(
+                "- Insecure patterns (eval/exec): {}",
+                report.insecure_patterns
+            );
             println!("- Weak crypto: {}", report.weak_crypto);
             println!("- Permissive CORS: {}", report.permissive_cors);
             println!("- Tainted flows: {}", report.tainted_flows);
@@ -1455,7 +1479,10 @@ fn render_security(report: &SecurityReport, format: OutputFormat) -> Result<()> 
             }
         }
         OutputFormat::Text => {
-            println!("Security findings: {} (scanned the indexed repository)", report.total);
+            println!(
+                "Security findings: {} (scanned the indexed repository)",
+                report.total
+            );
             println!(
                 "  secrets {}, insecure {}, weak-crypto {}, cors {}, tainted-flows {}",
                 report.secrets,
@@ -1495,7 +1522,9 @@ struct AuditReport {
 
 fn render_audit(report: &AuditReport, format: OutputFormat) -> Result<()> {
     match format {
-        OutputFormat::Json | OutputFormat::Sarif | OutputFormat::Codeclimate => emit_json("audit", report, meta_for("audit"))?,
+        OutputFormat::Json | OutputFormat::Sarif | OutputFormat::Codeclimate => {
+            emit_json("audit", report, meta_for("audit"))?
+        }
         OutputFormat::Ndjson => {
             emit_ndjson_meta("audit", &meta_for("audit"))?;
             for finding in &report.findings {
@@ -1627,7 +1656,10 @@ fn build_gate_report(
 
 fn render_gate(report: &GateReport, format: OutputFormat) -> Result<()> {
     match format {
-        OutputFormat::Json | OutputFormat::Ndjson | OutputFormat::Sarif | OutputFormat::Codeclimate => emit_json("gate", report, meta_for("gate"))?,
+        OutputFormat::Json
+        | OutputFormat::Ndjson
+        | OutputFormat::Sarif
+        | OutputFormat::Codeclimate => emit_json("gate", report, meta_for("gate"))?,
         OutputFormat::Markdown => {
             println!("# CI gate: {}", report.verdict.to_uppercase());
             println!();
@@ -1647,7 +1679,10 @@ fn render_gate(report: &GateReport, format: OutputFormat) -> Result<()> {
             }
         }
         OutputFormat::Text => {
-            println!("Gate: {} ({} -> {})", report.verdict, report.base, report.head);
+            println!(
+                "Gate: {} ({} -> {})",
+                report.verdict, report.base, report.head
+            );
             println!(
                 "New cycles: {}, new modules: {}, new deps: {}, risk: {}",
                 report.new_cycles, report.new_modules, report.new_dependencies, report.risk
@@ -1746,7 +1781,8 @@ fn build_review_report(
         .collect();
 
     // 2. The files the change touched (for scoping duplication).
-    let changed_files = store.changed_files(&repository_id, &base_snapshot.id, &head_snapshot.id)?;
+    let changed_files =
+        store.changed_files(&repository_id, &base_snapshot.id, &head_snapshot.id)?;
 
     // 3. New dependency cycles WITH witness edges. Head cycles come from the
     //    current graph (file-level, so witnesses carry file:line); a cycle is
@@ -1865,9 +1901,7 @@ fn review_crosses_threshold(
         FailOn::Any => {
             !new_findings.is_empty() || !new_cycles.is_empty() || !new_duplications.is_empty()
         }
-        FailOn::Medium => {
-            !new_cycles.is_empty() || max_new_severity >= Some(Severity::Medium)
-        }
+        FailOn::Medium => !new_cycles.is_empty() || max_new_severity >= Some(Severity::Medium),
         FailOn::High => !new_cycles.is_empty() || max_new_severity >= Some(Severity::High),
     }
 }
@@ -1899,7 +1933,7 @@ fn review_rationale(
     if !new_cycles.is_empty() {
         let names: Vec<String> = new_cycles
             .iter()
-            .map(|cycle| cycle.modules.join(" ↔ "))
+            .map(|cycle| format_cycle_path(&cycle.modules, " ↔ ", " → "))
             .collect();
         rationale.push(format!(
             "{} new dependency cycle(s): {}",
@@ -1911,9 +1945,7 @@ fn review_rationale(
         rationale.push(format!("{new_security} new security finding(s)"));
     }
     if new_complexity > 0 {
-        rationale.push(format!(
-            "{new_complexity} new high-complexity function(s)"
-        ));
+        rationale.push(format!("{new_complexity} new high-complexity function(s)"));
     }
     if new_dead_code > 0 {
         rationale.push(format!("{new_dead_code} new dead-code finding(s)"));
@@ -1925,6 +1957,22 @@ fn review_rationale(
         rationale.push("no new defects introduced by this change".to_string());
     }
     rationale
+}
+
+/// Renders a cycle's module path for display. A 2-node loop is genuinely
+/// bidirectional (`a ↔ b`); a longer loop is *directed*, so it reads as the
+/// actual path back to the start (`a → b → c → a`) rather than a misleading
+/// `a ↔ b ↔ c` (which would imply `a` and `c` depend on each other directly).
+fn format_cycle_path(modules: &[String], bidi: &str, arrow: &str) -> String {
+    match modules.first() {
+        Some(first) if modules.len() >= 3 => {
+            let mut path = modules.join(arrow);
+            path.push_str(arrow);
+            path.push_str(first);
+            path
+        }
+        _ => modules.join(bidi),
+    }
 }
 
 fn render_review(report: &ReviewReport, format: OutputFormat) -> Result<()> {
@@ -1966,7 +2014,7 @@ fn render_review(report: &ReviewReport, format: OutputFormat) -> Result<()> {
             }
             for cycle in &report.new_cycles {
                 println!();
-                println!("### {}", cycle.modules.join(" ↔ "));
+                println!("### {}", format_cycle_path(&cycle.modules, " ↔ ", " → "));
                 for edge in &cycle.edges {
                     let target = edge.to_file.as_deref().unwrap_or(edge.to_module.as_str());
                     println!(
@@ -1994,10 +2042,7 @@ fn render_review(report: &ReviewReport, format: OutputFormat) -> Result<()> {
             }
 
             println!();
-            println!(
-                "## New duplications ({})",
-                report.new_duplications.len()
-            );
+            println!("## New duplications ({})", report.new_duplications.len());
             if report.new_duplications.is_empty() {
                 println!("_None._");
             }
@@ -2029,7 +2074,7 @@ fn render_review(report: &ReviewReport, format: OutputFormat) -> Result<()> {
             if !report.new_cycles.is_empty() {
                 println!("New cycles:");
                 for cycle in &report.new_cycles {
-                    println!("  {}", cycle.modules.join(" <-> "));
+                    println!("  {}", format_cycle_path(&cycle.modules, " <-> ", " -> "));
                     for edge in &cycle.edges {
                         println!(
                             "    {}:{} imports {} -> {}",
@@ -2102,20 +2147,23 @@ fn render_full_report(paths: &ProjectPaths, format: OutputFormat) -> Result<()> 
     let store = open_store(paths)?;
     let modules = store.current_modules(&repository_id)?;
     let dependencies = store.current_dependencies(&repository_id)?;
-    let cycles: Vec<Vec<String>> =
-        ovecc_graph::cycles::elementary_cycles(&modules, &dependencies)
-            .into_iter()
-            .map(|mut members| {
-                if let Some(first) = members.first().cloned() {
-                    members.push(first);
-                }
-                members
-            })
-            .collect();
+    let cycles: Vec<Vec<String>> = ovecc_graph::cycles::elementary_cycles(&modules, &dependencies)
+        .into_iter()
+        .map(|mut members| {
+            if let Some(first) = members.first().cloned() {
+                members.push(first);
+            }
+            members
+        })
+        .collect();
     let mut findings = store.findings(&repository_id, None)?;
     drop(store);
     // Highest severity first, then stable by title, for deterministic output.
-    findings.sort_by(|a, b| b.severity.cmp(&a.severity).then_with(|| a.title.cmp(&b.title)));
+    findings.sort_by(|a, b| {
+        b.severity
+            .cmp(&a.severity)
+            .then_with(|| a.title.cmp(&b.title))
+    });
     let security = build_security_report(&findings, None);
 
     match format {
@@ -2218,7 +2266,9 @@ struct DupesReport {
 fn render_dupes(report: &DupesReport, format: OutputFormat) -> Result<()> {
     let plural = |n: usize| if n == 1 { "y" } else { "ies" };
     match format {
-        OutputFormat::Json | OutputFormat::Sarif | OutputFormat::Codeclimate => emit_json("dupes", report, meta_for("dupes"))?,
+        OutputFormat::Json | OutputFormat::Sarif | OutputFormat::Codeclimate => {
+            emit_json("dupes", report, meta_for("dupes"))?
+        }
         OutputFormat::Ndjson => {
             emit_ndjson_meta("dupes", &meta_for("dupes"))?;
             for family in &report.families {
@@ -2300,7 +2350,9 @@ struct HealthReport {
 
 fn render_health(report: &HealthReport, format: OutputFormat) -> Result<()> {
     match format {
-        OutputFormat::Json | OutputFormat::Sarif | OutputFormat::Codeclimate => emit_json("health", report, meta_for("health"))?,
+        OutputFormat::Json | OutputFormat::Sarif | OutputFormat::Codeclimate => {
+            emit_json("health", report, meta_for("health"))?
+        }
         OutputFormat::Ndjson => {
             emit_ndjson_meta("health", &meta_for("health"))?;
             for finding in &report.findings {
@@ -2360,7 +2412,9 @@ struct DeadcodeReport {
 
 fn render_deadcode(report: &DeadcodeReport, format: OutputFormat) -> Result<()> {
     match format {
-        OutputFormat::Json | OutputFormat::Sarif | OutputFormat::Codeclimate => emit_json("deadcode", report, meta_for("deadcode"))?,
+        OutputFormat::Json | OutputFormat::Sarif | OutputFormat::Codeclimate => {
+            emit_json("deadcode", report, meta_for("deadcode"))?
+        }
         OutputFormat::Ndjson => {
             emit_ndjson_meta("deadcode", &meta_for("deadcode"))?;
             for finding in &report.findings {
@@ -2532,6 +2586,19 @@ fn load_impact(
     let Some(node) = blast::resolve_target(target, &nodes) else {
         return Ok(None);
     };
+    // A file target carries no architectural edges of its own — dependency edges
+    // are module-level — so a raw file node yields an empty (and falsely
+    // reassuring "Low risk") blast radius. Redirect it to the module that
+    // `contains` it, so `impact src/foo/bar.ts` answers for module `foo`.
+    let node = if node.kind == "file" {
+        edges
+            .iter()
+            .find(|edge| edge.kind == "contains" && edge.target == node.id)
+            .and_then(|edge| nodes.iter().find(|candidate| candidate.id == edge.source))
+            .unwrap_or(node)
+    } else {
+        node
+    };
     Ok(blast::blast_radius(
         &nodes, &edges, &node.id, direction, max_depth,
     ))
@@ -2567,7 +2634,9 @@ fn ndjson_header<T: serde::Serialize>(kind: &str, payload: &T, drop: &[&str]) ->
 
 fn render_index_report(report: &IndexReport, format: OutputFormat) -> Result<()> {
     match format {
-        OutputFormat::Json | OutputFormat::Sarif | OutputFormat::Codeclimate => emit_json("index", report, meta_for("index"))?,
+        OutputFormat::Json | OutputFormat::Sarif | OutputFormat::Codeclimate => {
+            emit_json("index", report, meta_for("index"))?
+        }
         OutputFormat::Ndjson => {
             emit_ndjson_meta("index", &meta_for("index"))?;
             println!("{}", ndjson_line("index", report)?);
@@ -2628,7 +2697,9 @@ fn render_index_report(report: &IndexReport, format: OutputFormat) -> Result<()>
 
 fn render_summary_report(report: &SummaryReport, format: OutputFormat) -> Result<()> {
     match format {
-        OutputFormat::Json | OutputFormat::Sarif | OutputFormat::Codeclimate => emit_json("summary", report, meta_for("summary"))?,
+        OutputFormat::Json | OutputFormat::Sarif | OutputFormat::Codeclimate => {
+            emit_json("summary", report, meta_for("summary"))?
+        }
         OutputFormat::Ndjson => {
             emit_ndjson_meta("summary", &meta_for("summary"))?;
             println!("{}", ndjson_header("summary", report, &["hotspots"])?);
@@ -2736,7 +2807,9 @@ fn render_blast(target: &str, result: Option<&BlastResult>, format: OutputFormat
     };
 
     match format {
-        OutputFormat::Json | OutputFormat::Sarif | OutputFormat::Codeclimate => emit_json("impact", result, meta_for("impact"))?,
+        OutputFormat::Json | OutputFormat::Sarif | OutputFormat::Codeclimate => {
+            emit_json("impact", result, meta_for("impact"))?
+        }
         OutputFormat::Ndjson => {
             emit_ndjson_meta("impact", &meta_for("impact"))?;
             println!(
@@ -2792,7 +2865,9 @@ fn render_blast(target: &str, result: Option<&BlastResult>, format: OutputFormat
 
 fn render_diff_report(report: &DiffReport, format: OutputFormat) -> Result<()> {
     match format {
-        OutputFormat::Json | OutputFormat::Sarif | OutputFormat::Codeclimate => emit_json("diff", report, meta_for("diff"))?,
+        OutputFormat::Json | OutputFormat::Sarif | OutputFormat::Codeclimate => {
+            emit_json("diff", report, meta_for("diff"))?
+        }
         OutputFormat::Ndjson => {
             emit_ndjson_meta("diff", &meta_for("diff"))?;
             println!(
@@ -2875,7 +2950,9 @@ fn render_diff_report(report: &DiffReport, format: OutputFormat) -> Result<()> {
 
 fn render_drift_report(report: &DriftReport, format: OutputFormat) -> Result<()> {
     match format {
-        OutputFormat::Json | OutputFormat::Sarif | OutputFormat::Codeclimate => emit_json("drift", report, meta_for("drift"))?,
+        OutputFormat::Json | OutputFormat::Sarif | OutputFormat::Codeclimate => {
+            emit_json("drift", report, meta_for("drift"))?
+        }
         OutputFormat::Ndjson => {
             emit_ndjson_meta("drift", &meta_for("drift"))?;
             println!("{}", ndjson_line("drift", report)?);
@@ -3018,21 +3095,66 @@ mod tests {
         // Nothing new → pass at any threshold.
         assert!(!review_crosses_threshold(FailOn::Any, &[], &[], &[], None));
         // A new cycle is an architectural regression: it fails at every level.
-        assert!(review_crosses_threshold(FailOn::Any, &[], &[cycle("a", "b")], &[], None));
-        assert!(review_crosses_threshold(FailOn::High, &[], &[cycle("a", "b")], &[], None));
+        assert!(review_crosses_threshold(
+            FailOn::Any,
+            &[],
+            &[cycle("a", "b")],
+            &[],
+            None
+        ));
+        assert!(review_crosses_threshold(
+            FailOn::High,
+            &[],
+            &[cycle("a", "b")],
+            &[],
+            None
+        ));
         // Under `any`, a lone new duplication fails; under medium/high it does not.
-        assert!(review_crosses_threshold(FailOn::Any, &[], &[], &[clone_family()], None));
-        assert!(!review_crosses_threshold(FailOn::Medium, &[], &[], &[clone_family()], None));
+        assert!(review_crosses_threshold(
+            FailOn::Any,
+            &[],
+            &[],
+            &[clone_family()],
+            None
+        ));
+        assert!(!review_crosses_threshold(
+            FailOn::Medium,
+            &[],
+            &[],
+            &[clone_family()],
+            None
+        ));
         // Findings gate by severity.
-        assert!(!review_crosses_threshold(FailOn::High, &[], &[], &[], Some(Severity::Medium)));
-        assert!(review_crosses_threshold(FailOn::High, &[], &[], &[], Some(Severity::High)));
-        assert!(review_crosses_threshold(FailOn::Medium, &[], &[], &[], Some(Severity::Medium)));
+        assert!(!review_crosses_threshold(
+            FailOn::High,
+            &[],
+            &[],
+            &[],
+            Some(Severity::Medium)
+        ));
+        assert!(review_crosses_threshold(
+            FailOn::High,
+            &[],
+            &[],
+            &[],
+            Some(Severity::High)
+        ));
+        assert!(review_crosses_threshold(
+            FailOn::Medium,
+            &[],
+            &[],
+            &[],
+            Some(Severity::Medium)
+        ));
     }
 
     #[test]
     fn review_risk_band_reflects_worst_signal() {
         assert_eq!(review_risk(None, &[], &[]).as_str(), "Low");
-        assert_eq!(review_risk(Some(Severity::Medium), &[], &[]).as_str(), "Medium");
+        assert_eq!(
+            review_risk(Some(Severity::Medium), &[], &[]).as_str(),
+            "Medium"
+        );
         // A new duplication alone lifts risk to Medium.
         assert_eq!(review_risk(None, &[], &[clone_family()]).as_str(), "Medium");
         // A new cycle (or a High finding) is High.
@@ -3054,7 +3176,11 @@ mod tests {
         let rationale = review_rationale(&[cycle("alpha", "beta")], 2, 1, 3, &[clone_family()]);
         assert!(rationale.iter().any(|r| r.contains("alpha ↔ beta")));
         assert!(rationale.iter().any(|r| r.contains("2 new security")));
-        assert!(rationale.iter().any(|r| r.contains("1 new high-complexity")));
+        assert!(
+            rationale
+                .iter()
+                .any(|r| r.contains("1 new high-complexity"))
+        );
         assert!(rationale.iter().any(|r| r.contains("3 new dead-code")));
         assert!(rationale.iter().any(|r| r.contains("1 new duplication")));
     }

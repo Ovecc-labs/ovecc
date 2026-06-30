@@ -482,6 +482,18 @@ impl<'a> Extractor<'a> {
         match function_node.kind() {
             "identifier" => {
                 let callee = self.text(function_node).to_string();
+                // Weak hash via a *destructured* import — `createHash("md5")` after
+                // `import { createHash } from "crypto"` — which is at least as
+                // common as the `crypto.createHash(...)` member form handled in
+                // extract_member_call, and was previously missed.
+                if matches!(callee.as_str(), "createHash" | "createHmac")
+                    && let Some(algo) = self
+                        .first_string_argument(node)
+                        .and_then(|value| security::weak_hash(&value))
+                {
+                    self.security
+                        .push(security::weak_hash_fact(self.line(node), algo));
+                }
                 // require()/import() are imports, not architectural calls.
                 match callee.as_str() {
                     "require" => self.push_call_import(node, ImportFactKind::Require),
@@ -500,6 +512,13 @@ impl<'a> Extractor<'a> {
                     }),
                 }
             }
+            // Dynamic `import("…")`: tree-sitter parses the callee as the `import`
+            // keyword node, not an `identifier`, so it never reaches the "import"
+            // case above. Without this, dynamic imports (lazy loading, code
+            // splitting) vanish from the graph — hiding cycles closed by a dynamic
+            // import and, worse, flagging a module used only via `await import()`
+            // as dead (a false positive).
+            "import" => self.push_call_import(node, ImportFactKind::Dynamic),
             "member_expression" => {
                 self.extract_member_call(node, function_node);
             }
@@ -867,15 +886,29 @@ fn collect_descendant_names(node: Node<'_>, source: &[u8], names: &mut Vec<Strin
             }
         }
         "import_specifier" => {
-            // Prefer the local alias (the `name` field) when present.
-            let target = node
-                .child_by_field_name("alias")
-                .or_else(|| node.child_by_field_name("name"));
-            if let Some(target) = target
-                && let Ok(text) = target.utf8_text(source)
-            {
-                names.push(text.to_string());
+            // Record BOTH the imported (source) name and the local alias — they
+            // serve different consumers. Dead-code crediting needs the source
+            // name (what the TARGET module exports); call-graph bindings need the
+            // local name (what THIS file calls). For `import { a as b }`, `a` must
+            // be credited as a use of the export *and* `b` must bind the local
+            // call. Recording only the alias (the old behavior) made every
+            // aliased import look like a use of a non-existent export, so the real
+            // export was reported as dead — a false positive.
+            for field in ["name", "alias"] {
+                if let Some(part) = node.child_by_field_name(field)
+                    && let Ok(text) = part.utf8_text(source)
+                {
+                    names.push(text.to_string());
+                }
             }
+            return;
+        }
+        "namespace_import" => {
+            // `import * as ns`: pulls the WHOLE module. Recording the binding name
+            // (`ns`) would make this look like a named import of `ns` and miss
+            // that it uses every export of the target — flagging all of them as
+            // dead (a false positive). Contribute no name so the indexer marks the
+            // edge `is_namespace` and credits all of the target's exports.
             return;
         }
         "export_specifier" => {

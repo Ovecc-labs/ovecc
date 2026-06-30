@@ -25,7 +25,10 @@ use oxc_span::{SourceType, Span as OxcSpan};
 /// Extracts `(exports, complexity)` from one JS/TS source via oxc. Returns
 /// `None` for non-JS languages or on a hard parser panic (the caller then keeps
 /// the tree-sitter facts unchanged).
-pub fn extract(source: &str, language: SourceLanguage) -> Option<(Vec<ExportFact>, Vec<ComplexityFact>)> {
+pub fn extract(
+    source: &str,
+    language: SourceLanguage,
+) -> Option<(Vec<ExportFact>, Vec<ComplexityFact>)> {
     let source_type = match language {
         SourceLanguage::TypeScript => SourceType::ts(),
         SourceLanguage::Tsx => SourceType::tsx(),
@@ -41,8 +44,14 @@ pub fn extract(source: &str, language: SourceLanguage) -> Option<(Vec<ExportFact
     let line_offsets = compute_line_offsets(source);
     let mut walker = OxcWalk::new(&line_offsets);
     walker.visit_program(&parsed.program);
-    walker.exports.sort_by(|a, b| a.line.cmp(&b.line).then_with(|| a.name.cmp(&b.name)));
-    walker.complexity.sort_by(|a, b| a.line.cmp(&b.line).then_with(|| a.qualified_name.cmp(&b.qualified_name)));
+    walker
+        .exports
+        .sort_by(|a, b| a.line.cmp(&b.line).then_with(|| a.name.cmp(&b.name)));
+    walker.complexity.sort_by(|a, b| {
+        a.line
+            .cmp(&b.line)
+            .then_with(|| a.qualified_name.cmp(&b.qualified_name))
+    });
     Some((walker.exports, walker.complexity))
 }
 
@@ -129,7 +138,12 @@ impl<'s> OxcWalk<'s> {
         }
     }
 
-    fn enter_function(&mut self, name: Option<String>, span: OxcSpan, params: &FormalParameters<'_>) {
+    fn enter_function(
+        &mut self,
+        name: Option<String>,
+        span: OxcSpan,
+        params: &FormalParameters<'_>,
+    ) {
         let resolved = name
             .or_else(|| self.pending_name.take())
             .unwrap_or_else(|| "<anonymous>".to_string());
@@ -224,7 +238,9 @@ fn declaration_export_names(declaration: &Declaration<'_>) -> Vec<(String, bool)
         Declaration::TSInterfaceDeclaration(interface) => {
             vec![(interface.id.name.to_string(), true)]
         }
-        Declaration::TSEnumDeclaration(enumeration) => vec![(enumeration.id.name.to_string(), false)],
+        Declaration::TSEnumDeclaration(enumeration) => {
+            vec![(enumeration.id.name.to_string(), false)]
+        }
         _ => Vec::new(),
     }
 }
@@ -517,15 +533,13 @@ mod tests {
         )
         .unwrap();
         let reexport = exports.iter().find(|e| e.name == "y").unwrap();
-        assert_eq!(
-            reexport.re_export.as_ref().unwrap().source_specifier,
-            "./m"
-        );
+        assert_eq!(reexport.re_export.as_ref().unwrap().source_specifier, "./m");
         assert_eq!(reexport.re_export.as_ref().unwrap().imported_name, "x");
-        assert!(exports.iter().any(|e| e
-            .re_export
-            .as_ref()
-            .is_some_and(|r| r.imported_name == "*")));
+        assert!(
+            exports
+                .iter()
+                .any(|e| e.re_export.as_ref().is_some_and(|r| r.imported_name == "*"))
+        );
     }
 
     #[test]
@@ -541,7 +555,10 @@ mod tests {
             SourceLanguage::TypeScript,
         )
         .unwrap();
-        let names: Vec<&str> = complexity.iter().map(|c| c.qualified_name.as_str()).collect();
+        let names: Vec<&str> = complexity
+            .iter()
+            .map(|c| c.qualified_name.as_str())
+            .collect();
         assert!(names.contains(&"Foo"), "{names:?}");
         assert!(names.contains(&"bar"), "{names:?}");
         assert!(names.contains(&"baz"), "{names:?}");
@@ -565,9 +582,15 @@ mod tests {
 
     #[test]
     fn empty_function_is_cyclomatic_one() {
-        let (_, complexity) =
-            extract("function plain() { return 1; }\n", SourceLanguage::TypeScript).unwrap();
-        let f = complexity.iter().find(|c| c.qualified_name == "plain").unwrap();
+        let (_, complexity) = extract(
+            "function plain() { return 1; }\n",
+            SourceLanguage::TypeScript,
+        )
+        .unwrap();
+        let f = complexity
+            .iter()
+            .find(|c| c.qualified_name == "plain")
+            .unwrap();
         assert_eq!(f.cyclomatic, 1);
         assert_eq!(f.cognitive, 0);
     }

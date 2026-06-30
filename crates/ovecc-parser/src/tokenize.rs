@@ -99,11 +99,17 @@ fn normalized_leaf(kind: &str, node: Node<'_>, source: &[u8]) -> Option<String> 
 
 fn is_string_like(kind: &str) -> bool {
     kind.contains("string")
-        || matches!(kind, "char_literal" | "char" | "rune_literal" | "template_string")
+        || matches!(
+            kind,
+            "char_literal" | "char" | "rune_literal" | "template_string"
+        )
 }
 
 fn is_comment(kind: &str) -> bool {
-    matches!(kind, "comment" | "line_comment" | "block_comment" | "comment_block")
+    matches!(
+        kind,
+        "comment" | "line_comment" | "block_comment" | "comment_block"
+    )
 }
 
 /// FNV-1a 64-bit hash for stable, deterministic token identity.

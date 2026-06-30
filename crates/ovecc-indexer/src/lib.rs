@@ -43,7 +43,7 @@ const SOURCE_EXTENSIONS: &[&str] = &[
 
 /// `(variable, type)` bindings; older entries
 /// miss and re-parse.
-const PARSE_CACHE_VERSION: &str = "v9";
+const PARSE_CACHE_VERSION: &str = "v11";
 
 pub fn index_repository(
     paths: &ProjectPaths,

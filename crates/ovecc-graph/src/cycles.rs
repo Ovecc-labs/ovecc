@@ -144,27 +144,43 @@ pub fn elementary_cycles_with_witness(
     modules: &[String],
     dependencies: &[DependencyRecord],
 ) -> Vec<CycleWitness> {
-    let representatives = representative_edges(dependencies);
+    let candidates = candidate_edges(dependencies);
     elementary_cycles(modules, dependencies)
         .into_iter()
         .map(|cycle| {
             let len = cycle.len();
-            let edges = (0..len)
-                .filter_map(|i| {
-                    let from = &cycle[i];
-                    let to = &cycle[(i + 1) % len];
-                    representatives
-                        .get(&(from.as_str(), to.as_str()))
-                        .map(|dependency| WitnessEdge {
-                            from_module: from.clone(),
-                            to_module: to.clone(),
-                            from_file: dependency.source_file_path.clone(),
-                            to_file: dependency.target_file_path.clone(),
-                            specifier: dependency.specifier.clone(),
-                            line: dependency.evidence_line,
-                        })
-                })
-                .collect();
+            let mut edges: Vec<WitnessEdge> = Vec::with_capacity(len);
+            // The file the previous hop arrived at. We thread the witness through
+            // it so the edges read as one connected file-level walk around the
+            // loop — and so we never cite a parallel-but-unrelated file (e.g. a
+            // dead module that imports the target but isn't on the live path).
+            let mut arrived_at: Option<String> = None;
+            for i in 0..len {
+                let from = &cycle[i];
+                let to = &cycle[(i + 1) % len];
+                let Some(choices) = candidates.get(&(from.as_str(), to.as_str())) else {
+                    arrived_at = None;
+                    continue;
+                };
+                let chosen = arrived_at
+                    .as_deref()
+                    .and_then(|file| {
+                        choices
+                            .iter()
+                            .find(|dependency| dependency.source_file_path == file)
+                    })
+                    .copied()
+                    .unwrap_or(choices[0]);
+                arrived_at = chosen.target_file_path.clone();
+                edges.push(WitnessEdge {
+                    from_module: from.clone(),
+                    to_module: to.clone(),
+                    from_file: chosen.source_file_path.clone(),
+                    to_file: chosen.target_file_path.clone(),
+                    specifier: chosen.specifier.clone(),
+                    line: chosen.evidence_line,
+                });
+            }
             CycleWitness {
                 modules: cycle,
                 edges,
@@ -173,36 +189,34 @@ pub fn elementary_cycles_with_witness(
         .collect()
 }
 
-/// The representative in-repo file edge for each `(source_module, target_module)`
-/// pair: the deterministic first one, ordered by source path, then line, then
-/// specifier, so the witness is stable across runs.
-fn representative_edges(
+/// All in-repo file edges for each `(source_module, target_module)` pair, each
+/// list sorted deterministically (by source path, then line, then specifier) so
+/// witness selection is stable across runs. The first element is the canonical
+/// representative; later elements let the witness chain hop-to-hop by file.
+fn candidate_edges(
     dependencies: &[DependencyRecord],
-) -> HashMap<(&str, &str), &DependencyRecord> {
-    let key_of = |dependency: &DependencyRecord| {
-        (
-            dependency.source_file_path.clone(),
-            dependency.evidence_line,
-            dependency.specifier.clone(),
-        )
-    };
-    let mut best: HashMap<(&str, &str), &DependencyRecord> = HashMap::new();
+) -> HashMap<(&str, &str), Vec<&DependencyRecord>> {
+    let mut map: HashMap<(&str, &str), Vec<&DependencyRecord>> = HashMap::new();
     for dependency in dependencies {
         if dependency.is_external || dependency.source_module == dependency.target_module {
             continue;
         }
-        let module_key = (
+        map.entry((
             dependency.source_module.as_str(),
             dependency.target_module.as_str(),
-        );
-        match best.get(&module_key) {
-            Some(existing) if key_of(existing) <= key_of(dependency) => {}
-            _ => {
-                best.insert(module_key, dependency);
-            }
-        }
+        ))
+        .or_default()
+        .push(dependency);
     }
-    best
+    for edges in map.values_mut() {
+        edges.sort_by(|a, b| {
+            a.source_file_path
+                .cmp(&b.source_file_path)
+                .then_with(|| a.evidence_line.cmp(&b.evidence_line))
+                .then_with(|| a.specifier.cmp(&b.specifier))
+        });
+    }
+    map
 }
 
 /// Shared SCC + elementary-cycle enumeration over a prebuilt adjacency.
@@ -481,12 +495,7 @@ mod tests {
     fn overlapping_cycles_are_enumerated_individually() {
         // a<->b and b<->c share node b but are two distinct elementary cycles.
         let mods = modules(&["a", "b", "c"]);
-        let deps = vec![
-            dep("a", "b"),
-            dep("b", "a"),
-            dep("b", "c"),
-            dep("c", "b"),
-        ];
+        let deps = vec![dep("a", "b"), dep("b", "a"), dep("b", "c"), dep("c", "b")];
         let cycles = elementary_cycles(&mods, &deps);
         assert_eq!(cycles.len(), 2, "two elementary cycles, not one SCC");
         assert!(cycles.iter().all(|c| c.len() == 2));
@@ -512,7 +521,10 @@ mod tests {
     fn deterministic_across_runs() {
         let mods = modules(&["a", "b", "c"]);
         let deps = vec![dep("a", "b"), dep("b", "c"), dep("c", "a")];
-        assert_eq!(elementary_cycles(&mods, &deps), elementary_cycles(&mods, &deps));
+        assert_eq!(
+            elementary_cycles(&mods, &deps),
+            elementary_cycles(&mods, &deps)
+        );
     }
 
     #[test]
@@ -566,7 +578,8 @@ mod tests {
         late.evidence_line = 99;
         let back = dep("beta", "alpha");
 
-        let one = elementary_cycles_with_witness(&mods, &[late.clone(), early.clone(), back.clone()]);
+        let one =
+            elementary_cycles_with_witness(&mods, &[late.clone(), early.clone(), back.clone()]);
         let two = elementary_cycles_with_witness(&mods, &[early, late, back]);
         let edge_of = |w: &[CycleWitness]| {
             w[0].edges

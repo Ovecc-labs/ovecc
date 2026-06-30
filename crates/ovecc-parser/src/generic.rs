@@ -23,7 +23,8 @@
 use crate::security;
 use ovecc_core::facts::{
     ApiFact, ApiKind, CallFact, CallKind, ComplexityFact, FileFacts, ImportFact, ImportFactKind,
-    ParseFailure, SecurityPatternFact, SecurityPatternKind, SourceFile, Span, SymbolFact, SymbolKind,
+    ParseFailure, SecurityPatternFact, SecurityPatternKind, SourceFile, Span, SymbolFact,
+    SymbolKind,
 };
 use ovecc_core::lang::SourceLanguage;
 use ovecc_core::traits::LanguageAdapter;
@@ -1235,23 +1236,40 @@ fn decision_node(language: SourceLanguage, kind: &str) -> bool {
     match language {
         SourceLanguage::Python => matches!(
             kind,
-            "if_statement" | "elif_clause" | "for_statement" | "while_statement"
-                | "except_clause" | "conditional_expression" | "case_clause"
+            "if_statement"
+                | "elif_clause"
+                | "for_statement"
+                | "while_statement"
+                | "except_clause"
+                | "conditional_expression"
+                | "case_clause"
         ),
         SourceLanguage::Go => matches!(
             kind,
-            "if_statement" | "for_statement" | "expression_case" | "type_case"
+            "if_statement"
+                | "for_statement"
+                | "expression_case"
+                | "type_case"
                 | "communication_case"
         ),
         SourceLanguage::Rust => matches!(
             kind,
-            "if_expression" | "while_expression" | "for_expression" | "loop_expression"
-                | "match_arm" | "try_expression"
+            "if_expression"
+                | "while_expression"
+                | "for_expression"
+                | "loop_expression"
+                | "match_arm"
+                | "try_expression"
         ),
         SourceLanguage::Cpp => matches!(
             kind,
-            "if_statement" | "for_statement" | "while_statement" | "do_statement"
-                | "case_statement" | "catch_clause" | "conditional_expression"
+            "if_statement"
+                | "for_statement"
+                | "while_statement"
+                | "do_statement"
+                | "case_statement"
+                | "catch_clause"
+                | "conditional_expression"
                 | "for_range_loop"
         ),
         _ => false,
@@ -1264,23 +1282,38 @@ fn nesting_node(language: SourceLanguage, kind: &str) -> bool {
     match language {
         SourceLanguage::Python => matches!(
             kind,
-            "if_statement" | "for_statement" | "while_statement" | "conditional_expression"
-                | "match_statement" | "except_clause"
+            "if_statement"
+                | "for_statement"
+                | "while_statement"
+                | "conditional_expression"
+                | "match_statement"
+                | "except_clause"
         ),
         SourceLanguage::Go => matches!(
             kind,
-            "if_statement" | "for_statement" | "expression_switch_statement"
-                | "type_switch_statement" | "select_statement"
+            "if_statement"
+                | "for_statement"
+                | "expression_switch_statement"
+                | "type_switch_statement"
+                | "select_statement"
         ),
         SourceLanguage::Rust => matches!(
             kind,
-            "if_expression" | "while_expression" | "for_expression" | "loop_expression"
+            "if_expression"
+                | "while_expression"
+                | "for_expression"
+                | "loop_expression"
                 | "match_expression"
         ),
         SourceLanguage::Cpp => matches!(
             kind,
-            "if_statement" | "for_statement" | "while_statement" | "do_statement"
-                | "switch_statement" | "try_statement" | "conditional_expression"
+            "if_statement"
+                | "for_statement"
+                | "while_statement"
+                | "do_statement"
+                | "switch_statement"
+                | "try_statement"
+                | "conditional_expression"
                 | "for_range_loop"
         ),
         _ => false,
@@ -1357,7 +1390,10 @@ mod tests {
         assert_eq!(simple.param_count, 1);
         let branchy = complexity_of(&facts, "branchy");
         assert!(branchy.cyclomatic >= 4, "{branchy:?}");
-        assert!(branchy.cognitive >= 5, "deep nesting must weigh: {branchy:?}");
+        assert!(
+            branchy.cognitive >= 5,
+            "deep nesting must weigh: {branchy:?}"
+        );
     }
 
     #[test]

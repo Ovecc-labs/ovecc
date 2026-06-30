@@ -311,10 +311,24 @@ mod tests {
 
     #[test]
     fn builds_argv_for_simple_and_parameterized_tools() {
-        assert_eq!(build_argv("ovecc_summary", &json!({})).unwrap(), vec!["summary"]);
         assert_eq!(
-            build_argv("ovecc_impact", &json!({"target": "Billing", "direction": "both", "max_depth": 3})).unwrap(),
-            vec!["impact", "Billing", "--direction", "both", "--max-depth", "3"]
+            build_argv("ovecc_summary", &json!({})).unwrap(),
+            vec!["summary"]
+        );
+        assert_eq!(
+            build_argv(
+                "ovecc_impact",
+                &json!({"target": "Billing", "direction": "both", "max_depth": 3})
+            )
+            .unwrap(),
+            vec![
+                "impact",
+                "Billing",
+                "--direction",
+                "both",
+                "--max-depth",
+                "3"
+            ]
         );
         assert_eq!(
             build_argv("ovecc_query", &json!({"query": "cycles"})).unwrap(),
@@ -329,7 +343,11 @@ mod tests {
             vec!["security", "--severity", "high"]
         );
         assert_eq!(
-            build_argv("ovecc_gate", &json!({"base": "main", "head": "HEAD", "fail_on": "medium"})).unwrap(),
+            build_argv(
+                "ovecc_gate",
+                &json!({"base": "main", "head": "HEAD", "fail_on": "medium"})
+            )
+            .unwrap(),
             vec!["gate", "main", "HEAD", "--fail-on", "medium"]
         );
         // base/head are positional: a `head` with no `base` backfills the default.
@@ -342,7 +360,10 @@ mod tests {
             build_argv("ovecc_review", &json!({"base": "main", "fail_on": "any"})).unwrap(),
             vec!["review", "main", "--fail-on", "any"]
         );
-        assert_eq!(build_argv("ovecc_review", &json!({})).unwrap(), vec!["review"]);
+        assert_eq!(
+            build_argv("ovecc_review", &json!({})).unwrap(),
+            vec!["review"]
+        );
     }
 
     #[test]
@@ -355,7 +376,12 @@ mod tests {
     #[test]
     fn initialize_echoes_protocol_version_and_lists_tools() {
         let exe = std::path::PathBuf::from("ovecc");
-        let init = handle("initialize", Some(&json!({"protocolVersion": "2025-03-26"})), &exe).unwrap();
+        let init = handle(
+            "initialize",
+            Some(&json!({"protocolVersion": "2025-03-26"})),
+            &exe,
+        )
+        .unwrap();
         assert_eq!(init["protocolVersion"], "2025-03-26");
         assert_eq!(init["serverInfo"]["name"], "ovecc");
 
