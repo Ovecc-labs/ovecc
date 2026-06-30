@@ -8,6 +8,7 @@
 pub mod blast;
 pub mod conventions;
 pub mod cycles;
+pub mod diagnose;
 pub mod dupes;
 
 use ovecc_core::legacy::{

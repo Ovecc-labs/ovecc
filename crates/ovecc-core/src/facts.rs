@@ -433,6 +433,112 @@ pub enum FindingKind {
     HighComplexity,
 }
 
+/// A machine-actionable fix descriptor attached to a finding so an agent can act
+/// without re-deriving the remedy. `auto_fixable` is true only when a purely
+/// mechanical edit fully resolves the finding (safe to apply unattended);
+/// otherwise the fix needs judgement and `instruction` is the guidance.
+/// Deterministic — derived from the finding kind, never invented at runtime.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FixSpec {
+    pub kind: String,
+    pub auto_fixable: bool,
+    pub instruction: String,
+}
+
+impl FixSpec {
+    fn new(kind: &str, auto_fixable: bool, instruction: &str) -> Self {
+        Self {
+            kind: kind.to_string(),
+            auto_fixable,
+            instruction: instruction.to_string(),
+        }
+    }
+}
+
+impl FindingKind {
+    /// The deterministic fix descriptor for this kind of finding. Only the
+    /// mechanical dead-code removals are `auto_fixable`; everything that needs a
+    /// refactoring or a human decision is guidance-only.
+    pub fn fix_spec(&self) -> FixSpec {
+        match self {
+            FindingKind::UnusedFile => FixSpec::new(
+                "remove_unused_file",
+                true,
+                "Delete this unreachable file (no entry point reaches it).",
+            ),
+            FindingKind::UnusedExport => FixSpec::new(
+                "remove_unused_export",
+                true,
+                "Drop the `export` keyword (or delete the symbol if it is unused internally too).",
+            ),
+            FindingKind::UnusedDependency => FixSpec::new(
+                "remove_unused_dependency",
+                true,
+                "Remove this dependency from the manifest; no indexed file imports it.",
+            ),
+            FindingKind::HighComplexity => FixSpec::new(
+                "reduce_complexity",
+                false,
+                "Extract functions and reduce nesting to lower cognitive complexity.",
+            ),
+            FindingKind::HardcodedSecret => FixSpec::new(
+                "rotate_and_externalize_secret",
+                false,
+                "Remove the secret from source, rotate it, and load it from env / a secret manager.",
+            ),
+            FindingKind::WeakCrypto => FixSpec::new(
+                "replace_weak_crypto",
+                false,
+                "Replace MD5/SHA-1 with SHA-256+ or a vetted KDF.",
+            ),
+            FindingKind::InsecurePattern => FixSpec::new(
+                "remove_dynamic_eval",
+                false,
+                "Replace eval / dynamic execution with a safe, explicit alternative.",
+            ),
+            FindingKind::PermissiveCors => FixSpec::new(
+                "restrict_cors",
+                false,
+                "Restrict the CORS origin to an explicit allow-list.",
+            ),
+            FindingKind::VulnerableDependency => FixSpec::new(
+                "upgrade_dependency",
+                false,
+                "Upgrade to a fixed version, then re-run the test suite.",
+            ),
+            FindingKind::TaintedFlow => FixSpec::new(
+                "sanitize_tainted_flow",
+                false,
+                "Validate or parameterize the input before it reaches the sink.",
+            ),
+            FindingKind::CircularDependency => FixSpec::new(
+                "break_cycle",
+                false,
+                "Invert one dependency or extract the shared module both sides depend on.",
+            ),
+            FindingKind::LayerViolation
+            | FindingKind::ForbiddenImport
+            | FindingKind::CrossDomainDependency
+            | FindingKind::DirectDatabaseAccess
+            | FindingKind::OwnershipBoundaryViolation => FixSpec::new(
+                "fix_boundary_violation",
+                false,
+                "Route through the allowed boundary or move the code to the correct layer/domain.",
+            ),
+            FindingKind::ConventionDeviation => FixSpec::new(
+                "align_with_convention",
+                false,
+                "Bring the file in line with the dominant convention for its role.",
+            ),
+            FindingKind::Hotspot | FindingKind::DriftWarning => FixSpec::new(
+                "review",
+                false,
+                "Informational: review and prioritise; no single mechanical fix.",
+            ),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Raw extraction facts (language adapter output, pre-resolution)
 // ---------------------------------------------------------------------------

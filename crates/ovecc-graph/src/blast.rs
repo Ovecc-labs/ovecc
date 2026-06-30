@@ -53,6 +53,9 @@ pub struct BlastResult {
     pub impacted_apis: usize,
     pub impacted_tables: usize,
     pub impacted_symbols: usize,
+    /// Dependent source files reached over file→file dependency edges. This is
+    /// the file-granularity blast radius the module counts can't express.
+    pub impacted_files: usize,
     /// Labels of every impacted node, sorted for determinism.
     pub impacted_labels: Vec<String>,
     /// Up to a few representative label paths from the target outward.
@@ -68,6 +71,7 @@ enum Category {
     Api,
     Table,
     Symbol,
+    File,
     Other,
 }
 
@@ -77,6 +81,7 @@ fn categorize(kind: &str) -> Category {
         "api" | "route" | "rpc_method" | "event" => Category::Api,
         "table" | "view" | "column" => Category::Table,
         "symbol" | "function" | "class" | "trait" | "interface" | "type" => Category::Symbol,
+        "file" => Category::File,
         _ => Category::Other,
     }
 }
@@ -198,18 +203,21 @@ pub fn blast_radius(
         }
     }
 
-    let (mut modules, mut apis, mut tables, mut symbols) = (0, 0, 0, 0);
+    let (mut modules, mut apis, mut tables, mut symbols, mut files) = (0, 0, 0, 0, 0);
     for id in &visited {
         match node_by_id.get(id).map(|node| categorize(&node.kind)) {
             Some(Category::Module) => modules += 1,
             Some(Category::Api) => apis += 1,
             Some(Category::Table) => tables += 1,
             Some(Category::Symbol) => symbols += 1,
+            Some(Category::File) => files += 1,
             _ => {}
         }
     }
 
-    let (risk_value, risk) = risk_score(modules, apis, tables, symbols, false);
+    // Impacted files weigh like symbols (1 each) in the risk score, so a file
+    // with many dependents no longer scores Low just because no module is crossed.
+    let (risk_value, risk) = risk_score(modules, apis, tables, symbols + files, false);
     let mut impacted_labels: Vec<String> = visited
         .iter()
         .filter_map(|id| node_by_id.get(id).map(|node| node.label.clone()))
@@ -225,6 +233,7 @@ pub fn blast_radius(
         impacted_apis: apis,
         impacted_tables: tables,
         impacted_symbols: symbols,
+        impacted_files: files,
         impacted_labels,
         paths,
         risk_value,

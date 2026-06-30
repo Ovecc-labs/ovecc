@@ -99,7 +99,43 @@ fn handle(method: &str, params: Option<&Value>, exe: &Path) -> Result<Value, (i6
 /// Runs the CLI subcommand behind a tool and wraps stdout as the tool result.
 /// Unknown tools and bad arguments come back as `isError` results so the agent
 /// can recover without a protocol-level failure.
+///
+/// When `OVECC_MCP_LOG` is set, each call is traced to stderr (never stdout, so
+/// the JSON-RPC stream stays clean) — drives a live "backend" panel in demos.
 fn call_tool(name: &str, arguments: &Value, exe: &Path) -> Value {
+    let log = std::env::var_os("OVECC_MCP_LOG").is_some();
+    let started = std::time::Instant::now();
+    if log {
+        let args = serde_json::to_string(arguments).unwrap_or_default();
+        eprintln!("[ovecc-mcp] → {name} {}", truncate(&args, 80));
+    }
+    let result = run_tool(name, arguments, exe);
+    if log {
+        let is_err = result.get("isError").and_then(Value::as_bool).unwrap_or(false);
+        let bytes = result
+            .pointer("/content/0/text")
+            .and_then(Value::as_str)
+            .map_or(0, str::len);
+        eprintln!(
+            "[ovecc-mcp] ← {name} {} {bytes}B {}ms",
+            if is_err { "ERR" } else { "ok" },
+            started.elapsed().as_millis()
+        );
+    }
+    result
+}
+
+/// Char-boundary-safe truncation for the stderr trace.
+fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let head: String = s.chars().take(max).collect();
+        format!("{head}…")
+    }
+}
+
+fn run_tool(name: &str, arguments: &Value, exe: &Path) -> Value {
     let Some(sub_argv) = build_argv(name, arguments) else {
         return error_result(format!("unknown tool or missing required argument: {name}"));
     };
@@ -252,6 +288,28 @@ fn build_argv(name: &str, args: &Value) -> Option<Vec<String>> {
                 argv.push(fail_on.into());
             }
         }
+        "ovecc_diagnose" => {
+            argv.push("diagnose".into());
+            if let Some(target) = s("target") {
+                argv.push("--target".into());
+                argv.push(target.into());
+            }
+            if let Some(severity) = s("severity") {
+                argv.push("--severity".into());
+                argv.push(severity.into());
+            }
+        }
+        "ovecc_advise" => {
+            argv.push("advise".into());
+            argv.push(s("target")?.into());
+        }
+        "ovecc_metrics" => {
+            argv.push("metrics".into());
+            if let Some(target) = s("target") {
+                argv.push("--target".into());
+                argv.push(target.into());
+            }
+        }
         _ => return None,
     }
     Some(argv)
@@ -301,7 +359,10 @@ fn tool_specs() -> Value {
         {"name": "ovecc_gate", "description": "CI gate: fail when a change introduces new cycles, violations, or quality regressions (security/dead-code/complexity) versus a base snapshot or Git ref. Returns a pass/fail verdict and the signals behind it. For the named defects behind the verdict, use ovecc_review.", "inputSchema": obj(json!({"repo": repo, "base": base, "head": head, "fail_on": fail_on}), json!([]))},
         {"name": "ovecc_diff", "description": "Compare two stored architecture snapshots (or Git refs): added/removed modules and dependency edges, plus the overall diff risk score.", "inputSchema": obj(json!({"repo": repo, "base": base, "head": head, "fail_on": fail_on}), json!([]))},
         {"name": "ovecc_explain", "description": "Offline, deterministic architectural explanation of a target from its context slice.", "inputSchema": obj(json!({"repo": repo, "target": {"type": "string", "description": "Element to explain, e.g. Billing."}}), json!(["target"]))},
-        {"name": "ovecc_context", "description": "Deterministic ContextSlice for a target as JSON, for feeding other tools or agents.", "inputSchema": obj(json!({"repo": repo, "target": {"type": "string", "description": "Element to slice, e.g. Billing."}}), json!(["target"]))}
+        {"name": "ovecc_context", "description": "Deterministic ContextSlice for a target as JSON, for feeding other tools or agents.", "inputSchema": obj(json!({"repo": repo, "target": {"type": "string", "description": "Element to slice, e.g. Billing."}}), json!(["target"]))},
+        {"name": "ovecc_diagnose", "description": "Deterministic architectural diagnosis: cycles, hub-like (crossing), unstable and god components, dense structure, and hotspots — each with evidence, the design principle it breaks, and an established remediation. Components are directories; no design patterns are invented.", "inputSchema": obj(json!({"repo": repo, "target": {"type": "string", "description": "Scope to findings touching this file or component (substring)."}, "severity": severity}), json!([]))},
+        {"name": "ovecc_advise", "description": "Advise on one file, module, or component: the findings touching it and the established fix for each. Call before editing that area.", "inputSchema": obj(json!({"repo": repo, "target": {"type": "string", "description": "File, module, or component to advise on."}}), json!(["target"]))},
+        {"name": "ovecc_metrics", "description": "Per-component architecture metrics: fan-in/out, coupling, Martin instability, aggregate complexity, churn, and repository coupling density.", "inputSchema": obj(json!({"repo": repo, "target": {"type": "string", "description": "Scope to a single component (substring)."}}), json!([]))}
     ])
 }
 

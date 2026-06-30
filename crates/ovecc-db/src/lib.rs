@@ -235,6 +235,14 @@ fn depends_on_edge_id(
     )
 }
 
+/// Stable ID of a file→file `depends_on` edge. Derived from the owning
+/// dependency's ID alone (like `code_edge_id`) so the delete path — which knows
+/// only the dependency ID — can recompute it. These edges let blast/impact reach
+/// a file's direct dependents, which the coarser module→module edge can't express.
+fn depends_on_file_edge_id(repository_id: &str, dependency_id: &str) -> String {
+    stable_id("edge", &[repository_id, dependency_id, "depends_on_file"])
+}
+
 /// One versioned schema migration. Migrations are append-only:
 /// never edit a shipped migration, add a new version instead.
 struct SchemaMigration {
@@ -831,6 +839,11 @@ impl ArchitectureStore {
                     target_module_id,
                     dependency_id
                 )])?;
+                // Mirror of the file→file edge added on insert (no-op if absent).
+                delete_edge.execute(params![depends_on_file_edge_id(
+                    repository_id,
+                    dependency_id
+                )])?;
                 stats.dependencies_removed += 1;
             }
             for module_id in &modules_to_remove {
@@ -941,6 +954,33 @@ impl ArchitectureStore {
                 ])?;
             }
             for dependency in &dependencies_to_add {
+                // File→file edge first: lets blast/impact reach a file's direct
+                // dependents (the module→module edge alone hides intra-module
+                // coupling). Only internal deps carry a target file node; skip
+                // self-loops.
+                if let Some(target_file_id) = dependency.target_file_id.as_deref()
+                    && !dependency.is_external
+                    && !target_file_id.is_empty()
+                    && dependency.source_file_id != target_file_id
+                {
+                    let file_edge_id = depends_on_file_edge_id(repository_id, &dependency.id);
+                    if seen.insert(file_edge_id.clone()) {
+                        edges.append_row(params![
+                            file_edge_id,
+                            repository_id,
+                            dependency.source_file_id,
+                            target_file_id,
+                            "depends_on",
+                            1.0_f64,
+                            format!(
+                                r#"{{"file":"{}","line":{},"specifier":"{}"}}"#,
+                                dependency.source_file_path,
+                                dependency.evidence_line,
+                                dependency.specifier
+                            )
+                        ])?;
+                    }
+                }
                 let edge_id = depends_on_edge_id(
                     repository_id,
                     &dependency.source_module_id,
@@ -1847,6 +1887,102 @@ impl ArchitectureStore {
         collect_rows(rows)
     }
 
+    /// Commits touching each file (per-file churn), so callers can aggregate
+    /// churn to any component granularity (e.g. directories), not just modules.
+    pub fn file_churn(&self, repository_id: &str) -> Result<Vec<(String, f64)>> {
+        let mut statement = self.conn.prepare(
+            "SELECT f.path, COUNT(fc.id)
+             FROM files f
+             LEFT JOIN file_changes fc
+               ON fc.file_path = f.path AND fc.repository_id = f.repository_id
+             WHERE f.repository_id = ?
+             GROUP BY f.path",
+        )?;
+        let rows = statement.query_map(params![repository_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as f64))
+        })?;
+        collect_rows(rows)
+    }
+
+    /// Total cognitive complexity per file (oxc), for per-component aggregation.
+    pub fn file_complexity(&self, repository_id: &str) -> Result<Vec<(String, f64)>> {
+        let mut statement = self.conn.prepare(
+            "SELECT f.path, SUM(c.cognitive)::BIGINT
+             FROM complexity c
+             JOIN files f ON c.file_id = f.id AND c.repository_id = f.repository_id
+             WHERE c.repository_id = ?
+             GROUP BY f.path",
+        )?;
+        let rows = statement.query_map(params![repository_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as f64))
+        })?;
+        collect_rows(rows)
+    }
+
+    /// Per-file `(abstract_types, total_types)` for Martin's Abstractness
+    /// `A = abstract / total`. Abstract types are interfaces and traits; the
+    /// denominator counts the type-defining symbols (class, struct, enum,
+    /// interface, trait), not functions or variables. Files with no type
+    /// declarations are omitted. Feeds the `metrics` report and the
+    /// `zone_of_pain` detector.
+    pub fn file_abstractness(&self, repository_id: &str) -> Result<Vec<(String, f64, f64)>> {
+        let mut statement = self.conn.prepare(
+            "SELECT f.path,
+                    SUM(CASE WHEN s.kind IN ('interface','trait') THEN 1 ELSE 0 END)::BIGINT,
+                    COUNT(*)::BIGINT
+             FROM symbols s
+             JOIN files f ON s.file_id = f.id AND s.repository_id = f.repository_id
+             WHERE s.repository_id = ?
+               AND s.kind IN ('class','struct','enum','interface','trait')
+             GROUP BY f.path",
+        )?;
+        let rows = statement.query_map(params![repository_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)? as f64,
+                row.get::<_, i64>(2)? as f64,
+            ))
+        })?;
+        collect_rows(rows)
+    }
+
+    /// Pairs of files that changed together in the same commit, with how many
+    /// times — the evolutionary "change coupling" signal. Bulk commits (more
+    /// than 30 files: merges, mass reformats) are excluded as noise, and only
+    /// pairs that co-changed at least 3 times are returned. Empty without git
+    /// history. Feeds the `change_coupling` and `modularity_violation`
+    /// detectors.
+    pub fn co_change_pairs(&self, repository_id: &str) -> Result<Vec<(String, String, f64)>> {
+        let mut statement = self.conn.prepare(
+            "WITH sized AS (
+                 SELECT commit_id
+                 FROM file_changes
+                 WHERE repository_id = ?
+                 GROUP BY commit_id
+                 HAVING COUNT(*) BETWEEN 2 AND 30
+             )
+             SELECT a.file_path, b.file_path, COUNT(*)
+             FROM file_changes a
+             JOIN file_changes b
+               ON a.commit_id = b.commit_id
+              AND a.repository_id = b.repository_id
+              AND a.file_path < b.file_path
+             WHERE a.repository_id = ?
+               AND a.commit_id IN (SELECT commit_id FROM sized)
+             GROUP BY a.file_path, b.file_path
+             HAVING COUNT(*) >= 3
+             ORDER BY a.file_path, b.file_path",
+        )?;
+        let rows = statement.query_map(params![repository_id, repository_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)? as f64,
+            ))
+        })?;
+        collect_rows(rows)
+    }
+
     /// Number of persisted graph edges of a given kind for a repository.
     pub fn count_edges(&self, repository_id: &str, edge_kind: &str) -> Result<usize> {
         let count = self.conn.query_row(
@@ -2749,8 +2885,8 @@ mod tests {
         );
         assert_eq!(count(&store, "SELECT count(*) FROM files"), 2);
         assert_eq!(count(&store, "SELECT count(*) FROM snapshots"), 2);
-        // 2 contains edges + 1 depends_on edge
-        assert_eq!(count(&store, "SELECT count(*) FROM graph_edges"), 3);
+        // 2 contains edges + 1 module depends_on + 1 file→file depends_on edge
+        assert_eq!(count(&store, "SELECT count(*) FROM graph_edges"), 4);
 
         // Changed content hash: file row is rewritten, nothing duplicated.
         let mut f1_changed = f1.clone();

@@ -224,19 +224,44 @@ fn flag_unused_exports(
         if used.contains(&(file.as_str(), export.name.as_str())) {
             continue;
         }
+        // Type-only exports are reported under the same `UnusedExport` kind (so
+        // counts, gate, and baselines are unchanged) but carry the `unused-type`
+        // rule and a `type-only` detail so callers can filter them — and an
+        // unused type is even safer to drop than a value (no runtime effect).
+        let (title, description, rule, detail) = if export.is_type_only {
+            (
+                format!("Unused type export: {} in {file}", export.name),
+                format!(
+                    "type '{}' is exported from {file} but never imported by a reachable \
+                     module. Safe to remove — types have no runtime effect.",
+                    export.name
+                ),
+                "unused-type",
+                Some("type-only"),
+            )
+        } else {
+            (
+                format!("Unused export: {} in {file}", export.name),
+                format!(
+                    "'{}' is exported from {file} but never imported by a reachable module. \
+                     Candidate for removal (verify it is not a public API surface).",
+                    export.name
+                ),
+                "unused-export",
+                None,
+            )
+        };
         out.push(finding(
             input,
             FindingKind::UnusedExport,
             Severity::Low,
             file,
             export.line,
-            format!("Unused export: {} in {file}", export.name),
-            format!(
-                "'{}' is exported from {file} but never imported by a reachable module. \
-                 Candidate for removal (verify it is not a public API surface).",
-                export.name
-            ),
+            title,
+            description,
             Some(export.name.clone()),
+            rule,
+            detail,
         ));
     }
 }
@@ -284,6 +309,8 @@ fn flag_unused_files(
             1,
             format!("Unused file: {file}"),
             format!("{file} is not reachable from any entry point and nothing imports it."),
+            None,
+            "unused-file",
             None,
         ));
     }
@@ -336,7 +363,12 @@ fn finding(
     title: String,
     description: String,
     symbol: Option<String>,
+    rule: &str,
+    detail: Option<&str>,
 ) -> FindingRecord {
+    // The id slug is keyed on the kind (stable for baselines/fingerprints), even
+    // when the displayed `rule` differs (e.g. an `unused-type` is still an
+    // `UnusedExport`).
     let kind_slug = match kind {
         FindingKind::UnusedExport => "unused-export",
         _ => "unused-file",
@@ -359,7 +391,7 @@ fn finding(
         snapshot_id: input.snapshot_id.map(SnapshotId::from_raw),
         kind,
         severity,
-        rule_name: Some(kind_slug.to_string()),
+        rule_name: Some(rule.to_string()),
         target: Some(EntityRef {
             kind: NodeKind::File,
             id: file.to_string(),
@@ -370,7 +402,7 @@ fn finding(
             file_path: file.to_string(),
             line: Some(line),
             symbol,
-            detail: None,
+            detail: detail.map(|d| d.to_string()),
         }],
         created_at: Utc::now(),
     }
@@ -450,6 +482,43 @@ mod tests {
             .collect();
         assert_eq!(unused.len(), 1, "{findings:?}");
         assert!(unused[0].title.contains("unused"));
+    }
+
+    #[test]
+    fn unused_type_export_is_tagged_unused_type_but_keeps_kind() {
+        // A type-only export that's unused must stay `UnusedExport` (so counts,
+        // gate, and baselines are unchanged) yet carry the `unused-type` rule and
+        // a `type-only` detail so it is filterable as a distinct category.
+        let files = vec!["src/index.ts".to_string(), "src/types.ts".to_string()];
+        let mut type_export = export_at("Orphaned", 5);
+        type_export.is_type_only = true;
+        let exports = vec![
+            ("src/types.ts".to_string(), export_at("used", 1)),
+            ("src/types.ts".to_string(), type_export),
+        ];
+        let imports = vec![ImportEdge {
+            source_file: "src/index.ts".to_string(),
+            target_file: "src/types.ts".to_string(),
+            imported_names: vec!["used".to_string()],
+            is_namespace: false,
+        }];
+        let input = DeadCodeInput {
+            repository_id: "r",
+            snapshot_id: None,
+            files: &files,
+            entry_points: &entry(&["src/index.ts"]),
+            exports: &exports,
+            imports: &imports,
+        };
+        let findings = analyze(&input);
+        let found = findings
+            .iter()
+            .find(|f| f.title.contains("Orphaned"))
+            .expect("unused type export flagged");
+        assert_eq!(found.kind, FindingKind::UnusedExport);
+        assert_eq!(found.rule_name.as_deref(), Some("unused-type"));
+        assert!(found.title.contains("Unused type export"));
+        assert_eq!(found.evidence[0].detail.as_deref(), Some("type-only"));
     }
 
     #[test]

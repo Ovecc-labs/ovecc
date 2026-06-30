@@ -21,6 +21,7 @@ pub struct OveccConfig {
     pub architecture: ArchitectureConfig,
     pub rules: RulesConfig,
     pub output: OutputConfig,
+    pub diagnose: DiagnoseConfig,
 }
 
 impl OveccConfig {
@@ -239,6 +240,75 @@ pub struct LayerRuleConfig {
 pub struct OutputConfig {
     pub default_format: OutputFormat,
     pub color: ColorMode,
+}
+
+/// Thresholds and toggles for `ovecc diagnose` / `advise` / `metrics`. Tuned for
+/// precision; override any field under `[diagnose]` in `.ovecc/config.toml`.
+/// Detection runs at *component* (directory) granularity derived from the
+/// file→file graph. See `docs/dev/DIAGNOSE.md`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DiagnoseConfig {
+    /// Component granularity: 0 = the file's parent directory; N > 0 = truncate
+    /// the path to its first N segments (coarser).
+    pub component_depth: usize,
+    /// Percentile (0..1) above which both fan-in and fan-out qualify as a hub.
+    pub hub_percentile: f64,
+    /// Min share of a component's out-edges to a less-stable component before it
+    /// is an Unstable Dependency (Arcan DoUD).
+    pub unstable_doud: f64,
+    /// Percentile (0..1) of component size (file count) for a God Component.
+    pub god_percentile: f64,
+    /// Absolute minimum file count for a God Component.
+    pub god_min_files: usize,
+    /// Coupling-density thresholds for the repo-level Dense Structure finding.
+    pub dense_medium: f64,
+    pub dense_high: f64,
+    /// How many top hotspots to surface.
+    pub hotspot_limit: usize,
+    /// Findings below this confidence are dropped.
+    pub min_confidence: f64,
+    /// Minimum co-change count for a Change Coupling / Modularity Violation.
+    pub change_coupling_min: usize,
+    /// Minimum distance from the main sequence `D = |A + I − 1|` for a Zone of
+    /// Pain finding (0..1).
+    pub zone_distance: f64,
+    /// Minimum number of type declarations a component must hold before its
+    /// Abstractness is trusted enough to flag a Zone of Pain.
+    pub zone_min_types: usize,
+    /// Files to exclude (precision-first defaults: tests, fixtures, generated,
+    /// vendored). A token with `.` matches the filename as a substring; else it
+    /// matches a whole path segment. Case-insensitive.
+    pub exclude: Vec<String>,
+}
+
+impl Default for DiagnoseConfig {
+    fn default() -> Self {
+        Self {
+            component_depth: 0,
+            hub_percentile: 0.90,
+            unstable_doud: 0.30,
+            god_percentile: 0.90,
+            god_min_files: 8,
+            dense_medium: 0.15,
+            dense_high: 0.35,
+            hotspot_limit: 10,
+            min_confidence: 0.5,
+            change_coupling_min: 4,
+            zone_distance: 0.7,
+            zone_min_types: 5,
+            exclude: [
+                "test", "tests", "__tests__", "__mocks__", "mocks", "fixtures",
+                "fixture", "e2e", "generated", "node_modules", "dist", "build",
+                "out", "coverage", "vendor", "vendored", "docs", "doc",
+                "examples", "example", "samples", ".spec.", ".test.",
+                ".min.", ".generated.",
+            ]
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+        }
+    }
 }
 
 /// Output formats every analysis command must support.

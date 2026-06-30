@@ -113,6 +113,27 @@ pub const COMMANDS: &[CommandSpec] = &[
         read_only: true,
     },
     CommandSpec {
+        name: "diagnose",
+        summary: "Diagnose architectural smells (cycles, hub-like/crossing, unstable & god components, dense structure, hotspots) at component (directory) granularity.",
+        key_params: &["--target", "--severity", "--fail-on medium|high|any"],
+        output: "Ranked findings: detector, target component, file:line/metric evidence, the principle broken, severity, deterministic confidence, and language-aware remediation.",
+        read_only: true,
+    },
+    CommandSpec {
+        name: "advise",
+        summary: "Advise on one file, module, or component: the findings touching it and the established fix for each. The agent surface — call before editing.",
+        key_params: &["target"],
+        output: "The diagnose findings scoped to the target, each with its remediation.",
+        read_only: true,
+    },
+    CommandSpec {
+        name: "metrics",
+        summary: "Per-component architecture metrics: fan-in/out, coupling, Martin instability, aggregate complexity, churn, and repository coupling density.",
+        key_params: &["--target"],
+        output: "Component metrics rows plus the repository coupling density.",
+        read_only: true,
+    },
+    CommandSpec {
         name: "conventions",
         summary: "Learn dominant repository conventions and detect deviations.",
         key_params: &[],
