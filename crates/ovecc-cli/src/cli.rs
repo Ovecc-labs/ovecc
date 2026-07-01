@@ -703,8 +703,12 @@ pub fn run() -> Result<u8> {
         } => {
             let paths = ProjectPaths::resolve(cli.repo.unwrap_or_else(|| PathBuf::from(".")))?;
             let config = load_config(&paths, format_override)?;
-            let report =
-                run_diagnose(&paths, target.as_deref(), severity.map(Into::into), &config.diagnose)?;
+            let report = run_diagnose(
+                &paths,
+                target.as_deref(),
+                severity.map(Into::into),
+                &config.diagnose,
+            )?;
             render_diagnose(&report, config.output.default_format, group_by)?;
             Ok(diagnose_exit(&report, fail_on))
         }
@@ -1311,7 +1315,9 @@ fn run_diagnose(
     if let Some(needle) = target.map(|t| t.to_ascii_lowercase()) {
         findings.retain(|finding| finding.target.to_ascii_lowercase().contains(&needle));
     }
-    Ok(ovecc_graph::diagnose::DiagnoseReport::new(components, findings))
+    Ok(ovecc_graph::diagnose::DiagnoseReport::new(
+        components, findings,
+    ))
 }
 
 /// CI exit code for `diagnose`: 1 when a finding crosses the threshold, else 0.
@@ -1321,7 +1327,10 @@ fn diagnose_exit(report: &ovecc_graph::diagnose::DiagnoseReport, fail_on: Option
     };
     let triggered = match fail_on {
         FailOn::Any => !report.findings.is_empty(),
-        FailOn::Medium => report.findings.iter().any(|f| f.severity >= Severity::Medium),
+        FailOn::Medium => report
+            .findings
+            .iter()
+            .any(|f| f.severity >= Severity::Medium),
         FailOn::High => report.findings.iter().any(|f| f.severity >= Severity::High),
     };
     u8::from(triggered)
@@ -1734,15 +1743,12 @@ fn findings_exit(findings: &[FindingRecord], fail_on: Option<FailOn>) -> u8 {
 fn enrich_findings_with_fix(value: &mut serde_json::Value) {
     fn enrich_array(arr: &mut [serde_json::Value]) {
         for item in arr {
-            let kind = item
-                .get("kind")
-                .and_then(|k| k.as_str())
-                .and_then(|s| {
-                    serde_json::from_value::<ovecc_core::facts::FindingKind>(
-                        serde_json::Value::String(s.to_string()),
-                    )
-                    .ok()
-                });
+            let kind = item.get("kind").and_then(|k| k.as_str()).and_then(|s| {
+                serde_json::from_value::<ovecc_core::facts::FindingKind>(serde_json::Value::String(
+                    s.to_string(),
+                ))
+                .ok()
+            });
             if let (Some(kind), serde_json::Value::Object(map)) = (kind, item) {
                 map.insert(
                     "fix".to_string(),
@@ -2630,7 +2636,11 @@ fn render_review(report: &ReviewReport, format: OutputFormat) -> Result<()> {
             for finding in &report.new_findings {
                 let rule = finding.rule_name.as_deref().unwrap_or("-");
                 let fix = finding.kind.fix_spec();
-                let auto = if fix.auto_fixable { ", auto-fixable" } else { "" };
+                let auto = if fix.auto_fixable {
+                    ", auto-fixable"
+                } else {
+                    ""
+                };
                 println!(
                     "- **[{:?}] {:?}**{} — {} _(rule `{}`)_ · action: `{}`{}",
                     finding.severity,

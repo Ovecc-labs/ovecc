@@ -10,8 +10,8 @@ use anyhow::{Context, Result, anyhow};
 use chrono::Utc;
 use duckdb::{Connection, Transaction, params};
 use ovecc_core::facts::{
-    ApiRecord, CallRecord, CommitRecord, ComplexityRecord, Evidence, ExportRecord, FileChangeRecord,
-    FindingKind, FindingRecord, SchemaObjectRecord, Severity, SymbolRecord,
+    ApiRecord, CallRecord, CommitRecord, ComplexityRecord, Evidence, ExportRecord,
+    FileChangeRecord, FindingKind, FindingRecord, SchemaObjectRecord, Severity, SymbolRecord,
 };
 use ovecc_core::id::{FindingId, RepositoryId, SnapshotId};
 use ovecc_core::legacy::{
@@ -691,7 +691,10 @@ impl ArchitectureStore {
         let prof_t0 = std::time::Instant::now();
         let mark = |label: &str| {
             if prof {
-                eprintln!("[persist] {label:<14} +{} ms", prof_t0.elapsed().as_millis());
+                eprintln!(
+                    "[persist] {label:<14} +{} ms",
+                    prof_t0.elapsed().as_millis()
+                );
             }
         };
 
@@ -929,7 +932,13 @@ impl ArchitectureStore {
         {
             let mut nodes = tx.appender("graph_nodes")?;
             for module in &modules_to_add {
-                nodes.append_row(params![module.id, repository_id, "module", module.name, "{}"])?;
+                nodes.append_row(params![
+                    module.id,
+                    repository_id,
+                    "module",
+                    module.name,
+                    "{}"
+                ])?;
             }
             for file in &files_to_add {
                 nodes.append_row(params![file.id, repository_id, "file", file.path, "{}"])?;
@@ -2222,7 +2231,11 @@ impl ArchitectureStore {
             .into_iter()
             .map(|row| row.into_record(repository_id))
             .collect();
-        findings.sort_by(|a, b| b.severity.cmp(&a.severity).then_with(|| a.title.cmp(&b.title)));
+        findings.sort_by(|a, b| {
+            b.severity
+                .cmp(&a.severity)
+                .then_with(|| a.title.cmp(&b.title))
+        });
         Ok(findings)
     }
 
@@ -2269,7 +2282,9 @@ impl ArchitectureStore {
         let rows = statement.query_map(params![snapshot_id], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         })?;
-        Ok(collect_rows::<(String, String)>(rows)?.into_iter().collect())
+        Ok(collect_rows::<(String, String)>(rows)?
+            .into_iter()
+            .collect())
     }
 
     /// Module names recorded in a snapshot, as a vector (the cycle enumerators
@@ -2658,7 +2673,11 @@ mod tests {
         assert_eq!(changed.added, vec!["src/new.ts".to_string()]);
         assert_eq!(changed.modified, vec!["src/shared.ts".to_string()]);
         assert_eq!(changed.removed, vec!["src/a.ts".to_string()]);
-        assert_eq!(changed.touched().count(), 2, "added + modified are 'touched'");
+        assert_eq!(
+            changed.touched().count(),
+            2,
+            "added + modified are 'touched'"
+        );
     }
 
     #[test]

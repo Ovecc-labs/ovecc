@@ -111,7 +111,10 @@ fn call_tool(name: &str, arguments: &Value, exe: &Path) -> Value {
     }
     let result = run_tool(name, arguments, exe);
     if log {
-        let is_err = result.get("isError").and_then(Value::as_bool).unwrap_or(false);
+        let is_err = result
+            .get("isError")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         let bytes = result
             .pointer("/content/0/text")
             .and_then(Value::as_str)

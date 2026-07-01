@@ -13,7 +13,8 @@
 use crate::graph::NodeKind;
 use crate::id::{
     ApiId, CallId, CommitId, ComplexityId, DependencyId, ExportId, FileChangeId, FileId, FindingId,
-    MetricId, MigrationId, ModuleId, OwnershipId, RepositoryId, SchemaObjectId, SnapshotId, SymbolId,
+    MetricId, MigrationId, ModuleId, OwnershipId, RepositoryId, SchemaObjectId, SnapshotId,
+    SymbolId,
 };
 use crate::lang::SourceLanguage;
 use chrono::{DateTime, Utc};

@@ -445,7 +445,11 @@ fn detect_cyclic_dependency(g: &ComponentGraph, out: &mut Vec<Diagnosis>) {
         let target = if size <= 5 {
             component.join(" <-> ")
         } else {
-            format!("{} … (+{} more components)", component[..4].join(" <-> "), size - 4)
+            format!(
+                "{} … (+{} more components)",
+                component[..4].join(" <-> "),
+                size - 4
+            )
         };
         out.push(Diagnosis {
             detector: "cyclic_dependency".to_string(),
@@ -561,7 +565,11 @@ fn detect_hub_like(g: &ComponentGraph, config: &DiagnoseConfig, out: &mut Vec<Di
     }
 }
 
-fn detect_unstable_dependency(g: &ComponentGraph, config: &DiagnoseConfig, out: &mut Vec<Diagnosis>) {
+fn detect_unstable_dependency(
+    g: &ComponentGraph,
+    config: &DiagnoseConfig,
+    out: &mut Vec<Diagnosis>,
+) {
     let inst = |c: &str| {
         instability(
             *g.fan_in.get(c).unwrap_or(&0),
@@ -657,7 +665,11 @@ fn detect_zone_of_pain(g: &ComponentGraph, config: &DiagnoseConfig, out: &mut Ve
 /// God Component: a component whose file count is in the top percentile and over
 /// an absolute floor. Size is file count, so this is language-agnostic.
 fn detect_god_component(g: &ComponentGraph, config: &DiagnoseConfig, out: &mut Vec<Diagnosis>) {
-    let counts: Vec<f64> = g.components.iter().map(|c| *g.files.get(c).unwrap_or(&0) as f64).collect();
+    let counts: Vec<f64> = g
+        .components
+        .iter()
+        .map(|c| *g.files.get(c).unwrap_or(&0) as f64)
+        .collect();
     let threshold = percentile(&counts, config.god_percentile).max(config.god_min_files as f64);
     for c in &g.components {
         let n = *g.files.get(c).unwrap_or(&0) as f64;
@@ -727,7 +739,12 @@ fn detect_dense_structure(g: &ComponentGraph, config: &DiagnoseConfig, out: &mut
 /// intersection). A prioritisation signal (low), not a defect in itself.
 fn detect_hotspots(g: &ComponentGraph, config: &DiagnoseConfig, out: &mut Vec<Diagnosis>) {
     let max_churn = g.churn.values().copied().fold(0.0_f64, f64::max).max(1.0);
-    let max_cx = g.complexity.values().copied().fold(0.0_f64, f64::max).max(1.0);
+    let max_cx = g
+        .complexity
+        .values()
+        .copied()
+        .fold(0.0_f64, f64::max)
+        .max(1.0);
     let mut ranked: Vec<(String, f64, f64, f64)> = g
         .components
         .iter()
@@ -773,13 +790,21 @@ fn detect_hotspots(g: &ComponentGraph, config: &DiagnoseConfig, out: &mut Vec<Di
 /// Unstable Interface: a widely-depended-on component that also changes
 /// frequently — high fan-in ∧ high churn. Per Cai 2019, one of the two most
 /// bug-correlated anti-patterns, so it starts High. Silent without git history.
-fn detect_unstable_interface(g: &ComponentGraph, config: &DiagnoseConfig, out: &mut Vec<Diagnosis>) {
+fn detect_unstable_interface(
+    g: &ComponentGraph,
+    config: &DiagnoseConfig,
+    out: &mut Vec<Diagnosis>,
+) {
     let fins: Vec<f64> = g
         .components
         .iter()
         .map(|c| *g.fan_in.get(c).unwrap_or(&0) as f64)
         .collect();
-    let churns: Vec<f64> = g.components.iter().map(|c| *g.churn.get(c).unwrap_or(&0.0)).collect();
+    let churns: Vec<f64> = g
+        .components
+        .iter()
+        .map(|c| *g.churn.get(c).unwrap_or(&0.0))
+        .collect();
     let in_th = percentile(&fins, config.hub_percentile).max(3.0);
     let ch_th = percentile(&churns, config.hub_percentile).max(1.0);
     for c in &g.components {
@@ -847,8 +872,8 @@ fn detect_change_coupling(
         if *n < min {
             continue;
         }
-        let structural =
-            g.edges.contains(&(ca.clone(), cb.clone())) || g.edges.contains(&(cb.clone(), ca.clone()));
+        let structural = g.edges.contains(&(ca.clone(), cb.clone()))
+            || g.edges.contains(&(cb.clone(), ca.clone()));
         let target = format!("{ca} <-> {cb}");
         let evidence = vec![DiagEvidence::metric("co_changes", *n, min)];
         if structural {
@@ -1091,7 +1116,12 @@ mod tests {
         );
         assert!(report.findings.iter().any(|f| f.detector == "file_cycle"));
         // It is intra-component, so cyclic_dependency must NOT also fire.
-        assert!(!report.findings.iter().any(|f| f.detector == "cyclic_dependency"));
+        assert!(
+            !report
+                .findings
+                .iter()
+                .any(|f| f.detector == "cyclic_dependency")
+        );
     }
 
     #[test]
@@ -1099,8 +1129,9 @@ mod tests {
         let files = vec!["core/a.ts".to_string()];
         let deps: Vec<(String, String)> = vec![];
         // 1 abstract type of 4 total → A = 0.25; no edges → I = 0 → D = |0.25+0-1| = 0.75.
-        let abst: HashMap<String, (f64, f64)> =
-            [("core/a.ts".to_string(), (1.0, 4.0))].into_iter().collect();
+        let abst: HashMap<String, (f64, f64)> = [("core/a.ts".to_string(), (1.0, 4.0))]
+            .into_iter()
+            .collect();
         let report = metrics(
             &files,
             &deps,
@@ -1133,8 +1164,9 @@ mod tests {
             ("c2/x.ts".to_string(), "core/a.ts".to_string()),
             ("c3/x.ts".to_string(), "core/a.ts".to_string()),
         ];
-        let abst: HashMap<String, (f64, f64)> =
-            [("core/a.ts".to_string(), (0.0, 5.0))].into_iter().collect();
+        let abst: HashMap<String, (f64, f64)> = [("core/a.ts".to_string(), (0.0, 5.0))]
+            .into_iter()
+            .collect();
         let report = diagnose(
             &files,
             &deps,
@@ -1166,8 +1198,24 @@ mod tests {
             ("c/z.ts".to_string(), "a/x.ts".to_string()),
         ];
         let cfg = DiagnoseConfig::default();
-        let one = diagnose(&files, &deps, &HashMap::new(), &HashMap::new(), &HashMap::new(), &[], &cfg);
-        let two = diagnose(&files, &deps, &HashMap::new(), &HashMap::new(), &HashMap::new(), &[], &cfg);
+        let one = diagnose(
+            &files,
+            &deps,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &[],
+            &cfg,
+        );
+        let two = diagnose(
+            &files,
+            &deps,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &[],
+            &cfg,
+        );
         assert_eq!(format!("{:?}", one.findings), format!("{:?}", two.findings));
     }
 }

@@ -52,21 +52,32 @@ pub const COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         name: "impact",
         summary: "Analyze the blast radius of a module, symbol, api: or table: target.",
-        key_params: &["target", "--direction downstream|upstream|both", "--max-depth"],
+        key_params: &[
+            "target",
+            "--direction downstream|upstream|both",
+            "--max-depth",
+        ],
         output: "Impacted modules/apis/tables/symbols, representative paths, and a calibrated risk score.",
         read_only: true,
     },
     CommandSpec {
         name: "query",
         summary: "Run a structured architecture query over the persisted graph.",
-        key_params: &["deps X", "rdeps X", "paths X", "cycles", "hotspots", "a -> b"],
+        key_params: &[
+            "deps X", "rdeps X", "paths X", "cycles", "hotspots", "a -> b",
+        ],
         output: "Query-shaped result: label lists, cycle/dependency paths, or a relation answer.",
         read_only: true,
     },
     CommandSpec {
         name: "violations",
         summary: "Report architecture and security violations recorded at index time.",
-        key_params: &["--severity", "--fail-on medium|high|any", "--baseline", "--write-baseline"],
+        key_params: &[
+            "--severity",
+            "--fail-on medium|high|any",
+            "--baseline",
+            "--write-baseline",
+        ],
         output: "Findings with kind, severity, rule, and file:line evidence.",
         read_only: true,
     },
@@ -201,14 +212,46 @@ pub struct ExitCodeSpec {
 
 /// The stable exit-code contract (mirrors `error::ExitCode`).
 pub const EXIT_CODES: &[ExitCodeSpec] = &[
-    ExitCodeSpec { code: 0, name: "success", meaning: "Command succeeded; no gating threshold crossed." },
-    ExitCodeSpec { code: 1, name: "findings_present", meaning: "A --fail-on threshold was crossed (findings/cycles/risk)." },
-    ExitCodeSpec { code: 2, name: "usage", meaning: "CLI usage error (bad arguments)." },
-    ExitCodeSpec { code: 3, name: "repository", meaning: "Repository or configuration error." },
-    ExitCodeSpec { code: 4, name: "index", meaning: "Index or database error (e.g. database missing)." },
-    ExitCodeSpec { code: 5, name: "parser", meaning: "Parser error." },
-    ExitCodeSpec { code: 6, name: "git", meaning: "Git error." },
-    ExitCodeSpec { code: 7, name: "internal", meaning: "Unexpected internal error." },
+    ExitCodeSpec {
+        code: 0,
+        name: "success",
+        meaning: "Command succeeded; no gating threshold crossed.",
+    },
+    ExitCodeSpec {
+        code: 1,
+        name: "findings_present",
+        meaning: "A --fail-on threshold was crossed (findings/cycles/risk).",
+    },
+    ExitCodeSpec {
+        code: 2,
+        name: "usage",
+        meaning: "CLI usage error (bad arguments).",
+    },
+    ExitCodeSpec {
+        code: 3,
+        name: "repository",
+        meaning: "Repository or configuration error.",
+    },
+    ExitCodeSpec {
+        code: 4,
+        name: "index",
+        meaning: "Index or database error (e.g. database missing).",
+    },
+    ExitCodeSpec {
+        code: 5,
+        name: "parser",
+        meaning: "Parser error.",
+    },
+    ExitCodeSpec {
+        code: 6,
+        name: "git",
+        meaning: "Git error.",
+    },
+    ExitCodeSpec {
+        code: 7,
+        name: "internal",
+        meaning: "Unexpected internal error.",
+    },
 ];
 
 /// Output formats every analysis command supports.
@@ -251,22 +294,130 @@ fn metric(description: &str, range: &str, interpretation: &str) -> MetaMetric {
 /// Definitions of the metrics Ovecc computes and surfaces.
 pub fn metric_definitions() -> BTreeMap<String, MetaMetric> {
     BTreeMap::from([
-        ("modules".to_string(), metric("Number of inferred or declared modules.", "[0, inf)", "structural size")),
-        ("files".to_string(), metric("Number of indexed source files.", "[0, inf)", "structural size")),
-        ("dependencies".to_string(), metric("Number of resolved import dependencies.", "[0, inf)", "structural size")),
-        ("external_dependencies".to_string(), metric("Dependencies resolving outside the repository.", "[0, inf)", "informational")),
-        ("circular_dependencies".to_string(), metric("Number of strongly-connected (cyclic) module components.", "[0, inf)", "lower is better")),
-        ("coupling_density".to_string(), metric("Realized module edges over all possible directed edges.", "[0, 1]", "lower is looser coupling")),
-        ("symbols".to_string(), metric("Extracted top-level symbols (functions, classes, ...).", "[0, inf)", "structural size")),
-        ("calls".to_string(), metric("Resolved call-graph edges.", "[0, inf)", "informational")),
-        ("apis".to_string(), metric("Exposed routes, RPC methods, and handlers.", "[0, inf)", "informational")),
-        ("tables".to_string(), metric("Database schema objects referenced by code.", "[0, inf)", "informational")),
-        ("boundary_violations".to_string(), metric("Findings crossing a declared architecture boundary.", "[0, inf)", "lower is better")),
-        ("security_findings".to_string(), metric("Security findings: secrets, insecure patterns, weak crypto, vulnerable deps, tainted flows.", "[0, inf)", "lower is better")),
-        ("commits_ingested".to_string(), metric("Git commits ingested this run; 0 means no git history.", "[0, inf)", "0 disables churn/ownership signals")),
-        ("functions".to_string(), metric("Functions/methods analyzed for complexity (oxc TS/JS).", "[0, inf)", "informational")),
-        ("max_cyclomatic".to_string(), metric("Highest per-function McCabe cyclomatic complexity.", "[1, inf)", "lower is better")),
-        ("max_cognitive".to_string(), metric("Highest per-function SonarSource cognitive complexity.", "[0, inf)", "lower is better")),
+        (
+            "modules".to_string(),
+            metric(
+                "Number of inferred or declared modules.",
+                "[0, inf)",
+                "structural size",
+            ),
+        ),
+        (
+            "files".to_string(),
+            metric(
+                "Number of indexed source files.",
+                "[0, inf)",
+                "structural size",
+            ),
+        ),
+        (
+            "dependencies".to_string(),
+            metric(
+                "Number of resolved import dependencies.",
+                "[0, inf)",
+                "structural size",
+            ),
+        ),
+        (
+            "external_dependencies".to_string(),
+            metric(
+                "Dependencies resolving outside the repository.",
+                "[0, inf)",
+                "informational",
+            ),
+        ),
+        (
+            "circular_dependencies".to_string(),
+            metric(
+                "Number of strongly-connected (cyclic) module components.",
+                "[0, inf)",
+                "lower is better",
+            ),
+        ),
+        (
+            "coupling_density".to_string(),
+            metric(
+                "Realized module edges over all possible directed edges.",
+                "[0, 1]",
+                "lower is looser coupling",
+            ),
+        ),
+        (
+            "symbols".to_string(),
+            metric(
+                "Extracted top-level symbols (functions, classes, ...).",
+                "[0, inf)",
+                "structural size",
+            ),
+        ),
+        (
+            "calls".to_string(),
+            metric("Resolved call-graph edges.", "[0, inf)", "informational"),
+        ),
+        (
+            "apis".to_string(),
+            metric(
+                "Exposed routes, RPC methods, and handlers.",
+                "[0, inf)",
+                "informational",
+            ),
+        ),
+        (
+            "tables".to_string(),
+            metric(
+                "Database schema objects referenced by code.",
+                "[0, inf)",
+                "informational",
+            ),
+        ),
+        (
+            "boundary_violations".to_string(),
+            metric(
+                "Findings crossing a declared architecture boundary.",
+                "[0, inf)",
+                "lower is better",
+            ),
+        ),
+        (
+            "security_findings".to_string(),
+            metric(
+                "Security findings: secrets, insecure patterns, weak crypto, vulnerable deps, tainted flows.",
+                "[0, inf)",
+                "lower is better",
+            ),
+        ),
+        (
+            "commits_ingested".to_string(),
+            metric(
+                "Git commits ingested this run; 0 means no git history.",
+                "[0, inf)",
+                "0 disables churn/ownership signals",
+            ),
+        ),
+        (
+            "functions".to_string(),
+            metric(
+                "Functions/methods analyzed for complexity (oxc TS/JS).",
+                "[0, inf)",
+                "informational",
+            ),
+        ),
+        (
+            "max_cyclomatic".to_string(),
+            metric(
+                "Highest per-function McCabe cyclomatic complexity.",
+                "[1, inf)",
+                "lower is better",
+            ),
+        ),
+        (
+            "max_cognitive".to_string(),
+            metric(
+                "Highest per-function SonarSource cognitive complexity.",
+                "[0, inf)",
+                "lower is better",
+            ),
+        ),
     ])
 }
 
@@ -281,21 +432,96 @@ fn rule(description: &str, severity: &str) -> MetaRule {
 /// their own configured names and severities.
 pub fn rule_definitions() -> BTreeMap<String, MetaRule> {
     BTreeMap::from([
-        ("circular-dependency".to_string(), rule("An elementary dependency cycle A -> ... -> A among modules.", "high")),
-        ("banned-import".to_string(), rule("An import matches a banned specifier pattern declared in [[rules.banned_imports]].", "configurable")),
-        ("complexity".to_string(), rule("A function exceeds the cyclomatic/cognitive complexity thresholds (oxc TS/JS).", "medium/high")),
-        ("unused-export".to_string(), rule("An export is reachable but imported by no reachable module (candidate dead code).", "low")),
-        ("unused-file".to_string(), rule("A file is reachable from no entry point and imported by nothing.", "low")),
-        ("security/secret".to_string(), rule("A hardcoded credential (provider-pattern or high-entropy).", "critical")),
-        ("security/eval".to_string(), rule("Dynamic code execution (eval / new Function).", "high")),
-        ("security/command-exec".to_string(), rule("OS command execution (exec / spawn).", "high")),
-        ("security/weak-hash".to_string(), rule("Obsolete hashing algorithm (MD5 / SHA-1).", "medium")),
-        ("security/cors".to_string(), rule("Permissive CORS configuration (origin: \"*\").", "medium")),
-        ("taint/writes".to_string(), rule("User-controlled input may reach a database write (injection candidate).", "high")),
-        ("taint/reads".to_string(), rule("User-controlled input may reach a database read.", "medium")),
-        ("taint/eval".to_string(), rule("User-controlled input may reach dynamic code execution.", "critical")),
-        ("taint/command".to_string(), rule("User-controlled input may reach OS command execution.", "critical")),
-        ("audit/osv".to_string(), rule("A declared dependency matches a known OSV advisory.", "high")),
+        (
+            "circular-dependency".to_string(),
+            rule(
+                "An elementary dependency cycle A -> ... -> A among modules.",
+                "high",
+            ),
+        ),
+        (
+            "banned-import".to_string(),
+            rule(
+                "An import matches a banned specifier pattern declared in [[rules.banned_imports]].",
+                "configurable",
+            ),
+        ),
+        (
+            "complexity".to_string(),
+            rule(
+                "A function exceeds the cyclomatic/cognitive complexity thresholds (oxc TS/JS).",
+                "medium/high",
+            ),
+        ),
+        (
+            "unused-export".to_string(),
+            rule(
+                "An export is reachable but imported by no reachable module (candidate dead code).",
+                "low",
+            ),
+        ),
+        (
+            "unused-file".to_string(),
+            rule(
+                "A file is reachable from no entry point and imported by nothing.",
+                "low",
+            ),
+        ),
+        (
+            "security/secret".to_string(),
+            rule(
+                "A hardcoded credential (provider-pattern or high-entropy).",
+                "critical",
+            ),
+        ),
+        (
+            "security/eval".to_string(),
+            rule("Dynamic code execution (eval / new Function).", "high"),
+        ),
+        (
+            "security/command-exec".to_string(),
+            rule("OS command execution (exec / spawn).", "high"),
+        ),
+        (
+            "security/weak-hash".to_string(),
+            rule("Obsolete hashing algorithm (MD5 / SHA-1).", "medium"),
+        ),
+        (
+            "security/cors".to_string(),
+            rule("Permissive CORS configuration (origin: \"*\").", "medium"),
+        ),
+        (
+            "taint/writes".to_string(),
+            rule(
+                "User-controlled input may reach a database write (injection candidate).",
+                "high",
+            ),
+        ),
+        (
+            "taint/reads".to_string(),
+            rule("User-controlled input may reach a database read.", "medium"),
+        ),
+        (
+            "taint/eval".to_string(),
+            rule(
+                "User-controlled input may reach dynamic code execution.",
+                "critical",
+            ),
+        ),
+        (
+            "taint/command".to_string(),
+            rule(
+                "User-controlled input may reach OS command execution.",
+                "critical",
+            ),
+        ),
+        (
+            "audit/osv".to_string(),
+            rule(
+                "A declared dependency matches a known OSV advisory.",
+                "high",
+            ),
+        ),
     ])
 }
 
@@ -344,8 +570,7 @@ mod tests {
         assert_eq!(SEVERITIES, &["low", "medium", "high", "critical"]);
         // Each label must round-trip through the typed Severity enum.
         for s in SEVERITIES {
-            let parsed: crate::facts::Severity =
-                serde_json::from_str(&format!("\"{s}\"")).unwrap();
+            let parsed: crate::facts::Severity = serde_json::from_str(&format!("\"{s}\"")).unwrap();
             assert_eq!(serde_json::to_string(&parsed).unwrap(), format!("\"{s}\""));
         }
     }

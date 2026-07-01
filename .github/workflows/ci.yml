@@ -1,5 +1,6 @@
-# Build, test, and publish downloadable ovecc binaries.
+# Lint, build, test, and publish downloadable ovecc binaries.
 #
+# - `lint` runs fmt + clippy on Linux; a failure blocks everything downstream.
 # - `build-test` runs on every push to `mvp` or `main` and every PR, on Linux +
 #   Windows, compiling and testing in release mode. The heavy dependencies
 #   (DuckDB's bundled C++ build, oxc, tree-sitter) are cached by
@@ -9,9 +10,11 @@
 #   recreates a rolling "latest" GitHub Release with both binaries attached, so
 #   the newest Linux and Windows builds are always downloadable.
 #
-# Note: on windows-latest this builds the MSVC target (the preinstalled, most
-# reliable toolchain on GitHub runners). The .cargo/config.toml link flags are
-# scoped to x86_64-pc-windows-gnu, so they don't apply here and don't interfere.
+# Windows uses the GNU (MinGW-w64) toolchain — the supported path per
+# docs/dev/SETUP.md. We install the gnu host toolchain and MSYS2's gcc so
+# .cargo/config.toml (big-obj assembly + static MinGW/rstrtmgr linking) applies
+# and produces the same self-contained ovecc.exe as a local build. MSVC is NOT
+# used: it would require patching crates/ovecc-db/build.rs and pinning VS 14.41.
 name: CI
 
 on:
@@ -30,24 +33,68 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  lint:
+    name: Lint (fmt + clippy)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (+ rustfmt, clippy)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry + target
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: lint
+
+      - name: rustfmt
+        run: cargo fmt --all --check
+
+      - name: clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
   build-test:
     name: Build & test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
         include:
           - os: ubuntu-latest
+            toolchain: stable
             asset: ovecc-linux-x86_64
-            bin: target/release/ovecc
+            ext: ""
           - os: windows-latest
+            toolchain: stable-x86_64-pc-windows-gnu
             asset: ovecc-windows-x86_64.exe
-            bin: target/release/ovecc.exe
+            ext: ".exe"
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust (${{ matrix.toolchain }})
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.toolchain }}
+
+      # Windows: DuckDB + ring compile from C/C++, so we need a real MinGW gcc.
+      # rustup's gnu toolchain only ships link libs, not a compiler.
+      - name: Set up MinGW-w64 (Windows)
+        if: runner.os == 'Windows'
+        id: msys2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: false
+          install: mingw-w64-x86_64-gcc
+
+      - name: Put MinGW-w64 first on PATH (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: echo "${{ steps.msys2.outputs.msys2-location }}/mingw64/bin" >> "$GITHUB_PATH"
 
       - name: Cache cargo registry + target
         uses: Swatinem/rust-cache@v2
@@ -62,7 +109,7 @@ jobs:
         shell: bash
         run: |
           mkdir -p dist
-          cp "${{ matrix.bin }}" "dist/${{ matrix.asset }}"
+          cp "target/release/ovecc${{ matrix.ext }}" "dist/${{ matrix.asset }}"
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
@@ -73,9 +120,10 @@ jobs:
 
   release:
     name: Publish rolling "latest" release
-    needs: build-test
+    needs: [lint, build-test]
     if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       contents: write
     steps:
