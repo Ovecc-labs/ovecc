@@ -1,0 +1,104 @@
+# Build, test, and publish downloadable ovecc binaries.
+#
+# - `build-test` runs on every push to `mvp` or `main` and every PR, on Linux +
+#   Windows, compiling and testing in release mode. The heavy dependencies
+#   (DuckDB's bundled C++ build, oxc, tree-sitter) are cached by
+#   Swatinem/rust-cache, so only the first run per OS pays the full ~15-20 min;
+#   later runs are minutes.
+# - `release` runs only on push to `main` (or manual dispatch from main). It
+#   recreates a rolling "latest" GitHub Release with both binaries attached, so
+#   the newest Linux and Windows builds are always downloadable.
+#
+# Note: on windows-latest this builds the MSVC target (the preinstalled, most
+# reliable toolchain on GitHub runners). The .cargo/config.toml link flags are
+# scoped to x86_64-pc-windows-gnu, so they don't apply here and don't interfere.
+name: CI
+
+on:
+  push:
+    branches: [mvp, main]
+  pull_request:
+  workflow_dispatch:
+
+# Default to read-only; the release job opts into write for creating releases.
+permissions:
+  contents: read
+
+# Supersede in-flight runs on the same ref so pushes don't race on the release.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-test:
+    name: Build & test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            asset: ovecc-linux-x86_64
+            bin: target/release/ovecc
+          - os: windows-latest
+            asset: ovecc-windows-x86_64.exe
+            bin: target/release/ovecc.exe
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry + target
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build (release)
+        run: cargo build --release --bin ovecc
+
+      - name: Test (release)
+        run: cargo test --release
+
+      - name: Package binary
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp "${{ matrix.bin }}" "dist/${{ matrix.asset }}"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: dist/${{ matrix.asset }}
+          if-no-files-found: error
+
+  release:
+    name: Publish rolling "latest" release
+    needs: build-test
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Recreate the "latest" release with fresh binaries
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Drop the previous rolling release and its tag (ignore if absent),
+          # then recreate it at this commit with the new assets.
+          gh release delete latest --yes --cleanup-tag 2>/dev/null || true
+          gh release create latest \
+            --title "Latest build (${GITHUB_SHA::7})" \
+            --notes "Rolling build from \`${GITHUB_SHA}\` — Linux + Windows x86_64 binaries." \
+            --target "${GITHUB_SHA}" \
+            --latest \
+            dist/*
