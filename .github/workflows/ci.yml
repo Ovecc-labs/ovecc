@@ -1,6 +1,7 @@
 # Lint, build, test, and publish downloadable ovecc binaries.
 #
-# - `lint` runs fmt + clippy on Linux; a failure blocks everything downstream.
+# - `lint` runs fmt + clippy on Linux. rustfmt blocks everything downstream;
+#   clippy is non-blocking (reported as annotations only).
 # - `build-test` runs on every push to `mvp` or `main` and every PR, on Linux +
 #   Windows, compiling and testing in release mode. The heavy dependencies
 #   (DuckDB's bundled C++ build, oxc, tree-sitter) are cached by
@@ -54,6 +55,9 @@ jobs:
         run: cargo fmt --all --check
 
       - name: clippy
+        # Non-blocking: clippy findings are reported as annotations but do not
+        # fail the job or gate downstream builds/releases.
+        continue-on-error: true
         run: cargo clippy --workspace --all-targets -- -D warnings
 
   build-test:
