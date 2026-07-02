@@ -90,93 +90,136 @@ pub fn detect(
         }
     }
 
+    // Distinct-file reach of each fingerprint, so the most widely-shared clone
+    // families are formed FIRST. Without this, a long run shared by two
+    // near-identical *copies* can consume their overlapping windows before the
+    // shorter run that ALSO covers the canonical original is ever considered —
+    // silently dropping the original from the family. That made membership depend
+    // on file scan order (a canonical util sorted after its copies vanished from
+    // the report). Ranking seeds by reach makes the output order-independent.
+    let mut fingerprint_reach: HashMap<u128, usize> = HashMap::with_capacity(index.len());
+    for (fingerprint, occurrences) in &index {
+        let distinct = occurrences
+            .iter()
+            .map(|(file, _)| *file)
+            .collect::<BTreeSet<_>>()
+            .len();
+        fingerprint_reach.insert(*fingerprint, distinct);
+    }
+
+    let mut seeds: Vec<(usize, usize)> = Vec::new();
+    for (file_index, file_fps) in fps.iter().enumerate() {
+        for start in 0..file_fps.len() {
+            seeds.push((file_index, start));
+        }
+    }
+    seeds.sort_by(|&(file_a, start_a), &(file_b, start_b)| {
+        let reach_a = fingerprint_reach
+            .get(&fps[file_a][start_a])
+            .copied()
+            .unwrap_or(0);
+        let reach_b = fingerprint_reach
+            .get(&fps[file_b][start_b])
+            .copied()
+            .unwrap_or(0);
+        reach_b
+            .cmp(&reach_a)
+            .then_with(|| file_a.cmp(&file_b))
+            .then_with(|| start_a.cmp(&start_b))
+    });
+
     // Window starts already absorbed into an emitted clone, so the overlapping
     // windows of one maximal clone are not re-reported as many families.
     let mut consumed: Vec<HashSet<usize>> = files.iter().map(|_| HashSet::new()).collect();
     let mut families: Vec<CloneFamily> = Vec::new();
 
-    // Deterministic scan: by file, then start position.
-    for file_index in 0..files.len() {
-        for start in 0..fps[file_index].len() {
-            if consumed[file_index].contains(&start) {
-                continue;
-            }
-            let fingerprint = fps[file_index][start];
-            let Some(group) = index.get(&fingerprint) else {
-                continue;
+    // Ranked scan: widest-reaching fingerprints first, then (file, start).
+    for (file_index, start) in seeds {
+        if consumed[file_index].contains(&start) {
+            continue;
+        }
+        let fingerprint = fps[file_index][start];
+        let Some(group) = index.get(&fingerprint) else {
+            continue;
+        };
+        // Live instances that begin with this exact window.
+        let members: Vec<(usize, usize)> = group
+            .iter()
+            .copied()
+            .filter(|(file, pos)| !consumed[*file].contains(pos))
+            .collect();
+        if members.len() < 2 {
+            continue;
+        }
+        let distinct = members
+            .iter()
+            .map(|(file, _)| *file)
+            .collect::<BTreeSet<_>>();
+        if cross_file_only && distinct.len() < 2 {
+            continue;
+        }
+
+        // Extend in lock-step while every member's next window agrees — this
+        // grows the shared run to its maximal common length.
+        let mut windows = 1usize;
+        loop {
+            let Some(expected) = fps[members[0].0].get(members[0].1 + windows).copied() else {
+                break;
             };
-            // Live instances that begin with this exact window.
-            let members: Vec<(usize, usize)> = group
+            let all_match = members
                 .iter()
-                .copied()
-                .filter(|(file, pos)| !consumed[*file].contains(pos))
-                .collect();
-            if members.len() < 2 {
+                .all(|(file, pos)| fps[*file].get(pos + windows).copied() == Some(expected));
+            if all_match {
+                windows += 1;
+            } else {
+                break;
+            }
+        }
+        let token_count = windows - 1 + k;
+
+        // Mark every covered window start consumed, then build instances.
+        let mut instances: Vec<CloneInstance> = Vec::new();
+        for (file, pos) in &members {
+            for offset in 0..windows {
+                consumed[*file].insert(pos + offset);
+            }
+            let lines = &files[*file].token_lines;
+            let start_line = lines[*pos];
+            let end_line = lines[(pos + token_count - 1).min(lines.len() - 1)];
+            if end_line.saturating_sub(start_line) + 1 < min_lines as u32 {
                 continue;
             }
-            let distinct = members.iter().map(|(file, _)| *file).collect::<BTreeSet<_>>();
-            if cross_file_only && distinct.len() < 2 {
-                continue;
-            }
-
-            // Extend in lock-step while every member's next window agrees — this
-            // grows the shared run to its maximal common length.
-            let mut windows = 1usize;
-            loop {
-                let Some(expected) = fps[members[0].0].get(members[0].1 + windows).copied() else {
-                    break;
-                };
-                let all_match = members
-                    .iter()
-                    .all(|(file, pos)| fps[*file].get(pos + windows).copied() == Some(expected));
-                if all_match {
-                    windows += 1;
-                } else {
-                    break;
-                }
-            }
-            let token_count = windows - 1 + k;
-
-            // Mark every covered window start consumed, then build instances.
-            let mut instances: Vec<CloneInstance> = Vec::new();
-            for (file, pos) in &members {
-                for offset in 0..windows {
-                    consumed[*file].insert(pos + offset);
-                }
-                let lines = &files[*file].token_lines;
-                let start_line = lines[*pos];
-                let end_line = lines[(pos + token_count - 1).min(lines.len() - 1)];
-                if end_line.saturating_sub(start_line) + 1 < min_lines as u32 {
-                    continue;
-                }
-                instances.push(CloneInstance {
-                    path: files[*file].path.clone(),
-                    start_line,
-                    end_line,
-                    token_count,
-                });
-            }
-
-            let distinct_files = instances
-                .iter()
-                .map(|instance| instance.path.as_str())
-                .collect::<BTreeSet<_>>()
-                .len();
-            if instances.len() < 2 || (cross_file_only && distinct_files < 2) {
-                continue;
-            }
-            let line_span = instances
-                .iter()
-                .map(|instance| instance.end_line.saturating_sub(instance.start_line) + 1)
-                .max()
-                .unwrap_or(0);
-            instances.sort_by(|a, b| a.path.cmp(&b.path).then_with(|| a.start_line.cmp(&b.start_line)));
-            families.push(CloneFamily {
-                token_length: token_count,
-                line_span,
-                instances,
+            instances.push(CloneInstance {
+                path: files[*file].path.clone(),
+                start_line,
+                end_line,
+                token_count,
             });
         }
+
+        let distinct_files = instances
+            .iter()
+            .map(|instance| instance.path.as_str())
+            .collect::<BTreeSet<_>>()
+            .len();
+        if instances.len() < 2 || (cross_file_only && distinct_files < 2) {
+            continue;
+        }
+        let line_span = instances
+            .iter()
+            .map(|instance| instance.end_line.saturating_sub(instance.start_line) + 1)
+            .max()
+            .unwrap_or(0);
+        instances.sort_by(|a, b| {
+            a.path
+                .cmp(&b.path)
+                .then_with(|| a.start_line.cmp(&b.start_line))
+        });
+        families.push(CloneFamily {
+            token_length: token_count,
+            line_span,
+            instances,
+        });
     }
 
     families.sort_by(|a, b| {

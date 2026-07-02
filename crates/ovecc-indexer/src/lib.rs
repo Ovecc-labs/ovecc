@@ -43,7 +43,7 @@ const SOURCE_EXTENSIONS: &[&str] = &[
 
 /// `(variable, type)` bindings; older entries
 /// miss and re-parse.
-const PARSE_CACHE_VERSION: &str = "v9";
+const PARSE_CACHE_VERSION: &str = "v11";
 
 pub fn index_repository(
     paths: &ProjectPaths,
@@ -462,9 +462,7 @@ pub fn index_repository(
     for finding in &mut findings {
         let is_security = matches!(
             finding.kind,
-            FindingKind::HardcodedSecret
-                | FindingKind::InsecurePattern
-                | FindingKind::WeakCrypto
+            FindingKind::HardcodedSecret | FindingKind::InsecurePattern | FindingKind::WeakCrypto
         );
         if is_security
             && finding.severity != ovecc_core::facts::Severity::Low
@@ -595,7 +593,10 @@ pub fn index_repository(
                 name: export.name.clone(),
                 line: export.line,
                 is_type_only: export.is_type_only,
-                re_export_source: export.re_export.as_ref().map(|r| r.source_specifier.clone()),
+                re_export_source: export
+                    .re_export
+                    .as_ref()
+                    .map(|r| r.source_specifier.clone()),
                 re_export_name: export.re_export.as_ref().map(|r| r.imported_name.clone()),
             });
         }
@@ -1304,7 +1305,10 @@ fn configured_module<'a>(
 /// The directory segments that name a module for `relative`, honoring the
 /// configured depth. Empty for a file that sits directly at the repository root.
 fn auto_module_segments(relative: &str, depth: usize) -> Vec<&str> {
-    let parts: Vec<&str> = relative.split('/').filter(|part| !part.is_empty()).collect();
+    let parts: Vec<&str> = relative
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .collect();
     if parts.len() < 2 {
         return Vec::new(); // a file at the repo root has no module directory
     }
@@ -1338,13 +1342,18 @@ fn infer_module_prefix(relative: &str, architecture: &ArchitectureConfig) -> Str
     if let Some(mapping) = configured_module(relative, architecture) {
         return mapping.path_prefix.clone();
     }
-    let parts: Vec<&str> = relative.split('/').filter(|part| !part.is_empty()).collect();
+    let parts: Vec<&str> = relative
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .collect();
     if parts.len() < 2 {
         return ".".to_string();
     }
     let dirs = &parts[..parts.len() - 1];
     let start = usize::from(MODULE_CONTAINERS.contains(&dirs[0]) && dirs.len() > 1);
-    let end = start.saturating_add(architecture.module_depth.max(1)).min(dirs.len());
+    let end = start
+        .saturating_add(architecture.module_depth.max(1))
+        .min(dirs.len());
     dirs[..end].join("/")
 }
 
@@ -1487,19 +1496,28 @@ fn resolve_dependencies(
 /// JS/TS extensions to probe, TS family first so a `.ts` shadowing a built `.js`
 /// wins (fallow `specifier.rs:34`).
 fn js_resolver_extensions() -> Vec<String> {
-    [".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs", ".json"]
-        .iter()
-        .map(|extension| (*extension).to_string())
-        .collect()
+    [
+        ".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs", ".json",
+    ]
+    .iter()
+    .map(|extension| (*extension).to_string())
+    .collect()
 }
 
 /// Package `exports`/`imports` condition names, highest priority first
 /// (fallow `react_native.rs` baseline, minus the RN conditions).
 fn js_resolver_conditions() -> Vec<String> {
-    ["development", "import", "require", "default", "types", "node"]
-        .iter()
-        .map(|condition| (*condition).to_string())
-        .collect()
+    [
+        "development",
+        "import",
+        "require",
+        "default",
+        "types",
+        "node",
+    ]
+    .iter()
+    .map(|condition| (*condition).to_string())
+    .collect()
 }
 
 /// Builds one shared resolver for the whole index run; per-file tsconfig
@@ -1596,7 +1614,11 @@ fn repo_relative_path(root: &Path, abs: &Path) -> Option<String> {
     {
         return None;
     }
-    Some(abs_norm[root_norm.len()..].trim_start_matches('/').to_string())
+    Some(
+        abs_norm[root_norm.len()..]
+            .trim_start_matches('/')
+            .to_string(),
+    )
 }
 
 // --- non-JS import resolution -------------------------------------
@@ -1927,9 +1949,30 @@ fn external_package_root(specifier: &str) -> Option<String> {
         return None;
     }
     const BUILTINS: [&str; 24] = [
-        "fs", "path", "os", "http", "https", "url", "util", "stream", "events", "crypto", "child_process",
-        "process", "buffer", "assert", "zlib", "net", "tls", "dns", "querystring", "readline", "cluster",
-        "worker_threads", "perf_hooks", "module",
+        "fs",
+        "path",
+        "os",
+        "http",
+        "https",
+        "url",
+        "util",
+        "stream",
+        "events",
+        "crypto",
+        "child_process",
+        "process",
+        "buffer",
+        "assert",
+        "zlib",
+        "net",
+        "tls",
+        "dns",
+        "querystring",
+        "readline",
+        "cluster",
+        "worker_threads",
+        "perf_hooks",
+        "module",
     ];
     let root = if let Some(rest) = specifier.strip_prefix('@') {
         let mut parts = rest.splitn(3, '/');
@@ -1956,7 +1999,10 @@ fn detect_unused_dependencies(
 ) -> Vec<ovecc_core::facts::FindingRecord> {
     let mut findings = Vec::new();
     for (dir, manifest) in find_package_manifests(root) {
-        let Some(deps) = manifest.get("dependencies").and_then(|value| value.as_object()) else {
+        let Some(deps) = manifest
+            .get("dependencies")
+            .and_then(|value| value.as_object())
+        else {
             continue;
         };
         let manifest_path = format!("{dir}package.json");
@@ -2027,7 +2073,9 @@ fn find_package_manifests(root: &Path) -> Vec<(String, serde_json::Value)> {
         let Ok(content) = std::fs::read_to_string(entry.path()) else {
             continue;
         };
-        let Ok(manifest) = serde_json::from_str::<serde_json::Value>(content.trim_start_matches('\u{feff}')) else {
+        let Ok(manifest) =
+            serde_json::from_str::<serde_json::Value>(content.trim_start_matches('\u{feff}'))
+        else {
             continue;
         };
         let dir = entry
@@ -2141,8 +2189,18 @@ fn is_framework_entry(path: &str) -> bool {
     if is_route_segment("app")
         && matches!(
             stem,
-            "page" | "layout" | "route" | "loading" | "error" | "template" | "default"
-                | "not-found" | "global-error" | "sitemap" | "robots" | "opengraph-image"
+            "page"
+                | "layout"
+                | "route"
+                | "loading"
+                | "error"
+                | "template"
+                | "default"
+                | "not-found"
+                | "global-error"
+                | "sitemap"
+                | "robots"
+                | "opengraph-image"
         )
     {
         return true;
@@ -2288,12 +2346,18 @@ mod tests {
     #[test]
     fn normalizes_external_package_roots() {
         assert_eq!(external_package_root("lodash").as_deref(), Some("lodash"));
-        assert_eq!(external_package_root("lodash/fp").as_deref(), Some("lodash"));
+        assert_eq!(
+            external_package_root("lodash/fp").as_deref(),
+            Some("lodash")
+        );
         assert_eq!(
             external_package_root("@scope/pkg/sub").as_deref(),
             Some("@scope/pkg")
         );
-        assert_eq!(external_package_root("@scope/pkg").as_deref(), Some("@scope/pkg"));
+        assert_eq!(
+            external_package_root("@scope/pkg").as_deref(),
+            Some("@scope/pkg")
+        );
         // Relative imports and Node built-ins are not npm dependencies.
         assert_eq!(external_package_root("./local"), None);
         assert_eq!(external_package_root("../up"), None);
@@ -2321,13 +2385,19 @@ mod tests {
     fn infers_modules_from_common_layouts() {
         // Default depth (1) preserves the historical behavior.
         let arch = ArchitectureConfig::default();
-        assert_eq!(infer_module_name("src/billing/service.ts", &arch), "billing");
+        assert_eq!(
+            infer_module_name("src/billing/service.ts", &arch),
+            "billing"
+        );
         assert_eq!(infer_module_name("packages/api/index.ts", &arch), "api");
         assert_eq!(infer_module_name("index.ts", &arch), "root");
         // A top-level non-container directory names the module after itself.
         assert_eq!(infer_module_name("cli/src/util/command.rs", &arch), "cli");
         // Prefix stays consistent with the name.
-        assert_eq!(infer_module_prefix("src/billing/service.ts", &arch), "src/billing");
+        assert_eq!(
+            infer_module_prefix("src/billing/service.ts", &arch),
+            "src/billing"
+        );
         assert_eq!(infer_module_prefix("index.ts", &arch), ".");
     }
 
@@ -2336,19 +2406,40 @@ mod tests {
         // The VS Code case: everything lives under `src/vs`, so depth 1 collapses
         // the repo into one `vs` module. Depth 2 recovers real boundaries.
         let depth1 = ArchitectureConfig::default();
-        let depth2 = ArchitectureConfig { module_depth: 2, ..Default::default() };
+        let depth2 = ArchitectureConfig {
+            module_depth: 2,
+            ..Default::default()
+        };
         assert_eq!(infer_module_name("src/vs/editor/foo.ts", &depth1), "vs");
-        assert_eq!(infer_module_name("src/vs/editor/foo.ts", &depth2), "vs/editor");
-        assert_eq!(infer_module_name("src/vs/workbench/x/y.ts", &depth2), "vs/workbench");
-        assert_eq!(infer_module_prefix("src/vs/editor/foo.ts", &depth2), "src/vs/editor");
+        assert_eq!(
+            infer_module_name("src/vs/editor/foo.ts", &depth2),
+            "vs/editor"
+        );
+        assert_eq!(
+            infer_module_name("src/vs/workbench/x/y.ts", &depth2),
+            "vs/workbench"
+        );
+        assert_eq!(
+            infer_module_prefix("src/vs/editor/foo.ts", &depth2),
+            "src/vs/editor"
+        );
         // Depth never consumes the file name: a file directly under the module dir
         // keeps the module, not the file, as the last segment.
         assert_eq!(infer_module_name("src/vs/editor.ts", &depth2), "vs");
         // A depth larger than the available directories is clamped, not padded.
-        let depth9 = ArchitectureConfig { module_depth: 9, ..Default::default() };
-        assert_eq!(infer_module_name("src/vs/editor/foo.ts", &depth9), "vs/editor");
+        let depth9 = ArchitectureConfig {
+            module_depth: 9,
+            ..Default::default()
+        };
+        assert_eq!(
+            infer_module_name("src/vs/editor/foo.ts", &depth9),
+            "vs/editor"
+        );
         // 0 is treated as 1.
-        let depth0 = ArchitectureConfig { module_depth: 0, ..Default::default() };
+        let depth0 = ArchitectureConfig {
+            module_depth: 0,
+            ..Default::default()
+        };
         assert_eq!(infer_module_name("src/vs/editor/foo.ts", &depth0), "vs");
     }
 
@@ -2375,13 +2466,19 @@ mod tests {
         };
         // Longest matching prefix wins.
         assert_eq!(infer_module_name("src/vs/editor/foo.ts", &arch), "Editor");
-        assert_eq!(infer_module_prefix("src/vs/editor/foo.ts", &arch), "src/vs/editor");
+        assert_eq!(
+            infer_module_prefix("src/vs/editor/foo.ts", &arch),
+            "src/vs/editor"
+        );
         // Covered by the shorter prefix only.
         assert_eq!(infer_module_name("src/vs/base/bar.ts", &arch), "Core");
         // Unmapped file falls back to depth inference.
         assert_eq!(infer_module_name("packages/api/x.ts", &arch), "api");
         // `auto` strategy ignores explicit mappings entirely.
-        let auto = ArchitectureConfig { modules: arch.modules.clone(), ..Default::default() };
+        let auto = ArchitectureConfig {
+            modules: arch.modules.clone(),
+            ..Default::default()
+        };
         assert_eq!(infer_module_name("src/vs/editor/foo.ts", &auto), "vs");
     }
 
@@ -2394,8 +2491,14 @@ mod tests {
             p
         };
         // Name-based: minified bundles and wasm glue.
-        assert!(looks_generated(&write("bundle.min.js", "export const x = 1;\n")));
-        assert!(looks_generated(&write("woff2-wasm.ts", "export default 1;\n")));
+        assert!(looks_generated(&write(
+            "bundle.min.js",
+            "export const x = 1;\n"
+        )));
+        assert!(looks_generated(&write(
+            "woff2-wasm.ts",
+            "export default 1;\n"
+        )));
         // Head markers.
         assert!(looks_generated(&write(
             "client.ts",

@@ -168,7 +168,14 @@ fn capabilities_manifest_lists_commands() {
     assert!(stdout.contains("\"schema_version\": 1"), "{stdout}");
     assert!(stdout.contains("\"command\": \"capabilities\""), "{stdout}");
     for command in [
-        "index", "summary", "impact", "security", "audit", "gate", "report", "violations",
+        "index",
+        "summary",
+        "impact",
+        "security",
+        "audit",
+        "gate",
+        "report",
+        "violations",
     ] {
         assert!(
             stdout.contains(&format!("\"name\": \"{command}\"")),

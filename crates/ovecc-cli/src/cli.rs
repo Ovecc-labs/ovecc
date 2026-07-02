@@ -10,13 +10,21 @@ use ovecc_core::legacy::{
     IndexReport, RiskLevel, SummaryReport,
 };
 use ovecc_core::query::{Query, TargetSelector};
-use ovecc_core::report::{ContextSlice, Envelope, Meta, ToolInfo};
+use ovecc_core::report::{ChangedFiles, ContextSlice, Envelope, Meta, ToolInfo};
 use ovecc_core::traits::ExplanationProvider;
 use ovecc_db::ArchitectureStore;
 use ovecc_graph as graph;
 use ovecc_graph::blast::{self, BlastEdge, BlastNode, BlastResult};
 use ovecc_indexer::index_repository;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Set by the global `--no-meta` flag. When true, [`meta_for`] returns an empty
+/// `Meta`, so the self-describing metric/rule dictionaries are omitted from every
+/// command's JSON. The MCP server sets this on every tool call: the agent reads
+/// the dictionaries once via `capabilities`, so repeating them on every result
+/// only inflates tokens (roughly halving MCP tool-result size in practice).
+static SUPPRESS_META: AtomicBool = AtomicBool::new(false);
 
 /// Prints `data` wrapped in the stable, self-describing JSON envelope
 /// (schema_version + tool + command + meta). The `data` payload is
@@ -45,16 +53,27 @@ fn emit_ndjson_meta(command: &str, meta: &Meta) -> Result<()> {
 /// metric and/or rule dictionaries relevant to it, so an agent can interpret the
 /// payload without the docs site. Static and therefore deterministic.
 fn meta_for(command: &str) -> Meta {
+    if SUPPRESS_META.load(Ordering::Relaxed) {
+        return Meta::default();
+    }
     let mut meta = Meta::default();
     if matches!(
         command,
-        "summary" | "report" | "drift" | "diff" | "hotspots" | "index" | "health"
+        "summary" | "report" | "drift" | "diff" | "hotspots" | "index" | "health" | "review"
     ) {
         meta.metrics = capabilities::metric_definitions();
     }
     if matches!(
         command,
-        "violations" | "security" | "audit" | "gate" | "report" | "summary" | "health" | "deadcode"
+        "violations"
+            | "security"
+            | "audit"
+            | "gate"
+            | "report"
+            | "summary"
+            | "health"
+            | "deadcode"
+            | "review"
     ) {
         meta.rules = capabilities::rule_definitions();
     }
@@ -76,6 +95,13 @@ pub struct Cli {
     /// For `index`, also shows the per-phase breakdown.
     #[arg(long, global = true)]
     stats: bool,
+
+    /// Omit the self-describing `meta` block (metric/rule definitions) from JSON
+    /// output. The `capabilities` command still carries the full contract; agents
+    /// read it once, so repeating it on every result is redundant. The MCP server
+    /// sets this automatically to keep tool results small.
+    #[arg(long, global = true)]
+    no_meta: bool,
 
     #[command(subcommand)]
     command: Command,
@@ -274,6 +300,50 @@ pub enum Command {
         #[arg(long, value_enum)]
         fail_on: Option<FailOn>,
     },
+    /// Review what a change introduced: the NAMED new defects between a base and
+    /// a head snapshot — new findings (security / dead code / complexity), new
+    /// dependency cycles WITH their file-level witness edges, and the
+    /// duplications the change added — in one deterministic call. The
+    /// change-scoped companion to `gate`, which reports only counts.
+    Review {
+        #[arg(default_value = "previous")]
+        base: String,
+        #[arg(default_value = "latest")]
+        head: String,
+        /// Exit with code 1 when the change crosses this threshold (CI check).
+        #[arg(long, value_enum, default_value_t = FailOn::Any)]
+        fail_on: FailOn,
+    },
+    /// Diagnose architectural smells (cycles, hubs, unstable/god components,
+    /// dense structure, hotspots), each with evidence, the principle it breaks,
+    /// and an established remediation. Deterministic; no patterns are invented.
+    Diagnose {
+        /// Scope to findings touching this file or module (substring match).
+        #[arg(long)]
+        target: Option<String>,
+        /// Only show findings at or above this severity.
+        #[arg(long, value_enum)]
+        severity: Option<SeverityArg>,
+        /// Group the human (text/markdown) report by family, severity, or component.
+        #[arg(long, value_enum)]
+        group_by: Option<GroupByArg>,
+        /// Exit with code 1 when a finding crosses this threshold (CI check).
+        #[arg(long, value_enum)]
+        fail_on: Option<FailOn>,
+    },
+    /// Advise on one file, module, or symbol: the findings touching it and the
+    /// established fix for each. The agent-facing surface — call before editing.
+    Advise {
+        /// The file, module, or symbol to advise on.
+        target: String,
+    },
+    /// Report per-module architecture metrics: fan-in/out, coupling, Martin
+    /// instability, aggregate complexity, and churn, plus repo coupling density.
+    Metrics {
+        /// Scope to a single file or module (substring match).
+        #[arg(long)]
+        target: Option<String>,
+    },
     /// Run an MCP (Model Context Protocol) server over stdio, exposing Ovecc's
     /// commands as tools for coding agents. Reads/writes JSON-RPC on stdin/stdout.
     Mcp,
@@ -306,10 +376,25 @@ impl From<SeverityArg> for Severity {
     }
 }
 
+/// How to partition `diagnose` findings in the human (text/markdown) output.
+/// (`owner` is intentionally absent until CODEOWNERS ingestion lands.)
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum GroupByArg {
+    /// Detector family: structural / stability / size / evolutionary.
+    Family,
+    /// Severity bucket.
+    Severity,
+    /// The finding's component (target directory).
+    Component,
+}
+
 pub fn run() -> Result<u8> {
     let cli = Cli::parse();
     let format_override = cli.format;
     let stats = cli.stats;
+    if cli.no_meta {
+        SUPPRESS_META.store(true, Ordering::Relaxed);
+    }
     let started = std::time::Instant::now();
 
     let outcome = match cli.command {
@@ -512,7 +597,8 @@ pub fn run() -> Result<u8> {
             let store = open_store(&paths)?;
             let base = resolve_ref(&paths.root, &base);
             let head = resolve_ref(&paths.root, &head);
-            let report = build_gate_report(&store, &paths.repository_id().0, &base, &head, fail_on)?;
+            let report =
+                build_gate_report(&store, &paths.repository_id().0, &base, &head, fail_on)?;
             let failed = report.verdict == "fail";
             render_gate(&report, config.output.default_format)?;
             Ok(u8::from(failed))
@@ -548,7 +634,11 @@ pub fn run() -> Result<u8> {
                 .into_iter()
                 .filter(|finding| finding.kind == FindingKind::HighComplexity)
                 .collect();
-            findings.sort_by(|a, b| b.severity.cmp(&a.severity).then_with(|| a.title.cmp(&b.title)));
+            findings.sort_by(|a, b| {
+                b.severity
+                    .cmp(&a.severity)
+                    .then_with(|| a.title.cmp(&b.title))
+            });
             let report = HealthReport {
                 high_complexity_functions: findings.len(),
                 findings,
@@ -589,6 +679,68 @@ pub fn run() -> Result<u8> {
             };
             render_deadcode(&report, config.output.default_format)?;
             Ok(findings_exit(&report.findings, fail_on))
+        }
+        Command::Review {
+            base,
+            head,
+            fail_on,
+        } => {
+            let paths = ProjectPaths::resolve(cli.repo.unwrap_or_else(|| PathBuf::from(".")))?;
+            let config = load_config(&paths, format_override)?;
+            let store = open_store(&paths)?;
+            let base = resolve_ref(&paths.root, &base);
+            let head = resolve_ref(&paths.root, &head);
+            let report = build_review_report(&paths, &config, &store, &base, &head, fail_on)?;
+            let failed = report.verdict == "fail";
+            render_review(&report, config.output.default_format)?;
+            Ok(u8::from(failed))
+        }
+        Command::Diagnose {
+            target,
+            severity,
+            group_by,
+            fail_on,
+        } => {
+            let paths = ProjectPaths::resolve(cli.repo.unwrap_or_else(|| PathBuf::from(".")))?;
+            let config = load_config(&paths, format_override)?;
+            let report = run_diagnose(
+                &paths,
+                target.as_deref(),
+                severity.map(Into::into),
+                &config.diagnose,
+            )?;
+            render_diagnose(&report, config.output.default_format, group_by)?;
+            Ok(diagnose_exit(&report, fail_on))
+        }
+        Command::Advise { target } => {
+            let paths = ProjectPaths::resolve(cli.repo.unwrap_or_else(|| PathBuf::from(".")))?;
+            let config = load_config(&paths, format_override)?;
+            // Advise is diagnose focused on a single target.
+            let report = run_diagnose(&paths, Some(&target), None, &config.diagnose)?;
+            render_diagnose(&report, config.output.default_format, None)?;
+            Ok(0)
+        }
+        Command::Metrics { target } => {
+            let paths = ProjectPaths::resolve(cli.repo.unwrap_or_else(|| PathBuf::from(".")))?;
+            let config = load_config(&paths, format_override)?;
+            let (files, file_deps, churn, complexity, abstractness, _co_change) =
+                load_diagnose_inputs(&paths)?;
+            let mut report = ovecc_graph::diagnose::metrics(
+                &files,
+                &file_deps,
+                &churn,
+                &complexity,
+                &abstractness,
+                &config.diagnose,
+            );
+            if let Some(t) = &target {
+                let needle = t.to_ascii_lowercase();
+                report
+                    .components
+                    .retain(|m| m.component.to_ascii_lowercase().contains(&needle));
+            }
+            render_metrics(&report, config.output.default_format)?;
+            Ok(0)
         }
         Command::Mcp => crate::mcp::serve(),
     };
@@ -862,7 +1014,9 @@ fn build_context_slice(
 
 fn render_conventions(report: &ConventionsReport, format: OutputFormat) -> Result<()> {
     match format {
-        OutputFormat::Json | OutputFormat::Sarif | OutputFormat::Codeclimate => emit_json("conventions", report, meta_for("conventions"))?,
+        OutputFormat::Json | OutputFormat::Sarif | OutputFormat::Codeclimate => {
+            emit_json("conventions", report, meta_for("conventions"))?
+        }
         OutputFormat::Ndjson => {
             emit_ndjson_meta("conventions", &meta_for("conventions"))?;
             for convention in &report.conventions {
@@ -983,8 +1137,10 @@ fn load_hotspots(paths: &ProjectPaths, limit: usize) -> Result<HotspotsReport> {
     }
 
     // Per-module cognitive complexity (oxc), aggregated from the v4 table.
-    let complexity: HashMap<String, f64> =
-        store.module_complexity(&repository_id)?.into_iter().collect();
+    let complexity: HashMap<String, f64> = store
+        .module_complexity(&repository_id)?
+        .into_iter()
+        .collect();
 
     Ok(HotspotsReport {
         hotspots: graph::compute_hotspots(
@@ -1002,7 +1158,9 @@ fn load_hotspots(paths: &ProjectPaths, limit: usize) -> Result<HotspotsReport> {
 
 fn render_hotspots(report: &HotspotsReport, format: OutputFormat) -> Result<()> {
     match format {
-        OutputFormat::Json | OutputFormat::Sarif | OutputFormat::Codeclimate => emit_json("hotspots", report, meta_for("hotspots"))?,
+        OutputFormat::Json | OutputFormat::Sarif | OutputFormat::Codeclimate => {
+            emit_json("hotspots", report, meta_for("hotspots"))?
+        }
         OutputFormat::Ndjson => {
             emit_ndjson_meta("hotspots", &meta_for("hotspots"))?;
             for hotspot in &report.hotspots {
@@ -1079,6 +1237,481 @@ fn render_hotspots(report: &HotspotsReport, format: OutputFormat) -> Result<()> 
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// ovecc diagnose / advise / metrics
+// ---------------------------------------------------------------------------
+
+/// Assembles the per-module graph inputs the diagnosis engine consumes: module
+/// names, the dependency records, churn, and aggregate complexity. Mirrors the
+/// inputs `load_hotspots` gathers, minus the hotspot-only fragmentation.
+type DiagnoseInputs = (
+    Vec<String>,
+    Vec<(String, String)>,
+    std::collections::HashMap<String, f64>,
+    std::collections::HashMap<String, f64>,
+    std::collections::HashMap<String, (f64, f64)>,
+    Vec<(String, String, f64)>,
+);
+
+fn load_diagnose_inputs(paths: &ProjectPaths) -> Result<DiagnoseInputs> {
+    let store = open_store(paths)?;
+    let repository_id = paths.repository_id().0;
+    // Every indexed file (so components with no edges still count toward size).
+    let files: Vec<String> = store
+        .file_modules(&repository_id)?
+        .into_iter()
+        .map(|(path, _module)| path)
+        .collect();
+    // Internal file -> file edges (the component graph is aggregated from these).
+    let file_deps: Vec<(String, String)> = store
+        .current_dependencies(&repository_id)?
+        .into_iter()
+        .filter(|dependency| !dependency.is_external)
+        .filter_map(|dependency| {
+            dependency
+                .target_file_path
+                .map(|target| (dependency.source_file_path, target))
+        })
+        .collect();
+    let churn: std::collections::HashMap<String, f64> =
+        store.file_churn(&repository_id)?.into_iter().collect();
+    let complexity: std::collections::HashMap<String, f64> =
+        store.file_complexity(&repository_id)?.into_iter().collect();
+    // Per-file (abstract_types, total_types) for Abstractness / Zone of Pain.
+    let abstractness: std::collections::HashMap<String, (f64, f64)> = store
+        .file_abstractness(&repository_id)?
+        .into_iter()
+        .map(|(path, abs, tot)| (path, (abs, tot)))
+        .collect();
+    // Evolutionary signal (empty without git history).
+    let co_change = store.co_change_pairs(&repository_id)?;
+    Ok((files, file_deps, churn, complexity, abstractness, co_change))
+}
+
+/// Runs the diagnosis engine, then applies the optional severity and target
+/// filters and rebuilds the ranked report.
+fn run_diagnose(
+    paths: &ProjectPaths,
+    target: Option<&str>,
+    min_severity: Option<Severity>,
+    cfg: &ovecc_graph::diagnose::DiagnoseConfig,
+) -> Result<ovecc_graph::diagnose::DiagnoseReport> {
+    let (files, file_deps, churn, complexity, abstractness, co_change) =
+        load_diagnose_inputs(paths)?;
+    let report = ovecc_graph::diagnose::diagnose(
+        &files,
+        &file_deps,
+        &churn,
+        &complexity,
+        &abstractness,
+        &co_change,
+        cfg,
+    );
+    let components = report.components;
+    let mut findings = report.findings;
+    if let Some(min) = min_severity {
+        findings.retain(|finding| finding.severity >= min);
+    }
+    if let Some(needle) = target.map(|t| t.to_ascii_lowercase()) {
+        findings.retain(|finding| finding.target.to_ascii_lowercase().contains(&needle));
+    }
+    Ok(ovecc_graph::diagnose::DiagnoseReport::new(
+        components, findings,
+    ))
+}
+
+/// CI exit code for `diagnose`: 1 when a finding crosses the threshold, else 0.
+fn diagnose_exit(report: &ovecc_graph::diagnose::DiagnoseReport, fail_on: Option<FailOn>) -> u8 {
+    let Some(fail_on) = fail_on else {
+        return 0;
+    };
+    let triggered = match fail_on {
+        FailOn::Any => !report.findings.is_empty(),
+        FailOn::Medium => report
+            .findings
+            .iter()
+            .any(|f| f.severity >= Severity::Medium),
+        FailOn::High => report.findings.iter().any(|f| f.severity >= Severity::High),
+    };
+    u8::from(triggered)
+}
+
+/// Formats a number with no trailing `.0` for whole values.
+fn fmt_num(value: f64) -> String {
+    if value.fract().abs() < 1e-9 {
+        format!("{value:.0}")
+    } else {
+        format!("{value:.2}")
+    }
+}
+
+/// Renders one piece of diagnosis evidence as `file:line — metric=value (>= t)`.
+fn fmt_diag_evidence(e: &ovecc_graph::diagnose::DiagEvidence) -> String {
+    let mut text = String::new();
+    if let Some(file) = &e.file {
+        text.push_str(file);
+        if let Some(line) = e.line {
+            text.push_str(&format!(":{line}"));
+        }
+        text.push_str(" — ");
+    }
+    text.push_str(&format!("{}={}", e.metric, fmt_num(e.value)));
+    if let Some(threshold) = e.threshold {
+        if threshold > 0.0 {
+            text.push_str(&format!(" (>= {})", fmt_num(threshold)));
+        }
+    }
+    text
+}
+
+/// Serializes a diagnosis and enriches it with its machine-actionable `fix`
+/// descriptor (derived deterministically from the detector) — the field an agent
+/// branches on after reading the finding.
+fn diagnosis_value(finding: &ovecc_graph::diagnose::Diagnosis) -> serde_json::Value {
+    let mut value = serde_json::to_value(finding).unwrap_or(serde_json::Value::Null);
+    if let serde_json::Value::Object(map) = &mut value {
+        let fix = ovecc_graph::diagnose::fix_spec(&finding.detector);
+        map.insert(
+            "fix".to_string(),
+            serde_json::to_value(fix).unwrap_or(serde_json::Value::Null),
+        );
+    }
+    value
+}
+
+/// Partitions findings for the human report, preserving the overall severity
+/// ranking (groups appear in order of their most-severe finding). `None` yields a
+/// single unlabelled group = the flat ranked list.
+fn group_diagnoses<'a>(
+    findings: &'a [ovecc_graph::diagnose::Diagnosis],
+    group_by: Option<GroupByArg>,
+) -> Vec<(String, Vec<&'a ovecc_graph::diagnose::Diagnosis>)> {
+    let mut groups: Vec<(String, Vec<&ovecc_graph::diagnose::Diagnosis>)> = Vec::new();
+    for finding in findings {
+        let label = match group_by {
+            None => String::new(),
+            Some(GroupByArg::Family) => finding.family.clone(),
+            Some(GroupByArg::Severity) => format!("{:?}", finding.severity),
+            Some(GroupByArg::Component) => diagnose_location(finding).0,
+        };
+        match groups.iter_mut().find(|(existing, _)| *existing == label) {
+            Some((_, bucket)) => bucket.push(finding),
+            None => groups.push((label, vec![finding])),
+        }
+    }
+    groups
+}
+
+fn render_diagnose(
+    report: &ovecc_graph::diagnose::DiagnoseReport,
+    format: OutputFormat,
+    group_by: Option<GroupByArg>,
+) -> Result<()> {
+    match format {
+        OutputFormat::Json => {
+            let findings: Vec<serde_json::Value> =
+                report.findings.iter().map(diagnosis_value).collect();
+            let data = serde_json::json!({
+                "components": report.components,
+                "findings": findings,
+                "total": report.total,
+                "critical": report.critical,
+                "high": report.high,
+                "medium": report.medium,
+                "low": report.low,
+            });
+            emit_json("diagnose", &data, meta_for("diagnose"))?
+        }
+        OutputFormat::Sarif => emit_diagnose_sarif(&report.findings)?,
+        OutputFormat::Codeclimate => emit_diagnose_codeclimate(&report.findings)?,
+        OutputFormat::Ndjson => {
+            emit_ndjson_meta("diagnose", &meta_for("diagnose"))?;
+            for finding in &report.findings {
+                println!("{}", ndjson_line("diagnosis", &diagnosis_value(finding))?);
+            }
+        }
+        OutputFormat::Markdown => {
+            println!("# Diagnosis ({} finding(s))", report.total);
+            println!();
+            println!(
+                "Critical: {} · High: {} · Medium: {} · Low: {}",
+                report.critical, report.high, report.medium, report.low
+            );
+            for (label, bucket) in group_diagnoses(&report.findings, group_by) {
+                if !label.is_empty() {
+                    println!();
+                    println!("# {} ({})", label, bucket.len());
+                }
+                for finding in bucket {
+                    println!();
+                    println!(
+                        "## [{:?}] {} — `{}`",
+                        finding.severity, finding.title, finding.target
+                    );
+                    println!("- Principle: {}", finding.principle);
+                    println!("- Confidence: {:.2}", finding.confidence);
+                    for evidence in &finding.evidence {
+                        println!("- Evidence: `{}`", fmt_diag_evidence(evidence));
+                    }
+                    println!(
+                        "- Fix: {} ({})",
+                        finding.remediation.summary, finding.remediation.refactoring
+                    );
+                    let fix = ovecc_graph::diagnose::fix_spec(&finding.detector);
+                    println!(
+                        "- Action: `{}` (auto-fixable: {})",
+                        fix.kind,
+                        if fix.auto_fixable { "yes" } else { "no" }
+                    );
+                    if let Some(note) = &finding.remediation.when_not_to_act {
+                        println!("- When not to act: {note}");
+                    }
+                }
+            }
+        }
+        OutputFormat::Text => {
+            println!(
+                "Diagnosis: {} finding(s) — critical {}, high {}, medium {}, low {}",
+                report.total, report.critical, report.high, report.medium, report.low
+            );
+            for (label, bucket) in group_diagnoses(&report.findings, group_by) {
+                if !label.is_empty() {
+                    println!();
+                    println!("== {} ({}) ==", label, bucket.len());
+                }
+                for finding in bucket {
+                    println!();
+                    println!(
+                        "[{:?}] {} — {} {}  (confidence {:.2})",
+                        finding.severity,
+                        finding.title,
+                        finding.target_kind,
+                        finding.target,
+                        finding.confidence
+                    );
+                    println!("  Principle: {}", finding.principle);
+                    let evidence: Vec<String> =
+                        finding.evidence.iter().map(fmt_diag_evidence).collect();
+                    println!("  Evidence: {}", evidence.join(", "));
+                    println!(
+                        "  Fix: {} [{}]",
+                        finding.remediation.summary, finding.remediation.refactoring
+                    );
+                    let fix = ovecc_graph::diagnose::fix_spec(&finding.detector);
+                    println!(
+                        "  Action: {} (auto-fixable: {})",
+                        fix.kind,
+                        if fix.auto_fixable { "yes" } else { "no" }
+                    );
+                    if let Some(note) = &finding.remediation.when_not_to_act {
+                        println!("  When not to act: {note}");
+                    }
+                }
+            }
+            if report.total == 0 {
+                println!("  (no findings)");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A best-effort file/path location for a diagnosis: the first evidence with a
+/// concrete file, else a path extracted from the target (the first component of
+/// a `a <-> b` pair/group; `.` for the whole-repository target).
+fn diagnose_location(finding: &ovecc_graph::diagnose::Diagnosis) -> (String, u32) {
+    if let Some(e) = finding.evidence.iter().find(|e| e.file.is_some()) {
+        return (e.file.clone().unwrap(), e.line.unwrap_or(1).max(1));
+    }
+    if finding.target == "<repository>" {
+        return (".".to_string(), 1);
+    }
+    let path = finding
+        .target
+        .split(" <-> ")
+        .next()
+        .unwrap_or(&finding.target)
+        .split(" … ")
+        .next()
+        .unwrap_or(&finding.target)
+        .trim()
+        .to_string();
+    (path, 1)
+}
+
+/// A stable fingerprint (FNV-1a over `detector|target`) so GitLab can diff a
+/// diagnosis across pipelines even though diagnoses have no persisted id.
+fn diagnose_fingerprint(finding: &ovecc_graph::diagnose::Diagnosis) -> String {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in format!("{}|{}", finding.detector, finding.target).bytes() {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
+}
+
+/// Serializes diagnoses as SARIF 2.1.0 (one rule per detector), so
+/// `ovecc diagnose --format sarif` flows into GitHub code scanning.
+fn emit_diagnose_sarif(findings: &[ovecc_graph::diagnose::Diagnosis]) -> Result<()> {
+    use std::collections::BTreeMap;
+    let mut rules: BTreeMap<String, (String, String)> = BTreeMap::new();
+    for f in findings {
+        rules
+            .entry(f.detector.clone())
+            .or_insert_with(|| (f.title.clone(), f.principle.clone()));
+    }
+    let rule_list: Vec<serde_json::Value> = rules
+        .iter()
+        .map(|(id, (title, principle))| {
+            serde_json::json!({
+                "id": id,
+                "shortDescription": { "text": title },
+                "fullDescription": { "text": principle },
+            })
+        })
+        .collect();
+
+    let results: Vec<serde_json::Value> = findings
+        .iter()
+        .map(|f| {
+            let level = match f.severity {
+                Severity::Critical | Severity::High => "error",
+                Severity::Medium => "warning",
+                Severity::Low => "note",
+            };
+            let (path, line) = diagnose_location(f);
+            let message = format!(
+                "{} — {}. Fix: {} [{}]",
+                f.title, f.principle, f.remediation.summary, f.remediation.refactoring
+            );
+            serde_json::json!({
+                "ruleId": f.detector,
+                "level": level,
+                "message": { "text": message },
+                "locations": [{
+                    "physicalLocation": {
+                        "artifactLocation": { "uri": path },
+                        "region": { "startLine": line },
+                    }
+                }],
+                "properties": {
+                    "family": f.family,
+                    "confidence": f.confidence,
+                    "target": f.target,
+                    "fix": {
+                        "kind": ovecc_graph::diagnose::fix_spec(&f.detector).kind,
+                        "auto_fixable": ovecc_graph::diagnose::fix_spec(&f.detector).auto_fixable,
+                    },
+                },
+            })
+        })
+        .collect();
+
+    let sarif = serde_json::json!({
+        "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+        "version": "2.1.0",
+        "runs": [{
+            "tool": { "driver": {
+                "name": "ovecc",
+                "version": env!("CARGO_PKG_VERSION"),
+                "informationUri": "https://github.com/gitvonBS/ovecc",
+                "rules": rule_list,
+            }},
+            "results": results,
+        }],
+    });
+    println!("{}", serde_json::to_string_pretty(&sarif)?);
+    Ok(())
+}
+
+/// Serializes diagnoses as Code Climate / GitLab Code Quality JSON.
+fn emit_diagnose_codeclimate(findings: &[ovecc_graph::diagnose::Diagnosis]) -> Result<()> {
+    let issues: Vec<serde_json::Value> = findings
+        .iter()
+        .map(|f| {
+            let severity = match f.severity {
+                Severity::Critical => "blocker",
+                Severity::High => "critical",
+                Severity::Medium => "major",
+                Severity::Low => "minor",
+            };
+            let (path, line) = diagnose_location(f);
+            serde_json::json!({
+                "type": "issue",
+                "check_name": f.detector,
+                "description": format!("{} ({})", f.title, f.target),
+                "fingerprint": diagnose_fingerprint(f),
+                "severity": severity,
+                "location": { "path": path, "lines": { "begin": line } },
+            })
+        })
+        .collect();
+    println!("{}", serde_json::to_string_pretty(&issues)?);
+    Ok(())
+}
+
+fn render_metrics(
+    report: &ovecc_graph::diagnose::MetricsReport,
+    format: OutputFormat,
+) -> Result<()> {
+    match format {
+        OutputFormat::Json | OutputFormat::Sarif | OutputFormat::Codeclimate => {
+            emit_json("metrics", report, meta_for("metrics"))?
+        }
+        OutputFormat::Ndjson => {
+            emit_ndjson_meta("metrics", &meta_for("metrics"))?;
+            for component in &report.components {
+                println!("{}", ndjson_line("component_metric", component)?);
+            }
+        }
+        OutputFormat::Markdown => {
+            println!("# Metrics");
+            println!();
+            println!("Coupling density: {:.2}%", report.coupling_density * 100.0);
+            println!();
+            println!(
+                "| Component | Files | Fan-in | Fan-out | Coupling | Instability | Abstractness | Distance | Complexity | Churn |"
+            );
+            println!("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |");
+            for m in &report.components {
+                println!(
+                    "| {} | {} | {} | {} | {} | {:.2} | {:.2} | {:.2} | {:.0} | {:.0} |",
+                    m.component,
+                    m.files,
+                    m.fan_in,
+                    m.fan_out,
+                    m.coupling,
+                    m.instability,
+                    m.abstractness,
+                    m.distance,
+                    m.complexity,
+                    m.churn
+                );
+            }
+        }
+        OutputFormat::Text => {
+            println!(
+                "Metrics: {} component(s), coupling density {:.2}%",
+                report.components.len(),
+                report.coupling_density * 100.0
+            );
+            for m in &report.components {
+                println!();
+                println!("{}", m.component);
+                println!(
+                    "  files {}, fan-in {}, fan-out {}, coupling {}, instability {:.2}",
+                    m.files, m.fan_in, m.fan_out, m.coupling, m.instability
+                );
+                println!(
+                    "  abstractness {:.2}, distance {:.2}, complexity {:.0}, churn {:.0}",
+                    m.abstractness, m.distance, m.complexity, m.churn
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Loads the accepted finding IDs from a baseline file (JSON array). A missing
 /// or invalid file is treated as an empty baseline.
 fn load_baseline(path: &std::path::Path) -> std::collections::HashSet<String> {
@@ -1103,9 +1736,49 @@ fn findings_exit(findings: &[FindingRecord], fail_on: Option<FailOn>) -> u8 {
     u8::from(triggered)
 }
 
+/// Injects each finding's machine-actionable `fix` (derived from its kind) into a
+/// serialized findings payload — whether a bare array of findings or a report
+/// object carrying a `findings` array. Pure output enrichment: nothing is
+/// persisted, so the DB schema is untouched.
+fn enrich_findings_with_fix(value: &mut serde_json::Value) {
+    fn enrich_array(arr: &mut [serde_json::Value]) {
+        for item in arr {
+            let kind = item.get("kind").and_then(|k| k.as_str()).and_then(|s| {
+                serde_json::from_value::<ovecc_core::facts::FindingKind>(serde_json::Value::String(
+                    s.to_string(),
+                ))
+                .ok()
+            });
+            if let (Some(kind), serde_json::Value::Object(map)) = (kind, item) {
+                map.insert(
+                    "fix".to_string(),
+                    serde_json::to_value(kind.fix_spec()).unwrap_or(serde_json::Value::Null),
+                );
+            }
+        }
+    }
+    match value {
+        serde_json::Value::Array(arr) => enrich_array(arr),
+        serde_json::Value::Object(map) => {
+            if let Some(serde_json::Value::Array(arr)) = map.get_mut("findings") {
+                enrich_array(arr);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Serializes `data`, enriches its findings with `fix` descriptors, and emits the
+/// standard envelope.
+fn emit_json_with_fix(command: &str, data: impl serde::Serialize) -> Result<()> {
+    let mut value = serde_json::to_value(data).unwrap_or(serde_json::Value::Null);
+    enrich_findings_with_fix(&mut value);
+    emit_json(command, &value, meta_for(command))
+}
+
 fn render_violations(findings: &[FindingRecord], format: OutputFormat) -> Result<()> {
     match format {
-        OutputFormat::Json => emit_json("violations", findings, meta_for("violations"))?,
+        OutputFormat::Json => emit_json_with_fix("violations", findings)?,
         OutputFormat::Ndjson => {
             emit_ndjson_meta("violations", &meta_for("violations"))?;
             for finding in findings {
@@ -1155,14 +1828,17 @@ fn emit_sarif(findings: &[FindingRecord]) -> Result<()> {
     // One SARIF rule per distinct rule name, with its description.
     let mut rules: BTreeMap<String, String> = BTreeMap::new();
     for finding in findings {
-        let rule_id = finding.rule_name.clone().unwrap_or_else(|| format!("{:?}", finding.kind));
-        rules.entry(rule_id).or_insert_with(|| finding.title.clone());
+        let rule_id = finding
+            .rule_name
+            .clone()
+            .unwrap_or_else(|| format!("{:?}", finding.kind));
+        rules
+            .entry(rule_id)
+            .or_insert_with(|| finding.title.clone());
     }
     let rule_list: Vec<serde_json::Value> = rules
         .iter()
-        .map(|(id, desc)| {
-            serde_json::json!({ "id": id, "shortDescription": { "text": desc } })
-        })
+        .map(|(id, desc)| serde_json::json!({ "id": id, "shortDescription": { "text": desc } }))
         .collect();
 
     let results: Vec<serde_json::Value> = findings
@@ -1278,9 +1954,10 @@ fn format_evidence(evidence: &ovecc_core::facts::Evidence) -> String {
 fn render_capabilities(format: OutputFormat) -> Result<()> {
     let caps = capabilities::capabilities();
     match format {
-        OutputFormat::Json | OutputFormat::Ndjson | OutputFormat::Sarif | OutputFormat::Codeclimate => {
-            emit_json("capabilities", &caps, Meta::default())?
-        }
+        OutputFormat::Json
+        | OutputFormat::Ndjson
+        | OutputFormat::Sarif
+        | OutputFormat::Codeclimate => emit_json("capabilities", &caps, Meta::default())?,
         OutputFormat::Markdown => {
             println!("# Ovecc capabilities");
             println!();
@@ -1289,7 +1966,11 @@ fn render_capabilities(format: OutputFormat) -> Result<()> {
             println!("## Commands");
             println!();
             for command in caps.commands {
-                let ro = if command.read_only { " _(read-only)_" } else { "" };
+                let ro = if command.read_only {
+                    " _(read-only)_"
+                } else {
+                    ""
+                };
                 println!("- **{}** — {}{ro}", command.name, command.summary);
             }
             println!();
@@ -1372,7 +2053,9 @@ fn build_security_report(all: &[FindingRecord], min_severity: Option<Severity>) 
 
 fn render_security(report: &SecurityReport, format: OutputFormat) -> Result<()> {
     match format {
-        OutputFormat::Json | OutputFormat::Sarif | OutputFormat::Codeclimate => emit_json("security", report, meta_for("security"))?,
+        OutputFormat::Json | OutputFormat::Sarif | OutputFormat::Codeclimate => {
+            emit_json_with_fix("security", report)?
+        }
         OutputFormat::Ndjson => {
             emit_ndjson_meta("security", &meta_for("security"))?;
             for finding in &report.findings {
@@ -1383,7 +2066,10 @@ fn render_security(report: &SecurityReport, format: OutputFormat) -> Result<()> 
             println!("# Security ({} finding(s))", report.total);
             println!();
             println!("- Hardcoded secrets: {}", report.secrets);
-            println!("- Insecure patterns (eval/exec): {}", report.insecure_patterns);
+            println!(
+                "- Insecure patterns (eval/exec): {}",
+                report.insecure_patterns
+            );
             println!("- Weak crypto: {}", report.weak_crypto);
             println!("- Permissive CORS: {}", report.permissive_cors);
             println!("- Tainted flows: {}", report.tainted_flows);
@@ -1397,7 +2083,10 @@ fn render_security(report: &SecurityReport, format: OutputFormat) -> Result<()> 
             }
         }
         OutputFormat::Text => {
-            println!("Security findings: {} (scanned the indexed repository)", report.total);
+            println!(
+                "Security findings: {} (scanned the indexed repository)",
+                report.total
+            );
             println!(
                 "  secrets {}, insecure {}, weak-crypto {}, cors {}, tainted-flows {}",
                 report.secrets,
@@ -1437,7 +2126,9 @@ struct AuditReport {
 
 fn render_audit(report: &AuditReport, format: OutputFormat) -> Result<()> {
     match format {
-        OutputFormat::Json | OutputFormat::Sarif | OutputFormat::Codeclimate => emit_json("audit", report, meta_for("audit"))?,
+        OutputFormat::Json | OutputFormat::Sarif | OutputFormat::Codeclimate => {
+            emit_json("audit", report, meta_for("audit"))?
+        }
         OutputFormat::Ndjson => {
             emit_ndjson_meta("audit", &meta_for("audit"))?;
             for finding in &report.findings {
@@ -1569,7 +2260,10 @@ fn build_gate_report(
 
 fn render_gate(report: &GateReport, format: OutputFormat) -> Result<()> {
     match format {
-        OutputFormat::Json | OutputFormat::Ndjson | OutputFormat::Sarif | OutputFormat::Codeclimate => emit_json("gate", report, meta_for("gate"))?,
+        OutputFormat::Json
+        | OutputFormat::Ndjson
+        | OutputFormat::Sarif
+        | OutputFormat::Codeclimate => emit_json("gate", report, meta_for("gate"))?,
         OutputFormat::Markdown => {
             println!("# CI gate: {}", report.verdict.to_uppercase());
             println!();
@@ -1589,13 +2283,449 @@ fn render_gate(report: &GateReport, format: OutputFormat) -> Result<()> {
             }
         }
         OutputFormat::Text => {
-            println!("Gate: {} ({} -> {})", report.verdict, report.base, report.head);
+            println!(
+                "Gate: {} ({} -> {})",
+                report.verdict, report.base, report.head
+            );
             println!(
                 "New cycles: {}, new modules: {}, new deps: {}, risk: {}",
                 report.new_cycles, report.new_modules, report.new_dependencies, report.risk
             );
             for signal in &report.signals {
                 println!("  - {signal}");
+            }
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// ovecc review (change-scoped, named new defects)
+// ---------------------------------------------------------------------------
+
+/// The named defects a change introduced between two snapshots: the actionable,
+/// change-scoped report that `gate` (counts only) cannot give.
+#[derive(serde::Serialize)]
+struct ReviewReport {
+    base: String,
+    head: String,
+    /// `"pass"` or `"fail"` against `--fail-on`.
+    verdict: String,
+    /// Calibrated risk band: Low/Medium/High/Critical.
+    risk: String,
+    /// Human-readable reasons behind the verdict — the explanation `gate` lacks.
+    rationale: Vec<String>,
+    summary: ReviewSummary,
+    /// Each new finding is a full, named record with file:line evidence.
+    new_findings: Vec<FindingRecord>,
+    /// New dependency cycles, each carrying the file-level witness edges that
+    /// form it (so a consumer never has to guess — and mis-guess — the edges).
+    new_cycles: Vec<graph::cycles::CycleWitness>,
+    /// Clone families the change introduced (scoped to touched files), so new
+    /// duplication is not buried under pre-existing repo-wide clones.
+    new_duplications: Vec<graph::dupes::CloneFamily>,
+    changed_files: ChangedFiles,
+}
+
+#[derive(serde::Serialize)]
+struct ReviewSummary {
+    files_added: usize,
+    files_modified: usize,
+    new_findings: usize,
+    new_security: usize,
+    new_dead_code: usize,
+    new_complexity: usize,
+    new_cycles: usize,
+    new_duplications: usize,
+    /// Findings present in base but gone in head — credit for fixes.
+    resolved_findings: usize,
+}
+
+/// Assembles the change review from the snapshot-diff primitives in `ovecc-db`
+/// (named finding diff, changed files) and the graph analyses (cycle witnesses,
+/// change-scoped duplication). Head cycle/duplication evidence is drawn from the
+/// current index, so this is most precise when `head` is `latest` (the gate
+/// workflow: index base, apply change, index, review).
+fn build_review_report(
+    paths: &ProjectPaths,
+    config: &OveccConfig,
+    store: &ArchitectureStore,
+    base: &str,
+    head: &str,
+    fail_on: FailOn,
+) -> Result<ReviewReport> {
+    let repository_id = paths.repository_id().0;
+
+    let base_snapshot = store
+        .resolve_snapshot(&repository_id, base)?
+        .ok_or_else(|| OveccError::Index {
+            message: format!(
+                "could not resolve base snapshot '{base}'; index the repository at \
+                 least twice (a baseline, then again after the change) so there is a \
+                 base to compare against"
+            ),
+            source: None,
+        })?;
+    let head_snapshot = store
+        .resolve_snapshot(&repository_id, head)?
+        .ok_or_else(|| OveccError::Index {
+            message: format!("could not resolve head snapshot '{head}'; run 'ovecc index' first"),
+            source: None,
+        })?;
+
+    // 1. Named new/resolved findings (security, dead code, complexity, ...).
+    //    Cycles are surfaced richly (with witness edges) in `new_cycles` below,
+    //    so the plain CircularDependency findings are dropped here to avoid
+    //    double-reporting the same cycle.
+    let finding_diff = store.finding_diff(&repository_id, &base_snapshot.id, &head_snapshot.id)?;
+    let new_findings: Vec<FindingRecord> = finding_diff
+        .new
+        .into_iter()
+        .filter(|finding| finding.kind != FindingKind::CircularDependency)
+        .collect();
+
+    // 2. The files the change touched (for scoping duplication).
+    let changed_files =
+        store.changed_files(&repository_id, &base_snapshot.id, &head_snapshot.id)?;
+
+    // 3. New dependency cycles WITH witness edges. Head cycles come from the
+    //    current graph (file-level, so witnesses carry file:line); a cycle is
+    //    new when its module set is not already a cycle in the base snapshot.
+    let head_modules = store.current_modules(&repository_id)?;
+    let head_dependencies = store.current_dependencies(&repository_id)?;
+    let base_cycles: std::collections::HashSet<Vec<String>> = graph::cycles::module_cycles(
+        &store.snapshot_module_names(&base_snapshot.id)?,
+        &store.snapshot_module_edges(&base_snapshot.id)?,
+    )
+    .into_iter()
+    .collect();
+    let new_cycles: Vec<graph::cycles::CycleWitness> =
+        graph::cycles::elementary_cycles_with_witness(&head_modules, &head_dependencies)
+            .into_iter()
+            .filter(|cycle| !base_cycles.contains(&cycle.modules))
+            .collect();
+
+    // 4. Duplications the change introduced: clone families with at least one
+    //    region in a touched file, so pre-existing clones elsewhere do not drown
+    //    out what THIS change added. (Scanning is still repo-wide — that is how a
+    //    new block is matched against an existing utility — only the output is
+    //    scoped.)
+    let touched: std::collections::HashSet<&str> =
+        changed_files.touched().map(String::as_str).collect();
+    let new_duplications: Vec<graph::dupes::CloneFamily> = if touched.is_empty() {
+        Vec::new()
+    } else {
+        ovecc_indexer::collect_file_tokens(paths, config)
+            .map(|files| graph::dupes::detect(&files, 50, 5, true))
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|family| {
+                family
+                    .instances
+                    .iter()
+                    .any(|instance| touched.contains(instance.path.as_str()))
+            })
+            .collect()
+    };
+
+    // Category counts over the new findings.
+    let count_kinds = |kinds: &[FindingKind]| {
+        new_findings
+            .iter()
+            .filter(|finding| kinds.contains(&finding.kind))
+            .count()
+    };
+    let new_security = count_kinds(&[
+        FindingKind::HardcodedSecret,
+        FindingKind::InsecurePattern,
+        FindingKind::WeakCrypto,
+        FindingKind::PermissiveCors,
+        FindingKind::VulnerableDependency,
+        FindingKind::TaintedFlow,
+    ]);
+    let new_dead_code = count_kinds(&[
+        FindingKind::UnusedExport,
+        FindingKind::UnusedFile,
+        FindingKind::UnusedDependency,
+    ]);
+    let new_complexity = count_kinds(&[FindingKind::HighComplexity]);
+    let max_new_severity = new_findings.iter().map(|finding| finding.severity).max();
+
+    let failed = review_crosses_threshold(
+        fail_on,
+        &new_findings,
+        &new_cycles,
+        &new_duplications,
+        max_new_severity,
+    );
+    let risk = review_risk(max_new_severity, &new_cycles, &new_duplications);
+    let rationale = review_rationale(
+        &new_cycles,
+        new_security,
+        new_complexity,
+        new_dead_code,
+        &new_duplications,
+    );
+
+    Ok(ReviewReport {
+        base: base_snapshot.id,
+        head: head_snapshot.id,
+        verdict: if failed { "fail" } else { "pass" }.to_string(),
+        risk: risk.as_str().to_string(),
+        rationale,
+        summary: ReviewSummary {
+            files_added: changed_files.added.len(),
+            files_modified: changed_files.modified.len(),
+            new_findings: new_findings.len(),
+            new_security,
+            new_dead_code,
+            new_complexity,
+            new_cycles: new_cycles.len(),
+            new_duplications: new_duplications.len(),
+            resolved_findings: finding_diff.resolved.len(),
+        },
+        new_findings,
+        new_cycles,
+        new_duplications,
+        changed_files,
+    })
+}
+
+/// Whether the change fails the gate at `fail_on`. A new cycle always fails (it
+/// is an architectural regression); findings fail by severity; duplication only
+/// counts under `any`.
+fn review_crosses_threshold(
+    fail_on: FailOn,
+    new_findings: &[FindingRecord],
+    new_cycles: &[graph::cycles::CycleWitness],
+    new_duplications: &[graph::dupes::CloneFamily],
+    max_new_severity: Option<Severity>,
+) -> bool {
+    match fail_on {
+        FailOn::Any => {
+            !new_findings.is_empty() || !new_cycles.is_empty() || !new_duplications.is_empty()
+        }
+        FailOn::Medium => !new_cycles.is_empty() || max_new_severity >= Some(Severity::Medium),
+        FailOn::High => !new_cycles.is_empty() || max_new_severity >= Some(Severity::High),
+    }
+}
+
+fn review_risk(
+    max_new_severity: Option<Severity>,
+    new_cycles: &[graph::cycles::CycleWitness],
+    new_duplications: &[graph::dupes::CloneFamily],
+) -> RiskLevel {
+    if max_new_severity == Some(Severity::Critical) {
+        RiskLevel::Critical
+    } else if !new_cycles.is_empty() || max_new_severity == Some(Severity::High) {
+        RiskLevel::High
+    } else if max_new_severity == Some(Severity::Medium) || !new_duplications.is_empty() {
+        RiskLevel::Medium
+    } else {
+        RiskLevel::Low
+    }
+}
+
+fn review_rationale(
+    new_cycles: &[graph::cycles::CycleWitness],
+    new_security: usize,
+    new_complexity: usize,
+    new_dead_code: usize,
+    new_duplications: &[graph::dupes::CloneFamily],
+) -> Vec<String> {
+    let mut rationale = Vec::new();
+    if !new_cycles.is_empty() {
+        let names: Vec<String> = new_cycles
+            .iter()
+            .map(|cycle| format_cycle_path(&cycle.modules, " ↔ ", " → "))
+            .collect();
+        rationale.push(format!(
+            "{} new dependency cycle(s): {}",
+            new_cycles.len(),
+            names.join("; ")
+        ));
+    }
+    if new_security > 0 {
+        rationale.push(format!("{new_security} new security finding(s)"));
+    }
+    if new_complexity > 0 {
+        rationale.push(format!("{new_complexity} new high-complexity function(s)"));
+    }
+    if new_dead_code > 0 {
+        rationale.push(format!("{new_dead_code} new dead-code finding(s)"));
+    }
+    if !new_duplications.is_empty() {
+        rationale.push(format!("{} new duplication(s)", new_duplications.len()));
+    }
+    if rationale.is_empty() {
+        rationale.push("no new defects introduced by this change".to_string());
+    }
+    rationale
+}
+
+/// Renders a cycle's module path for display. A 2-node loop is genuinely
+/// bidirectional (`a ↔ b`); a longer loop is *directed*, so it reads as the
+/// actual path back to the start (`a → b → c → a`) rather than a misleading
+/// `a ↔ b ↔ c` (which would imply `a` and `c` depend on each other directly).
+fn format_cycle_path(modules: &[String], bidi: &str, arrow: &str) -> String {
+    match modules.first() {
+        Some(first) if modules.len() >= 3 => {
+            let mut path = modules.join(arrow);
+            path.push_str(arrow);
+            path.push_str(first);
+            path
+        }
+        _ => modules.join(bidi),
+    }
+}
+
+fn render_review(report: &ReviewReport, format: OutputFormat) -> Result<()> {
+    match format {
+        OutputFormat::Json | OutputFormat::Sarif | OutputFormat::Codeclimate => {
+            emit_json("review", report, meta_for("review"))?
+        }
+        OutputFormat::Ndjson => {
+            emit_ndjson_meta("review", &meta_for("review"))?;
+            println!("{}", ndjson_line("review_summary", &report.summary)?);
+            for finding in &report.new_findings {
+                println!("{}", ndjson_line("new_finding", finding)?);
+            }
+            for cycle in &report.new_cycles {
+                println!("{}", ndjson_line("new_cycle", cycle)?);
+            }
+            for family in &report.new_duplications {
+                println!("{}", ndjson_line("new_duplication", family)?);
+            }
+        }
+        OutputFormat::Markdown => {
+            println!("# Change review: {}", report.verdict.to_uppercase());
+            println!();
+            println!("- Base: `{}`", report.base);
+            println!("- Head: `{}`", report.head);
+            println!("- Risk: **{}**", report.risk);
+            println!(
+                "- Files: +{} added, ~{} modified",
+                report.summary.files_added, report.summary.files_modified
+            );
+            for reason in &report.rationale {
+                println!("- {reason}");
+            }
+
+            println!();
+            println!("## New dependency cycles ({})", report.new_cycles.len());
+            if report.new_cycles.is_empty() {
+                println!("_None._");
+            }
+            for cycle in &report.new_cycles {
+                println!();
+                println!("### {}", format_cycle_path(&cycle.modules, " ↔ ", " → "));
+                for edge in &cycle.edges {
+                    let target = edge.to_file.as_deref().unwrap_or(edge.to_module.as_str());
+                    println!(
+                        "- `{}:{}` imports `{}` → `{}`",
+                        edge.from_file, edge.line, edge.specifier, target
+                    );
+                }
+            }
+
+            println!();
+            println!("## New findings ({})", report.new_findings.len());
+            if report.new_findings.is_empty() {
+                println!("_None._");
+            }
+            for finding in &report.new_findings {
+                let rule = finding.rule_name.as_deref().unwrap_or("-");
+                let fix = finding.kind.fix_spec();
+                let auto = if fix.auto_fixable {
+                    ", auto-fixable"
+                } else {
+                    ""
+                };
+                println!(
+                    "- **[{:?}] {:?}**{} — {} _(rule `{}`)_ · action: `{}`{}",
+                    finding.severity,
+                    finding.kind,
+                    first_evidence(finding),
+                    finding.title,
+                    rule,
+                    fix.kind,
+                    auto
+                );
+            }
+
+            println!();
+            println!("## New duplications ({})", report.new_duplications.len());
+            if report.new_duplications.is_empty() {
+                println!("_None._");
+            }
+            for (rank, family) in report.new_duplications.iter().enumerate() {
+                println!();
+                println!(
+                    "### Clone {} ({} tokens, {} lines, {} copies)",
+                    rank + 1,
+                    family.token_length,
+                    family.line_span,
+                    family.instances.len()
+                );
+                for instance in &family.instances {
+                    println!(
+                        "- `{}:{}-{}`",
+                        instance.path, instance.start_line, instance.end_line
+                    );
+                }
+            }
+        }
+        OutputFormat::Text => {
+            println!(
+                "Review: {} (risk {}) {} -> {}",
+                report.verdict, report.risk, report.base, report.head
+            );
+            for reason in &report.rationale {
+                println!("  - {reason}");
+            }
+            if !report.new_cycles.is_empty() {
+                println!("New cycles:");
+                for cycle in &report.new_cycles {
+                    println!("  {}", format_cycle_path(&cycle.modules, " <-> ", " -> "));
+                    for edge in &cycle.edges {
+                        println!(
+                            "    {}:{} imports {} -> {}",
+                            edge.from_file,
+                            edge.line,
+                            edge.specifier,
+                            edge.to_file.as_deref().unwrap_or(edge.to_module.as_str())
+                        );
+                    }
+                }
+            }
+            if !report.new_findings.is_empty() {
+                println!("New findings:");
+                for finding in &report.new_findings {
+                    println!(
+                        "  [{:?}] {:?}{} {}",
+                        finding.severity,
+                        finding.kind,
+                        first_evidence(finding),
+                        finding.title
+                    );
+                }
+            }
+            if !report.new_duplications.is_empty() {
+                println!("New duplications:");
+                for family in &report.new_duplications {
+                    println!(
+                        "  {} tokens / {} lines / {} copies",
+                        family.token_length,
+                        family.line_span,
+                        family.instances.len()
+                    );
+                    for instance in &family.instances {
+                        println!(
+                            "    {}:{}-{}",
+                            instance.path, instance.start_line, instance.end_line
+                        );
+                    }
+                }
             }
         }
     }
@@ -1629,20 +2759,23 @@ fn render_full_report(paths: &ProjectPaths, format: OutputFormat) -> Result<()> 
     let store = open_store(paths)?;
     let modules = store.current_modules(&repository_id)?;
     let dependencies = store.current_dependencies(&repository_id)?;
-    let cycles: Vec<Vec<String>> =
-        ovecc_graph::cycles::elementary_cycles(&modules, &dependencies)
-            .into_iter()
-            .map(|mut members| {
-                if let Some(first) = members.first().cloned() {
-                    members.push(first);
-                }
-                members
-            })
-            .collect();
+    let cycles: Vec<Vec<String>> = ovecc_graph::cycles::elementary_cycles(&modules, &dependencies)
+        .into_iter()
+        .map(|mut members| {
+            if let Some(first) = members.first().cloned() {
+                members.push(first);
+            }
+            members
+        })
+        .collect();
     let mut findings = store.findings(&repository_id, None)?;
     drop(store);
     // Highest severity first, then stable by title, for deterministic output.
-    findings.sort_by(|a, b| b.severity.cmp(&a.severity).then_with(|| a.title.cmp(&b.title)));
+    findings.sort_by(|a, b| {
+        b.severity
+            .cmp(&a.severity)
+            .then_with(|| a.title.cmp(&b.title))
+    });
     let security = build_security_report(&findings, None);
 
     match format {
@@ -1745,7 +2878,9 @@ struct DupesReport {
 fn render_dupes(report: &DupesReport, format: OutputFormat) -> Result<()> {
     let plural = |n: usize| if n == 1 { "y" } else { "ies" };
     match format {
-        OutputFormat::Json | OutputFormat::Sarif | OutputFormat::Codeclimate => emit_json("dupes", report, meta_for("dupes"))?,
+        OutputFormat::Json | OutputFormat::Sarif | OutputFormat::Codeclimate => {
+            emit_json("dupes", report, meta_for("dupes"))?
+        }
         OutputFormat::Ndjson => {
             emit_ndjson_meta("dupes", &meta_for("dupes"))?;
             for family in &report.families {
@@ -1827,7 +2962,9 @@ struct HealthReport {
 
 fn render_health(report: &HealthReport, format: OutputFormat) -> Result<()> {
     match format {
-        OutputFormat::Json | OutputFormat::Sarif | OutputFormat::Codeclimate => emit_json("health", report, meta_for("health"))?,
+        OutputFormat::Json | OutputFormat::Sarif | OutputFormat::Codeclimate => {
+            emit_json("health", report, meta_for("health"))?
+        }
         OutputFormat::Ndjson => {
             emit_ndjson_meta("health", &meta_for("health"))?;
             for finding in &report.findings {
@@ -1887,7 +3024,9 @@ struct DeadcodeReport {
 
 fn render_deadcode(report: &DeadcodeReport, format: OutputFormat) -> Result<()> {
     match format {
-        OutputFormat::Json | OutputFormat::Sarif | OutputFormat::Codeclimate => emit_json("deadcode", report, meta_for("deadcode"))?,
+        OutputFormat::Json | OutputFormat::Sarif | OutputFormat::Codeclimate => {
+            emit_json_with_fix("deadcode", report)?
+        }
         OutputFormat::Ndjson => {
             emit_ndjson_meta("deadcode", &meta_for("deadcode"))?;
             for finding in &report.findings {
@@ -2059,6 +3198,19 @@ fn load_impact(
     let Some(node) = blast::resolve_target(target, &nodes) else {
         return Ok(None);
     };
+    // A file target carries no architectural edges of its own — dependency edges
+    // are module-level — so a raw file node yields an empty (and falsely
+    // reassuring "Low risk") blast radius. Redirect it to the module that
+    // `contains` it, so `impact src/foo/bar.ts` answers for module `foo`.
+    let node = if node.kind == "file" {
+        edges
+            .iter()
+            .find(|edge| edge.kind == "contains" && edge.target == node.id)
+            .and_then(|edge| nodes.iter().find(|candidate| candidate.id == edge.source))
+            .unwrap_or(node)
+    } else {
+        node
+    };
     Ok(blast::blast_radius(
         &nodes, &edges, &node.id, direction, max_depth,
     ))
@@ -2094,7 +3246,9 @@ fn ndjson_header<T: serde::Serialize>(kind: &str, payload: &T, drop: &[&str]) ->
 
 fn render_index_report(report: &IndexReport, format: OutputFormat) -> Result<()> {
     match format {
-        OutputFormat::Json | OutputFormat::Sarif | OutputFormat::Codeclimate => emit_json("index", report, meta_for("index"))?,
+        OutputFormat::Json | OutputFormat::Sarif | OutputFormat::Codeclimate => {
+            emit_json("index", report, meta_for("index"))?
+        }
         OutputFormat::Ndjson => {
             emit_ndjson_meta("index", &meta_for("index"))?;
             println!("{}", ndjson_line("index", report)?);
@@ -2155,7 +3309,9 @@ fn render_index_report(report: &IndexReport, format: OutputFormat) -> Result<()>
 
 fn render_summary_report(report: &SummaryReport, format: OutputFormat) -> Result<()> {
     match format {
-        OutputFormat::Json | OutputFormat::Sarif | OutputFormat::Codeclimate => emit_json("summary", report, meta_for("summary"))?,
+        OutputFormat::Json | OutputFormat::Sarif | OutputFormat::Codeclimate => {
+            emit_json("summary", report, meta_for("summary"))?
+        }
         OutputFormat::Ndjson => {
             emit_ndjson_meta("summary", &meta_for("summary"))?;
             println!("{}", ndjson_header("summary", report, &["hotspots"])?);
@@ -2263,7 +3419,9 @@ fn render_blast(target: &str, result: Option<&BlastResult>, format: OutputFormat
     };
 
     match format {
-        OutputFormat::Json | OutputFormat::Sarif | OutputFormat::Codeclimate => emit_json("impact", result, meta_for("impact"))?,
+        OutputFormat::Json | OutputFormat::Sarif | OutputFormat::Codeclimate => {
+            emit_json("impact", result, meta_for("impact"))?
+        }
         OutputFormat::Ndjson => {
             emit_ndjson_meta("impact", &meta_for("impact"))?;
             println!(
@@ -2284,6 +3442,7 @@ fn render_blast(target: &str, result: Option<&BlastResult>, format: OutputFormat
             println!("- Affected APIs: {}", result.impacted_apis);
             println!("- Affected tables: {}", result.impacted_tables);
             println!("- Affected symbols: {}", result.impacted_symbols);
+            println!("- Affected files: {}", result.impacted_files);
             println!(
                 "- Risk: **{}** ({})",
                 result.risk.as_str(),
@@ -2304,6 +3463,7 @@ fn render_blast(target: &str, result: Option<&BlastResult>, format: OutputFormat
             println!("Affected APIs: {}", result.impacted_apis);
             println!("Affected tables: {}", result.impacted_tables);
             println!("Affected symbols: {}", result.impacted_symbols);
+            println!("Affected files: {}", result.impacted_files);
             println!("Risk: {} ({})", result.risk.as_str(), result.risk_value);
             if !result.paths.is_empty() {
                 println!();
@@ -2319,7 +3479,9 @@ fn render_blast(target: &str, result: Option<&BlastResult>, format: OutputFormat
 
 fn render_diff_report(report: &DiffReport, format: OutputFormat) -> Result<()> {
     match format {
-        OutputFormat::Json | OutputFormat::Sarif | OutputFormat::Codeclimate => emit_json("diff", report, meta_for("diff"))?,
+        OutputFormat::Json | OutputFormat::Sarif | OutputFormat::Codeclimate => {
+            emit_json("diff", report, meta_for("diff"))?
+        }
         OutputFormat::Ndjson => {
             emit_ndjson_meta("diff", &meta_for("diff"))?;
             println!(
@@ -2402,7 +3564,9 @@ fn render_diff_report(report: &DiffReport, format: OutputFormat) -> Result<()> {
 
 fn render_drift_report(report: &DriftReport, format: OutputFormat) -> Result<()> {
     match format {
-        OutputFormat::Json | OutputFormat::Sarif | OutputFormat::Codeclimate => emit_json("drift", report, meta_for("drift"))?,
+        OutputFormat::Json | OutputFormat::Sarif | OutputFormat::Codeclimate => {
+            emit_json("drift", report, meta_for("drift"))?
+        }
         OutputFormat::Ndjson => {
             emit_ndjson_meta("drift", &meta_for("drift"))?;
             println!("{}", ndjson_line("drift", report)?);
@@ -2504,5 +3668,134 @@ fn print_markdown_dependencies(label: &str, dependencies: &[DependencyEdge]) {
             "- `{} -> {}` ({})",
             dependency.source_module, dependency.target_module, dependency.specifier
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cycle(a: &str, b: &str) -> graph::cycles::CycleWitness {
+        graph::cycles::CycleWitness {
+            modules: vec![a.to_string(), b.to_string()],
+            edges: Vec::new(),
+        }
+    }
+
+    fn clone_family() -> graph::dupes::CloneFamily {
+        graph::dupes::CloneFamily {
+            token_length: 60,
+            line_span: 8,
+            instances: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn no_meta_flag_suppresses_the_meta_block() {
+        // Default: a command that carries metric/rule dictionaries has meta.
+        SUPPRESS_META.store(false, Ordering::Relaxed);
+        assert!(!meta_for("summary").is_empty());
+        // Suppressed: every command's meta collapses to empty (so the envelope
+        // omits it), while `capabilities` output is unaffected (it never uses
+        // meta_for — the contract lives in its `data`).
+        SUPPRESS_META.store(true, Ordering::Relaxed);
+        assert!(meta_for("summary").is_empty());
+        assert!(meta_for("review").is_empty());
+        SUPPRESS_META.store(false, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn review_verdict_respects_fail_on_threshold() {
+        // Nothing new → pass at any threshold.
+        assert!(!review_crosses_threshold(FailOn::Any, &[], &[], &[], None));
+        // A new cycle is an architectural regression: it fails at every level.
+        assert!(review_crosses_threshold(
+            FailOn::Any,
+            &[],
+            &[cycle("a", "b")],
+            &[],
+            None
+        ));
+        assert!(review_crosses_threshold(
+            FailOn::High,
+            &[],
+            &[cycle("a", "b")],
+            &[],
+            None
+        ));
+        // Under `any`, a lone new duplication fails; under medium/high it does not.
+        assert!(review_crosses_threshold(
+            FailOn::Any,
+            &[],
+            &[],
+            &[clone_family()],
+            None
+        ));
+        assert!(!review_crosses_threshold(
+            FailOn::Medium,
+            &[],
+            &[],
+            &[clone_family()],
+            None
+        ));
+        // Findings gate by severity.
+        assert!(!review_crosses_threshold(
+            FailOn::High,
+            &[],
+            &[],
+            &[],
+            Some(Severity::Medium)
+        ));
+        assert!(review_crosses_threshold(
+            FailOn::High,
+            &[],
+            &[],
+            &[],
+            Some(Severity::High)
+        ));
+        assert!(review_crosses_threshold(
+            FailOn::Medium,
+            &[],
+            &[],
+            &[],
+            Some(Severity::Medium)
+        ));
+    }
+
+    #[test]
+    fn review_risk_band_reflects_worst_signal() {
+        assert_eq!(review_risk(None, &[], &[]).as_str(), "Low");
+        assert_eq!(
+            review_risk(Some(Severity::Medium), &[], &[]).as_str(),
+            "Medium"
+        );
+        // A new duplication alone lifts risk to Medium.
+        assert_eq!(review_risk(None, &[], &[clone_family()]).as_str(), "Medium");
+        // A new cycle (or a High finding) is High.
+        assert_eq!(review_risk(None, &[cycle("a", "b")], &[]).as_str(), "High");
+        assert_eq!(review_risk(Some(Severity::High), &[], &[]).as_str(), "High");
+        // A Critical finding dominates everything.
+        assert_eq!(
+            review_risk(Some(Severity::Critical), &[cycle("a", "b")], &[]).as_str(),
+            "Critical"
+        );
+    }
+
+    #[test]
+    fn review_rationale_is_empty_message_when_clean() {
+        let rationale = review_rationale(&[], 0, 0, 0, &[]);
+        assert_eq!(rationale.len(), 1);
+        assert!(rationale[0].contains("no new defects"));
+        // Populated signals are each spelled out for the verdict explanation.
+        let rationale = review_rationale(&[cycle("alpha", "beta")], 2, 1, 3, &[clone_family()]);
+        assert!(rationale.iter().any(|r| r.contains("alpha ↔ beta")));
+        assert!(rationale.iter().any(|r| r.contains("2 new security")));
+        assert!(
+            rationale
+                .iter()
+                .any(|r| r.contains("1 new high-complexity"))
+        );
+        assert!(rationale.iter().any(|r| r.contains("3 new dead-code")));
+        assert!(rationale.iter().any(|r| r.contains("1 new duplication")));
     }
 }

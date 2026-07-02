@@ -119,7 +119,7 @@ printf '%s\n' \
 ```
 
 You should get an `initialize` result (serverInfo `ovecc`) followed by a `tools/list`
-result enumerating **19 tools**. To exercise a real analysis tool against an indexed
+result enumerating **20 tools**. To exercise a real analysis tool against an indexed
 repo:
 
 ```sh
@@ -136,7 +136,7 @@ automatically — you only send it by hand in this manual test.
 
 ## Tool catalog
 
-All 19 tools (every one takes an optional `repo`; `*` marks required arguments):
+All 20 tools (every one takes an optional `repo`; `*` marks required arguments):
 
 | Tool | Maps to | Key arguments |
 | --- | --- | --- |
@@ -155,6 +155,7 @@ All 19 tools (every one takes an optional `repo`; `*` marks required arguments):
 | `ovecc_hotspots` | `hotspots` | `limit` |
 | `ovecc_conventions` | `conventions` | — |
 | `ovecc_drift` | `drift` | `since` (git ref / snapshot) |
+| `ovecc_review` | `review` | `base`, `head`, `fail_on` (lead with this for PR review) |
 | `ovecc_gate` | `gate` | `base`, `head`, `fail_on` |
 | `ovecc_diff` | `diff` | `base`, `head`, `fail_on` |
 | `ovecc_explain` | `explain` | `target*` |
@@ -177,10 +178,11 @@ All 19 tools (every one takes an optional `repo`; `*` marks required arguments):
 
 1. `ovecc_index` on the base ref → produces a snapshot.
 2. Make the change, `ovecc_index` again → second snapshot.
-3. `ovecc_gate` (`base`/`head`/`fail_on`) → pass/fail verdict + the `signals` naming
-   each new cycle, violation, vulnerable dep, dead export, or complexity regression.
-4. Cross-check with `ovecc_diff` (raw added/removed structure) and
-   `ovecc_violations` with `baseline: true` (only *new* findings).
+3. `ovecc_review` (`base`/`head`/`fail_on`) → the **named** new defects in one call:
+   new findings with `file:line`, new dependency cycles **with their concrete import
+   witness edges**, and the duplications the change added. This is what you report.
+4. `ovecc_gate` for a bare pass/fail verdict; `ovecc_diff` for raw added/removed
+   structure if you need the module/dependency deltas behind the review.
 
 ---
 

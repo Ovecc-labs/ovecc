@@ -8,6 +8,7 @@
 pub mod blast;
 pub mod conventions;
 pub mod cycles;
+pub mod diagnose;
 pub mod dupes;
 
 use ovecc_core::legacy::{
@@ -454,7 +455,8 @@ mod hotspot_tests {
         let churn = HashMap::from([("billing".to_string(), 50.0), ("user".to_string(), 5.0)]);
         let fragmentation = HashMap::from([("billing".to_string(), 0.8)]);
         let violations = HashMap::from([("billing".to_string(), 3usize)]);
-        let complexity = HashMap::from([("billing".to_string(), 120.0), ("util".to_string(), 30.0)]);
+        let complexity =
+            HashMap::from([("billing".to_string(), 120.0), ("util".to_string(), 30.0)]);
 
         let hotspots = compute_hotspots(
             &modules,
@@ -477,8 +479,16 @@ mod hotspot_tests {
         assert!(hotspots[1..].iter().all(|h| h.score < billing_score));
         // The limit is respected.
         assert_eq!(
-            compute_hotspots(&modules, &deps, &churn, &fragmentation, &violations, &complexity, 1)
-                .len(),
+            compute_hotspots(
+                &modules,
+                &deps,
+                &churn,
+                &fragmentation,
+                &violations,
+                &complexity,
+                1
+            )
+            .len(),
             1
         );
     }

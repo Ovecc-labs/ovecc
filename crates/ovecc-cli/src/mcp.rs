@@ -99,7 +99,46 @@ fn handle(method: &str, params: Option<&Value>, exe: &Path) -> Result<Value, (i6
 /// Runs the CLI subcommand behind a tool and wraps stdout as the tool result.
 /// Unknown tools and bad arguments come back as `isError` results so the agent
 /// can recover without a protocol-level failure.
+///
+/// When `OVECC_MCP_LOG` is set, each call is traced to stderr (never stdout, so
+/// the JSON-RPC stream stays clean) — drives a live "backend" panel in demos.
 fn call_tool(name: &str, arguments: &Value, exe: &Path) -> Value {
+    let log = std::env::var_os("OVECC_MCP_LOG").is_some();
+    let started = std::time::Instant::now();
+    if log {
+        let args = serde_json::to_string(arguments).unwrap_or_default();
+        eprintln!("[ovecc-mcp] → {name} {}", truncate(&args, 80));
+    }
+    let result = run_tool(name, arguments, exe);
+    if log {
+        let is_err = result
+            .get("isError")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let bytes = result
+            .pointer("/content/0/text")
+            .and_then(Value::as_str)
+            .map_or(0, str::len);
+        eprintln!(
+            "[ovecc-mcp] ← {name} {} {bytes}B {}ms",
+            if is_err { "ERR" } else { "ok" },
+            started.elapsed().as_millis()
+        );
+    }
+    result
+}
+
+/// Char-boundary-safe truncation for the stderr trace.
+fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let head: String = s.chars().take(max).collect();
+        format!("{head}…")
+    }
+}
+
+fn run_tool(name: &str, arguments: &Value, exe: &Path) -> Value {
     let Some(sub_argv) = build_argv(name, arguments) else {
         return error_result(format!("unknown tool or missing required argument: {name}"));
     };
@@ -109,11 +148,16 @@ fn call_tool(name: &str, arguments: &Value, exe: &Path) -> Value {
         .unwrap_or(".")
         .to_string();
 
+    // `--no-meta`: the agent reads the metric/rule dictionaries once via
+    // ovecc_capabilities, so repeating them on every tool result only inflates
+    // tokens. `capabilities` itself carries the full contract in `data`,
+    // unaffected by this flag.
     let mut argv = vec![
         "--repo".to_string(),
         repo,
         "--format".to_string(),
         "json".to_string(),
+        "--no-meta".to_string(),
     ];
     argv.extend(sub_argv);
 
@@ -239,6 +283,36 @@ fn build_argv(name: &str, args: &Value) -> Option<Vec<String>> {
                 argv.push(fail_on.into());
             }
         }
+        "ovecc_review" => {
+            argv.push("review".into());
+            push_base_head(&mut argv, s("base"), s("head"));
+            if let Some(fail_on) = s("fail_on") {
+                argv.push("--fail-on".into());
+                argv.push(fail_on.into());
+            }
+        }
+        "ovecc_diagnose" => {
+            argv.push("diagnose".into());
+            if let Some(target) = s("target") {
+                argv.push("--target".into());
+                argv.push(target.into());
+            }
+            if let Some(severity) = s("severity") {
+                argv.push("--severity".into());
+                argv.push(severity.into());
+            }
+        }
+        "ovecc_advise" => {
+            argv.push("advise".into());
+            argv.push(s("target")?.into());
+        }
+        "ovecc_metrics" => {
+            argv.push("metrics".into());
+            if let Some(target) = s("target") {
+                argv.push("--target".into());
+                argv.push(target.into());
+            }
+        }
         _ => return None,
     }
     Some(argv)
@@ -284,10 +358,14 @@ fn tool_specs() -> Value {
         {"name": "ovecc_hotspots", "description": "Technical-debt hotspot ranking: churn x coupling x ownership.", "inputSchema": obj(json!({"repo": repo, "limit": {"type": "integer", "description": "Number of hotspots to return (default 10)."}}), json!([]))},
         {"name": "ovecc_conventions", "description": "Learned repository conventions and their deviations.", "inputSchema": obj(json!({"repo": repo}), json!([]))},
         {"name": "ovecc_drift", "description": "Architecture drift over time versus a previous snapshot or Git ref.", "inputSchema": obj(json!({"repo": repo, "since": {"type": "string", "description": "Git ref or snapshot to compare against, e.g. main or v1.0.0."}}), json!([]))},
-        {"name": "ovecc_gate", "description": "CI gate: fail when a change introduces new cycles, violations, or quality regressions (security/dead-code/complexity) versus a base snapshot or Git ref. Returns a pass/fail verdict and the signals behind it.", "inputSchema": obj(json!({"repo": repo, "base": base, "head": head, "fail_on": fail_on}), json!([]))},
+        {"name": "ovecc_review", "description": "Change review (lead with this for PR review): the NAMED new defects a change introduced between base and head — new findings (security/dead-code/complexity) with file:line, new dependency cycles WITH their concrete import witness edges, and the duplications the change added (scoped to touched files). One deterministic call; the actionable companion to ovecc_gate, which reports only counts.", "inputSchema": obj(json!({"repo": repo, "base": base, "head": head, "fail_on": fail_on}), json!([]))},
+        {"name": "ovecc_gate", "description": "CI gate: fail when a change introduces new cycles, violations, or quality regressions (security/dead-code/complexity) versus a base snapshot or Git ref. Returns a pass/fail verdict and the signals behind it. For the named defects behind the verdict, use ovecc_review.", "inputSchema": obj(json!({"repo": repo, "base": base, "head": head, "fail_on": fail_on}), json!([]))},
         {"name": "ovecc_diff", "description": "Compare two stored architecture snapshots (or Git refs): added/removed modules and dependency edges, plus the overall diff risk score.", "inputSchema": obj(json!({"repo": repo, "base": base, "head": head, "fail_on": fail_on}), json!([]))},
         {"name": "ovecc_explain", "description": "Offline, deterministic architectural explanation of a target from its context slice.", "inputSchema": obj(json!({"repo": repo, "target": {"type": "string", "description": "Element to explain, e.g. Billing."}}), json!(["target"]))},
-        {"name": "ovecc_context", "description": "Deterministic ContextSlice for a target as JSON, for feeding other tools or agents.", "inputSchema": obj(json!({"repo": repo, "target": {"type": "string", "description": "Element to slice, e.g. Billing."}}), json!(["target"]))}
+        {"name": "ovecc_context", "description": "Deterministic ContextSlice for a target as JSON, for feeding other tools or agents.", "inputSchema": obj(json!({"repo": repo, "target": {"type": "string", "description": "Element to slice, e.g. Billing."}}), json!(["target"]))},
+        {"name": "ovecc_diagnose", "description": "Deterministic architectural diagnosis: cycles, hub-like (crossing), unstable and god components, dense structure, and hotspots — each with evidence, the design principle it breaks, and an established remediation. Components are directories; no design patterns are invented.", "inputSchema": obj(json!({"repo": repo, "target": {"type": "string", "description": "Scope to findings touching this file or component (substring)."}, "severity": severity}), json!([]))},
+        {"name": "ovecc_advise", "description": "Advise on one file, module, or component: the findings touching it and the established fix for each. Call before editing that area.", "inputSchema": obj(json!({"repo": repo, "target": {"type": "string", "description": "File, module, or component to advise on."}}), json!(["target"]))},
+        {"name": "ovecc_metrics", "description": "Per-component architecture metrics: fan-in/out, coupling, Martin instability, aggregate complexity, churn, and repository coupling density.", "inputSchema": obj(json!({"repo": repo, "target": {"type": "string", "description": "Scope to a single component (substring)."}}), json!([]))}
     ])
 }
 
@@ -297,10 +375,24 @@ mod tests {
 
     #[test]
     fn builds_argv_for_simple_and_parameterized_tools() {
-        assert_eq!(build_argv("ovecc_summary", &json!({})).unwrap(), vec!["summary"]);
         assert_eq!(
-            build_argv("ovecc_impact", &json!({"target": "Billing", "direction": "both", "max_depth": 3})).unwrap(),
-            vec!["impact", "Billing", "--direction", "both", "--max-depth", "3"]
+            build_argv("ovecc_summary", &json!({})).unwrap(),
+            vec!["summary"]
+        );
+        assert_eq!(
+            build_argv(
+                "ovecc_impact",
+                &json!({"target": "Billing", "direction": "both", "max_depth": 3})
+            )
+            .unwrap(),
+            vec![
+                "impact",
+                "Billing",
+                "--direction",
+                "both",
+                "--max-depth",
+                "3"
+            ]
         );
         assert_eq!(
             build_argv("ovecc_query", &json!({"query": "cycles"})).unwrap(),
@@ -315,7 +407,11 @@ mod tests {
             vec!["security", "--severity", "high"]
         );
         assert_eq!(
-            build_argv("ovecc_gate", &json!({"base": "main", "head": "HEAD", "fail_on": "medium"})).unwrap(),
+            build_argv(
+                "ovecc_gate",
+                &json!({"base": "main", "head": "HEAD", "fail_on": "medium"})
+            )
+            .unwrap(),
             vec!["gate", "main", "HEAD", "--fail-on", "medium"]
         );
         // base/head are positional: a `head` with no `base` backfills the default.
@@ -324,6 +420,14 @@ mod tests {
             vec!["diff", "previous", "HEAD"]
         );
         assert_eq!(build_argv("ovecc_gate", &json!({})).unwrap(), vec!["gate"]);
+        assert_eq!(
+            build_argv("ovecc_review", &json!({"base": "main", "fail_on": "any"})).unwrap(),
+            vec!["review", "main", "--fail-on", "any"]
+        );
+        assert_eq!(
+            build_argv("ovecc_review", &json!({})).unwrap(),
+            vec!["review"]
+        );
     }
 
     #[test]
@@ -336,7 +440,12 @@ mod tests {
     #[test]
     fn initialize_echoes_protocol_version_and_lists_tools() {
         let exe = std::path::PathBuf::from("ovecc");
-        let init = handle("initialize", Some(&json!({"protocolVersion": "2025-03-26"})), &exe).unwrap();
+        let init = handle(
+            "initialize",
+            Some(&json!({"protocolVersion": "2025-03-26"})),
+            &exe,
+        )
+        .unwrap();
         assert_eq!(init["protocolVersion"], "2025-03-26");
         assert_eq!(init["serverInfo"]["name"], "ovecc");
 
@@ -346,7 +455,8 @@ mod tests {
         assert!(has("ovecc_capabilities"));
         assert!(has("ovecc_gate"));
         assert!(has("ovecc_diff"));
-        assert!(tools.len() >= 17);
+        assert!(has("ovecc_review"));
+        assert!(tools.len() >= 18);
     }
 
     #[test]

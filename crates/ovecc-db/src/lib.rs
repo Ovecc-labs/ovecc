@@ -10,14 +10,15 @@ use anyhow::{Context, Result, anyhow};
 use chrono::Utc;
 use duckdb::{Connection, Transaction, params};
 use ovecc_core::facts::{
-    ApiRecord, CallRecord, CommitRecord, ComplexityRecord, Evidence, ExportRecord, FileChangeRecord,
-    FindingKind, FindingRecord, SchemaObjectRecord, Severity, SymbolRecord,
+    ApiRecord, CallRecord, CommitRecord, ComplexityRecord, Evidence, ExportRecord,
+    FileChangeRecord, FindingKind, FindingRecord, SchemaObjectRecord, Severity, SymbolRecord,
 };
 use ovecc_core::id::{FindingId, RepositoryId, SnapshotId};
 use ovecc_core::legacy::{
     DependencyEdge, DependencyRecord, DiffReport, DriftReport, FileRecord, MetricDelta,
     ModuleRecord, RiskLevel, SnapshotRecord, drift_trend,
 };
+use ovecc_core::report::{ChangedFiles, FindingDiff};
 use ovecc_core::util::stable_id;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
@@ -154,6 +155,36 @@ impl FindingRow {
     }
 }
 
+/// Stable, snapshot-independent content identity of a finding, so the *same*
+/// defect in two snapshots collapses to one key and a set-difference yields the
+/// genuinely new ones. Keyed by kind + first-evidence location (path, then the
+/// enclosing symbol when known, else the line) + rule — stable across unrelated
+/// edits elsewhere in the repo, where the volatile per-run `FindingId` is not.
+fn finding_identity(finding: &FindingRecord) -> String {
+    let kind = enum_str(&finding.kind);
+    let rule = finding.rule_name.clone().unwrap_or_default();
+    let (path, locator) = match finding.evidence.first() {
+        Some(evidence) => {
+            let locator = evidence
+                .symbol
+                .clone()
+                .or_else(|| evidence.line.map(|line| line.to_string()))
+                .unwrap_or_default();
+            (evidence.file_path.clone(), locator)
+        }
+        // Evidence-free findings (rare) fall back to target id + title.
+        None => (
+            finding
+                .target
+                .as_ref()
+                .map(|target| target.id.clone())
+                .unwrap_or_default(),
+            finding.title.clone(),
+        ),
+    };
+    stable_id("finding-identity", &[&kind, &path, &locator, &rule])
+}
+
 /// IDs of every row of `table` already persisted for the repository.
 fn existing_ids(tx: &Transaction<'_>, table: &str, repository_id: &str) -> Result<HashSet<String>> {
     let mut statement = tx.prepare(&format!("SELECT id FROM {table} WHERE repository_id = ?"))?;
@@ -202,6 +233,14 @@ fn depends_on_edge_id(
             dependency_id,
         ],
     )
+}
+
+/// Stable ID of a file→file `depends_on` edge. Derived from the owning
+/// dependency's ID alone (like `code_edge_id`) so the delete path — which knows
+/// only the dependency ID — can recompute it. These edges let blast/impact reach
+/// a file's direct dependents, which the coarser module→module edge can't express.
+fn depends_on_file_edge_id(repository_id: &str, dependency_id: &str) -> String {
+    stable_id("edge", &[repository_id, dependency_id, "depends_on_file"])
 }
 
 /// One versioned schema migration. Migrations are append-only:
@@ -487,6 +526,35 @@ const MIGRATION_V4_CODE_HEALTH: &str = r#"
             CREATE INDEX IF NOT EXISTS idx_exports_repo ON exports (repository_id);
             "#;
 
+/// Per-snapshot retention of findings and file hashes. The base schema only
+/// snapshots modules/dependencies/metrics (so drift could trend *counts*); this
+/// retains the findings themselves and the file content hashes, so a change
+/// between two snapshots can be reported as the **named** new defects and scoped
+/// to the files it touched. Append-only, exactly like `snapshot_modules`.
+const MIGRATION_V5_SNAPSHOT_RETENTION: &str = r#"
+            CREATE TABLE IF NOT EXISTS snapshot_findings (
+                snapshot_id TEXT NOT NULL,
+                identity TEXT NOT NULL,
+                id TEXT NOT NULL,
+                finding_kind TEXT NOT NULL,
+                severity TEXT NOT NULL,
+                rule_name TEXT,
+                target_id TEXT,
+                title TEXT NOT NULL,
+                description TEXT NOT NULL,
+                evidence_json TEXT,
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_snapshot_findings_snap ON snapshot_findings (snapshot_id);
+
+            CREATE TABLE IF NOT EXISTS snapshot_files (
+                snapshot_id TEXT NOT NULL,
+                path TEXT NOT NULL,
+                content_hash TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_snapshot_files_snap ON snapshot_files (snapshot_id);
+            "#;
+
 const SCHEMA_MIGRATIONS: &[SchemaMigration] = &[
     SchemaMigration {
         version: 1,
@@ -507,6 +575,11 @@ const SCHEMA_MIGRATIONS: &[SchemaMigration] = &[
         version: 4,
         name: "code_health",
         sql: MIGRATION_V4_CODE_HEALTH,
+    },
+    SchemaMigration {
+        version: 5,
+        name: "snapshot_retention",
+        sql: MIGRATION_V5_SNAPSHOT_RETENTION,
     },
 ];
 
@@ -618,7 +691,10 @@ impl ArchitectureStore {
         let prof_t0 = std::time::Instant::now();
         let mark = |label: &str| {
             if prof {
-                eprintln!("[persist] {label:<14} +{} ms", prof_t0.elapsed().as_millis());
+                eprintln!(
+                    "[persist] {label:<14} +{} ms",
+                    prof_t0.elapsed().as_millis()
+                );
             }
         };
 
@@ -766,6 +842,11 @@ impl ArchitectureStore {
                     target_module_id,
                     dependency_id
                 )])?;
+                // Mirror of the file→file edge added on insert (no-op if absent).
+                delete_edge.execute(params![depends_on_file_edge_id(
+                    repository_id,
+                    dependency_id
+                )])?;
                 stats.dependencies_removed += 1;
             }
             for module_id in &modules_to_remove {
@@ -851,7 +932,13 @@ impl ArchitectureStore {
         {
             let mut nodes = tx.appender("graph_nodes")?;
             for module in &modules_to_add {
-                nodes.append_row(params![module.id, repository_id, "module", module.name, "{}"])?;
+                nodes.append_row(params![
+                    module.id,
+                    repository_id,
+                    "module",
+                    module.name,
+                    "{}"
+                ])?;
             }
             for file in &files_to_add {
                 nodes.append_row(params![file.id, repository_id, "file", file.path, "{}"])?;
@@ -876,6 +963,33 @@ impl ArchitectureStore {
                 ])?;
             }
             for dependency in &dependencies_to_add {
+                // File→file edge first: lets blast/impact reach a file's direct
+                // dependents (the module→module edge alone hides intra-module
+                // coupling). Only internal deps carry a target file node; skip
+                // self-loops.
+                if let Some(target_file_id) = dependency.target_file_id.as_deref()
+                    && !dependency.is_external
+                    && !target_file_id.is_empty()
+                    && dependency.source_file_id != target_file_id
+                {
+                    let file_edge_id = depends_on_file_edge_id(repository_id, &dependency.id);
+                    if seen.insert(file_edge_id.clone()) {
+                        edges.append_row(params![
+                            file_edge_id,
+                            repository_id,
+                            dependency.source_file_id,
+                            target_file_id,
+                            "depends_on",
+                            1.0_f64,
+                            format!(
+                                r#"{{"file":"{}","line":{},"specifier":"{}"}}"#,
+                                dependency.source_file_path,
+                                dependency.evidence_line,
+                                dependency.specifier
+                            )
+                        ])?;
+                    }
+                }
                 let edge_id = depends_on_edge_id(
                     repository_id,
                     &dependency.source_module_id,
@@ -1393,6 +1507,15 @@ impl ArchitectureStore {
                 appender.append_row(params![snapshot_id, name, value])?;
             }
         }
+        {
+            // Retain per-file content hashes so a later review can tell exactly
+            // which files a change added/modified (and scope clone detection to
+            // them). Append-only, like the other snapshot_* tables.
+            let mut appender = tx.appender("snapshot_files")?;
+            for file in files {
+                appender.append_row(params![snapshot_id, file.path, file.content_hash])?;
+            }
+        }
 
         mark("snapshot");
         tx.commit()?;
@@ -1535,6 +1658,32 @@ impl ArchitectureStore {
                     finding.id.as_str(),
                     finding.repository_id.as_str(),
                     finding.snapshot_id.as_ref().map(|s| s.as_str()),
+                    enum_str(&finding.kind),
+                    enum_str(&finding.severity),
+                    finding.rule_name,
+                    finding.target.as_ref().map(|t| t.id.clone()),
+                    finding.title,
+                    finding.description,
+                    evidence_json,
+                    finding.created_at.to_rfc3339(),
+                ])?;
+            }
+        }
+        {
+            // Retain each finding under its snapshot (append-only) so a change
+            // review can diff base→head findings by stable identity and report
+            // the *named* new ones, not just a count delta. The current-state
+            // `findings` table above still backs the point-in-time commands.
+            let mut appender = tx.appender("snapshot_findings")?;
+            for finding in findings {
+                let Some(snapshot_id) = finding.snapshot_id.as_ref() else {
+                    continue;
+                };
+                let evidence_json = serde_json::to_string(&finding.evidence).unwrap_or_default();
+                appender.append_row(params![
+                    snapshot_id.as_str(),
+                    finding_identity(finding),
+                    finding.id.as_str(),
                     enum_str(&finding.kind),
                     enum_str(&finding.severity),
                     finding.rule_name,
@@ -1747,6 +1896,102 @@ impl ArchitectureStore {
         collect_rows(rows)
     }
 
+    /// Commits touching each file (per-file churn), so callers can aggregate
+    /// churn to any component granularity (e.g. directories), not just modules.
+    pub fn file_churn(&self, repository_id: &str) -> Result<Vec<(String, f64)>> {
+        let mut statement = self.conn.prepare(
+            "SELECT f.path, COUNT(fc.id)
+             FROM files f
+             LEFT JOIN file_changes fc
+               ON fc.file_path = f.path AND fc.repository_id = f.repository_id
+             WHERE f.repository_id = ?
+             GROUP BY f.path",
+        )?;
+        let rows = statement.query_map(params![repository_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as f64))
+        })?;
+        collect_rows(rows)
+    }
+
+    /// Total cognitive complexity per file (oxc), for per-component aggregation.
+    pub fn file_complexity(&self, repository_id: &str) -> Result<Vec<(String, f64)>> {
+        let mut statement = self.conn.prepare(
+            "SELECT f.path, SUM(c.cognitive)::BIGINT
+             FROM complexity c
+             JOIN files f ON c.file_id = f.id AND c.repository_id = f.repository_id
+             WHERE c.repository_id = ?
+             GROUP BY f.path",
+        )?;
+        let rows = statement.query_map(params![repository_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as f64))
+        })?;
+        collect_rows(rows)
+    }
+
+    /// Per-file `(abstract_types, total_types)` for Martin's Abstractness
+    /// `A = abstract / total`. Abstract types are interfaces and traits; the
+    /// denominator counts the type-defining symbols (class, struct, enum,
+    /// interface, trait), not functions or variables. Files with no type
+    /// declarations are omitted. Feeds the `metrics` report and the
+    /// `zone_of_pain` detector.
+    pub fn file_abstractness(&self, repository_id: &str) -> Result<Vec<(String, f64, f64)>> {
+        let mut statement = self.conn.prepare(
+            "SELECT f.path,
+                    SUM(CASE WHEN s.kind IN ('interface','trait') THEN 1 ELSE 0 END)::BIGINT,
+                    COUNT(*)::BIGINT
+             FROM symbols s
+             JOIN files f ON s.file_id = f.id AND s.repository_id = f.repository_id
+             WHERE s.repository_id = ?
+               AND s.kind IN ('class','struct','enum','interface','trait')
+             GROUP BY f.path",
+        )?;
+        let rows = statement.query_map(params![repository_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)? as f64,
+                row.get::<_, i64>(2)? as f64,
+            ))
+        })?;
+        collect_rows(rows)
+    }
+
+    /// Pairs of files that changed together in the same commit, with how many
+    /// times — the evolutionary "change coupling" signal. Bulk commits (more
+    /// than 30 files: merges, mass reformats) are excluded as noise, and only
+    /// pairs that co-changed at least 3 times are returned. Empty without git
+    /// history. Feeds the `change_coupling` and `modularity_violation`
+    /// detectors.
+    pub fn co_change_pairs(&self, repository_id: &str) -> Result<Vec<(String, String, f64)>> {
+        let mut statement = self.conn.prepare(
+            "WITH sized AS (
+                 SELECT commit_id
+                 FROM file_changes
+                 WHERE repository_id = ?
+                 GROUP BY commit_id
+                 HAVING COUNT(*) BETWEEN 2 AND 30
+             )
+             SELECT a.file_path, b.file_path, COUNT(*)
+             FROM file_changes a
+             JOIN file_changes b
+               ON a.commit_id = b.commit_id
+              AND a.repository_id = b.repository_id
+              AND a.file_path < b.file_path
+             WHERE a.repository_id = ?
+               AND a.commit_id IN (SELECT commit_id FROM sized)
+             GROUP BY a.file_path, b.file_path
+             HAVING COUNT(*) >= 3
+             ORDER BY a.file_path, b.file_path",
+        )?;
+        let rows = statement.query_map(params![repository_id, repository_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)? as f64,
+            ))
+        })?;
+        collect_rows(rows)
+    }
+
     /// Number of persisted graph edges of a given kind for a repository.
     pub fn count_edges(&self, repository_id: &str, edge_kind: &str) -> Result<usize> {
         let count = self.conn.query_row(
@@ -1806,7 +2051,10 @@ impl ArchitectureStore {
                 "SELECT id, commit_sha, created_at FROM snapshots WHERE repository_id = ? ORDER BY created_at DESC LIMIT 1 OFFSET 1"
             }
             _ => {
-                return self.resolve_named_snapshot(repository_id, normalized);
+                // Pass the ORIGINAL reference (not the stripped form): snapshot
+                // ids are stored with their `snapshot:` prefix, so resolution
+                // must stay idempotent for an already-resolved id.
+                return self.resolve_named_snapshot(repository_id, reference);
             }
         };
 
@@ -1931,23 +2179,157 @@ impl ArchitectureStore {
         })
     }
 
+    /// The findings a change introduced (`new`) or removed (`resolved`) between
+    /// two snapshots, computed from the retained per-snapshot findings by stable
+    /// content identity. Unlike [`drift`](Self::drift) (which trends *counts*),
+    /// this returns the **named** findings with their `file:line` evidence — the
+    /// core of `ovecc review`. A finding is "new" when its identity is present in
+    /// `head` but absent from `base`.
+    pub fn finding_diff(&self, repository_id: &str, base: &str, head: &str) -> Result<FindingDiff> {
+        let base = self
+            .resolve_snapshot(repository_id, base)?
+            .ok_or_else(|| anyhow!("could not resolve base snapshot '{base}'"))?;
+        let head = self
+            .resolve_snapshot(repository_id, head)?
+            .ok_or_else(|| anyhow!("could not resolve head snapshot '{head}'"))?;
+        Ok(FindingDiff {
+            new: self.snapshot_findings_minus(repository_id, &head.id, &base.id)?,
+            resolved: self.snapshot_findings_minus(repository_id, &base.id, &head.id)?,
+        })
+    }
+
+    /// Findings retained in `snapshot_id` whose identity is absent from
+    /// `other_snapshot_id`, reconstructed as full records, most-severe first then
+    /// by title (deterministic).
+    fn snapshot_findings_minus(
+        &self,
+        repository_id: &str,
+        snapshot_id: &str,
+        other_snapshot_id: &str,
+    ) -> Result<Vec<FindingRecord>> {
+        let mut statement = self.conn.prepare(
+            "SELECT id, snapshot_id, finding_kind, severity, rule_name, target_id, title, description, evidence_json, created_at
+             FROM snapshot_findings
+             WHERE snapshot_id = ?
+               AND identity NOT IN (SELECT identity FROM snapshot_findings WHERE snapshot_id = ?)",
+        )?;
+        let rows = statement.query_map(params![snapshot_id, other_snapshot_id], |row| {
+            Ok(FindingRow {
+                id: row.get(0)?,
+                snapshot_id: row.get(1)?,
+                kind: row.get(2)?,
+                severity: row.get(3)?,
+                rule_name: row.get(4)?,
+                target_id: row.get(5)?,
+                title: row.get(6)?,
+                description: row.get(7)?,
+                evidence_json: row.get(8)?,
+                created_at: row.get(9)?,
+            })
+        })?;
+        let mut findings: Vec<FindingRecord> = collect_rows::<FindingRow>(rows)?
+            .into_iter()
+            .map(|row| row.into_record(repository_id))
+            .collect();
+        findings.sort_by(|a, b| {
+            b.severity
+                .cmp(&a.severity)
+                .then_with(|| a.title.cmp(&b.title))
+        });
+        Ok(findings)
+    }
+
+    /// Files added/modified/removed between two snapshots, by content hash, so a
+    /// review can scope per-file analyses (e.g. duplication) to what changed.
+    pub fn changed_files(
+        &self,
+        repository_id: &str,
+        base: &str,
+        head: &str,
+    ) -> Result<ChangedFiles> {
+        let base = self
+            .resolve_snapshot(repository_id, base)?
+            .ok_or_else(|| anyhow!("could not resolve base snapshot '{base}'"))?;
+        let head = self
+            .resolve_snapshot(repository_id, head)?
+            .ok_or_else(|| anyhow!("could not resolve head snapshot '{head}'"))?;
+        let base_files = self.snapshot_file_hashes(&base.id)?;
+        let head_files = self.snapshot_file_hashes(&head.id)?;
+
+        let mut changed = ChangedFiles::default();
+        for (path, hash) in &head_files {
+            match base_files.get(path) {
+                None => changed.added.push(path.clone()),
+                Some(base_hash) if base_hash != hash => changed.modified.push(path.clone()),
+                Some(_) => {}
+            }
+        }
+        for path in base_files.keys() {
+            if !head_files.contains_key(path) {
+                changed.removed.push(path.clone());
+            }
+        }
+        changed.added.sort();
+        changed.modified.sort();
+        changed.removed.sort();
+        Ok(changed)
+    }
+
+    fn snapshot_file_hashes(&self, snapshot_id: &str) -> Result<HashMap<String, String>> {
+        let mut statement = self
+            .conn
+            .prepare("SELECT path, content_hash FROM snapshot_files WHERE snapshot_id = ?")?;
+        let rows = statement.query_map(params![snapshot_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        Ok(collect_rows::<(String, String)>(rows)?
+            .into_iter()
+            .collect())
+    }
+
+    /// Module names recorded in a snapshot, as a vector (the cycle enumerators
+    /// take `&[String]`). Mirrors the private set form used by `diff`.
+    pub fn snapshot_module_names(&self, snapshot_id: &str) -> Result<Vec<String>> {
+        Ok(self.snapshot_modules(snapshot_id)?.into_iter().collect())
+    }
+
+    /// In-repository module→module edges recorded in a snapshot, for enumerating
+    /// that snapshot's cycle set (external edges never form a cycle).
+    pub fn snapshot_module_edges(&self, snapshot_id: &str) -> Result<Vec<(String, String)>> {
+        Ok(self
+            .snapshot_dependency_edges(snapshot_id)?
+            .into_iter()
+            .filter(|edge| !edge.is_external)
+            .map(|edge| (edge.source_module, edge.target_module))
+            .collect())
+    }
+
     fn resolve_named_snapshot(
         &self,
         repository_id: &str,
         reference: &str,
     ) -> Result<Option<SnapshotRecord>> {
+        // Accept any of: a full snapshot id (`snapshot:abc…`), a bare hash
+        // (`abc…`), a short prefix, or a commit SHA. Snapshot ids are stored
+        // with their `snapshot:` prefix, so we match the raw reference *and* a
+        // `snapshot:`-prefixed form (exact and as a prefix), which makes
+        // resolution idempotent for an already-resolved id.
+        let normalized = reference.strip_prefix("snapshot:").unwrap_or(reference);
+        let prefixed = format!("snapshot:{normalized}");
         let mut statement = self.conn.prepare(
             "SELECT id, commit_sha, created_at
              FROM snapshots
              WHERE repository_id = ?
-               AND (id = ? OR commit_sha = ? OR starts_with(id, ?) OR starts_with(COALESCE(commit_sha, ''), ?))
+               AND (id = ? OR id = ? OR starts_with(id, ?)
+                    OR commit_sha = ? OR starts_with(COALESCE(commit_sha, ''), ?))
              ORDER BY created_at DESC
              LIMIT 1",
         )?;
         let mut rows = statement.query(params![
             repository_id,
             reference,
-            reference,
+            prefixed,
+            prefixed,
             reference,
             reference
         ])?;
@@ -2091,8 +2473,8 @@ mod tests {
 
         let version = store.migrate_to_latest().unwrap();
 
-        assert_eq!(version, 4);
-        assert_eq!(store.schema_version().unwrap(), Some(4));
+        assert_eq!(version, 5);
+        assert_eq!(store.schema_version().unwrap(), Some(5));
         for table in [
             "repositories",
             "files",
@@ -2114,6 +2496,8 @@ mod tests {
             "packages",
             "complexity",
             "exports",
+            "snapshot_findings",
+            "snapshot_files",
         ] {
             assert!(table_exists(&store, table), "missing table {table}");
         }
@@ -2125,15 +2509,212 @@ mod tests {
         store.migrate_to_latest().unwrap();
         store.migrate_to_latest().unwrap();
 
-        assert_eq!(store.schema_version().unwrap(), Some(4));
+        assert_eq!(store.schema_version().unwrap(), Some(5));
         let applied: i64 = store
             .conn
             .query_row("SELECT count(*) FROM ovecc_schema", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(applied, 4, "each migration must be recorded exactly once");
+        assert_eq!(applied, 5, "each migration must be recorded exactly once");
     }
 
     use ovecc_core::legacy::SourceLanguage;
+
+    fn sample_finding(
+        snapshot: &str,
+        kind: ovecc_core::facts::FindingKind,
+        path: &str,
+        line: u32,
+        symbol: &str,
+        severity: ovecc_core::facts::Severity,
+    ) -> FindingRecord {
+        use ovecc_core::facts::Evidence;
+        FindingRecord {
+            id: FindingId::from_raw(format!("{snapshot}:{path}:{symbol}")),
+            repository_id: RepositoryId::from_raw("repo:test"),
+            snapshot_id: Some(SnapshotId::from_raw(snapshot)),
+            kind,
+            severity,
+            rule_name: Some("r".to_string()),
+            target: None,
+            title: format!("{symbol} issue"),
+            description: "d".to_string(),
+            evidence: vec![Evidence {
+                file_path: path.to_string(),
+                line: Some(line),
+                symbol: Some(symbol.to_string()),
+                detail: None,
+            }],
+            created_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn finding_diff_reports_named_new_and_resolved_findings() {
+        use ovecc_core::facts::{FindingKind, Severity};
+        let (_dir, mut store) = temp_store();
+        store.migrate_to_latest().unwrap();
+        let repo = "repo:test";
+        let module = sample_module(repo, "billing");
+        let file = sample_file(repo, "src/billing/a.ts", "h", &module);
+        let index = |store: &mut ArchitectureStore, snap: &str| {
+            store
+                .sync_current_index(
+                    repo,
+                    "/tmp/repo",
+                    std::slice::from_ref(&module),
+                    std::slice::from_ref(&file),
+                    &[],
+                    snap,
+                    None,
+                    &[],
+                    &ResolvedCode::default(),
+                )
+                .unwrap();
+        };
+
+        // Base: one pre-existing complexity finding.
+        index(&mut store, "snap-base");
+        store
+            .replace_findings(
+                repo,
+                &[sample_finding(
+                    "snap-base",
+                    FindingKind::HighComplexity,
+                    "src/billing/a.ts",
+                    10,
+                    "oldFn",
+                    Severity::Medium,
+                )],
+            )
+            .unwrap();
+
+        // Head: the SAME complexity finding (new snapshot id, identical identity)
+        // plus a genuinely new hardcoded secret.
+        index(&mut store, "snap-head");
+        store
+            .replace_findings(
+                repo,
+                &[
+                    sample_finding(
+                        "snap-head",
+                        FindingKind::HighComplexity,
+                        "src/billing/a.ts",
+                        10,
+                        "oldFn",
+                        Severity::Medium,
+                    ),
+                    sample_finding(
+                        "snap-head",
+                        FindingKind::HardcodedSecret,
+                        "src/billing/a.ts",
+                        3,
+                        "TOKEN",
+                        Severity::Critical,
+                    ),
+                ],
+            )
+            .unwrap();
+
+        // Only the secret is new; the unchanged complexity finding is not.
+        let diff = store.finding_diff(repo, "snap-base", "snap-head").unwrap();
+        assert_eq!(diff.new.len(), 1, "only the genuinely new finding");
+        assert_eq!(diff.new[0].kind, FindingKind::HardcodedSecret);
+        assert_eq!(diff.new[0].evidence[0].file_path, "src/billing/a.ts");
+        assert_eq!(diff.new[0].evidence[0].line, Some(3));
+        assert!(diff.resolved.is_empty(), "nothing was removed base->head");
+
+        // Reversed direction: the secret reads as "resolved", nothing new.
+        let reversed = store.finding_diff(repo, "snap-head", "snap-base").unwrap();
+        assert!(reversed.new.is_empty());
+        assert_eq!(reversed.resolved.len(), 1);
+        assert_eq!(reversed.resolved[0].kind, FindingKind::HardcodedSecret);
+    }
+
+    #[test]
+    fn changed_files_classifies_added_modified_removed() {
+        let (_dir, mut store) = temp_store();
+        store.migrate_to_latest().unwrap();
+        let repo = "repo:test";
+        let module = sample_module(repo, "billing");
+        let a = sample_file(repo, "src/a.ts", "h1", &module);
+        let shared = sample_file(repo, "src/shared.ts", "hX", &module);
+        store
+            .sync_current_index(
+                repo,
+                "/tmp/repo",
+                std::slice::from_ref(&module),
+                &[a.clone(), shared.clone()],
+                &[],
+                "snap-base",
+                None,
+                &[],
+                &ResolvedCode::default(),
+            )
+            .unwrap();
+
+        // Head: a.ts removed, shared.ts modified (hX -> hY), new.ts added.
+        let shared_v2 = sample_file(repo, "src/shared.ts", "hY", &module);
+        let new = sample_file(repo, "src/new.ts", "h2", &module);
+        store
+            .sync_current_index(
+                repo,
+                "/tmp/repo",
+                std::slice::from_ref(&module),
+                &[shared_v2, new],
+                &[],
+                "snap-head",
+                None,
+                &[],
+                &ResolvedCode::default(),
+            )
+            .unwrap();
+
+        let changed = store.changed_files(repo, "snap-base", "snap-head").unwrap();
+        assert_eq!(changed.added, vec!["src/new.ts".to_string()]);
+        assert_eq!(changed.modified, vec!["src/shared.ts".to_string()]);
+        assert_eq!(changed.removed, vec!["src/a.ts".to_string()]);
+        assert_eq!(
+            changed.touched().count(),
+            2,
+            "added + modified are 'touched'"
+        );
+    }
+
+    #[test]
+    fn resolve_snapshot_is_idempotent_for_a_full_id() {
+        // A real snapshot id is `snapshot:<hash>` (see `stable_id`). Resolving a
+        // keyword like `latest` returns that full id; feeding it straight back
+        // must round-trip — otherwise change-scoped commands that resolve, then
+        // re-resolve the resulting id (review/diff) break.
+        let (_dir, mut store) = temp_store();
+        store.migrate_to_latest().unwrap();
+        let repo = "repo:test";
+        let module = sample_module(repo, "billing");
+        let file = sample_file(repo, "src/billing/a.ts", "h", &module);
+        store
+            .sync_current_index(
+                repo,
+                "/tmp/repo",
+                std::slice::from_ref(&module),
+                std::slice::from_ref(&file),
+                &[],
+                "snapshot:abcdef123456",
+                None,
+                &[],
+                &ResolvedCode::default(),
+            )
+            .unwrap();
+
+        let latest = store.resolve_snapshot(repo, "latest").unwrap().unwrap();
+        assert_eq!(latest.id, "snapshot:abcdef123456");
+        let by_full_id = store.resolve_snapshot(repo, &latest.id).unwrap();
+        assert_eq!(by_full_id.map(|s| s.id), Some(latest.id.clone()));
+        // A bare hash and a short prefix (with or without the keyword) also work.
+        let bare = store.resolve_snapshot(repo, "abcdef123456").unwrap();
+        assert_eq!(bare.map(|s| s.id), Some(latest.id.clone()));
+        let short = store.resolve_snapshot(repo, "snapshot:abcdef").unwrap();
+        assert_eq!(short.map(|s| s.id), Some(latest.id));
+    }
 
     fn sample_module(repo: &str, name: &str) -> ModuleRecord {
         ModuleRecord {
@@ -2323,8 +2904,8 @@ mod tests {
         );
         assert_eq!(count(&store, "SELECT count(*) FROM files"), 2);
         assert_eq!(count(&store, "SELECT count(*) FROM snapshots"), 2);
-        // 2 contains edges + 1 depends_on edge
-        assert_eq!(count(&store, "SELECT count(*) FROM graph_edges"), 3);
+        // 2 contains edges + 1 module depends_on + 1 file→file depends_on edge
+        assert_eq!(count(&store, "SELECT count(*) FROM graph_edges"), 4);
 
         // Changed content hash: file row is rewritten, nothing duplicated.
         let mut f1_changed = f1.clone();
@@ -2383,11 +2964,13 @@ mod tests {
 
         let version = store.migrate_to_latest().unwrap();
 
-        assert_eq!(version, 4);
+        assert_eq!(version, 5);
         assert!(table_exists(&store, "findings"));
         assert!(table_exists(&store, "packages"));
         assert!(table_exists(&store, "complexity"));
         assert!(table_exists(&store, "exports"));
+        assert!(table_exists(&store, "snapshot_findings"));
+        assert!(table_exists(&store, "snapshot_files"));
     }
 
     #[test]

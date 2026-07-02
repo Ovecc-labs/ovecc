@@ -1,0 +1,156 @@
+# Lint, build, test, and publish downloadable ovecc binaries.
+#
+# - `lint` runs fmt + clippy on Linux. rustfmt blocks everything downstream;
+#   clippy is non-blocking (reported as annotations only).
+# - `build-test` runs on every push to `mvp` or `main` and every PR, on Linux +
+#   Windows, compiling and testing in release mode. The heavy dependencies
+#   (DuckDB's bundled C++ build, oxc, tree-sitter) are cached by
+#   Swatinem/rust-cache, so only the first run per OS pays the full ~15-20 min;
+#   later runs are minutes.
+# - `release` runs only on push to `main` (or manual dispatch from main). It
+#   recreates a rolling "latest" GitHub Release with both binaries attached, so
+#   the newest Linux and Windows builds are always downloadable.
+#
+# Windows uses the GNU (MinGW-w64) toolchain — the supported path per
+# docs/dev/SETUP.md. We install the gnu host toolchain and MSYS2's gcc so
+# .cargo/config.toml (big-obj assembly + static MinGW/rstrtmgr linking) applies
+# and produces the same self-contained ovecc.exe as a local build. MSVC is NOT
+# used: it would require patching crates/ovecc-db/build.rs and pinning VS 14.41.
+name: CI
+
+on:
+  push:
+    branches: [mvp, main]
+  pull_request:
+  workflow_dispatch:
+
+# Default to read-only; the release job opts into write for creating releases.
+permissions:
+  contents: read
+
+# Supersede in-flight runs on the same ref so pushes don't race on the release.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: Lint (fmt + clippy)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (+ rustfmt, clippy)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry + target
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: lint
+
+      - name: rustfmt
+        run: cargo fmt --all --check
+
+      - name: clippy
+        # Non-blocking: clippy findings are reported as annotations but do not
+        # fail the job or gate downstream builds/releases.
+        continue-on-error: true
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+  build-test:
+    name: Build & test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            toolchain: stable
+            asset: ovecc-linux-x86_64
+            ext: ""
+          - os: windows-latest
+            toolchain: stable-x86_64-pc-windows-gnu
+            asset: ovecc-windows-x86_64.exe
+            ext: ".exe"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (${{ matrix.toolchain }})
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.toolchain }}
+
+      # Windows: DuckDB + ring compile from C/C++, so we need a real MinGW gcc.
+      # rustup's gnu toolchain only ships link libs, not a compiler.
+      - name: Set up MinGW-w64 (Windows)
+        if: runner.os == 'Windows'
+        id: msys2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: false
+          install: mingw-w64-x86_64-gcc
+
+      - name: Put MinGW-w64 first on PATH (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: echo "${{ steps.msys2.outputs.msys2-location }}/mingw64/bin" >> "$GITHUB_PATH"
+
+      - name: Cache cargo registry + target
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build (release)
+        run: cargo build --release --bin ovecc
+
+      - name: Test (release)
+        run: cargo test --release
+
+      - name: Package binary
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp "target/release/ovecc${{ matrix.ext }}" "dist/${{ matrix.asset }}"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: dist/${{ matrix.asset }}
+          if-no-files-found: error
+
+  release:
+    name: Publish rolling "latest" release
+    needs: [lint, build-test]
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Recreate the "latest" release with fresh binaries
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Drop the previous rolling release and its tag (ignore if absent),
+          # then recreate it at this commit with the new assets.
+          gh release delete latest --yes --cleanup-tag 2>/dev/null || true
+          gh release create latest \
+            --title "Latest build (${GITHUB_SHA::7})" \
+            --notes "Rolling build from \`${GITHUB_SHA}\` — Linux + Windows x86_64 binaries." \
+            --target "${GITHUB_SHA}" \
+            --latest \
+            dist/*

@@ -95,27 +95,48 @@ mod tests {
     #[test]
     fn every_error_variant_maps_to_its_exit_code() {
         assert_eq!(
-            OveccError::Usage { message: "x".into() }.exit_code(),
+            OveccError::Usage {
+                message: "x".into()
+            }
+            .exit_code(),
             ExitCode::Usage
         );
         assert_eq!(
-            OveccError::Repository { message: "x".into() }.exit_code(),
+            OveccError::Repository {
+                message: "x".into()
+            }
+            .exit_code(),
             ExitCode::Repository
         );
         assert_eq!(
-            OveccError::Index { message: "x".into(), source: None }.exit_code(),
+            OveccError::Index {
+                message: "x".into(),
+                source: None
+            }
+            .exit_code(),
             ExitCode::Index
         );
         assert_eq!(
-            OveccError::Parser { path: "a.ts".into(), message: "x".into() }.exit_code(),
+            OveccError::Parser {
+                path: "a.ts".into(),
+                message: "x".into()
+            }
+            .exit_code(),
             ExitCode::Parser
         );
         assert_eq!(
-            OveccError::Git { message: "x".into(), source: None }.exit_code(),
+            OveccError::Git {
+                message: "x".into(),
+                source: None
+            }
+            .exit_code(),
             ExitCode::Git
         );
         assert_eq!(
-            OveccError::Internal { message: "x".into() }.exit_code(),
+            OveccError::Internal {
+                message: "x".into()
+            }
+            .exit_code(),
             ExitCode::Internal
         );
     }

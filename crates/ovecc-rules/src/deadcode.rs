@@ -17,9 +17,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use chrono::Utc;
-use ovecc_core::facts::{
-    EntityRef, Evidence, ExportFact, FindingKind, FindingRecord, Severity,
-};
+use ovecc_core::facts::{EntityRef, Evidence, ExportFact, FindingKind, FindingRecord, Severity};
 use ovecc_core::graph::NodeKind;
 use ovecc_core::id::{FindingId, RepositoryId, SnapshotId};
 
@@ -56,7 +54,10 @@ pub fn analyze(input: &DeadCodeInput<'_>) -> Vec<FindingRecord> {
 
     let mut exports_by_file: HashMap<&str, Vec<&ExportFact>> = HashMap::new();
     for (file, export) in input.exports {
-        exports_by_file.entry(file.as_str()).or_default().push(export);
+        exports_by_file
+            .entry(file.as_str())
+            .or_default()
+            .push(export);
     }
 
     // Out-edges for reachability (importer -> imported internal files).
@@ -69,32 +70,103 @@ pub fn analyze(input: &DeadCodeInput<'_>) -> Vec<FindingRecord> {
     }
     let reachable = bfs_reachable(input.entry_points, &out_edges);
 
-    // refs[(target_file, export_name)] = set of importer files.
-    let mut refs: HashMap<(&str, String), HashSet<&str>> = HashMap::new();
+    // A re-exported name is "used" only when something downstream actually
+    // consumes it. Crediting a re-export *forward* as a use outright (the way a
+    // plain consuming import is credited) hides dead code that is mechanically
+    // forwarded through a barrel: `index` imports `a` from a barrel that
+    // `export {a, b}`s from a leaf, and `b` — forwarded the whole way but never
+    // consumed — looks used. So separate forwards from real uses and propagate
+    // usage along the re-export chain to a fixpoint.
+    let mut reexport_names: HashMap<&str, HashSet<&str>> = HashMap::new();
+    for (file, export) in input.exports {
+        if export.re_export.is_some() {
+            reexport_names
+                .entry(file.as_str())
+                .or_default()
+                .insert(export.name.as_str());
+        }
+    }
+
+    // `used` holds every (file, export) reached from a real consumer or the
+    // public (entry-point) surface; `forwards` carries the re-export hops along
+    // which that usage propagates.
+    let mut used: HashSet<(&str, &str)> = HashSet::new();
+    let mut worklist: Vec<(&str, &str)> = Vec::new();
+    let mut forwards: Vec<((&str, &str), (&str, &str))> = Vec::new();
+
+    // The public surface: every export of an entry-point file is a usage root, so
+    // a library barrel that re-exports its API never flags that API as dead.
+    for (file, export) in input.exports {
+        if input.entry_points.contains(file) {
+            let key = (file.as_str(), export.name.as_str());
+            if used.insert(key) {
+                worklist.push(key);
+            }
+        }
+    }
+
     for edge in input.imports {
+        // An import from an unreachable file is itself dead; it cannot keep
+        // anything alive (its target is reachable iff its source is).
+        if !reachable.contains(edge.source_file.as_str()) {
+            continue;
+        }
         let exported = exports_by_file.get(edge.target_file.as_str());
+        let forwarded_here = reexport_names.get(edge.source_file.as_str());
         if edge.is_namespace {
+            // `import *` (or an un-named `export *`): credit every export of the
+            // target outright. That is the conservative choice — it can only miss
+            // dead code, never invent a false positive.
             if let Some(exports) = exported {
                 for export in exports {
-                    refs.entry((edge.target_file.as_str(), export.name.clone()))
-                        .or_default()
-                        .insert(edge.source_file.as_str());
+                    let key = (edge.target_file.as_str(), export.name.as_str());
+                    if used.insert(key) {
+                        worklist.push(key);
+                    }
                 }
             }
-        } else {
-            for name in &edge.imported_names {
-                let exports_name = exported.is_some_and(|exports| exports.iter().any(|e| &e.name == name));
-                if exports_name {
-                    refs.entry((edge.target_file.as_str(), name.clone()))
-                        .or_default()
-                        .insert(edge.source_file.as_str());
+            continue;
+        }
+        for name in &edge.imported_names {
+            let exports_name =
+                exported.is_some_and(|exports| exports.iter().any(|e| &e.name == name));
+            if !exports_name {
+                continue;
+            }
+            if forwarded_here.is_some_and(|set| set.contains(name.as_str())) {
+                // A re-export forward: usage flows *through* it, it does not
+                // create it. (An aliased `export { a as b }` falls through to the
+                // real-use arm instead, which only ever over-credits — safe.)
+                forwards.push((
+                    (edge.source_file.as_str(), name.as_str()),
+                    (edge.target_file.as_str(), name.as_str()),
+                ));
+            } else {
+                let key = (edge.target_file.as_str(), name.as_str());
+                if used.insert(key) {
+                    worklist.push(key);
+                }
+            }
+        }
+    }
+
+    // Propagate usage across re-export hops until it stops spreading.
+    let mut forward_index: HashMap<(&str, &str), Vec<(&str, &str)>> = HashMap::new();
+    for (from, to) in forwards {
+        forward_index.entry(from).or_default().push(to);
+    }
+    while let Some(key) = worklist.pop() {
+        if let Some(targets) = forward_index.get(&key) {
+            for &target in targets {
+                if used.insert(target) {
+                    worklist.push(target);
                 }
             }
         }
     }
 
     let mut findings = Vec::new();
-    flag_unused_exports(input, &reachable, &refs, &mut findings);
+    flag_unused_exports(input, &reachable, &used, &mut findings);
     flag_unused_files(input, &reachable, &exports_by_file, &mut findings);
     // Sort by id, then drop any exact-id duplicates. The id carries the source
     // location, so genuinely distinct declarations (a name exported twice in one
@@ -135,7 +207,7 @@ fn bfs_reachable<'a>(
 fn flag_unused_exports(
     input: &DeadCodeInput<'_>,
     reachable: &HashSet<&str>,
-    refs: &HashMap<(&str, String), HashSet<&str>>,
+    used: &HashSet<(&str, &str)>,
     out: &mut Vec<FindingRecord>,
 ) {
     for (file, export) in input.exports {
@@ -149,25 +221,47 @@ fn flag_unused_exports(
         {
             continue;
         }
-        let referenced = refs
-            .get(&(file.as_str(), export.name.clone()))
-            .is_some_and(|importers| importers.iter().any(|importer| reachable.contains(importer)));
-        if referenced {
+        if used.contains(&(file.as_str(), export.name.as_str())) {
             continue;
         }
+        // Type-only exports are reported under the same `UnusedExport` kind (so
+        // counts, gate, and baselines are unchanged) but carry the `unused-type`
+        // rule and a `type-only` detail so callers can filter them — and an
+        // unused type is even safer to drop than a value (no runtime effect).
+        let (title, description, rule, detail) = if export.is_type_only {
+            (
+                format!("Unused type export: {} in {file}", export.name),
+                format!(
+                    "type '{}' is exported from {file} but never imported by a reachable \
+                     module. Safe to remove — types have no runtime effect.",
+                    export.name
+                ),
+                "unused-type",
+                Some("type-only"),
+            )
+        } else {
+            (
+                format!("Unused export: {} in {file}", export.name),
+                format!(
+                    "'{}' is exported from {file} but never imported by a reachable module. \
+                     Candidate for removal (verify it is not a public API surface).",
+                    export.name
+                ),
+                "unused-export",
+                None,
+            )
+        };
         out.push(finding(
             input,
             FindingKind::UnusedExport,
             Severity::Low,
             file,
             export.line,
-            format!("Unused export: {} in {file}", export.name),
-            format!(
-                "'{}' is exported from {file} but never imported by a reachable module. \
-                 Candidate for removal (verify it is not a public API surface).",
-                export.name
-            ),
+            title,
+            description,
             Some(export.name.clone()),
+            rule,
+            detail,
         ));
     }
 }
@@ -199,9 +293,11 @@ fn flag_unused_files(
             continue;
         }
         // Imported by any reachable file? (would have been reachable, but guard anyway)
-        let imported_by_reachable = importers_of
-            .get(path)
-            .is_some_and(|importers| importers.iter().any(|importer| reachable.contains(importer)));
+        let imported_by_reachable = importers_of.get(path).is_some_and(|importers| {
+            importers
+                .iter()
+                .any(|importer| reachable.contains(importer))
+        });
         if imported_by_reachable {
             continue;
         }
@@ -213,6 +309,8 @@ fn flag_unused_files(
             1,
             format!("Unused file: {file}"),
             format!("{file} is not reachable from any entry point and nothing imports it."),
+            None,
+            "unused-file",
             None,
         ));
     }
@@ -265,7 +363,12 @@ fn finding(
     title: String,
     description: String,
     symbol: Option<String>,
+    rule: &str,
+    detail: Option<&str>,
 ) -> FindingRecord {
+    // The id slug is keyed on the kind (stable for baselines/fingerprints), even
+    // when the displayed `rule` differs (e.g. an `unused-type` is still an
+    // `UnusedExport`).
     let kind_slug = match kind {
         FindingKind::UnusedExport => "unused-export",
         _ => "unused-file",
@@ -288,7 +391,7 @@ fn finding(
         snapshot_id: input.snapshot_id.map(SnapshotId::from_raw),
         kind,
         severity,
-        rule_name: Some(kind_slug.to_string()),
+        rule_name: Some(rule.to_string()),
         target: Some(EntityRef {
             kind: NodeKind::File,
             id: file.to_string(),
@@ -299,7 +402,7 @@ fn finding(
             file_path: file.to_string(),
             line: Some(line),
             symbol,
-            detail: None,
+            detail: detail.map(|d| d.to_string()),
         }],
         created_at: Utc::now(),
     }
@@ -382,11 +485,45 @@ mod tests {
     }
 
     #[test]
-    fn flags_unused_file() {
-        let files = vec![
-            "src/index.ts".to_string(),
-            "src/orphan.ts".to_string(),
+    fn unused_type_export_is_tagged_unused_type_but_keeps_kind() {
+        // A type-only export that's unused must stay `UnusedExport` (so counts,
+        // gate, and baselines are unchanged) yet carry the `unused-type` rule and
+        // a `type-only` detail so it is filterable as a distinct category.
+        let files = vec!["src/index.ts".to_string(), "src/types.ts".to_string()];
+        let mut type_export = export_at("Orphaned", 5);
+        type_export.is_type_only = true;
+        let exports = vec![
+            ("src/types.ts".to_string(), export_at("used", 1)),
+            ("src/types.ts".to_string(), type_export),
         ];
+        let imports = vec![ImportEdge {
+            source_file: "src/index.ts".to_string(),
+            target_file: "src/types.ts".to_string(),
+            imported_names: vec!["used".to_string()],
+            is_namespace: false,
+        }];
+        let input = DeadCodeInput {
+            repository_id: "r",
+            snapshot_id: None,
+            files: &files,
+            entry_points: &entry(&["src/index.ts"]),
+            exports: &exports,
+            imports: &imports,
+        };
+        let findings = analyze(&input);
+        let found = findings
+            .iter()
+            .find(|f| f.title.contains("Orphaned"))
+            .expect("unused type export flagged");
+        assert_eq!(found.kind, FindingKind::UnusedExport);
+        assert_eq!(found.rule_name.as_deref(), Some("unused-type"));
+        assert!(found.title.contains("Unused type export"));
+        assert_eq!(found.evidence[0].detail.as_deref(), Some("type-only"));
+    }
+
+    #[test]
+    fn flags_unused_file() {
+        let files = vec!["src/index.ts".to_string(), "src/orphan.ts".to_string()];
         let exports = vec![("src/orphan.ts".to_string(), export("thing"))];
         let input = DeadCodeInput {
             repository_id: "r",
@@ -398,8 +535,9 @@ mod tests {
         };
         let findings = analyze(&input);
         assert!(
-            findings.iter().any(|f| f.kind == FindingKind::UnusedFile
-                && f.title.contains("orphan")),
+            findings
+                .iter()
+                .any(|f| f.kind == FindingKind::UnusedFile && f.title.contains("orphan")),
             "{findings:?}"
         );
     }
@@ -435,8 +573,14 @@ mod tests {
             .iter()
             .filter(|f| f.kind == FindingKind::UnusedExport && f.title.contains("Widget"))
             .count();
-        assert_eq!(widgets, 2, "both same-named exports must be reported: {findings:?}");
-        assert!(unique_ids(&findings), "finding ids must be unique: {findings:?}");
+        assert_eq!(
+            widgets, 2,
+            "both same-named exports must be reported: {findings:?}"
+        );
+        assert!(
+            unique_ids(&findings),
+            "finding ids must be unique: {findings:?}"
+        );
     }
 
     #[test]
@@ -469,8 +613,14 @@ mod tests {
             .iter()
             .filter(|f| f.kind == FindingKind::UnusedExport && f.title.contains("dup"))
             .count();
-        assert_eq!(dups, 1, "identical export facts collapse to one finding: {findings:?}");
-        assert!(unique_ids(&findings), "finding ids must be unique: {findings:?}");
+        assert_eq!(
+            dups, 1,
+            "identical export facts collapse to one finding: {findings:?}"
+        );
+        assert!(
+            unique_ids(&findings),
+            "finding ids must be unique: {findings:?}"
+        );
     }
 
     #[test]
@@ -495,8 +645,10 @@ mod tests {
             imports: &imports,
         };
         // `import *` uses the whole module, so neither export is unused.
-        assert!(analyze(&input)
-            .iter()
-            .all(|f| f.kind != FindingKind::UnusedExport));
+        assert!(
+            analyze(&input)
+                .iter()
+                .all(|f| f.kind != FindingKind::UnusedExport)
+        );
     }
 }
