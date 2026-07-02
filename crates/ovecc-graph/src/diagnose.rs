@@ -541,7 +541,10 @@ fn detect_cyclic_dependency(
             .cloned()
             .collect();
         let mut evidence = vec![DiagEvidence::metric("cycle_size", size as f64, 1.0)];
-        if let Some(cycle) = cycles::module_cycles(&component, &scc_edges).into_iter().next() {
+        if let Some(cycle) = cycles::module_cycles(&component, &scc_edges)
+            .into_iter()
+            .next()
+        {
             for (hop, edge) in cycles::witness_walk(&cycle, &candidates).iter().enumerate() {
                 evidence.push(DiagEvidence::cycle_edge(hop + 1, edge));
             }

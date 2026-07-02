@@ -2314,32 +2314,34 @@ fn detect_unlisted_dependencies(
     first_use
         .into_iter()
         .filter(|(package_root, _)| !declared.contains(package_root))
-        .map(|(package_root, (file, line))| ovecc_core::facts::FindingRecord {
-            id: ovecc_core::id::FindingId::from_parts(&[
-                repository_id,
-                "unlisted-dependency",
-                &package_root,
-            ]),
-            repository_id: RepositoryId::from_raw(repository_id),
-            snapshot_id: Some(ovecc_core::id::SnapshotId::from_raw(snapshot_id)),
-            kind: FindingKind::UnlistedDependency,
-            severity: ovecc_core::facts::Severity::Medium,
-            rule_name: Some("unlisted-dependency".to_string()),
-            target: None,
-            title: format!("Unlisted dependency: {package_root}"),
-            description: format!(
-                "'{package_root}' is imported (first at {file}:{line}) but declared in no \
+        .map(
+            |(package_root, (file, line))| ovecc_core::facts::FindingRecord {
+                id: ovecc_core::id::FindingId::from_parts(&[
+                    repository_id,
+                    "unlisted-dependency",
+                    &package_root,
+                ]),
+                repository_id: RepositoryId::from_raw(repository_id),
+                snapshot_id: Some(ovecc_core::id::SnapshotId::from_raw(snapshot_id)),
+                kind: FindingKind::UnlistedDependency,
+                severity: ovecc_core::facts::Severity::Medium,
+                rule_name: Some("unlisted-dependency".to_string()),
+                target: None,
+                title: format!("Unlisted dependency: {package_root}"),
+                description: format!(
+                    "'{package_root}' is imported (first at {file}:{line}) but declared in no \
                  package.json — it resolves only via hoisting or a transitive install and can \
                  break on any lockfile change. Declare it explicitly."
-            ),
-            evidence: vec![ovecc_core::facts::Evidence {
-                file_path: file,
-                line: Some(line as u32),
-                symbol: Some(package_root.clone()),
-                detail: Some(dependency_import_detail(&package_root)),
-            }],
-            created_at: chrono::Utc::now(),
-        })
+                ),
+                evidence: vec![ovecc_core::facts::Evidence {
+                    file_path: file,
+                    line: Some(line as u32),
+                    symbol: Some(package_root.clone()),
+                    detail: Some(dependency_import_detail(&package_root)),
+                }],
+                created_at: chrono::Utc::now(),
+            },
+        )
         .collect()
 }
 
