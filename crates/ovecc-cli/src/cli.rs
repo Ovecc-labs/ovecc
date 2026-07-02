@@ -659,6 +659,7 @@ pub fn run() -> Result<u8> {
                         FindingKind::UnusedExport
                             | FindingKind::UnusedFile
                             | FindingKind::UnusedDependency
+                            | FindingKind::UnlistedDependency
                     )
                 })
                 .collect();
@@ -674,6 +675,10 @@ pub fn run() -> Result<u8> {
                 unused_dependencies: findings
                     .iter()
                     .filter(|f| f.kind == FindingKind::UnusedDependency)
+                    .count(),
+                unlisted_dependencies: findings
+                    .iter()
+                    .filter(|f| f.kind == FindingKind::UnlistedDependency)
                     .count(),
                 findings,
             };
@@ -2485,8 +2490,13 @@ fn build_review_report(
         FindingKind::UnusedExport,
         FindingKind::UnusedFile,
         FindingKind::UnusedDependency,
+        FindingKind::UnlistedDependency,
     ]);
-    let new_complexity = count_kinds(&[FindingKind::HighComplexity]);
+    let new_complexity = count_kinds(&[
+        FindingKind::HighComplexity,
+        FindingKind::LongFunction,
+        FindingKind::LongParameterList,
+    ]);
     let max_new_severity = new_findings.iter().map(|finding| finding.severity).max();
 
     let failed = review_crosses_threshold(
@@ -3057,6 +3067,7 @@ struct DeadcodeReport {
     unused_exports: usize,
     unused_files: usize,
     unused_dependencies: usize,
+    unlisted_dependencies: usize,
     findings: Vec<FindingRecord>,
 }
 
@@ -3073,8 +3084,11 @@ fn render_deadcode(report: &DeadcodeReport, format: OutputFormat) -> Result<()> 
         }
         OutputFormat::Markdown => {
             println!(
-                "# Dead code ({} unused export(s), {} unused file(s), {} unused dependency(ies))",
-                report.unused_exports, report.unused_files, report.unused_dependencies
+                "# Dead code ({} unused export(s), {} unused file(s), {} unused dependency(ies), {} unlisted dependency(ies))",
+                report.unused_exports,
+                report.unused_files,
+                report.unused_dependencies,
+                report.unlisted_dependencies
             );
             println!();
             if report.findings.is_empty() {
@@ -3091,8 +3105,11 @@ fn render_deadcode(report: &DeadcodeReport, format: OutputFormat) -> Result<()> 
         }
         OutputFormat::Text => {
             println!(
-                "Dead code: {} unused export(s), {} unused file(s), {} unused dependency(ies)",
-                report.unused_exports, report.unused_files, report.unused_dependencies
+                "Dead code: {} unused export(s), {} unused file(s), {} unused dependency(ies), {} unlisted dependency(ies)",
+                report.unused_exports,
+                report.unused_files,
+                report.unused_dependencies,
+                report.unlisted_dependencies
             );
             for finding in &report.findings {
                 println!();

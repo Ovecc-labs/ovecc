@@ -312,6 +312,60 @@ pub fn index_repository(
             max_cyclomatic = max_cyclomatic.max(complexity.cyclomatic);
             max_cognitive = max_cognitive.max(complexity.cognitive);
             total_cognitive += complexity.cognitive as u64;
+            // Unit size (Long Method) — independent of the branching thresholds:
+            // a linear-but-endless function is a maintainability risk too. Low
+            // below 150 lines so it informs without tripping medium/high gates.
+            if complexity.line_count >= 75 {
+                let severity = if complexity.line_count >= 150 {
+                    ovecc_core::facts::Severity::Medium
+                } else {
+                    ovecc_core::facts::Severity::Low
+                };
+                findings.push(function_metric_finding(
+                    &repository_id,
+                    &snapshot_id,
+                    path,
+                    complexity,
+                    ovecc_core::facts::FindingKind::LongFunction,
+                    "long-function",
+                    severity,
+                    format!(
+                        "Long function: {} ({} lines)",
+                        complexity.qualified_name, complexity.line_count
+                    ),
+                    format!(
+                        "{} at {}:{} spans {} source lines; extract cohesive sections into named helpers.",
+                        complexity.qualified_name, path, complexity.line, complexity.line_count
+                    ),
+                    format!("{} lines", complexity.line_count),
+                ));
+            }
+            // Long Parameter List — same shape: 7+ informs, 10+ is a real smell.
+            if complexity.param_count >= 7 {
+                let severity = if complexity.param_count >= 10 {
+                    ovecc_core::facts::Severity::Medium
+                } else {
+                    ovecc_core::facts::Severity::Low
+                };
+                findings.push(function_metric_finding(
+                    &repository_id,
+                    &snapshot_id,
+                    path,
+                    complexity,
+                    ovecc_core::facts::FindingKind::LongParameterList,
+                    "long-parameter-list",
+                    severity,
+                    format!(
+                        "Long parameter list: {} ({} parameters)",
+                        complexity.qualified_name, complexity.param_count
+                    ),
+                    format!(
+                        "{} at {}:{} takes {} parameters; group related ones into a typed options object.",
+                        complexity.qualified_name, path, complexity.line, complexity.param_count
+                    ),
+                    format!("{} parameters", complexity.param_count),
+                ));
+            }
             let severity = if complexity.cognitive >= 25 || complexity.cyclomatic >= 20 {
                 ovecc_core::facts::Severity::High
             } else if complexity.cognitive >= 15 || complexity.cyclomatic >= 10 {
@@ -452,6 +506,17 @@ pub fn index_repository(
         ));
         findings.extend(unused_dep_findings);
     }
+
+    // Unlisted (phantom) dependencies: imported but declared in no manifest.
+    // Precise by construction, so always on (silent on repos with no
+    // package.json).
+    let unlisted_findings =
+        detect_unlisted_dependencies(&paths.root, &repository_id, &snapshot_id, &dependencies);
+    metrics.push((
+        "unlisted_dependencies".to_string(),
+        unlisted_findings.len() as f64,
+    ));
+    findings.extend(unlisted_findings);
 
     // Security findings in test, fixture, and example files are usually test
     // data or deliberate test scaffolding (fake secrets, an `eval` under test,
@@ -1948,12 +2013,13 @@ fn external_package_root(specifier: &str) -> Option<String> {
     if specifier.starts_with('.') || specifier.starts_with('/') || specifier.starts_with("node:") {
         return None;
     }
-    const BUILTINS: [&str; 24] = [
+    const BUILTINS: [&str; 40] = [
         "fs",
         "path",
         "os",
         "http",
         "https",
+        "http2",
         "url",
         "util",
         "stream",
@@ -1973,6 +2039,23 @@ fn external_package_root(specifier: &str) -> Option<String> {
         "worker_threads",
         "perf_hooks",
         "module",
+        // Less common but real: any missing entry becomes a phantom-dependency
+        // false positive in `unlisted-dependency`.
+        "tty",
+        "vm",
+        "v8",
+        "repl",
+        "string_decoder",
+        "async_hooks",
+        "timers",
+        "constants",
+        "inspector",
+        "dgram",
+        "punycode",
+        "domain",
+        "trace_events",
+        "wasi",
+        "diagnostics_channel",
     ];
     let root = if let Some(rest) = specifier.strip_prefix('@') {
         let mut parts = rest.splitn(3, '/');
@@ -1991,6 +2074,113 @@ fn external_package_root(specifier: &str) -> Option<String> {
 /// Flags packages declared in a `package.json` `dependencies` map that no
 /// indexed file imports. Conservative: production deps only (not `devDeps`),
 /// `@types/*` excluded (ambient), one finding per (manifest, package).
+/// One per-function metric finding (long function, long parameter list) with
+/// the standard `file:line — symbol` evidence shape.
+#[allow(clippy::too_many_arguments)] // flat finding fields; a builder would obscure it
+fn function_metric_finding(
+    repository_id: &str,
+    snapshot_id: &str,
+    path: &str,
+    complexity: &ovecc_core::facts::ComplexityFact,
+    kind: FindingKind,
+    rule_name: &str,
+    severity: ovecc_core::facts::Severity,
+    title: String,
+    description: String,
+    detail: String,
+) -> ovecc_core::facts::FindingRecord {
+    ovecc_core::facts::FindingRecord {
+        id: ovecc_core::id::FindingId::from_parts(&[
+            repository_id,
+            rule_name,
+            path,
+            &complexity.line.to_string(),
+            &complexity.qualified_name,
+        ]),
+        repository_id: RepositoryId::from_raw(repository_id),
+        snapshot_id: Some(ovecc_core::id::SnapshotId::from_raw(snapshot_id)),
+        kind,
+        severity,
+        rule_name: Some(rule_name.to_string()),
+        target: None,
+        title,
+        description,
+        evidence: vec![ovecc_core::facts::Evidence {
+            file_path: path.to_string(),
+            line: Some(complexity.line),
+            symbol: Some(complexity.qualified_name.clone()),
+            detail: Some(detail),
+        }],
+        created_at: chrono::Utc::now(),
+    }
+}
+
+/// Tokens a manifest `scripts` map invokes — the words of every script command.
+/// A dependency whose name (or well-known binary) appears here is used even
+/// without an import (`tsc`, `jest`, `eslint`, ...).
+fn script_tokens(manifests: &[(String, serde_json::Value)]) -> HashSet<String> {
+    let mut tokens = HashSet::new();
+    for (_, manifest) in manifests {
+        let Some(scripts) = manifest.get("scripts").and_then(|value| value.as_object()) else {
+            continue;
+        };
+        for value in scripts.values() {
+            let Some(command) = value.as_str() else {
+                continue;
+            };
+            for token in command
+                .split(|c: char| c.is_whitespace() || "&|;()\"'".contains(c))
+                .filter(|t| !t.is_empty())
+            {
+                tokens.insert(token.to_string());
+            }
+        }
+    }
+    tokens
+}
+
+/// Whether a declared dev-tooling package is plausibly used without an import:
+/// via a script binary, a config-file plugin/preset convention, or as a types
+/// package. Precision-first — when in doubt, treat it as used.
+fn dev_dependency_plausibly_used(name: &str, script_tokens: &HashSet<String>) -> bool {
+    if name.starts_with("@types/") || script_tokens.contains(name) {
+        return true;
+    }
+    // Well-known binary -> package pairs (the bin name differs from the package).
+    const BIN_TO_PACKAGE: [(&str, &str); 4] = [
+        ("tsc", "typescript"),
+        ("tsserver", "typescript"),
+        ("wp", "webpack"),
+        ("sb", "storybook"),
+    ];
+    for (bin, package) in BIN_TO_PACKAGE {
+        if name == package && script_tokens.contains(bin) {
+            return true;
+        }
+    }
+    // Plugin/preset/config packages are loaded from config files (eslint,
+    // babel, postcss, jest transforms, ...), invisible to the import graph.
+    const CONFIG_LOADED_FRAGMENTS: [&str; 14] = [
+        "eslint",
+        "prettier",
+        "babel",
+        "postcss",
+        "tailwind",
+        "jest",
+        "vitest",
+        "husky",
+        "lint-staged",
+        "commitlint",
+        "-plugin",
+        "-preset",
+        "-config",
+        "-loader",
+    ];
+    CONFIG_LOADED_FRAGMENTS
+        .iter()
+        .any(|fragment| name.contains(fragment))
+}
+
 fn detect_unused_dependencies(
     root: &Path,
     repository_id: &str,
@@ -1998,48 +2188,154 @@ fn detect_unused_dependencies(
     imported_roots: &HashSet<String>,
 ) -> Vec<ovecc_core::facts::FindingRecord> {
     let mut findings = Vec::new();
-    for (dir, manifest) in find_package_manifests(root) {
-        let Some(deps) = manifest
-            .get("dependencies")
-            .and_then(|value| value.as_object())
-        else {
-            continue;
-        };
+    let manifests = find_package_manifests(root);
+    let tokens = script_tokens(&manifests);
+    // (manifest section, rule name, dev-tooling guards apply)
+    const SECTIONS: [(&str, &str, bool); 3] = [
+        ("dependencies", "unused-dependency", false),
+        ("devDependencies", "unused-dev-dependency", true),
+        ("optionalDependencies", "unused-optional-dependency", true),
+    ];
+    for (dir, manifest) in &manifests {
         let manifest_path = format!("{dir}package.json");
-        for name in deps.keys() {
-            if name.starts_with("@types/") || imported_roots.contains(name.as_str()) {
+        for (section, rule_name, dev_guards) in SECTIONS {
+            let Some(deps) = manifest.get(section).and_then(|value| value.as_object()) else {
                 continue;
+            };
+            for name in deps.keys() {
+                if name.starts_with("@types/")
+                    || imported_roots.contains(name.as_str())
+                    || tokens.contains(name.as_str())
+                {
+                    continue;
+                }
+                if dev_guards && dev_dependency_plausibly_used(name, &tokens) {
+                    continue;
+                }
+                findings.push(ovecc_core::facts::FindingRecord {
+                    id: ovecc_core::id::FindingId::from_parts(&[
+                        repository_id,
+                        "deadcode",
+                        rule_name,
+                        &manifest_path,
+                        name,
+                    ]),
+                    repository_id: RepositoryId::from_raw(repository_id),
+                    snapshot_id: Some(ovecc_core::id::SnapshotId::from_raw(snapshot_id)),
+                    kind: FindingKind::UnusedDependency,
+                    severity: ovecc_core::facts::Severity::Low,
+                    rule_name: Some(rule_name.to_string()),
+                    target: None,
+                    title: format!("Unused dependency: {name}"),
+                    description: format!(
+                        "'{name}' is declared in {manifest_path} ({section}) but never imported \
+                         by an indexed file or invoked by a script. Verify it is not used via \
+                         config, CLI, or dynamic import before removing."
+                    ),
+                    evidence: vec![ovecc_core::facts::Evidence {
+                        file_path: manifest_path.clone(),
+                        line: Some(1),
+                        symbol: Some(name.clone()),
+                        detail: Some(section.to_string()),
+                    }],
+                    created_at: chrono::Utc::now(),
+                });
             }
-            findings.push(ovecc_core::facts::FindingRecord {
-                id: ovecc_core::id::FindingId::from_parts(&[
-                    repository_id,
-                    "deadcode",
-                    "unused-dependency",
-                    &manifest_path,
-                    name,
-                ]),
-                repository_id: RepositoryId::from_raw(repository_id),
-                snapshot_id: Some(ovecc_core::id::SnapshotId::from_raw(snapshot_id)),
-                kind: FindingKind::UnusedDependency,
-                severity: ovecc_core::facts::Severity::Low,
-                rule_name: Some("unused-dependency".to_string()),
-                target: None,
-                title: format!("Unused dependency: {name}"),
-                description: format!(
-                    "'{name}' is declared in {manifest_path} but never imported by an indexed \
-                     file. Verify it is not used via config, CLI, or dynamic import before removing."
-                ),
-                evidence: vec![ovecc_core::facts::Evidence {
-                    file_path: manifest_path.clone(),
-                    line: Some(1),
-                    symbol: Some(name.clone()),
-                    detail: None,
-                }],
-                created_at: chrono::Utc::now(),
-            });
         }
     }
     findings
+}
+
+/// Phantom dependencies: packages imported by indexed source but declared in
+/// no `package.json` section — they resolve only via hoisting or a transitive
+/// install and break on a lockfile change. Precise by construction (the import
+/// is a fact; the absent declaration is a fact), so this runs unconditionally.
+/// Silent when the repo has no manifests at all (non-Node repositories).
+fn detect_unlisted_dependencies(
+    root: &Path,
+    repository_id: &str,
+    snapshot_id: &str,
+    dependencies: &[ovecc_core::legacy::DependencyRecord],
+) -> Vec<ovecc_core::facts::FindingRecord> {
+    let manifests = find_package_manifests(root);
+    if manifests.is_empty() {
+        return Vec::new();
+    }
+    let mut declared: HashSet<String> = HashSet::new();
+    for (_, manifest) in &manifests {
+        for section in [
+            "dependencies",
+            "devDependencies",
+            "peerDependencies",
+            "optionalDependencies",
+        ] {
+            if let Some(deps) = manifest.get(section).and_then(|value| value.as_object()) {
+                declared.extend(deps.keys().cloned());
+            }
+        }
+        // A workspace package's own name is importable inside the monorepo.
+        if let Some(name) = manifest.get("name").and_then(|value| value.as_str()) {
+            declared.insert(name.to_string());
+        }
+    }
+    // First import site per package root, deterministic (min by file, line).
+    let mut first_use: std::collections::BTreeMap<String, (String, usize)> =
+        std::collections::BTreeMap::new();
+    for dependency in dependencies {
+        if !dependency.is_external {
+            continue;
+        }
+        let Some(package_root) = external_package_root(&dependency.specifier) else {
+            continue;
+        };
+        let site = (
+            dependency.source_file_path.clone(),
+            dependency.evidence_line,
+        );
+        first_use
+            .entry(package_root)
+            .and_modify(|existing| {
+                if site < *existing {
+                    existing.clone_from(&site);
+                }
+            })
+            .or_insert(site);
+    }
+    first_use
+        .into_iter()
+        .filter(|(package_root, _)| !declared.contains(package_root))
+        .map(|(package_root, (file, line))| ovecc_core::facts::FindingRecord {
+            id: ovecc_core::id::FindingId::from_parts(&[
+                repository_id,
+                "unlisted-dependency",
+                &package_root,
+            ]),
+            repository_id: RepositoryId::from_raw(repository_id),
+            snapshot_id: Some(ovecc_core::id::SnapshotId::from_raw(snapshot_id)),
+            kind: FindingKind::UnlistedDependency,
+            severity: ovecc_core::facts::Severity::Medium,
+            rule_name: Some("unlisted-dependency".to_string()),
+            target: None,
+            title: format!("Unlisted dependency: {package_root}"),
+            description: format!(
+                "'{package_root}' is imported (first at {file}:{line}) but declared in no \
+                 package.json — it resolves only via hoisting or a transitive install and can \
+                 break on any lockfile change. Declare it explicitly."
+            ),
+            evidence: vec![ovecc_core::facts::Evidence {
+                file_path: file,
+                line: Some(line as u32),
+                symbol: Some(package_root.clone()),
+                detail: Some(dependency_import_detail(&package_root)),
+            }],
+            created_at: chrono::Utc::now(),
+        })
+        .collect()
+}
+
+/// Evidence detail for an unlisted dependency.
+fn dependency_import_detail(package_root: &str) -> String {
+    format!("bare import of '{package_root}' with no manifest declaration")
 }
 
 /// Locates every `package.json` in the tree (skipping the built-in excluded

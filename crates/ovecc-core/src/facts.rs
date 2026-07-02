@@ -431,7 +431,14 @@ pub enum FindingKind {
     UnusedExport,
     UnusedFile,
     UnusedDependency,
+    /// An imported package missing from every `package.json` (a phantom
+    /// dependency that only works via hoisting or a transitive install).
+    UnlistedDependency,
     HighComplexity,
+    /// A function long enough (source lines) to be a maintainability risk.
+    LongFunction,
+    /// A function with too many parameters.
+    LongParameterList,
 }
 
 /// A machine-actionable fix descriptor attached to a finding so an agent can act
@@ -477,10 +484,26 @@ impl FindingKind {
                 true,
                 "Remove this dependency from the manifest; no indexed file imports it.",
             ),
+            FindingKind::UnlistedDependency => FixSpec::new(
+                "declare_dependency",
+                false,
+                "Add the package to the manifest's dependencies with an explicit version \
+                 (it currently resolves only via hoisting or a transitive install).",
+            ),
             FindingKind::HighComplexity => FixSpec::new(
                 "reduce_complexity",
                 false,
                 "Extract functions and reduce nesting to lower cognitive complexity.",
+            ),
+            FindingKind::LongFunction => FixSpec::new(
+                "split_long_function",
+                false,
+                "Extract cohesive sections into named helper functions.",
+            ),
+            FindingKind::LongParameterList => FixSpec::new(
+                "reduce_parameters",
+                false,
+                "Group related parameters into a typed options object.",
             ),
             FindingKind::HardcodedSecret => FixSpec::new(
                 "rotate_and_externalize_secret",

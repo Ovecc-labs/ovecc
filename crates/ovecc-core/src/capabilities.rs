@@ -468,6 +468,55 @@ pub fn rule_definitions() -> BTreeMap<String, MetaRule> {
             ),
         ),
         (
+            "unused-type".to_string(),
+            rule(
+                "A type-only export (interface/type alias) never imported by a reachable module.",
+                "low",
+            ),
+        ),
+        (
+            "unused-dependency".to_string(),
+            rule(
+                "A manifest dependency never imported by an indexed file (opt-in: [index] detect_unused_deps).",
+                "low",
+            ),
+        ),
+        (
+            "unlisted-dependency".to_string(),
+            rule(
+                "An imported package missing from every package.json — a phantom dependency.",
+                "medium",
+            ),
+        ),
+        (
+            "unused-dev-dependency".to_string(),
+            rule(
+                "A devDependency never imported, invoked by a script, or config-loaded (opt-in: [index] detect_unused_deps).",
+                "low",
+            ),
+        ),
+        (
+            "unused-optional-dependency".to_string(),
+            rule(
+                "An optionalDependency never imported or invoked by a script (opt-in: [index] detect_unused_deps).",
+                "low",
+            ),
+        ),
+        (
+            "long-function".to_string(),
+            rule(
+                "A function whose source-line count exceeds the unit-size thresholds (75 low / 150 medium).",
+                "low/medium",
+            ),
+        ),
+        (
+            "long-parameter-list".to_string(),
+            rule(
+                "A function with too many parameters (7 low / 10 medium).",
+                "low/medium",
+            ),
+        ),
+        (
             "security/secret".to_string(),
             rule(
                 "A hardcoded credential (provider-pattern or high-entropy).",
