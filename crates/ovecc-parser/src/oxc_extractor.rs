@@ -393,10 +393,10 @@ impl<'a> Visit<'a> for OxcWalk<'a> {
         // its frame as `Foo`, not `<anonymous>` — the dominant React/TS shape
         // for components and handlers. The name is consumed by the arrow's
         // visit_arrow_function_expression as the walk descends into the init.
-        if let Some(init) = &declarator.init {
-            if initializer_is_function(init) {
-                self.pending_name = binding_name(declarator);
-            }
+        if let Some(init) = &declarator.init
+            && initializer_is_function(init)
+        {
+            self.pending_name = binding_name(declarator);
         }
         walk::walk_variable_declarator(self, declarator);
     }

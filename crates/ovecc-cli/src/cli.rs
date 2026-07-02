@@ -1356,10 +1356,10 @@ fn fmt_diag_evidence(e: &ovecc_graph::diagnose::DiagEvidence) -> String {
         text.push_str(" — ");
     }
     text.push_str(&format!("{}={}", e.metric, fmt_num(e.value)));
-    if let Some(threshold) = e.threshold {
-        if threshold > 0.0 {
-            text.push_str(&format!(" (>= {})", fmt_num(threshold)));
-        }
+    if let Some(threshold) = e.threshold
+        && threshold > 0.0
+    {
+        text.push_str(&format!(" (>= {})", fmt_num(threshold)));
     }
     text
 }
@@ -1382,10 +1382,10 @@ fn diagnosis_value(finding: &ovecc_graph::diagnose::Diagnosis) -> serde_json::Va
 /// Partitions findings for the human report, preserving the overall severity
 /// ranking (groups appear in order of their most-severe finding). `None` yields a
 /// single unlabelled group = the flat ranked list.
-fn group_diagnoses<'a>(
-    findings: &'a [ovecc_graph::diagnose::Diagnosis],
+fn group_diagnoses(
+    findings: &[ovecc_graph::diagnose::Diagnosis],
     group_by: Option<GroupByArg>,
-) -> Vec<(String, Vec<&'a ovecc_graph::diagnose::Diagnosis>)> {
+) -> Vec<(String, Vec<&ovecc_graph::diagnose::Diagnosis>)> {
     let mut groups: Vec<(String, Vec<&ovecc_graph::diagnose::Diagnosis>)> = Vec::new();
     for finding in findings {
         let label = match group_by {

@@ -45,6 +45,10 @@ pub struct DeadCodeInput<'a> {
     pub imports: &'a [ImportEdge],
 }
 
+/// A re-export forward hop: `(from_file, name) -> (to_file, name)`. Usage flows
+/// along these edges without a plain import crediting the source as consumed.
+type Forward<'a> = ((&'a str, &'a str), (&'a str, &'a str));
+
 /// Analyzes dead code, returning `UnusedExport` and `UnusedFile` findings. Empty
 /// when no entry points are known (avoids flagging an entire tree).
 pub fn analyze(input: &DeadCodeInput<'_>) -> Vec<FindingRecord> {
@@ -92,7 +96,7 @@ pub fn analyze(input: &DeadCodeInput<'_>) -> Vec<FindingRecord> {
     // which that usage propagates.
     let mut used: HashSet<(&str, &str)> = HashSet::new();
     let mut worklist: Vec<(&str, &str)> = Vec::new();
-    let mut forwards: Vec<((&str, &str), (&str, &str))> = Vec::new();
+    let mut forwards: Vec<Forward<'_>> = Vec::new();
 
     // The public surface: every export of an entry-point file is a usage root, so
     // a library barrel that re-exports its API never flags that API as dead.

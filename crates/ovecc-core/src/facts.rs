@@ -810,7 +810,7 @@ mod tests {
 
     #[test]
     fn confidence_thresholds_are_ordered_constants() {
-        assert!(Confidence::REPORT_THRESHOLD < Confidence::VIOLATION_THRESHOLD);
+        const { assert!(Confidence::REPORT_THRESHOLD < Confidence::VIOLATION_THRESHOLD) };
         assert_eq!(Confidence::REPORT_THRESHOLD, 0.70);
         assert_eq!(Confidence::VIOLATION_THRESHOLD, 0.85);
     }

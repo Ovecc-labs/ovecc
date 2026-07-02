@@ -147,7 +147,7 @@ mod tests {
     fn lines_track_tokens() {
         let (hashes, lines) = tokenize("const a = 1;\nconst b = 2;\n", SourceLanguage::TypeScript);
         assert_eq!(hashes.len(), lines.len());
-        assert!(lines.iter().any(|&l| l == 1));
-        assert!(lines.iter().any(|&l| l == 2));
+        assert!(lines.contains(&1));
+        assert!(lines.contains(&2));
     }
 }
