@@ -80,6 +80,8 @@ pub struct FileDep {
     pub target: String,
     pub specifier: String,
     pub line: usize,
+    /// `import type` — counts as coupling but can never form a runtime cycle.
+    pub type_only: bool,
 }
 
 impl FileDep {
@@ -90,6 +92,7 @@ impl FileDep {
             target: target.into(),
             specifier: String::new(),
             line: 1,
+            type_only: false,
         }
     }
 }
@@ -243,6 +246,9 @@ pub struct MetricsReport {
 struct ComponentGraph {
     components: BTreeSet<String>,
     edges: BTreeSet<(String, String)>,
+    /// The subset of `edges` witnessed by at least one non-type-only file
+    /// dependency — the only edges that can form a *runtime* cycle.
+    runtime_edges: BTreeSet<(String, String)>,
     fan_in: HashMap<String, usize>,
     fan_out: HashMap<String, usize>,
     files: HashMap<String, usize>,
@@ -302,6 +308,7 @@ fn build_graph(
     }
 
     let mut edges = BTreeSet::<(String, String)>::new();
+    let mut runtime_edges = BTreeSet::<(String, String)>::new();
     for dep in file_deps {
         if excluded(&dep.source) || excluded(&dep.target) {
             continue;
@@ -312,6 +319,9 @@ fn build_graph(
         components.insert(cs.clone());
         components.insert(ct.clone());
         if cs != ct {
+            if !dep.type_only {
+                runtime_edges.insert((cs.clone(), ct.clone()));
+            }
             edges.insert((cs, ct));
         }
     }
@@ -326,6 +336,7 @@ fn build_graph(
     ComponentGraph {
         components,
         edges,
+        runtime_edges,
         fan_in,
         fan_out,
         files: file_count,
@@ -487,7 +498,9 @@ fn detect_cyclic_dependency(
     let group_edges: Vec<cycles::GroupFileEdge> = file_deps
         .iter()
         .filter(|dep| {
-            !is_excluded(&dep.source, &config.exclude) && !is_excluded(&dep.target, &config.exclude)
+            !dep.type_only
+                && !is_excluded(&dep.source, &config.exclude)
+                && !is_excluded(&dep.target, &config.exclude)
         })
         .map(|dep| cycles::GroupFileEdge {
             from_group: component_of(&dep.source, depth),
@@ -500,7 +513,7 @@ fn detect_cyclic_dependency(
         .collect();
     let candidates = cycles::group_candidates(&group_edges);
 
-    for component in strongly_connected(&g.components, &g.edges) {
+    for component in strongly_connected(&g.components, &g.runtime_edges) {
         let size = component.len();
         let severity = if size >= 3 {
             Severity::High
@@ -522,7 +535,7 @@ fn detect_cyclic_dependency(
         // canonical shortest cycle), hop by hop with file:line evidence.
         let members: BTreeSet<&str> = component.iter().map(String::as_str).collect();
         let scc_edges: Vec<(String, String)> = g
-            .edges
+            .runtime_edges
             .iter()
             .filter(|(s, t)| members.contains(s.as_str()) && members.contains(t.as_str()))
             .cloned()
@@ -569,7 +582,9 @@ fn detect_file_cycle(
     // witness walk yields per-hop `file:line` evidence for the loop.
     let mut group_edges: Vec<cycles::GroupFileEdge> = Vec::new();
     for dep in file_deps {
-        if dep.source == dep.target
+        // Type-only imports are erased at runtime: no file-level cycle either.
+        if dep.type_only
+            || dep.source == dep.target
             || is_excluded(&dep.source, &config.exclude)
             || is_excluded(&dep.target, &config.exclude)
         {

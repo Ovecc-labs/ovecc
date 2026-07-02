@@ -1310,6 +1310,7 @@ fn load_diagnose_inputs(paths: &ProjectPaths) -> Result<DiagnoseInputs> {
                     target,
                     specifier: dependency.specifier,
                     line: dependency.evidence_line,
+                    type_only: dependency.dependency_kind == "type_import",
                 })
         })
         .collect();

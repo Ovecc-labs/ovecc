@@ -43,7 +43,9 @@ const SOURCE_EXTENSIONS: &[&str] = &[
 
 /// `(variable, type)` bindings; older entries
 /// miss and re-parse.
-const PARSE_CACHE_VERSION: &str = "v11";
+// v12: `export type { X } from` is now classified TypeOnly (was ReExport), so
+// cached facts from v11 would keep witnessing type-only cycles.
+const PARSE_CACHE_VERSION: &str = "v12";
 
 pub fn index_repository(
     paths: &ProjectPaths,
@@ -992,7 +994,10 @@ fn legacy_imports(facts: &FileFacts) -> Vec<ImportFact> {
             specifier: import.specifier.clone(),
             line: import.line as usize,
             import_kind: match import.kind {
-                ImportFactKind::Static | ImportFactKind::TypeOnly => ImportKind::Static,
+                ImportFactKind::Static => ImportKind::Static,
+                // Preserved as its own kind: type-only imports are erased at
+                // runtime, so cycle detection must be able to exclude them.
+                ImportFactKind::TypeOnly => ImportKind::Type,
                 ImportFactKind::ReExport => ImportKind::Export,
                 ImportFactKind::Require => ImportKind::Require,
                 ImportFactKind::Dynamic => ImportKind::Dynamic,
@@ -1520,6 +1525,11 @@ fn resolve_dependencies(
                         &import.specifier,
                         &target_module,
                         &import.line.to_string(),
+                        // The kind participates in the identity so a change in
+                        // resolution semantics (e.g. static -> type_import)
+                        // refreshes the persisted row via differential sync
+                        // even when the source file itself is unchanged.
+                        import.import_kind.as_str(),
                     ],
                 ),
                 repository_id: repository_id.to_string(),

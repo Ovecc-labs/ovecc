@@ -63,6 +63,10 @@ pub enum ImportKind {
     Export,
     Require,
     Dynamic,
+    /// `import type` / `export type ... from` — erased at runtime, so it
+    /// contributes coupling and reachability but can never form a runtime
+    /// dependency cycle.
+    Type,
 }
 
 impl ImportKind {
@@ -72,6 +76,7 @@ impl ImportKind {
             Self::Export => "re_export",
             Self::Require => "require",
             Self::Dynamic => "dynamic_import",
+            Self::Type => "type_import",
         }
     }
 
@@ -83,6 +88,7 @@ impl ImportKind {
             "re_export" => Some(Self::Export),
             "require" => Some(Self::Require),
             "dynamic_import" => Some(Self::Dynamic),
+            "type_import" => Some(Self::Type),
             _ => None,
         }
     }

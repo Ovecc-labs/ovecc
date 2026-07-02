@@ -40,13 +40,21 @@ struct ModuleAdjacency {
     succ: Vec<Vec<usize>>,
 }
 
+/// Whether a dependency edge can participate in a *runtime* cycle. Type-only
+/// imports (`import type`) are erased at compile time — they contribute
+/// coupling and reachability, but never a load-order loop, so cycle detection
+/// (and its witnesses) must exclude them.
+fn is_runtime_edge(dependency: &DependencyRecord) -> bool {
+    dependency.dependency_kind != "type_import"
+}
+
 impl ModuleAdjacency {
     fn build(modules: &[String], dependencies: &[DependencyRecord]) -> Self {
         Self::from_module_edges(
             modules,
             dependencies
                 .iter()
-                .filter(|dependency| !dependency.is_external)
+                .filter(|dependency| !dependency.is_external && is_runtime_edge(dependency))
                 .map(|dependency| {
                     (
                         dependency.source_module.clone(),
@@ -226,7 +234,9 @@ pub fn elementary_cycles_with_witness(
     let group_edges: Vec<GroupFileEdge> = dependencies
         .iter()
         .filter(|dependency| {
-            !dependency.is_external && dependency.source_module != dependency.target_module
+            !dependency.is_external
+                && is_runtime_edge(dependency)
+                && dependency.source_module != dependency.target_module
         })
         .map(|dependency| GroupFileEdge {
             from_group: dependency.source_module.clone(),

@@ -319,10 +319,22 @@ impl<'a> Extractor<'a> {
         let Some(specifier) = string_literal_value(self.text(source_node)) else {
             return;
         };
+        // `export type { X } from '...'` is erased at runtime, exactly like
+        // `import type` — it must not witness a cycle. Dead-code forwarding is
+        // unaffected: those edges are built from the dependency rows (any
+        // kind) plus the export facts' own re-export provenance.
+        let type_only = node
+            .child(1)
+            .map(|child| self.text(child) == "type")
+            .unwrap_or(false);
         self.imports.push(ImportFact {
             specifier,
             line: self.line(node),
-            kind: ImportFactKind::ReExport,
+            kind: if type_only {
+                ImportFactKind::TypeOnly
+            } else {
+                ImportFactKind::ReExport
+            },
             imported_names: self.collect_imported_names(node),
         });
     }
