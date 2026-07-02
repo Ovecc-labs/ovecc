@@ -135,6 +135,85 @@ pub fn module_cycles(modules: &[String], edges: &[(String, String)]) -> Vec<Vec<
     ))
 }
 
+/// A file-level dependency edge between two named groups (modules at the
+/// standard granularity, or directory components in `diagnose`), carrying the
+/// evidence a witness edge needs. This is the granularity-neutral input to
+/// [`witness_walk`], so every cycle-reporting surface picks witnesses with the
+/// same algorithm.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupFileEdge {
+    pub from_group: String,
+    pub to_group: String,
+    pub from_file: String,
+    pub to_file: Option<String>,
+    pub specifier: String,
+    pub line: usize,
+}
+
+/// Walks one cycle of group names and picks a representative file-level edge
+/// per hop. The witness is threaded through the file the previous hop arrived
+/// at, so the edges read as one connected file-level walk around the loop —
+/// and we never cite a parallel-but-unrelated file (e.g. a dead module that
+/// imports the target but isn't on the live path). `edges` must be sorted
+/// deterministically per group pair before calling (see [`group_candidates`]).
+pub fn witness_walk(cycle: &[String], candidates: &GroupCandidates<'_>) -> Vec<WitnessEdge> {
+    let len = cycle.len();
+    let mut edges: Vec<WitnessEdge> = Vec::with_capacity(len);
+    let mut arrived_at: Option<String> = None;
+    for i in 0..len {
+        let from = &cycle[i];
+        let to = &cycle[(i + 1) % len];
+        let Some(choices) = candidates.get(&(from.as_str(), to.as_str())) else {
+            arrived_at = None;
+            continue;
+        };
+        let chosen = arrived_at
+            .as_deref()
+            .and_then(|file| choices.iter().find(|edge| edge.from_file == file))
+            .copied()
+            .unwrap_or(choices[0]);
+        arrived_at = chosen.to_file.clone();
+        edges.push(WitnessEdge {
+            from_module: from.clone(),
+            to_module: to.clone(),
+            from_file: chosen.from_file.clone(),
+            to_file: chosen.to_file.clone(),
+            specifier: chosen.specifier.clone(),
+            line: chosen.line,
+        });
+    }
+    edges
+}
+
+/// Candidate file edges per `(from_group, to_group)` pair, sorted for
+/// deterministic witness selection.
+pub type GroupCandidates<'a> = HashMap<(&'a str, &'a str), Vec<&'a GroupFileEdge>>;
+
+/// Groups `edges` by `(from_group, to_group)`, each list sorted by
+/// (from_file, line, specifier) so the first element is the canonical
+/// representative and [`witness_walk`] is stable across runs. Self-edges are
+/// dropped.
+pub fn group_candidates(edges: &[GroupFileEdge]) -> GroupCandidates<'_> {
+    let mut map: GroupCandidates<'_> = HashMap::new();
+    for edge in edges {
+        if edge.from_group == edge.to_group {
+            continue;
+        }
+        map.entry((edge.from_group.as_str(), edge.to_group.as_str()))
+            .or_default()
+            .push(edge);
+    }
+    for choices in map.values_mut() {
+        choices.sort_by(|a, b| {
+            a.from_file
+                .cmp(&b.from_file)
+                .then_with(|| a.line.cmp(&b.line))
+                .then_with(|| a.specifier.cmp(&b.specifier))
+        });
+    }
+    map
+}
+
 /// Enumerates the elementary cycles and attaches the file-level import edges
 /// that witness each one (see [`CycleWitness`]). The witness is drawn from
 /// `dependencies`, so callers pass the *current/head* graph to get concrete
@@ -144,79 +223,31 @@ pub fn elementary_cycles_with_witness(
     modules: &[String],
     dependencies: &[DependencyRecord],
 ) -> Vec<CycleWitness> {
-    let candidates = candidate_edges(dependencies);
+    let group_edges: Vec<GroupFileEdge> = dependencies
+        .iter()
+        .filter(|dependency| {
+            !dependency.is_external && dependency.source_module != dependency.target_module
+        })
+        .map(|dependency| GroupFileEdge {
+            from_group: dependency.source_module.clone(),
+            to_group: dependency.target_module.clone(),
+            from_file: dependency.source_file_path.clone(),
+            to_file: dependency.target_file_path.clone(),
+            specifier: dependency.specifier.clone(),
+            line: dependency.evidence_line,
+        })
+        .collect();
+    let candidates = group_candidates(&group_edges);
     elementary_cycles(modules, dependencies)
         .into_iter()
         .map(|cycle| {
-            let len = cycle.len();
-            let mut edges: Vec<WitnessEdge> = Vec::with_capacity(len);
-            // The file the previous hop arrived at. We thread the witness through
-            // it so the edges read as one connected file-level walk around the
-            // loop — and so we never cite a parallel-but-unrelated file (e.g. a
-            // dead module that imports the target but isn't on the live path).
-            let mut arrived_at: Option<String> = None;
-            for i in 0..len {
-                let from = &cycle[i];
-                let to = &cycle[(i + 1) % len];
-                let Some(choices) = candidates.get(&(from.as_str(), to.as_str())) else {
-                    arrived_at = None;
-                    continue;
-                };
-                let chosen = arrived_at
-                    .as_deref()
-                    .and_then(|file| {
-                        choices
-                            .iter()
-                            .find(|dependency| dependency.source_file_path == file)
-                    })
-                    .copied()
-                    .unwrap_or(choices[0]);
-                arrived_at = chosen.target_file_path.clone();
-                edges.push(WitnessEdge {
-                    from_module: from.clone(),
-                    to_module: to.clone(),
-                    from_file: chosen.source_file_path.clone(),
-                    to_file: chosen.target_file_path.clone(),
-                    specifier: chosen.specifier.clone(),
-                    line: chosen.evidence_line,
-                });
-            }
+            let edges = witness_walk(&cycle, &candidates);
             CycleWitness {
                 modules: cycle,
                 edges,
             }
         })
         .collect()
-}
-
-/// All in-repo file edges for each `(source_module, target_module)` pair, each
-/// list sorted deterministically (by source path, then line, then specifier) so
-/// witness selection is stable across runs. The first element is the canonical
-/// representative; later elements let the witness chain hop-to-hop by file.
-fn candidate_edges(
-    dependencies: &[DependencyRecord],
-) -> HashMap<(&str, &str), Vec<&DependencyRecord>> {
-    let mut map: HashMap<(&str, &str), Vec<&DependencyRecord>> = HashMap::new();
-    for dependency in dependencies {
-        if dependency.is_external || dependency.source_module == dependency.target_module {
-            continue;
-        }
-        map.entry((
-            dependency.source_module.as_str(),
-            dependency.target_module.as_str(),
-        ))
-        .or_default()
-        .push(dependency);
-    }
-    for edges in map.values_mut() {
-        edges.sort_by(|a, b| {
-            a.source_file_path
-                .cmp(&b.source_file_path)
-                .then_with(|| a.evidence_line.cmp(&b.evidence_line))
-                .then_with(|| a.specifier.cmp(&b.specifier))
-        });
-    }
-    map
 }
 
 /// Shared SCC + elementary-cycle enumeration over a prebuilt adjacency.

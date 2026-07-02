@@ -820,18 +820,35 @@ fn run_query(paths: &ProjectPaths, query: &Query, format: OutputFormat) -> Resul
             let modules = store.current_modules(&repository_id)?;
             let dependencies = store.current_dependencies(&repository_id)?;
             // Actual elementary loops (A -> B -> C -> A), shortest-first, each
-            // closed back to its first module for display.
-            let cycles: Vec<Vec<String>> =
-                ovecc_graph::cycles::elementary_cycles(&modules, &dependencies)
-                    .into_iter()
-                    .map(|mut members| {
-                        if let Some(first) = members.first().cloned() {
-                            members.push(first);
+            // with the file:line import edges that witness every hop — the same
+            // walk `review` and the circular-dependency finding report.
+            let cycles =
+                ovecc_graph::cycles::elementary_cycles_with_witness(&modules, &dependencies);
+            match format {
+                OutputFormat::Json | OutputFormat::Ndjson => {
+                    let data = serde_json::json!({ "query": "cycles", "cycles": cycles });
+                    emit_json("query", &data, meta_for("query"))?;
+                }
+                _ => {
+                    println!("Cycles: {}", cycles.len());
+                    for cycle in &cycles {
+                        let mut closed = cycle.modules.clone();
+                        if let Some(first) = cycle.modules.first().cloned() {
+                            closed.push(first);
                         }
-                        members
-                    })
-                    .collect();
-            print_query_paths("Cycles", &cycles, format)?;
+                        println!("  {}", closed.join(" -> "));
+                        for edge in &cycle.edges {
+                            println!(
+                                "    {}:{} -> {} ({})",
+                                edge.from_file,
+                                edge.line,
+                                edge.to_file.as_deref().unwrap_or(&edge.to_module),
+                                edge.specifier
+                            );
+                        }
+                    }
+                }
+            }
             return Ok(0);
         }
         _ => {}
@@ -895,15 +912,16 @@ fn run_query(paths: &ProjectPaths, query: &Query, format: OutputFormat) -> Resul
                 })
                 .cloned();
             match format {
-                OutputFormat::Json | OutputFormat::Ndjson => println!(
-                    "{}",
-                    serde_json::to_string(&serde_json::json!({
+                OutputFormat::Json | OutputFormat::Ndjson => {
+                    let data = serde_json::json!({
+                        "query": "relation",
                         "source": source.needle(),
                         "target": target.needle(),
                         "depends_on": reached,
                         "path": path,
-                    }))?
-                ),
+                    });
+                    emit_json("query", &data, meta_for("query"))?;
+                }
                 _ => {
                     println!(
                         "{} depends on {}: {}",
@@ -931,7 +949,12 @@ fn print_query_labels(
     let labels = result.map(|r| r.impacted_labels).unwrap_or_default();
     match format {
         OutputFormat::Json | OutputFormat::Ndjson => {
-            println!("{}", serde_json::to_string(&labels)?)
+            // Same self-describing envelope as every other command.
+            let data = serde_json::json!({
+                "query": label.to_ascii_lowercase(),
+                "items": labels,
+            });
+            emit_json("query", &data, meta_for("query"))?;
         }
         _ => {
             println!("{label}: {}", labels.len());
@@ -946,7 +969,12 @@ fn print_query_labels(
 fn print_query_paths(label: &str, paths: &[Vec<String>], format: OutputFormat) -> Result<u8> {
     match format {
         OutputFormat::Json | OutputFormat::Ndjson => {
-            println!("{}", serde_json::to_string(paths)?)
+            // Same self-describing envelope as every other command.
+            let data = serde_json::json!({
+                "query": label.to_ascii_lowercase(),
+                "paths": paths,
+            });
+            emit_json("query", &data, meta_for("query"))?;
         }
         _ => {
             println!("{label}: {}", paths.len());
@@ -1246,7 +1274,7 @@ fn render_hotspots(report: &HotspotsReport, format: OutputFormat) -> Result<()> 
 /// inputs `load_hotspots` gathers, minus the hotspot-only fragmentation.
 type DiagnoseInputs = (
     Vec<String>,
-    Vec<(String, String)>,
+    Vec<ovecc_graph::diagnose::FileDep>,
     std::collections::HashMap<String, f64>,
     std::collections::HashMap<String, f64>,
     std::collections::HashMap<String, (f64, f64)>,
@@ -1262,15 +1290,22 @@ fn load_diagnose_inputs(paths: &ProjectPaths) -> Result<DiagnoseInputs> {
         .into_iter()
         .map(|(path, _module)| path)
         .collect();
-    // Internal file -> file edges (the component graph is aggregated from these).
-    let file_deps: Vec<(String, String)> = store
+    // Internal file -> file edges (the component graph is aggregated from
+    // these), each carrying its import evidence so detectors can cite the
+    // concrete `file:line` witness of a cycle hop.
+    let file_deps: Vec<ovecc_graph::diagnose::FileDep> = store
         .current_dependencies(&repository_id)?
         .into_iter()
         .filter(|dependency| !dependency.is_external)
         .filter_map(|dependency| {
             dependency
                 .target_file_path
-                .map(|target| (dependency.source_file_path, target))
+                .map(|target| ovecc_graph::diagnose::FileDep {
+                    source: dependency.source_file_path,
+                    target,
+                    specifier: dependency.specifier,
+                    line: dependency.evidence_line,
+                })
         })
         .collect();
     let churn: std::collections::HashMap<String, f64> =
@@ -1360,6 +1395,9 @@ fn fmt_diag_evidence(e: &ovecc_graph::diagnose::DiagEvidence) -> String {
         && threshold > 0.0
     {
         text.push_str(&format!(" (>= {})", fmt_num(threshold)));
+    }
+    if let Some(detail) = &e.detail {
+        text.push_str(&format!(" ({detail})"));
     }
     text
 }
