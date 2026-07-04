@@ -49,6 +49,44 @@ fn is_excluded(path: &str, exclude: &[String]) -> bool {
     false
 }
 
+/// The component a file belongs to under this config: manifest roots make the
+/// conventional `src/` layer transparent first, then the standard depth rule
+/// applies.
+pub fn component_for(path: &str, config: &DiagnoseConfig) -> String {
+    component_of(
+        &canonical_component_path(path, &config.component_roots),
+        config.component_depth,
+    )
+}
+
+/// Canonicalizes a path for component derivation: inside a manifest root
+/// (a Cargo crate or npm package directory) the `src/` layer is dropped —
+/// `crates/db/src/lib.rs` → `crates/db/lib.rs`, `crates/db/src/sub/x.rs` →
+/// `crates/db/sub/x.rs` — so a crate's `build.rs` and its `src/` land in one
+/// component while deeper structure stays distinct. Reported file paths are
+/// untouched; only component derivation sees the canonical form.
+pub fn canonical_component_path(path: &str, roots: &[String]) -> String {
+    let norm = path.replace('\\', "/");
+    // Most specific (longest) matching root wins for nested packages.
+    let mut best: Option<&str> = None;
+    for root in roots {
+        if norm.len() > root.len() + 1
+            && norm.starts_with(root.as_str())
+            && norm.as_bytes()[root.len()] == b'/'
+            && best.is_none_or(|b| root.len() > b.len())
+        {
+            best = Some(root);
+        }
+    }
+    let Some(root) = best else {
+        return norm;
+    };
+    match norm[root.len() + 1..].strip_prefix("src/") {
+        Some(stripped) => format!("{root}/{stripped}"),
+        None => norm,
+    }
+}
+
 /// The component a file belongs to. `depth == 0` => the parent directory;
 /// `depth > 0` => the first `depth` path segments. Paths are normalised to
 /// POSIX separators. A file at the repo root maps to `"<root>"`.
@@ -282,7 +320,6 @@ fn build_graph(
     file_abstractness: &HashMap<String, (f64, f64)>,
     config: &DiagnoseConfig,
 ) -> ComponentGraph {
-    let depth = config.component_depth;
     let excluded = |path: &str| is_excluded(path, &config.exclude);
     let mut components = BTreeSet::<String>::new();
     let mut file_count = HashMap::<String, usize>::new();
@@ -295,7 +332,7 @@ fn build_graph(
         if excluded(path) {
             continue;
         }
-        let c = component_of(path, depth);
+        let c = component_for(path, config);
         components.insert(c.clone());
         *file_count.entry(c.clone()).or_default() += 1;
         *churn.entry(c.clone()).or_default() += file_churn.get(path).copied().unwrap_or(0.0);
@@ -313,8 +350,8 @@ fn build_graph(
         if excluded(&dep.source) || excluded(&dep.target) {
             continue;
         }
-        let cs = component_of(&dep.source, depth);
-        let ct = component_of(&dep.target, depth);
+        let cs = component_for(&dep.source, config);
+        let ct = component_for(&dep.target, config);
         // Ensure endpoints exist even if they had no indexed files.
         components.insert(cs.clone());
         components.insert(ct.clone());
@@ -494,7 +531,6 @@ fn detect_cyclic_dependency(
     // Component-granularity file edges, so each cycle hop carries a concrete
     // `file:line` import witness — picked by the same connected-walk algorithm
     // `review` and the circular-dependency finding use.
-    let depth = config.component_depth;
     let group_edges: Vec<cycles::GroupFileEdge> = file_deps
         .iter()
         .filter(|dep| {
@@ -503,8 +539,8 @@ fn detect_cyclic_dependency(
                 && !is_excluded(&dep.target, &config.exclude)
         })
         .map(|dep| cycles::GroupFileEdge {
-            from_group: component_of(&dep.source, depth),
-            to_group: component_of(&dep.target, depth),
+            from_group: component_for(&dep.source, config),
+            to_group: component_for(&dep.target, config),
             from_file: dep.source.clone(),
             to_file: Some(dep.target.clone()),
             specifier: dep.specifier.clone(),
@@ -578,7 +614,6 @@ fn detect_file_cycle(
     out: &mut Vec<Diagnosis>,
 ) {
     let _ = files; // cyclic files always appear as dependency endpoints.
-    let depth = config.component_depth;
     let mut nodes = BTreeSet::<String>::new();
     let mut edges = BTreeSet::<(String, String)>::new();
     // File-granularity witness edges: each file is its own group, so the same
@@ -607,8 +642,8 @@ fn detect_file_cycle(
     }
     let candidates = cycles::group_candidates(&group_edges);
     for scc in strongly_connected(&nodes, &edges) {
-        let comp = component_of(&scc[0], depth);
-        if !scc.iter().all(|f| component_of(f, depth) == comp) {
+        let comp = component_for(&scc[0], config);
+        if !scc.iter().all(|f| component_for(f, config) == comp) {
             continue; // inter-component cycle: already covered by cyclic_dependency.
         }
         let size = scc.len();
@@ -994,15 +1029,20 @@ fn detect_change_coupling(
     if g.churn.values().sum::<f64>() < config.evolutionary_min_history {
         return;
     }
-    let depth = config.component_depth;
     let mut pairs: BTreeMap<(String, String), f64> = BTreeMap::new();
     for (a, b, n) in co_change {
         if is_excluded(a, &config.exclude) || is_excluded(b, &config.exclude) {
             continue;
         }
-        let ca = component_of(a, depth);
-        let cb = component_of(b, depth);
+        let ca = component_for(a, config);
+        let cb = component_for(b, config);
         if ca == cb {
+            continue;
+        }
+        // `<root>` is not a real component: repo-root files (manifests,
+        // lockfiles, stray scripts) co-change with everything at release
+        // time — that's process noise, not architecture.
+        if ca == "<root>" || cb == "<root>" {
             continue;
         }
         // Both endpoints must be real *source* components (i.e. directories that
@@ -1340,6 +1380,82 @@ mod tests {
             .expect("zone_of_pain detected");
         assert_eq!(pain.target, "core");
         assert!(pain.severity >= Severity::Medium);
+    }
+
+    #[test]
+    fn manifest_roots_make_src_transparent_for_components() {
+        let roots = vec!["crates/db".to_string(), "packages/zod".to_string()];
+        // The crate's src/ layer folds into the crate root…
+        assert_eq!(
+            canonical_component_path("crates/db/src/lib.rs", &roots),
+            "crates/db/lib.rs"
+        );
+        // …so build.rs and src/ land in one component…
+        let cfg = DiagnoseConfig {
+            component_roots: roots.clone(),
+            ..DiagnoseConfig::default()
+        };
+        assert_eq!(component_for("crates/db/build.rs", &cfg), "crates/db");
+        assert_eq!(component_for("crates/db/src/lib.rs", &cfg), "crates/db");
+        // …while deeper structure stays distinct.
+        assert_eq!(
+            component_for("packages/zod/src/v4/core/x.ts", &cfg),
+            "packages/zod/v4/core"
+        );
+        // Outside any root, nothing changes.
+        assert_eq!(
+            canonical_component_path("tools/src/gen.rs", &roots),
+            "tools/src/gen.rs"
+        );
+    }
+
+    #[test]
+    fn root_component_is_excluded_from_change_coupling_pairs() {
+        // A stray script at the repo root makes `<root>` a source component,
+        // and root manifests/lockfiles co-change with everything — that pair
+        // must stay silent while a real cross-component pair still fires.
+        let files = vec![
+            "tool.py".to_string(),
+            "app/x.ts".to_string(),
+            "lib/y.ts".to_string(),
+        ];
+        let deps: Vec<FileDep> = vec![];
+        let churn: HashMap<String, f64> = [
+            ("tool.py".to_string(), 12.0),
+            ("app/x.ts".to_string(), 12.0),
+            ("lib/y.ts".to_string(), 12.0),
+        ]
+        .into_iter()
+        .collect();
+        let co_change = vec![
+            ("tool.py".to_string(), "app/x.ts".to_string(), 10.0),
+            ("app/x.ts".to_string(), "lib/y.ts".to_string(), 10.0),
+        ];
+        let report = diagnose(
+            &files,
+            &deps,
+            &churn,
+            &HashMap::new(),
+            &HashMap::new(),
+            &co_change,
+            &DiagnoseConfig::default(),
+        );
+        let pair_targets: Vec<&str> = report
+            .findings
+            .iter()
+            .filter(|f| f.detector == "modularity_violation" || f.detector == "change_coupling")
+            .map(|f| f.target.as_str())
+            .collect();
+        assert!(
+            pair_targets.iter().all(|t| !t.contains("<root>")),
+            "{pair_targets:?}"
+        );
+        assert!(
+            pair_targets
+                .iter()
+                .any(|t| t.contains("app") && t.contains("lib")),
+            "the real pair must still be reported: {pair_targets:?}"
+        );
     }
 
     #[test]

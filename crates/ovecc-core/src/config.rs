@@ -297,6 +297,11 @@ pub struct DiagnoseConfig {
     /// vendored). A token with `.` matches the filename as a substring; else it
     /// matches a whole path segment. Case-insensitive.
     pub exclude: Vec<String>,
+    /// Manifest directories (Cargo crates, npm packages) whose conventional
+    /// `src/` segment is transparent for component derivation, so a crate's
+    /// `build.rs` and its `src/` land in one component. Filled automatically
+    /// from the repository's manifests; overridable here.
+    pub component_roots: Vec<String>,
 }
 
 impl Default for DiagnoseConfig {
@@ -348,6 +353,7 @@ impl Default for DiagnoseConfig {
             .iter()
             .map(|s| s.to_string())
             .collect(),
+            component_roots: Vec::new(),
         }
     }
 }

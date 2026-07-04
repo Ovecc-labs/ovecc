@@ -163,6 +163,13 @@ pub enum FailOn {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Set up ovecc in a repository: write a commented .ovecc/config.toml,
+    /// git-ignore the local state, and print the first commands to run.
+    Init {
+        /// Overwrite an existing .ovecc/config.toml.
+        #[arg(long)]
+        force: bool,
+    },
     /// Build or update the local architecture database.
     Index {
         #[arg(value_name = "PATH")]
@@ -223,6 +230,10 @@ pub enum Command {
         /// accepting them as the baseline.
         #[arg(long)]
         write_baseline: bool,
+        /// Only show findings touching files changed since this Git ref
+        /// (progressive adoption: gate the diff, not the backlog).
+        #[arg(long, value_name = "REF")]
+        changed_since: Option<String>,
     },
     /// Rank technical-debt hotspots.
     Hotspots {
@@ -263,6 +274,11 @@ pub enum Command {
         /// Exit with code 1 when a finding crosses this threshold (CI check).
         #[arg(long, value_enum)]
         fail_on: Option<FailOn>,
+        /// Download the OSV advisories for the discovered packages into
+        /// `.ovecc/osv/` first — the ONLY ovecc operation that touches the
+        /// network, and only with this flag.
+        #[arg(long)]
+        fetch: bool,
     },
     /// Produce a one-shot architecture report (summary + cycles + violations +
     /// security + hotspots). Markdown by default; `--format json` for agents.
@@ -299,6 +315,22 @@ pub enum Command {
         /// Exit with code 1 when a finding crosses this threshold (CI check).
         #[arg(long, value_enum)]
         fail_on: Option<FailOn>,
+        /// Only show findings touching files changed since this Git ref
+        /// (progressive adoption: gate the diff, not the backlog).
+        #[arg(long, value_name = "REF")]
+        changed_since: Option<String>,
+    },
+    /// Apply the mechanical fixes for auto-fixable findings: delete unused
+    /// files, drop the `export` keyword on unused exports, remove unused
+    /// manifest dependencies. Dry-run by default (prints exactly what would
+    /// change); every edit re-verifies the file against the index first.
+    Fix {
+        /// Write the changes (default is a dry-run preview).
+        #[arg(long)]
+        apply: bool,
+        /// Only fix findings from this rule (e.g. unused-export, unused-file).
+        #[arg(long)]
+        rule: Option<String>,
     },
     /// Review what a change introduced: the NAMED new defects between a base and
     /// a head snapshot — new findings (security / dead code / complexity), new
@@ -344,6 +376,17 @@ pub enum Command {
         #[arg(long)]
         target: Option<String>,
     },
+    /// Trend one snapshot metric over time: per-index values with deltas and a
+    /// sparkline ("is the codebase getting worse?"). Without a metric, lists
+    /// everything trendable. The data is already persisted at every `ovecc
+    /// index`; this renders it.
+    History {
+        /// Metric to trend (e.g. coupling_density, high_complexity_functions).
+        metric: Option<String>,
+        /// Keep only the most recent N snapshots.
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+    },
     /// Run an MCP (Model Context Protocol) server over stdio, exposing Ovecc's
     /// commands as tools for coding agents. Reads/writes JSON-RPC on stdin/stdout.
     Mcp,
@@ -354,6 +397,15 @@ pub enum ExportCommand {
     /// Export a compact context slice for an element (for external tools/AI).
     /// Never sends data over the network — just prints the slice.
     Context { target: String },
+    /// Export the dependency graph — module and file levels, nodes and edges —
+    /// as JSON, or as a self-contained interactive HTML viewer (the renderer
+    /// ships inside the binary: no CDN, no runtime dependency, opens offline).
+    Graph {
+        /// Write the interactive HTML viewer to this path instead of printing
+        /// JSON. Without a value, writes `ovecc-graph.html`.
+        #[arg(long, value_name = "PATH", num_args = 0..=1, default_missing_value = "ovecc-graph.html")]
+        html: Option<PathBuf>,
+    },
 }
 
 /// CLI-facing mirror of `ovecc_core::facts::Severity`.
@@ -398,6 +450,10 @@ pub fn run() -> Result<u8> {
     let started = std::time::Instant::now();
 
     let outcome = match cli.command {
+        Command::Init { force } => {
+            let paths = ProjectPaths::resolve(cli.repo.unwrap_or_else(|| PathBuf::from(".")))?;
+            run_init(&paths, force)
+        }
         Command::Index {
             path,
             no_git,
@@ -478,6 +534,7 @@ pub fn run() -> Result<u8> {
             fail_on,
             baseline,
             write_baseline,
+            changed_since,
         } => {
             let paths = ProjectPaths::resolve(cli.repo.unwrap_or_else(|| PathBuf::from(".")))?;
             let config = load_config(&paths, format_override)?;
@@ -500,9 +557,38 @@ pub fn run() -> Result<u8> {
                 let accepted = load_baseline(&baseline_path);
                 findings.retain(|finding| !accepted.contains(finding.id.as_str()));
             }
+            if let Some(reference) = &changed_since {
+                filter_changed_since(&mut findings, &paths.root, reference)?;
+            }
 
             render_violations(&findings, config.output.default_format)?;
             Ok(findings_exit(&findings, fail_on))
+        }
+        Command::History { metric, limit } => {
+            let paths = ProjectPaths::resolve(cli.repo.unwrap_or_else(|| PathBuf::from(".")))?;
+            let config = load_config(&paths, format_override)?;
+            let store = open_store(&paths)?;
+            let repository_id = paths.repository_id().0;
+            match metric {
+                None => {
+                    let names = store.metric_names(&repository_id)?;
+                    render_history_index(&names, config.output.default_format)?;
+                }
+                Some(name) => {
+                    let points = store.metric_history(&repository_id, &name, limit)?;
+                    if points.is_empty() {
+                        return Err(OveccError::Usage {
+                            message: format!(
+                                "no history for metric '{name}' — run `ovecc history` to list \
+                                 the trendable metrics"
+                            ),
+                        }
+                        .into());
+                    }
+                    render_history(&name, &points, config.output.default_format)?;
+                }
+            }
+            Ok(0)
         }
         Command::Hotspots { limit } => {
             let paths = ProjectPaths::resolve(cli.repo.unwrap_or_else(|| PathBuf::from(".")))?;
@@ -543,7 +629,44 @@ pub fn run() -> Result<u8> {
             let paths = ProjectPaths::resolve(cli.repo.unwrap_or_else(|| PathBuf::from(".")))?;
             let store = open_store(&paths)?;
             let slice = build_context_slice(&paths, &store, &target)?;
-            println!("{}", serde_json::to_string_pretty(&slice)?);
+            // The standard envelope, like every other command (the slice is
+            // the `data` payload).
+            emit_json("export context", &slice, meta_for("export context"))?;
+            Ok(0)
+        }
+        Command::Export {
+            what: ExportCommand::Graph { html },
+        } => {
+            let paths = ProjectPaths::resolve(cli.repo.unwrap_or_else(|| PathBuf::from(".")))?;
+            let store = open_store(&paths)?;
+            let repository_id = paths.repository_id().0;
+            let files = store.current_files(&repository_id)?;
+            let deps = store.current_dependencies(&repository_id)?;
+            let repository = paths
+                .root
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "repository".to_string());
+            let export = crate::export_graph::build(repository, &files, &deps);
+            match html {
+                None => emit_json("export graph", &export, meta_for("export graph"))?,
+                Some(path) => {
+                    let page = crate::export_graph::render_html(&export)?;
+                    std::fs::write(&path, &page).map_err(|error| {
+                        ovecc_core::error::OveccError::Repository {
+                            message: format!("failed to write {}: {error}", path.display()),
+                        }
+                    })?;
+                    let summary = serde_json::json!({
+                        "html": path.to_string_lossy(),
+                        "bytes": page.len(),
+                        "modules": export.modules.nodes.len(),
+                        "files": export.files.nodes.len(),
+                        "file_edges": export.files.edges.len(),
+                    });
+                    emit_json("export graph", &summary, meta_for("export graph"))?;
+                }
+            }
             Ok(0)
         }
         Command::Explain { target } => {
@@ -566,10 +689,19 @@ pub fn run() -> Result<u8> {
             render_security(&report, config.output.default_format)?;
             Ok(findings_exit(&report.findings, fail_on))
         }
-        Command::Audit { fail_on } => {
+        Command::Audit { fail_on, fetch } => {
             let paths = ProjectPaths::resolve(cli.repo.unwrap_or_else(|| PathBuf::from(".")))?;
             let config = load_config(&paths, format_override)?;
             let packages = ovecc_audit::discover_packages(&paths.root);
+            if fetch {
+                // Progress goes to stderr so stdout stays machine-readable.
+                let (written, queried) =
+                    ovecc_audit::fetch_advisories(&packages, &paths.ovecc_dir.join("osv"))
+                        .map_err(|error| OveccError::Repository {
+                            message: format!("audit --fetch failed: {error:#}"),
+                        })?;
+                eprintln!("Fetched {written} new advisory(ies) for {queried} package(s).");
+            }
             let osv = ovecc_audit::load_osv_dir(&paths.ovecc_dir.join("osv"));
             let findings = ovecc_audit::audit(&paths.repository_id().0, None, &packages, &osv);
             let report = AuditReport {
@@ -632,7 +764,14 @@ pub fn run() -> Result<u8> {
             let mut findings: Vec<FindingRecord> = store
                 .findings(&paths.repository_id().0, None)?
                 .into_iter()
-                .filter(|finding| finding.kind == FindingKind::HighComplexity)
+                .filter(|finding| {
+                    matches!(
+                        finding.kind,
+                        FindingKind::HighComplexity
+                            | FindingKind::LongFunction
+                            | FindingKind::LongParameterList
+                    )
+                })
                 .collect();
             findings.sort_by(|a, b| {
                 b.severity
@@ -640,17 +779,32 @@ pub fn run() -> Result<u8> {
                     .then_with(|| a.title.cmp(&b.title))
             });
             let report = HealthReport {
-                high_complexity_functions: findings.len(),
+                high_complexity_functions: findings
+                    .iter()
+                    .filter(|f| f.kind == FindingKind::HighComplexity)
+                    .count(),
+                oversized_units: findings
+                    .iter()
+                    .filter(|f| {
+                        matches!(
+                            f.kind,
+                            FindingKind::LongFunction | FindingKind::LongParameterList
+                        )
+                    })
+                    .count(),
                 findings,
             };
             render_health(&report, config.output.default_format)?;
             Ok(0)
         }
-        Command::Deadcode { fail_on } => {
+        Command::Deadcode {
+            fail_on,
+            changed_since,
+        } => {
             let paths = ProjectPaths::resolve(cli.repo.unwrap_or_else(|| PathBuf::from(".")))?;
             let config = load_config(&paths, format_override)?;
             let store = open_store(&paths)?;
-            let findings: Vec<FindingRecord> = store
+            let mut findings: Vec<FindingRecord> = store
                 .findings(&paths.repository_id().0, None)?
                 .into_iter()
                 .filter(|finding| {
@@ -663,6 +817,9 @@ pub fn run() -> Result<u8> {
                     )
                 })
                 .collect();
+            if let Some(reference) = &changed_since {
+                filter_changed_since(&mut findings, &paths.root, reference)?;
+            }
             let report = DeadcodeReport {
                 unused_exports: findings
                     .iter()
@@ -684,6 +841,23 @@ pub fn run() -> Result<u8> {
             };
             render_deadcode(&report, config.output.default_format)?;
             Ok(findings_exit(&report.findings, fail_on))
+        }
+        Command::Fix { apply, rule } => {
+            let paths = ProjectPaths::resolve(cli.repo.unwrap_or_else(|| PathBuf::from(".")))?;
+            let config = load_config(&paths, format_override)?;
+            let store = open_store(&paths)?;
+            let findings: Vec<FindingRecord> = store
+                .findings(&paths.repository_id().0, None)?
+                .into_iter()
+                .filter(|finding| finding.kind.fix_spec().auto_fixable)
+                .filter(|finding| {
+                    rule.as_deref()
+                        .is_none_or(|wanted| finding.rule_name.as_deref() == Some(wanted))
+                })
+                .collect();
+            let report = crate::fix::run(&paths.root, &findings, apply);
+            render_fix(&report, config.output.default_format)?;
+            Ok(0)
         }
         Command::Review {
             base,
@@ -708,11 +882,12 @@ pub fn run() -> Result<u8> {
         } => {
             let paths = ProjectPaths::resolve(cli.repo.unwrap_or_else(|| PathBuf::from(".")))?;
             let config = load_config(&paths, format_override)?;
+            let diagnose_config = diagnose_config_for(&paths, &config);
             let report = run_diagnose(
                 &paths,
                 target.as_deref(),
                 severity.map(Into::into),
-                &config.diagnose,
+                &diagnose_config,
             )?;
             render_diagnose(&report, config.output.default_format, group_by)?;
             Ok(diagnose_exit(&report, fail_on))
@@ -720,14 +895,16 @@ pub fn run() -> Result<u8> {
         Command::Advise { target } => {
             let paths = ProjectPaths::resolve(cli.repo.unwrap_or_else(|| PathBuf::from(".")))?;
             let config = load_config(&paths, format_override)?;
+            let diagnose_config = diagnose_config_for(&paths, &config);
             // Advise is diagnose focused on a single target.
-            let report = run_diagnose(&paths, Some(&target), None, &config.diagnose)?;
+            let report = run_diagnose(&paths, Some(&target), None, &diagnose_config)?;
             render_diagnose(&report, config.output.default_format, None)?;
             Ok(0)
         }
         Command::Metrics { target } => {
             let paths = ProjectPaths::resolve(cli.repo.unwrap_or_else(|| PathBuf::from(".")))?;
             let config = load_config(&paths, format_override)?;
+            let diagnose_config = diagnose_config_for(&paths, &config);
             let (files, file_deps, churn, complexity, abstractness, _co_change) =
                 load_diagnose_inputs(&paths)?;
             let mut report = ovecc_graph::diagnose::metrics(
@@ -736,7 +913,7 @@ pub fn run() -> Result<u8> {
                 &churn,
                 &complexity,
                 &abstractness,
-                &config.diagnose,
+                &diagnose_config,
             );
             if let Some(t) = &target {
                 let needle = t.to_ascii_lowercase();
@@ -781,13 +958,18 @@ fn render_index_timings(timings: &ovecc_core::report::IndexTimings) {
 /// (slice + explanation) for json/ndjson.
 fn render_explanation(slice: &ContextSlice, explanation: &str, format: OutputFormat) -> Result<()> {
     match format {
-        OutputFormat::Json | OutputFormat::Ndjson => {
-            let envelope = serde_json::json!({
+        // The standard envelope, like every other command — a bare object
+        // here would violate the documented JSON contract.
+        OutputFormat::Json
+        | OutputFormat::Ndjson
+        | OutputFormat::Sarif
+        | OutputFormat::Codeclimate => {
+            let data = serde_json::json!({
                 "target": slice.target,
                 "explanation": explanation,
                 "context": slice,
             });
-            println!("{}", serde_json::to_string_pretty(&envelope)?);
+            emit_json("explain", &data, meta_for("explain"))?;
         }
         _ => print!("{explanation}"),
     }
@@ -1002,6 +1184,17 @@ fn build_context_slice(
     let repository_id = paths.repository_id().0;
     let (nodes, edges) = load_graph(store, &repository_id)?;
     let resolved = blast::resolve_target(target, &nodes);
+    // An unknown target would otherwise narrate an empty slice as if the
+    // element existed and were isolated — actively misleading for an agent.
+    if resolved.is_none() {
+        return Err(OveccError::Usage {
+            message: format!(
+                "no architecture element matches '{target}' — try a module name, a file path, \
+                 or `ovecc query \"module {target}\"` to search"
+            ),
+        }
+        .into());
+    }
     let (label, target_id) = match &resolved {
         Some(node) => (node.label.clone(), Some(node.id.clone())),
         None => (target.to_string(), None),
@@ -1285,6 +1478,20 @@ type DiagnoseInputs = (
     std::collections::HashMap<String, (f64, f64)>,
     Vec<(String, String, f64)>,
 );
+
+/// The effective diagnose config for a run: user overrides win; when the user
+/// set no `component_roots`, they are derived from the repository's manifests
+/// (Cargo crates, npm packages) so components align with real packages.
+fn diagnose_config_for(
+    paths: &ProjectPaths,
+    config: &OveccConfig,
+) -> ovecc_core::config::DiagnoseConfig {
+    let mut diagnose = config.diagnose.clone();
+    if diagnose.component_roots.is_empty() {
+        diagnose.component_roots = ovecc_indexer::manifest_component_roots(&paths.root);
+    }
+    diagnose
+}
 
 fn load_diagnose_inputs(paths: &ProjectPaths) -> Result<DiagnoseInputs> {
     let store = open_store(paths)?;
@@ -1768,6 +1975,112 @@ fn load_baseline(path: &std::path::Path) -> std::collections::HashSet<String> {
 
 /// CI exit code for finding-bearing commands (`violations`, `security`,
 /// `audit`): 1 when a finding crosses the threshold, else 0.
+/// The commented starter config `ovecc init` writes: every key optional,
+/// every value shown is the default, so an untouched file changes nothing.
+const INIT_CONFIG_TEMPLATE: &str = r#"# ovecc configuration - every key is optional; commented values are the defaults.
+# Machine-readable reference: `ovecc capabilities`.
+
+[output]
+# text | json | ndjson | markdown (sarif / codeclimate via --format)
+# default_format = "text"
+
+[index]
+# Extra paths to skip, on top of the built-ins (node_modules, target, dist, .venv, ...).
+# exclude = ["vendored"]
+# Flag manifest dependencies that no indexed file imports (off by default:
+# config-only usages cause false positives).
+# detect_unused_deps = true
+
+# --- governance: declarative architecture rules, enforced at index time ---
+# [[rules.boundaries]]
+# name = "billing must not depend on user"
+# source = "billing"
+# target = "user"
+# allowed = false
+# severity = "high"
+
+# [[rules.banned_imports]]
+# name = "no-deprecated-lodash"
+# pattern = "lodash"
+# message = "use es-toolkit instead"
+# severity = "medium"
+
+# --- architecture diagnosis thresholds (see docs/dev/DIAGNOSE.md) ---
+# [diagnose]
+# min_confidence = 0.5
+"#;
+
+/// `ovecc init`: writes the starter config (never silently overwriting),
+/// git-ignores `.ovecc/`, and prints the first commands to run.
+fn run_init(paths: &ProjectPaths, force: bool) -> Result<u8> {
+    let config_path = paths.ovecc_dir.join("config.toml");
+    if config_path.exists() && !force {
+        println!(
+            "Already initialized: {} exists (pass --force to overwrite it).",
+            config_path.display()
+        );
+    } else {
+        std::fs::create_dir_all(&paths.ovecc_dir)?;
+        std::fs::write(&config_path, INIT_CONFIG_TEMPLATE)?;
+        println!("Wrote {}", config_path.display());
+    }
+
+    // `.ovecc/` holds local state (DuckDB database, parse cache) — never
+    // commit it. Only touch .gitignore inside an actual Git repository.
+    if paths.root.join(".git").exists() {
+        let gitignore = paths.root.join(".gitignore");
+        let current = std::fs::read_to_string(&gitignore).unwrap_or_default();
+        let already = current
+            .lines()
+            .any(|line| matches!(line.trim(), ".ovecc" | ".ovecc/" | "/.ovecc" | "/.ovecc/"));
+        if already {
+            println!(".gitignore already covers .ovecc/");
+        } else {
+            let mut updated = current;
+            if !updated.is_empty() && !updated.ends_with('\n') {
+                updated.push('\n');
+            }
+            updated.push_str("# ovecc local state (database + parse cache)\n.ovecc/\n");
+            std::fs::write(&gitignore, updated)?;
+            println!("Added .ovecc/ to .gitignore");
+        }
+    }
+
+    println!();
+    println!("Next steps:");
+    println!("  ovecc index .        build the architecture model (fully local)");
+    println!("  ovecc summary        one-screen health");
+    println!("  ovecc diagnose       named architecture smells, each with a fix");
+    println!("  ovecc mcp            expose every command to your coding agent");
+    Ok(0)
+}
+
+/// Retains only findings whose evidence touches a file changed since
+/// `reference` (tree-to-tree against HEAD). Errors when the ref cannot be
+/// resolved — silently reporting the whole backlog would defeat the flag.
+fn filter_changed_since(
+    findings: &mut Vec<FindingRecord>,
+    root: &std::path::Path,
+    reference: &str,
+) -> Result<()> {
+    let Some(changed) = ovecc_git::changed_files_since(root, reference) else {
+        return Err(OveccError::Git {
+            message: format!(
+                "--changed-since: cannot resolve '{reference}' (not a git repository, or unknown ref)"
+            ),
+            source: None,
+        }
+        .into());
+    };
+    findings.retain(|finding| {
+        finding
+            .evidence
+            .iter()
+            .any(|evidence| changed.contains(&evidence.file_path))
+    });
+    Ok(())
+}
+
 fn findings_exit(findings: &[FindingRecord], fail_on: Option<FailOn>) -> u8 {
     let Some(fail_on) = fail_on else {
         return 0;
@@ -3006,7 +3319,220 @@ fn render_dupes(report: &DupesReport, format: OutputFormat) -> Result<()> {
 #[derive(serde::Serialize)]
 struct HealthReport {
     high_complexity_functions: usize,
+    /// Unit-size findings (long function / long parameter list) — reported by
+    /// `health` alongside complexity so "0 high-complexity" is never shown
+    /// while size findings exist in `violations`.
+    oversized_units: usize,
     findings: Vec<FindingRecord>,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct HistoryPoint {
+    snapshot_id: String,
+    commit_sha: Option<String>,
+    created_at: String,
+    value: f64,
+    /// Change versus the previous point (absent on the first).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    delta: Option<f64>,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct HistoryReport {
+    metric: String,
+    snapshots: usize,
+    first: f64,
+    last: f64,
+    change: f64,
+    sparkline: String,
+    points: Vec<HistoryPoint>,
+}
+
+/// Eight-level Unicode sparkline over the raw values (flat series renders a
+/// mid-level bar so "no movement" still reads as a line, not an artifact).
+fn sparkline(values: &[f64]) -> String {
+    const LEVELS: [char; 8] = [
+        '\u{2581}', '\u{2582}', '\u{2583}', '\u{2584}', '\u{2585}', '\u{2586}', '\u{2587}',
+        '\u{2588}',
+    ];
+    let min = values.iter().copied().fold(f64::INFINITY, f64::min);
+    let max = values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    if !min.is_finite() || !max.is_finite() || (max - min).abs() < f64::EPSILON {
+        return LEVELS[3].to_string().repeat(values.len());
+    }
+    values
+        .iter()
+        .map(|v| {
+            let t = (v - min) / (max - min);
+            LEVELS[((t * 7.0).round() as usize).min(7)]
+        })
+        .collect()
+}
+
+fn build_history_report(
+    metric: &str,
+    points: &[(String, Option<String>, String, f64)],
+) -> HistoryReport {
+    let values: Vec<f64> = points.iter().map(|(_, _, _, v)| *v).collect();
+    let history_points: Vec<HistoryPoint> = points
+        .iter()
+        .enumerate()
+        .map(|(i, (id, sha, at, value))| HistoryPoint {
+            snapshot_id: id.clone(),
+            commit_sha: sha.clone(),
+            created_at: at.clone(),
+            value: *value,
+            delta: (i > 0).then(|| value - values[i - 1]),
+        })
+        .collect();
+    let first = *values.first().unwrap_or(&0.0);
+    let last = *values.last().unwrap_or(&0.0);
+    HistoryReport {
+        metric: metric.to_string(),
+        snapshots: points.len(),
+        first,
+        last,
+        change: last - first,
+        sparkline: sparkline(&values),
+        points: history_points,
+    }
+}
+
+fn render_history(
+    metric: &str,
+    points: &[(String, Option<String>, String, f64)],
+    format: OutputFormat,
+) -> Result<()> {
+    let report = build_history_report(metric, points);
+    match format {
+        OutputFormat::Json | OutputFormat::Sarif | OutputFormat::Codeclimate => {
+            emit_json("history", &report, meta_for("history"))?
+        }
+        OutputFormat::Ndjson => {
+            emit_ndjson_meta("history", &meta_for("history"))?;
+            for point in &report.points {
+                println!("{}", ndjson_line("history", point)?);
+            }
+        }
+        OutputFormat::Markdown => {
+            println!(
+                "# History: `{}` over {} snapshot(s) — {} -> {} ({:+})",
+                report.metric, report.snapshots, report.first, report.last, report.change
+            );
+            println!();
+            println!("`{}`", report.sparkline);
+            println!();
+            println!("| When | Commit | Value | Delta |");
+            println!("| --- | --- | ---: | ---: |");
+            for point in &report.points {
+                println!(
+                    "| {} | {} | {} | {} |",
+                    point.created_at,
+                    point
+                        .commit_sha
+                        .as_deref()
+                        .map(|s| &s[..s.len().min(7)])
+                        .unwrap_or("-"),
+                    point.value,
+                    point.delta.map(|d| format!("{d:+}")).unwrap_or_default()
+                );
+            }
+        }
+        OutputFormat::Text => {
+            println!(
+                "History: {} over {} snapshot(s)   {} -> {} ({:+})",
+                report.metric, report.snapshots, report.first, report.last, report.change
+            );
+            println!("  {}", report.sparkline);
+            for point in &report.points {
+                println!(
+                    "  {}  {:>7}  {:>10}  {}",
+                    point.created_at,
+                    point
+                        .commit_sha
+                        .as_deref()
+                        .map(|s| &s[..s.len().min(7)])
+                        .unwrap_or("-"),
+                    point.value,
+                    point.delta.map(|d| format!("{d:+}")).unwrap_or_default()
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn render_history_index(names: &[String], format: OutputFormat) -> Result<()> {
+    match format {
+        OutputFormat::Json
+        | OutputFormat::Ndjson
+        | OutputFormat::Sarif
+        | OutputFormat::Codeclimate => emit_json(
+            "history",
+            &serde_json::json!({ "metrics": names }),
+            meta_for("history"),
+        )?,
+        _ => {
+            println!("Trendable metrics ({}):", names.len());
+            for name in names {
+                println!("  {name}");
+            }
+            if names.is_empty() {
+                println!("  (none yet — run `ovecc index` first)");
+            } else {
+                println!();
+                println!("Run `ovecc history <metric>` to trend one.");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn render_fix(report: &crate::fix::FixReport, format: OutputFormat) -> Result<()> {
+    match format {
+        OutputFormat::Json | OutputFormat::Sarif | OutputFormat::Codeclimate => {
+            emit_json("fix", report, meta_for("fix"))?
+        }
+        OutputFormat::Ndjson => {
+            emit_ndjson_meta("fix", &meta_for("fix"))?;
+            for action in &report.actions {
+                println!("{}", ndjson_line("fix", action)?);
+            }
+        }
+        OutputFormat::Markdown | OutputFormat::Text => {
+            let mode = if report.applied {
+                "applied"
+            } else {
+                "dry-run (pass --apply to write)"
+            };
+            println!(
+                "Fix {}: {} change(s), {} skipped — {}",
+                if report.applied { "applied" } else { "plan" },
+                report.fixed,
+                report.skipped,
+                mode
+            );
+            for action in &report.actions {
+                println!();
+                let location = match action.line {
+                    Some(line) => format!("{}:{line}", action.file),
+                    None => action.file.clone(),
+                };
+                println!(
+                    "[{}] {} — {} ({})",
+                    action.status, action.fix, location, action.rule
+                );
+                println!("    {}", action.detail);
+            }
+            if report.actions.is_empty() {
+                println!("  (no auto-fixable findings — run `ovecc deadcode` to see candidates)");
+            } else if report.applied && report.fixed > 0 {
+                println!();
+                println!("Re-run `ovecc index` to refresh the model.");
+            }
+        }
+    }
+    Ok(())
 }
 
 fn render_health(report: &HealthReport, format: OutputFormat) -> Result<()> {
@@ -3022,12 +3548,12 @@ fn render_health(report: &HealthReport, format: OutputFormat) -> Result<()> {
         }
         OutputFormat::Markdown => {
             println!(
-                "# Health: {} high-complexity function(s)",
-                report.high_complexity_functions
+                "# Health: {} high-complexity function(s), {} oversized unit(s)",
+                report.high_complexity_functions, report.oversized_units
             );
             println!();
             if report.findings.is_empty() {
-                println!("_No functions over the complexity thresholds._");
+                println!("_No functions over the complexity or size thresholds._");
             }
             for finding in &report.findings {
                 println!(
@@ -3040,8 +3566,8 @@ fn render_health(report: &HealthReport, format: OutputFormat) -> Result<()> {
         }
         OutputFormat::Text => {
             println!(
-                "Code health: {} high-complexity function(s)",
-                report.high_complexity_functions
+                "Code health: {} high-complexity function(s), {} oversized unit(s)",
+                report.high_complexity_functions, report.oversized_units
             );
             for finding in &report.findings {
                 println!();
@@ -3051,7 +3577,7 @@ fn render_health(report: &HealthReport, format: OutputFormat) -> Result<()> {
                 }
             }
             if report.findings.is_empty() {
-                println!("  (no functions over the complexity thresholds)");
+                println!("  (no functions over the complexity or size thresholds)");
             }
         }
     }

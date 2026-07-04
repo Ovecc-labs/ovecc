@@ -13,6 +13,9 @@ bin/*.exe
 *.log
 export.json
 
+# Generated graph viewer (rebuilt anytime via `ovecc export graph --html`)
+ovecc-graph.html
+
 # Local benchmark checkouts — large third-party clones, never committed.
 # Measured results live in BENCHMARKS.md instead.
 /benchmarks/

@@ -410,6 +410,7 @@ mod tests {
                     line: 4,
                     detail: Some("AWS access key".to_string()),
                     caller_qualified_name: None,
+                    in_test_code: false,
                 },
             ),
             (
@@ -419,6 +420,7 @@ mod tests {
                     line: 9,
                     detail: Some("MD5".to_string()),
                     caller_qualified_name: None,
+                    in_test_code: false,
                 },
             ),
         ];

@@ -45,7 +45,12 @@ const SOURCE_EXTENSIONS: &[&str] = &[
 /// miss and re-parse.
 // v12: `export type { X } from` is now classified TypeOnly (was ReExport), so
 // cached facts from v11 would keep witnessing type-only cycles.
-const PARSE_CACHE_VERSION: &str = "v12";
+// v13: SecurityPatternFact gains `in_test_code` (Rust inline `#[cfg(test)]`
+// scopes); serde would default old cached facts to `false`, which is wrong for
+// test-scoped patterns, so force re-extraction.
+// v14: Rust fully-qualified paths (`other_crate::item`) now emit import facts,
+// so cached v13 facts would miss those dependency edges.
+const PARSE_CACHE_VERSION: &str = "v15";
 
 pub fn index_repository(
     paths: &ProjectPaths,
@@ -526,6 +531,14 @@ pub fn index_repository(
     // secret/SAST false positive. Down-rank them to Low so they stay visible in
     // `security` but do not trip a high-severity gate. Down-ranked, not dropped:
     // a real issue committed to a test file is still reported.
+    // Rust's inline `#[cfg(test)]` scopes are test code the path heuristics
+    // can't see; the parser stamped their patterns, collect the (file, line)
+    // sites so they down-rank exactly like test files.
+    let test_scoped_patterns: std::collections::HashSet<(&str, u32)> = security_patterns
+        .iter()
+        .filter(|(_, pattern)| pattern.in_test_code)
+        .map(|(path, pattern)| (path.as_str(), pattern.line))
+        .collect();
     for finding in &mut findings {
         let is_security = matches!(
             finding.kind,
@@ -534,7 +547,11 @@ pub fn index_repository(
         if is_security
             && finding.severity != ovecc_core::facts::Severity::Low
             && finding.evidence.iter().any(|evidence| {
-                is_test_file(&evidence.file_path) || is_standalone_entry(&evidence.file_path)
+                is_test_file(&evidence.file_path)
+                    || is_standalone_entry(&evidence.file_path)
+                    || evidence.line.is_some_and(|line| {
+                        test_scoped_patterns.contains(&(evidence.file_path.as_str(), line))
+                    })
             })
         {
             finding.severity = ovecc_core::facts::Severity::Low;
@@ -542,26 +559,74 @@ pub fn index_repository(
     }
 
     // Drop findings explicitly suppressed by an inline `// ovecc-ignore`.
-    let suppressions: HashMap<String, std::collections::HashSet<u32>> = file_facts
-        .iter()
-        .filter(|(_, facts)| !facts.suppressed_lines.is_empty())
-        .map(|(path, facts)| {
-            (
-                path.clone(),
-                facts.suppressed_lines.iter().copied().collect(),
-            )
-        })
-        .collect();
+    // BTreeMap so the stale-suppression sweep below iterates deterministically.
+    let suppressions: std::collections::BTreeMap<String, std::collections::BTreeSet<u32>> =
+        file_facts
+            .iter()
+            .filter(|(_, facts)| !facts.suppressed_lines.is_empty())
+            .map(|(path, facts)| {
+                (
+                    path.clone(),
+                    facts.suppressed_lines.iter().copied().collect(),
+                )
+            })
+            .collect();
     if !suppressions.is_empty() {
+        let mut used: HashSet<(String, u32)> = HashSet::new();
         findings.retain(|finding| {
-            !finding.evidence.iter().any(|evidence| {
-                evidence.line.is_some_and(|line| {
-                    suppressions
+            let mut suppressed = false;
+            for evidence in &finding.evidence {
+                if let Some(line) = evidence.line
+                    && suppressions
                         .get(&evidence.file_path)
                         .is_some_and(|lines| lines.contains(&line))
-                })
-            })
+                {
+                    used.insert((evidence.file_path.clone(), line));
+                    suppressed = true;
+                }
+            }
+            !suppressed
         });
+        // A suppression that silenced nothing is stale: it documents a finding
+        // that no longer exists and will silently swallow the next real one on
+        // its line. Surface it (Low) so it gets cleaned up.
+        let mut stale = 0usize;
+        for (path, lines) in &suppressions {
+            for line in lines {
+                if used.contains(&(path.clone(), *line)) {
+                    continue;
+                }
+                stale += 1;
+                findings.push(ovecc_core::facts::FindingRecord {
+                    id: ovecc_core::id::FindingId::from_parts(&[
+                        &repository_id,
+                        "stale-suppression",
+                        path,
+                        &line.to_string(),
+                    ]),
+                    repository_id: RepositoryId::from_raw(&repository_id),
+                    snapshot_id: Some(ovecc_core::id::SnapshotId::from_raw(&snapshot_id)),
+                    kind: FindingKind::StaleSuppression,
+                    severity: ovecc_core::facts::Severity::Low,
+                    rule_name: Some("stale-suppression".to_string()),
+                    target: None,
+                    title: format!("Stale suppression: {path}:{line}"),
+                    description: format!(
+                        "The ovecc-ignore targeting {path}:{line} suppresses no finding. \
+                         Delete it — a stale suppression silently swallows the next real \
+                         finding on that line."
+                    ),
+                    evidence: vec![ovecc_core::facts::Evidence {
+                        file_path: path.clone(),
+                        line: Some(*line),
+                        symbol: None,
+                        detail: Some("ovecc-ignore with no matching finding".to_string()),
+                    }],
+                    created_at: chrono::Utc::now(),
+                });
+            }
+        }
+        metrics.push(("stale_suppressions".to_string(), stale as f64));
     }
 
     findings.sort_by(|a, b| a.id.0.cmp(&b.id.0));
@@ -1312,6 +1377,17 @@ fn looks_generated(path: &Path) -> bool {
         return true;
     }
     let lower = text.to_ascii_lowercase();
+    // Generated-file banners live at the very top (Go's convention is even
+    // line-anchored; `@ts-nocheck` only works before the first statement).
+    // Scanning deeper turns files that merely *document* these markers — a
+    // codegen tool's config, this very detector — into silently skipped
+    // "generated" files. 1 KiB comfortably covers real banners, even behind
+    // a license header.
+    let mut banner_end = lower.len().min(1024);
+    while !lower.is_char_boundary(banner_end) {
+        banner_end -= 1;
+    }
+    let banner = &lower[..banner_end];
     const MARKERS: [&str; 6] = [
         "@generated",
         "do not edit",
@@ -1320,12 +1396,12 @@ fn looks_generated(path: &Path) -> bool {
         "autogenerated",
         "automatically generated",
     ];
-    if MARKERS.iter().any(|marker| lower.contains(marker)) {
+    if MARKERS.iter().any(|marker| banner.contains(marker)) {
         return true;
     }
     // Whole-file opt-out combo emscripten/codegen emit and that hand-maintained
     // code virtually never carries.
-    lower.contains("@ts-nocheck") && lower.contains("eslint-disable")
+    banner.contains("@ts-nocheck") && banner.contains("eslint-disable")
 }
 
 fn should_skip_path(root: &Path, path: &Path) -> bool {
@@ -1456,6 +1532,24 @@ fn resolve_dependencies(
     // internal); resolves relative, bare/package, and tsconfig-aliased JS/TS
     // imports — a strict superset of the old relative-only resolution.
     let js_resolver = create_js_resolver();
+    // Cargo workspace map: `ovecc_core` -> `crates/ovecc-core/src`. Without it
+    // every `use other_crate::…` in a Rust workspace reads as external and the
+    // architecture graph of a Rust monorepo has no inter-crate edges at all.
+    let cargo_crates = find_cargo_crate_roots(&paths.root);
+    // npm workspace map: package name -> (dir, manifest). A freshly cloned
+    // monorepo has no node_modules, so oxc cannot resolve `pkg-a` imports from
+    // `pkg-b`; this map resolves them through the workspace manifests instead.
+    let npm_workspace: HashMap<String, (String, serde_json::Value)> =
+        find_package_manifests(&paths.root)
+            .into_iter()
+            .filter_map(|(dir, manifest)| {
+                let name = manifest.get("name").and_then(|value| value.as_str())?;
+                Some((
+                    name.to_string(),
+                    (dir.trim_end_matches('/').to_string(), manifest),
+                ))
+            })
+            .collect();
 
     for file in files {
         let Some(imports) = parsed_imports.get(&file.path) else {
@@ -1473,17 +1567,31 @@ fn resolve_dependencies(
                     file,
                     &import.specifier,
                     file_by_path,
-                ),
+                )
+                .or_else(|| {
+                    resolve_workspace_package_import(
+                        &js_resolver,
+                        &paths.root,
+                        &npm_workspace,
+                        &import.specifier,
+                        file_by_path,
+                    )
+                }),
                 SourceLanguage::Python => resolve_suffix_unique(
                     &python_import_candidates(&file.path, &import.specifier),
                     &suffix_index,
                     file_by_path,
                 ),
-                SourceLanguage::Rust => resolve_suffix_unique(
-                    &rust_import_candidates(&file.path, &import.specifier),
-                    &suffix_index,
-                    file_by_path,
-                ),
+                SourceLanguage::Rust => {
+                    resolve_rust_workspace_import(&cargo_crates, &import.specifier, file_by_path)
+                        .or_else(|| {
+                            resolve_suffix_unique(
+                                &rust_import_candidates(&file.path, &import.specifier),
+                                &suffix_index,
+                                file_by_path,
+                            )
+                        })
+                }
                 SourceLanguage::Cpp => resolve_suffix_unique(
                     &cpp_import_candidates(&file.path, &import.specifier),
                     &suffix_index,
@@ -1662,6 +1770,121 @@ fn resolve_js_ts_import(
     // indexed set; outside root or a miss (node_modules) => external.
     let relative = repo_relative_path(root, &resolved_abs)?;
     file_by_path.get(&relative).cloned()
+}
+
+/// Resolves a bare import naming a *workspace package* (`pkg-a`, `zod/v4`)
+/// through the workspace manifests — the fallback when oxc found no
+/// node_modules (a freshly cloned monorepo). Entry candidates come from the
+/// package's own contract (`exports`, `module`, `main`, `types`), then the
+/// `src/index` convention; each resolves via oxc from the package directory so
+/// extension and index probing behave exactly like the primary path.
+fn resolve_workspace_package_import(
+    resolver: &oxc_resolver::Resolver,
+    root: &Path,
+    workspace: &HashMap<String, (String, serde_json::Value)>,
+    specifier: &str,
+    file_by_path: &HashMap<String, FileRecord>,
+) -> Option<FileRecord> {
+    if specifier.starts_with('.') || specifier.starts_with('/') {
+        return None;
+    }
+    let (name, subpath) = split_package_specifier(specifier)?;
+    let (dir, manifest) = workspace.get(name)?;
+    let package_dir = if dir.is_empty() {
+        root.to_path_buf()
+    } else {
+        root.join(dir)
+    };
+    let package_dir = strip_verbatim_prefix(&package_dir);
+
+    let mut candidates: Vec<String> = Vec::new();
+    if subpath.is_empty() {
+        if let Some(target) = exports_target(manifest, ".") {
+            candidates.push(target);
+        }
+        for key in ["module", "main", "types"] {
+            if let Some(entry) = manifest.get(key).and_then(|value| value.as_str()) {
+                candidates.push(entry.to_string());
+            }
+        }
+        candidates.push("./src/index".to_string());
+        candidates.push("./index".to_string());
+    } else {
+        if let Some(target) = exports_target(manifest, &format!("./{subpath}")) {
+            candidates.push(target);
+        }
+        candidates.push(format!("./{subpath}"));
+        candidates.push(format!("./src/{subpath}"));
+    }
+
+    for candidate in candidates {
+        let spec = if candidate.starts_with("./") || candidate.starts_with("../") {
+            candidate
+        } else {
+            format!("./{candidate}")
+        };
+        if let Ok(resolution) = resolver.resolve(&package_dir, &spec)
+            && let Some(relative) = repo_relative_path(root, resolution.path())
+            && let Some(file) = file_by_path.get(&relative)
+        {
+            return Some(file.clone());
+        }
+    }
+    None
+}
+
+/// Splits `@scope/pkg/sub/path` / `pkg/sub` into (package name, subpath).
+fn split_package_specifier(specifier: &str) -> Option<(&str, &str)> {
+    let mut slashes = specifier.match_indices('/');
+    let name_end = if specifier.starts_with('@') {
+        slashes.next()?; // scope separator
+        slashes.next().map(|(i, _)| i)
+    } else {
+        slashes.next().map(|(i, _)| i)
+    };
+    match name_end {
+        Some(end) => Some((&specifier[..end], &specifier[end + 1..])),
+        None => Some((specifier, "")),
+    }
+}
+
+/// Walks a manifest `exports` map to the concrete target for `key` (exact
+/// match, then a `./*` wildcard), unwrapping condition objects through the
+/// usual priorities. Returns a relative path string when one exists.
+fn exports_target(manifest: &serde_json::Value, key: &str) -> Option<String> {
+    fn unwrap_conditions(value: &serde_json::Value) -> Option<String> {
+        match value {
+            serde_json::Value::String(target) => Some(target.clone()),
+            serde_json::Value::Object(map) => {
+                for condition in ["import", "default", "node", "require", "types"] {
+                    if let Some(inner) = map.get(condition)
+                        && let Some(target) = unwrap_conditions(inner)
+                    {
+                        return Some(target);
+                    }
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+
+    let exports = manifest.get("exports")?;
+    // A bare-string `exports` is the "." target.
+    if let serde_json::Value::String(target) = exports {
+        return (key == ".").then(|| target.clone());
+    }
+    if let Some(value) = exports.get(key) {
+        return unwrap_conditions(value);
+    }
+    // Single-star wildcard: `"./*": "./src/*.ts"` with key `./v4` -> `./src/v4.ts`.
+    if let Some(stripped) = key.strip_prefix("./")
+        && let Some(pattern_value) = exports.get("./*")
+        && let Some(target) = unwrap_conditions(pattern_value)
+    {
+        return Some(target.replace('*', stripped));
+    }
+    None
 }
 
 /// Strips the Windows `\\?\` / `\\?\UNC\` verbatim prefix from an absolute path
@@ -1881,6 +2104,132 @@ fn rust_import_candidates(source_path: &str, specifier: &str) -> Vec<String> {
     candidates
 }
 
+/// Maps each workspace crate's import name (`ovecc_core`) to its source dir
+/// (`crates/ovecc-core/src`), by locating every `Cargo.toml` that declares a
+/// `[package]`. Hyphens normalize to underscores because that is how Cargo
+/// exposes the crate to `use` paths.
+fn find_cargo_crate_roots(root: &Path) -> HashMap<String, String> {
+    let mut roots = HashMap::new();
+    let mut builder = WalkBuilder::new(root);
+    // Same stance as `find_package_manifests`: don't honour .gitignore (an
+    // ignored manifest still names a real crate); prune via the built-in
+    // excluded dirs (`target`, `node_modules`, …); workspace manifests live
+    // near the top of the tree.
+    builder
+        .hidden(false)
+        .git_ignore(false)
+        .git_exclude(false)
+        .max_depth(Some(6));
+    builder.filter_entry(|entry| {
+        entry.depth() == 0
+            || entry
+                .file_name()
+                .to_str()
+                .map(|name| !is_excluded_component(name))
+                .unwrap_or(true)
+    });
+    for entry in builder.build().flatten() {
+        if entry.file_name() != "Cargo.toml" || !entry.path().is_file() {
+            continue;
+        }
+        let Ok(content) = std::fs::read_to_string(entry.path()) else {
+            continue;
+        };
+        let Ok(manifest) = content.parse::<toml::Table>() else {
+            continue;
+        };
+        let Some(name) = manifest
+            .get("package")
+            .and_then(|package| package.get("name"))
+            .and_then(|name| name.as_str())
+        else {
+            continue; // virtual workspace root, no importable crate
+        };
+        let Some(dir) = entry
+            .path()
+            .parent()
+            .and_then(|parent| parent.strip_prefix(root).ok())
+        else {
+            continue;
+        };
+        let posix = dir.to_string_lossy().replace('\\', "/");
+        let src = if posix.is_empty() {
+            "src".to_string()
+        } else {
+            format!("{posix}/src")
+        };
+        roots.insert(name.replace('-', "_"), src);
+    }
+    roots
+}
+
+/// Manifest directories (Cargo crates with a `[package]`, npm packages) —
+/// the component roots `diagnose` aligns on so a crate's `build.rs` and its
+/// `src/` land in one component. The repository root itself is excluded: a
+/// root-level manifest would silently reshape every single-package repo's
+/// components.
+pub fn manifest_component_roots(root: &Path) -> Vec<String> {
+    let mut roots: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for src in find_cargo_crate_roots(root).values() {
+        if let Some(dir) = src.strip_suffix("/src")
+            && !dir.is_empty()
+        {
+            roots.insert(dir.to_string());
+        }
+    }
+    for (dir, _) in find_package_manifests(root) {
+        let trimmed = dir.trim_end_matches('/');
+        if !trimmed.is_empty() {
+            roots.insert(trimmed.to_string());
+        }
+    }
+    roots.into_iter().collect()
+}
+
+/// Resolves `use other_crate::a::b` through the Cargo workspace map, trying the
+/// most specific file first and walking up: `<src>/a/b.rs`, `<src>/a/b/mod.rs`,
+/// then with the trailing segment dropped (an item, or a module nested inline
+/// in its parent file), down to the crate root `lib.rs`/`main.rs`. Exact-path
+/// lookups — no suffix ambiguity by construction. `None` when the first
+/// segment names no workspace crate (external) so the caller can fall back.
+fn resolve_rust_workspace_import(
+    crate_roots: &HashMap<String, String>,
+    specifier: &str,
+    file_by_path: &HashMap<String, FileRecord>,
+) -> Option<FileRecord> {
+    // Drop a glob or group tail: `a::{b, c}` / `a::*` resolve at module `a`.
+    let head = specifier.split(['{', '*']).next().unwrap_or(specifier);
+    let segments: Vec<&str> = head
+        .split("::")
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    let src = crate_roots.get(*segments.first()?)?;
+    let rest = &segments[1..];
+    for drop in 0..=rest.len() {
+        let kept = &rest[..rest.len() - drop];
+        if kept.is_empty() {
+            // The import lands on the crate root's public surface.
+            for entry in ["lib.rs", "main.rs"] {
+                if let Some(file) = file_by_path.get(&format!("{src}/{entry}")) {
+                    return Some(file.clone());
+                }
+            }
+        } else {
+            let joined = kept.join("/");
+            for candidate in [
+                format!("{src}/{joined}.rs"),
+                format!("{src}/{joined}/mod.rs"),
+            ] {
+                if let Some(file) = file_by_path.get(&candidate) {
+                    return Some(file.clone());
+                }
+            }
+        }
+    }
+    None
+}
+
 /// `#include "session.h"` / `<vector>` -> candidate file paths (system headers
 /// simply never match an indexed file, so they stay external).
 fn cpp_import_candidates(source_path: &str, specifier: &str) -> Vec<String> {
@@ -1965,6 +2314,12 @@ fn external_module_name(specifier: &str) -> String {
 ///   `bin` to indexed source — each relative to its own package directory;
 /// - **framework entry files** the runtime loads rather than `import`s (Next.js
 ///   `app`/`pages` routes, `middleware`);
+/// - **Cargo crate roots** — every crate's `src/main.rs`, `src/bin/*.rs`,
+///   `build.rs` (invoked by Cargo, nothing imports them) and `src/lib.rs`:
+///   cross-crate `use` edges resolve *through* the crate root straight to the
+///   module file, so nothing points at `lib.rs` itself, and a library's public
+///   API may be consumed outside the workspace anyway — intra-crate liveness
+///   is rustc's `dead_code` lint's job, not reachability's;
 /// - the conventional root / `src` `index`/`main`, and all test/spec files.
 ///
 /// Modelled on knip's resolver and fallow's entry-point detection. Biased toward
@@ -1978,6 +2333,27 @@ fn detect_entry_points(root: &Path, files: &[FileRecord]) -> HashSet<String> {
         for spec in manifest_entry_specs(&manifest) {
             if let Some(resolved) = resolve_entry_spec(&dir, &spec, &file_paths) {
                 entries.insert(resolved);
+            }
+        }
+    }
+    for src in find_cargo_crate_roots(root).values() {
+        for root_file in ["main.rs", "lib.rs"] {
+            let candidate = format!("{src}/{root_file}");
+            if file_paths.contains(candidate.as_str()) {
+                entries.insert(candidate);
+            }
+        }
+        // `src` always ends with "src", so this yields the crate directory
+        // ("crates/tool/" or "" for a root crate).
+        let crate_dir = src.strip_suffix("src").unwrap_or_default();
+        let build = format!("{crate_dir}build.rs");
+        if file_paths.contains(build.as_str()) {
+            entries.insert(build);
+        }
+        let bin_prefix = format!("{src}/bin/");
+        for file in files {
+            if file.path.starts_with(&bin_prefix) && file.path.ends_with(".rs") {
+                entries.insert(file.path.clone());
             }
         }
     }
@@ -2071,14 +2447,40 @@ fn external_package_root(specifier: &str) -> Option<String> {
         let mut parts = rest.splitn(3, '/');
         let scope = parts.next()?;
         let name = parts.next()?;
+        // `@/x` (empty scope) is the classic tsconfig root alias, never a
+        // valid npm scope — flagging it as a phantom dependency was a false
+        // positive (seen on zod's `@/.source`).
+        if !is_plausible_npm_segment(scope) || !is_plausible_npm_segment(name) {
+            return None;
+        }
         format!("@{scope}/{name}")
     } else {
-        specifier.split('/').next()?.to_string()
+        let root = specifier.split('/').next()?.to_string();
+        if !is_plausible_npm_segment(&root) {
+            return None;
+        }
+        root
     };
     if BUILTINS.contains(&root.as_str()) {
         return None;
     }
     Some(root)
+}
+
+/// True for a plausible npm package-name segment: non-empty, starts with an
+/// alphanumeric, and uses only URL-safe name characters. Alias-shaped
+/// specifiers — `~/lib` (webpack/Nuxt), `#internal` (Node subpath imports),
+/// `$lib` (SvelteKit), `_private` — all fail, so path aliases whose target is
+/// missing or generated never surface as phantom dependencies.
+fn is_plausible_npm_segment(segment: &str) -> bool {
+    let mut chars = segment.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    first.is_ascii_alphanumeric()
+        && segment
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
 }
 
 /// Flags packages declared in a `package.json` `dependencies` map that no
@@ -2652,6 +3054,79 @@ mod tests {
     }
 
     #[test]
+    fn cargo_binaries_and_build_scripts_are_entry_points() {
+        use ovecc_core::legacy::SourceLanguage;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("crates/tool/src/bin")).unwrap();
+        std::fs::write(
+            root.join("crates/tool/Cargo.toml"),
+            "[package]\nname = \"tool\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        let file = |path: &str| FileRecord {
+            id: String::new(),
+            repository_id: String::new(),
+            path: path.to_string(),
+            absolute_path: root.join(path),
+            language: SourceLanguage::Rust,
+            content_hash: String::new(),
+            size_bytes: 0,
+            module_id: String::new(),
+            module_name: String::new(),
+        };
+        let files = vec![
+            file("crates/tool/src/main.rs"),
+            file("crates/tool/src/bin/extra.rs"),
+            file("crates/tool/build.rs"),
+            file("crates/tool/src/lib.rs"),
+        ];
+        let entries = detect_entry_points(root, &files);
+        assert!(
+            entries.contains("crates/tool/src/main.rs"),
+            "crate binary must be an entry: {entries:?}"
+        );
+        assert!(
+            entries.contains("crates/tool/src/bin/extra.rs"),
+            "bin target must be an entry: {entries:?}"
+        );
+        assert!(
+            entries.contains("crates/tool/build.rs"),
+            "build script must be an entry: {entries:?}"
+        );
+        // Library roots too: cross-crate imports resolve through them to the
+        // module files, so nothing ever imports lib.rs itself.
+        assert!(
+            entries.contains("crates/tool/src/lib.rs"),
+            "lib.rs must be an entry: {entries:?}"
+        );
+    }
+
+    #[test]
+    fn generated_markers_only_count_in_the_file_banner() {
+        let dir = tempfile::tempdir().unwrap();
+        // A marker in the banner: generated.
+        let generated = dir.path().join("gen.rs");
+        std::fs::write(
+            &generated,
+            "// Code generated by protoc. DO NOT EDIT.\npub struct G;\n",
+        )
+        .unwrap();
+        assert!(looks_generated(&generated));
+        // The same words deep in the file merely *document* the convention
+        // (found dogfooding: ovecc-core's config.rs documents the
+        // skip-generated option and was silently dropped from the index).
+        let documenting = dir.path().join("config.rs");
+        let filler = "// filler line to push the mention past the banner window.\n".repeat(40);
+        std::fs::write(
+            &documenting,
+            format!("{filler}/// skips `@generated` / `DO NOT EDIT` markers\npub struct C;\n"),
+        )
+        .unwrap();
+        assert!(!looks_generated(&documenting));
+    }
+
+    #[test]
     fn normalizes_external_package_roots() {
         assert_eq!(external_package_root("lodash").as_deref(), Some("lodash"));
         assert_eq!(
@@ -2971,6 +3446,173 @@ mod tests {
             "external:@scope/pkg"
         );
         assert_eq!(external_module_name("react/jsx-runtime"), "external:react");
+    }
+
+    #[test]
+    fn resolves_workspace_crate_imports_through_cargo_map() {
+        let file = |path: &str| FileRecord {
+            id: format!("f:{path}"),
+            repository_id: "r".to_string(),
+            path: path.to_string(),
+            absolute_path: PathBuf::from(path),
+            language: SourceLanguage::Rust,
+            content_hash: "h".to_string(),
+            size_bytes: 0,
+            module_id: "m".to_string(),
+            module_name: "m".to_string(),
+        };
+        let files = [
+            file("crates/ovecc-core/src/lib.rs"),
+            file("crates/ovecc-core/src/facts.rs"),
+            file("crates/ovecc-core/src/id/mod.rs"),
+            file("crates/ovecc-cli/src/main.rs"),
+        ];
+        let by_path: HashMap<String, FileRecord> =
+            files.iter().map(|f| (f.path.clone(), f.clone())).collect();
+        let mut crates = HashMap::new();
+        crates.insert(
+            "ovecc_core".to_string(),
+            "crates/ovecc-core/src".to_string(),
+        );
+        crates.insert("ovecc_cli".to_string(), "crates/ovecc-cli/src".to_string());
+
+        let path_of = |specifier: &str| {
+            resolve_rust_workspace_import(&crates, specifier, &by_path).map(|f| f.path)
+        };
+        // Module file, most specific match.
+        assert_eq!(
+            path_of("ovecc_core::facts::FixSpec"),
+            Some("crates/ovecc-core/src/facts.rs".to_string())
+        );
+        // `mod.rs` layout.
+        assert_eq!(
+            path_of("ovecc_core::id::FindingId"),
+            Some("crates/ovecc-core/src/id/mod.rs".to_string())
+        );
+        // Group import resolves at the named module.
+        assert_eq!(
+            path_of("ovecc_core::facts::{FindingKind, Severity}"),
+            Some("crates/ovecc-core/src/facts.rs".to_string())
+        );
+        // Item at the crate root lands on lib.rs; bin crates fall back to main.rs.
+        assert_eq!(
+            path_of("ovecc_core::OveccError"),
+            Some("crates/ovecc-core/src/lib.rs".to_string())
+        );
+        assert_eq!(
+            path_of("ovecc_cli::run"),
+            Some("crates/ovecc-cli/src/main.rs".to_string())
+        );
+        // Unknown crates stay external for the caller's fallback.
+        assert_eq!(path_of("serde::Deserialize"), None);
+    }
+
+    #[test]
+    fn finds_cargo_crate_roots_in_a_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("crates").join("my-core").join("src")).unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/*\"]\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("crates").join("my-core").join("Cargo.toml"),
+            "[package]\nname = \"my-core\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        let roots = find_cargo_crate_roots(dir.path());
+        // Hyphen normalizes to underscore; the virtual workspace root is skipped.
+        assert_eq!(
+            roots.get("my_core").map(String::as_str),
+            Some("crates/my-core/src")
+        );
+        assert_eq!(roots.len(), 1);
+    }
+
+    #[test]
+    fn stale_suppressions_are_flagged_and_active_ones_are_not() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        // Line 1 suppresses the real secret on line 2 (active). The trailing
+        // ignore on line 3 suppresses nothing (stale).
+        std::fs::write(
+            dir.path().join("src").join("a.ts"),
+            "// ovecc-ignore-next-line\nconst k = \"AKIAIOSFODNN7EXAMPLB\";\nconst x = 1; // ovecc-ignore\n",
+        )
+        .unwrap();
+        let paths = ProjectPaths::resolve(dir.path()).unwrap();
+        let config = OveccConfig::default();
+        index_repository(&paths, &config, true).unwrap();
+
+        let store = ovecc_db::ArchitectureStore::open(&paths.db_path).unwrap();
+        let findings = store.findings(&paths.repository_id().0, None).unwrap();
+        let stale: Vec<_> = findings
+            .iter()
+            .filter(|f| f.rule_name.as_deref() == Some("stale-suppression"))
+            .collect();
+        assert_eq!(stale.len(), 1, "{findings:?}");
+        assert_eq!(stale[0].evidence[0].line, Some(3));
+        // The active suppression silenced the secret without going stale.
+        assert!(
+            findings
+                .iter()
+                .all(|f| f.kind != FindingKind::HardcodedSecret),
+            "{findings:?}"
+        );
+    }
+
+    #[test]
+    fn splits_package_specifiers_and_walks_exports() {
+        assert_eq!(split_package_specifier("zod"), Some(("zod", "")));
+        assert_eq!(split_package_specifier("zod/v4"), Some(("zod", "v4")));
+        assert_eq!(
+            split_package_specifier("@scope/pkg/sub/deep"),
+            Some(("@scope/pkg", "sub/deep"))
+        );
+
+        let manifest: serde_json::Value = serde_json::json!({
+            "exports": {
+                ".": { "import": "./src/index.ts" },
+                "./v4": { "types": "./src/v4/index.d.ts", "import": "./src/v4/index.ts" },
+                "./*": "./src/*.ts"
+            }
+        });
+        assert_eq!(
+            exports_target(&manifest, ".").as_deref(),
+            Some("./src/index.ts")
+        );
+        assert_eq!(
+            exports_target(&manifest, "./v4").as_deref(),
+            Some("./src/v4/index.ts")
+        );
+        // Wildcard fallback for keys without an exact entry.
+        assert_eq!(
+            exports_target(&manifest, "./locales").as_deref(),
+            Some("./src/locales.ts")
+        );
+    }
+
+    #[test]
+    fn alias_specifiers_are_never_phantom_dependencies() {
+        // tsconfig/webpack/SvelteKit/Node-subpath alias shapes.
+        assert_eq!(external_package_root("@/.source"), None);
+        assert_eq!(external_package_root("@/public"), None);
+        assert_eq!(external_package_root("~/lib/util"), None);
+        assert_eq!(external_package_root("#internal/config"), None);
+        assert_eq!(external_package_root("$lib/stores"), None);
+        assert_eq!(external_package_root("_private/mod"), None);
+        // Real packages still normalize to their root.
+        assert_eq!(
+            external_package_root("@scope/pkg/sub"),
+            Some("@scope/pkg".to_string())
+        );
+        assert_eq!(
+            external_package_root("lodash/fp"),
+            Some("lodash".to_string())
+        );
+        assert_eq!(external_package_root("node:fs"), None);
+        assert_eq!(external_package_root("fs"), None);
     }
 
     #[test]

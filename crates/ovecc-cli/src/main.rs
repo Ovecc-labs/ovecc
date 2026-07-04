@@ -1,4 +1,6 @@
 mod cli;
+mod export_graph;
+mod fix;
 mod mcp;
 
 use ovecc_core::error::OveccError;

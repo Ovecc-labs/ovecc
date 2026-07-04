@@ -21,6 +21,7 @@ ignore = { workspace = true }
 oxc_resolver = { workspace = true }
 rayon = { workspace = true }
 serde_json = { workspace = true }
+toml = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

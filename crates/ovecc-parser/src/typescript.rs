@@ -740,19 +740,13 @@ impl<'a> Extractor<'a> {
         }
     }
 
-    /// Records an inline suppression comment:
+    /// Records an inline suppression comment. The marker must lead the
+    /// comment (see [`crate::suppression_offset`]):
     /// `// ovecc-ignore-next-line` suppresses the following line, a bare
     /// `// ovecc-ignore` suppresses the comment's own line (trailing form).
     fn extract_suppression(&mut self, node: Node<'_>) {
-        let text = self.text(node);
-        if !text.contains("ovecc-ignore") {
-            return;
-        }
-        let line = self.line(node);
-        if text.contains("ovecc-ignore-next-line") {
-            self.suppressed.push(line + 1);
-        } else {
-            self.suppressed.push(line);
+        if let Some(offset) = crate::suppression_offset(self.text(node)) {
+            self.suppressed.push(self.line(node) + offset);
         }
     }
 
@@ -1308,7 +1302,7 @@ function scan(re, s) { re.exec(s); }
     #[test]
     fn detects_inline_suppressions() {
         let facts = extract(
-            "// ovecc-ignore-next-line\nconst apiKey = \"AKIAIOSFODNN7EXAMPLE\";\neval(x); // ovecc-ignore\n",
+            "// ovecc-ignore-next-line\nconst apiKey = \"AKIAIOSFODNN7EXAMPLB\";\neval(x); // ovecc-ignore\n",
             SourceLanguage::TypeScript,
         );
         // next-line comment (line 1) suppresses the secret on line 2.

@@ -119,7 +119,7 @@ printf '%s\n' \
 ```
 
 You should get an `initialize` result (serverInfo `ovecc`) followed by a `tools/list`
-result enumerating **20 tools**. To exercise a real analysis tool against an indexed
+result enumerating **27 tools**. To exercise a real analysis tool against an indexed
 repo:
 
 ```sh
@@ -136,10 +136,11 @@ automatically — you only send it by hand in this manual test.
 
 ## Tool catalog
 
-All 20 tools (every one takes an optional `repo`; `*` marks required arguments):
+All 27 tools (every one takes an optional `repo`; `*` marks required arguments):
 
 | Tool | Maps to | Key arguments |
 | --- | --- | --- |
+| `ovecc_init` | `init` | `force` — write the starter config, git-ignore `.ovecc/` |
 | `ovecc_capabilities` | `capabilities` | — (call first: the full contract) |
 | `ovecc_index` | `index` | `path` |
 | `ovecc_summary` | `summary` | — |
@@ -151,15 +152,21 @@ All 20 tools (every one takes an optional `repo`; `*` marks required arguments):
 | `ovecc_audit` | `audit` | — |
 | `ovecc_health` | `health` | — |
 | `ovecc_deadcode` | `deadcode` | — |
+| `ovecc_fix` | `fix` | `apply` (write; default dry-run), `rule` — mechanical fixes for auto-fixable findings |
 | `ovecc_dupes` | `dupes` | `min_tokens` |
 | `ovecc_hotspots` | `hotspots` | `limit` |
 | `ovecc_conventions` | `conventions` | — |
 | `ovecc_drift` | `drift` | `since` (git ref / snapshot) |
+| `ovecc_history` | `history` | `metric`, `limit` — trend one snapshot metric (values, deltas, sparkline) |
 | `ovecc_review` | `review` | `base`, `head`, `fail_on` (lead with this for PR review) |
+| `ovecc_diagnose` | `diagnose` | `target`, `severity` (architectural smells + remediation) |
+| `ovecc_advise` | `advise` | `target*` (findings touching one file/component + the fix) |
+| `ovecc_metrics` | `metrics` | `target` (per-component fan-in/out, instability, abstractness, distance) |
 | `ovecc_gate` | `gate` | `base`, `head`, `fail_on` |
 | `ovecc_diff` | `diff` | `base`, `head`, `fail_on` |
 | `ovecc_explain` | `explain` | `target*` |
 | `ovecc_context` | `export context` | `target*` |
+| `ovecc_export_graph` | `export graph` | `html` — nodes/edges as JSON, or a self-contained offline HTML viewer |
 
 ---
 

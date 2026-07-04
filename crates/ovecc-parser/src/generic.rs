@@ -77,7 +77,7 @@ impl LanguageAdapter for GenericAdapter {
                 message: "tree-sitter returned no syntax tree".to_string(),
             })?;
 
-        let mut walk = Walk::new(self.language, file.contents.as_bytes());
+        let mut walk = Walk::new(self.language, file.contents.as_bytes(), &file.path);
         walk.visit(tree.root_node());
         Ok(walk.into_facts())
     }
@@ -141,10 +141,37 @@ struct Walk<'a> {
     apis: Vec<ApiFact>,
     complexity: Vec<ComplexityFact>,
     suppressed: Vec<u32>,
+    /// Depth of enclosing Rust test scopes (`#[cfg(test)] mod`, `#[test] fn`):
+    /// security patterns emitted while > 0 are test vectors, not production
+    /// code, and get `in_test_code` so the indexer can down-rank them.
+    test_depth: usize,
+    /// Rust qualified paths already recorded as imports (one per file).
+    qualified_seen: std::collections::HashSet<String>,
+    /// `self::`-relative prefix for Rust `mod foo;` declarations. From a crate
+    /// root (`lib.rs`, `main.rs`, a `src/bin/` target) or a `mod.rs`, the child
+    /// file sits in the same directory (`self::foo`); from any other module
+    /// file `bar.rs` it sits under the module's own directory
+    /// (`self::bar::foo`, the 2018 layout).
+    mod_child_prefix: String,
+}
+
+/// Computes [`Walk::mod_child_prefix`] from the file's repo-relative path.
+fn mod_child_prefix(path: &str) -> String {
+    let normalized = path.replace('\\', "/");
+    let name = normalized.rsplit('/').next().unwrap_or(&normalized);
+    let stem = name.strip_suffix(".rs").unwrap_or(name);
+    // `src/bin/*.rs` files are crate roots too: their modules resolve as
+    // siblings, exactly like `main.rs`.
+    let dir = normalized.strip_suffix(name).unwrap_or("");
+    if matches!(stem, "lib" | "main" | "mod") || dir.ends_with("/bin/") || dir == "bin/" {
+        "self".to_string()
+    } else {
+        format!("self::{stem}")
+    }
 }
 
 impl<'a> Walk<'a> {
-    fn new(language: SourceLanguage, source: &'a [u8]) -> Self {
+    fn new(language: SourceLanguage, source: &'a [u8], path: &str) -> Self {
         Self {
             language,
             source,
@@ -158,6 +185,9 @@ impl<'a> Walk<'a> {
             apis: Vec::new(),
             complexity: Vec::new(),
             suppressed: Vec::new(),
+            test_depth: 0,
+            qualified_seen: std::collections::HashSet::new(),
+            mod_child_prefix: mod_child_prefix(path),
         }
     }
 
@@ -222,6 +252,22 @@ impl<'a> Walk<'a> {
     // -- traversal ---------------------------------------------------------
 
     fn visit(&mut self, node: Node<'a>) {
+        // Rust test scaffolding is inline (`#[cfg(test)] mod tests`,
+        // `#[test] fn`), invisible to the path-based test heuristics that
+        // cover other languages — track the scope around the dispatch so any
+        // security fact emitted inside carries `in_test_code`.
+        let entered_test_scope =
+            self.language == SourceLanguage::Rust && self.is_rust_test_scope(node);
+        if entered_test_scope {
+            self.test_depth += 1;
+        }
+        self.visit_dispatch(node);
+        if entered_test_scope {
+            self.test_depth -= 1;
+        }
+    }
+
+    fn visit_dispatch(&mut self, node: Node<'a>) {
         // Scan string literals for provider-pattern secrets anywhere they
         // appear, then keep descending (a string nests nothing of interest).
         if is_string_literal(node.kind()) {
@@ -244,6 +290,34 @@ impl<'a> Walk<'a> {
         // function below it as an HTTP handler.
         if self.language == SourceLanguage::Rust && node.kind() == "function_item" {
             self.detect_rust_route(node);
+        }
+        // A fully-qualified Rust reference (`other_crate::evaluate(...)`) is a
+        // real dependency even without a `use` declaration — record the
+        // topmost path once per file so the workspace resolver can link the
+        // crates. (Found dogfooding: the indexer calls ovecc_rules only via
+        // qualified paths, leaving a false "no structural dependency".)
+        if self.language == SourceLanguage::Rust
+            && matches!(node.kind(), "scoped_identifier" | "scoped_type_identifier")
+            && node.parent().is_none_or(|parent| {
+                !matches!(
+                    parent.kind(),
+                    "scoped_identifier" | "scoped_type_identifier" | "use_declaration"
+                )
+            })
+        {
+            self.record_rust_qualified_path(node);
+        }
+
+        // A Rust module declaration (`mod foo;`) binds a child FILE
+        // (`foo.rs` / `foo/mod.rs`) into the crate — the module tree's import
+        // edge. Without it, everything only a binary's `mod` tree references
+        // looks unreachable to dead-code. Inline `mod foo { .. }` has a body
+        // and references no other file.
+        if self.language == SourceLanguage::Rust
+            && node.kind() == "mod_item"
+            && node.child_by_field_name("body").is_none()
+        {
+            self.record_rust_mod_declaration(node);
         }
 
         // C++ declarations are overloaded (a method prototype, a free-function
@@ -499,11 +573,12 @@ impl<'a> Walk<'a> {
         // the callee + receiver, attributing them to the enclosing symbol so the
         // taint engine can reach them.
         if let Some((kind, detail)) = dangerous_call(self.language, &callee, receiver.as_deref()) {
-            self.security.push(SecurityPatternFact {
+            self.push_security(SecurityPatternFact {
                 kind,
                 line,
                 detail: Some(detail),
                 caller_qualified_name: self.callables.last().cloned(),
+                in_test_code: false,
             });
         }
         // A Go route registration (`http.HandleFunc("/x", h)`,
@@ -648,26 +723,109 @@ impl<'a> Walk<'a> {
         if let Some(text) = node_text(node, self.source)
             && let Some(label) = security::provider_secret(&text)
         {
-            self.security
-                .push(security::secret_fact(span_of(node).start_line, label));
+            self.push_security(security::secret_fact(span_of(node).start_line, label));
         }
     }
 
-    /// Records `ovecc-ignore` suppression lines from a comment. A bare
-    /// `ovecc-ignore` suppresses the comment's own line (trailing form); an
-    /// `ovecc-ignore-next-line` suppresses the line below.
+    /// All security facts go through here so the enclosing Rust test scope
+    /// (if any) stamps them.
+    fn push_security(&mut self, mut fact: SecurityPatternFact) {
+        fact.in_test_code = self.test_depth > 0;
+        self.security.push(fact);
+    }
+
+    /// True when a Rust `mod_item` / `function_item` is gated behind a test
+    /// attribute: `#[cfg(test)]`, `#[test]`, or a runtime variant like
+    /// `#[tokio::test]`. In tree-sitter-rust attributes are *sibling*
+    /// `attribute_item`s immediately before the item (comments may interleave).
+    fn is_rust_test_scope(&self, node: Node<'a>) -> bool {
+        if !matches!(node.kind(), "mod_item" | "function_item") {
+            return false;
+        }
+        let mut sibling = node.prev_sibling();
+        while let Some(prev) = sibling {
+            match prev.kind() {
+                "attribute_item" => {
+                    if let Some(text) = node_text(prev, self.source) {
+                        let compact: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+                        if compact.contains("cfg(test)")
+                            || compact == "#[test]"
+                            || compact.ends_with("::test]")
+                        {
+                            return true;
+                        }
+                    }
+                }
+                "line_comment" | "block_comment" => {}
+                _ => break,
+            }
+            sibling = prev.prev_sibling();
+        }
+        false
+    }
+
+    /// One import fact per distinct qualified path: `first::rest…` where the
+    /// head segment is snake_case (a crate name, not a type or keyword).
+    /// `crate`/`self`/`super` paths stay local; `Type::assoc()` is dispatch,
+    /// not a dependency.
+    fn record_rust_qualified_path(&mut self, node: Node<'a>) {
+        let Some(text) = node_text(node, self.source) else {
+            return;
+        };
+        let first = text.split("::").next().unwrap_or("");
+        let head_is_crate_like = first
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_lowercase() || c == '_');
+        if !head_is_crate_like
+            || matches!(first, "crate" | "self" | "super")
+            || !text.contains("::")
+            || !text
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == ':')
+        {
+            return;
+        }
+        if !self.qualified_seen.insert(text.clone()) {
+            return;
+        }
+        self.imports.push(ImportFact {
+            specifier: text,
+            line: span_of(node).start_line,
+            kind: ImportFactKind::Static,
+            imported_names: Vec::new(),
+        });
+    }
+
+    /// Emits the import edge for a Rust module declaration: `mod foo;` loads
+    /// `foo.rs` / `foo/mod.rs` relative to this file's module directory,
+    /// which is exactly what the `self::`-prefixed specifier resolves to.
+    fn record_rust_mod_declaration(&mut self, node: Node<'a>) {
+        let Some(name) = field_text(node, "name", self.source) else {
+            return;
+        };
+        let specifier = format!("{}::{name}", self.mod_child_prefix);
+        if !self.qualified_seen.insert(specifier.clone()) {
+            return;
+        }
+        self.imports.push(ImportFact {
+            specifier,
+            line: span_of(node).start_line,
+            kind: ImportFactKind::Static,
+            imported_names: Vec::new(),
+        });
+    }
+
+    /// Records `ovecc-ignore` suppression lines from a comment. The marker
+    /// must lead the comment (see [`crate::suppression_offset`]): a bare
+    /// `ovecc-ignore` suppresses the comment's own line (trailing form), an
+    /// `ovecc-ignore-next-line` the line below.
     fn extract_suppression(&mut self, node: Node<'a>) {
         let Some(text) = node_text(node, self.source) else {
             return;
         };
-        if !text.contains("ovecc-ignore") {
-            return;
-        }
-        let line = span_of(node).start_line;
-        if text.contains("ovecc-ignore-next-line") {
-            self.suppressed.push(line + 1);
-        } else {
-            self.suppressed.push(line);
+        if let Some(offset) = crate::suppression_offset(&text) {
+            self.suppressed.push(span_of(node).start_line + offset);
         }
     }
 
@@ -1377,6 +1535,136 @@ mod tests {
     }
 
     #[test]
+    fn rust_qualified_paths_become_imports() {
+        let facts = extract(
+            SourceLanguage::Rust,
+            "fn run() {\n\
+                 let x = other_crate::evaluate(1);\n\
+                 let y: other_crate::types::Input = x;\n\
+                 let z = other_crate::evaluate(2);\n\
+                 let c = Command::new(\"ls\");\n\
+                 let k = crate::local::thing();\n\
+             }\n",
+        );
+        let specifiers: Vec<&str> = facts.imports.iter().map(|i| i.specifier.as_str()).collect();
+        // Qualified crate paths are recorded, deduplicated per path…
+        assert!(
+            specifiers.contains(&"other_crate::evaluate"),
+            "{specifiers:?}"
+        );
+        assert!(
+            specifiers.contains(&"other_crate::types::Input"),
+            "{specifiers:?}"
+        );
+        assert_eq!(
+            specifiers
+                .iter()
+                .filter(|s| **s == "other_crate::evaluate")
+                .count(),
+            1
+        );
+        // …while type-associated calls and crate-local paths are not.
+        assert!(!specifiers.iter().any(|s| s.starts_with("Command")));
+        assert!(!specifiers.iter().any(|s| s.starts_with("crate::")));
+    }
+
+    fn extract_at(path: &str, contents: &str) -> FileFacts {
+        let adapter = GenericAdapter::for_language(SourceLanguage::Rust).expect("adapter");
+        let file = SourceFile {
+            path: path.to_string(),
+            absolute_path: std::path::PathBuf::from(path),
+            language: SourceLanguage::Rust,
+            contents: contents.to_string(),
+        };
+        adapter.extract(&file).expect("extraction")
+    }
+
+    #[test]
+    fn rust_mod_declarations_become_imports() {
+        // From a crate root, `mod foo;` loads the sibling file…
+        let facts = extract_at(
+            "crates/tool/src/main.rs",
+            "mod cli;\n\
+             #[cfg(test)]\n\
+             mod harness;\n\
+             mod inline { fn helper() {} }\n",
+        );
+        let specifiers: Vec<&str> = facts.imports.iter().map(|i| i.specifier.as_str()).collect();
+        assert!(specifiers.contains(&"self::cli"), "{specifiers:?}");
+        assert!(specifiers.contains(&"self::harness"), "{specifiers:?}");
+        // …but an inline module has a body and references no file.
+        assert!(!specifiers.iter().any(|s| s.contains("inline")), "{specifiers:?}");
+
+        // From a non-root module file, the child sits under the module's own
+        // directory (2018 layout): `bar.rs` + `mod foo;` -> `bar/foo.rs`.
+        let nested = extract_at("crates/tool/src/bar.rs", "mod foo;\n");
+        let nested_specs: Vec<&str> = nested.imports.iter().map(|i| i.specifier.as_str()).collect();
+        assert!(nested_specs.contains(&"self::bar::foo"), "{nested_specs:?}");
+
+        // A `src/bin/` target is a crate root again: siblings.
+        let bin = extract_at("crates/tool/src/bin/extra.rs", "mod support;\n");
+        let bin_specs: Vec<&str> = bin.imports.iter().map(|i| i.specifier.as_str()).collect();
+        assert!(bin_specs.contains(&"self::support"), "{bin_specs:?}");
+    }
+
+    #[test]
+    fn suppression_comments_that_mention_the_marker_are_not_directives() {
+        let facts = extract(
+            SourceLanguage::Rust,
+            "// The `// ovecc-ignore` marker suppresses findings on its line.\n\
+             fn a() {}\n\
+             // ovecc-ignore-next-line\n\
+             fn b() {}\n\
+             fn c() {} // ovecc-ignore\n",
+        );
+        // Only the real directives register: next-line (4) and trailing (5).
+        assert_eq!(facts.suppressed_lines, vec![4, 5]);
+    }
+
+    #[test]
+    fn rust_inline_test_scopes_stamp_security_facts() {
+        // The same fake AWS key at top level and inside `#[cfg(test)] mod` /
+        // `#[test] fn`: only the top-level one is production code.
+        let facts = extract(
+            SourceLanguage::Rust,
+            "const TOP: &str = \"AKIAIOSFODNN7EXAMPLB\";\n\
+             #[cfg(test)]\n\
+             mod tests {\n\
+                 const IN_MOD: &str = \"AKIAIOSFODNN7EXAMPLB\";\n\
+             }\n\
+             #[test]\n\
+             fn checks() {\n\
+                 let in_fn = \"AKIAIOSFODNN7EXAMPLB\";\n\
+             }\n",
+        );
+        let secrets: Vec<(u32, bool)> = facts
+            .security_patterns
+            .iter()
+            .map(|p| (p.line, p.in_test_code))
+            .collect();
+        assert_eq!(
+            secrets,
+            vec![(1, false), (4, true), (8, true)],
+            "{secrets:?}"
+        );
+    }
+
+    #[test]
+    fn aws_documented_example_keys_are_not_secrets() {
+        // AWS's own doc key must never be flagged; a real-shaped key still is.
+        let none = extract(
+            SourceLanguage::Rust,
+            "const K: &str = \"AKIAIOSFODNN7EXAMPLE\";\n",
+        );
+        assert!(none.security_patterns.is_empty(), "{none:?}");
+        let some = extract(
+            SourceLanguage::Rust,
+            "const K: &str = \"AKIAIOSFODNN7EXAMPLB\";\n",
+        );
+        assert_eq!(some.security_patterns.len(), 1, "{some:?}");
+    }
+
+    #[test]
     fn python_complexity_counts_branches_and_nesting() {
         let facts = extract(
             SourceLanguage::Python,
@@ -1908,7 +2196,7 @@ async fn health() -> &'static str {
             r#"
 package config
 
-const Key = "AKIAIOSFODNN7EXAMPLE"
+const Key = "AKIAIOSFODNN7EXAMPLB"
 "#,
         );
         assert!(

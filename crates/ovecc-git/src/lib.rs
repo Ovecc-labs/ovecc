@@ -122,6 +122,39 @@ pub fn resolve_ref(root: &std::path::Path, reference: &str) -> Option<String> {
     Some(id.detach().to_string())
 }
 
+/// The set of repo-relative paths whose content differs between `reference`
+/// and `HEAD` (tree-to-tree, so uncommitted working-tree edits are not
+/// included). Returns `None` outside a Git repository or when the reference
+/// does not resolve to a commit.
+pub fn changed_files_since(
+    root: &std::path::Path,
+    reference: &str,
+) -> Option<std::collections::BTreeSet<String>> {
+    use gix::diff::tree_with_rewrites::Change;
+    let repo = gix::discover(root).ok()?;
+    let base_id = repo.rev_parse_single(reference).ok()?;
+    let base_tree = repo.find_commit(base_id.detach()).ok()?.tree().ok()?;
+    let head_tree = repo.head_commit().ok()?.tree().ok()?;
+    let changes = repo
+        .diff_tree_to_tree(
+            Some(&base_tree),
+            Some(&head_tree),
+            gix::diff::Options::default(),
+        )
+        .ok()?;
+    Some(
+        changes
+            .into_iter()
+            .map(|change| match change {
+                Change::Addition { location, .. }
+                | Change::Deletion { location, .. }
+                | Change::Modification { location, .. }
+                | Change::Rewrite { location, .. } => location.to_string(),
+            })
+            .collect(),
+    )
+}
+
 /// Decodes one commit's metadata and the files it changed against its first
 /// parent. Returns `None` if the essential metadata cannot be read.
 fn decode_commit(repo: &gix::Repository, commit: &gix::Commit<'_>) -> Option<GitCommit> {

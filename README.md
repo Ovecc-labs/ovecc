@@ -40,12 +40,22 @@ Repository -> deterministic analysis -> architecture database -> insights -> opt
 ```
 
 The full design is in [ARCHITECTURE.md](ARCHITECTURE.md). Measured performance on
-real repositories is in [BENCHMARKS.md](BENCHMARKS.md).
+real repositories is in [docs/benchmark/BENCHMARKS.md](docs/benchmark/BENCHMARKS.md).
 
-## Build
+## Install
 
-The workspace builds on the `windows-gnu` toolchain (DuckDB is bundled and
-compiled from source on the first build).
+Grab a prebuilt binary from the rolling
+[**latest** release](../../releases/latest) — CI publishes fresh Linux and
+Windows x86_64 builds on every push to `main`. Drop it on your `PATH` and run
+`ovecc index .`; there is nothing else to install (DuckDB is bundled, no
+runtime, fully offline).
+
+### Build from source
+
+The workspace builds with stable Rust (on Windows use the `windows-gnu`
+toolchain; DuckDB is bundled and compiled from source on the first build —
+the step-by-step Windows toolchain setup is in
+[docs/dev/SETUP.md](docs/dev/SETUP.md)).
 
 ```sh
 cargo build --release
@@ -61,6 +71,7 @@ ovecc index .                 # parse, resolve, and persist the model into .ovec
 ovecc capabilities            # machine-readable contract: commands, metrics, rules, exit codes
 ovecc summary                 # coupling, density, cycles, risk score
 ovecc violations              # architecture + security findings, with file:line
+ovecc diagnose                # named architectural smells, evidence + curated remediation
 ovecc security                # secrets, insecure patterns, weak crypto, tainted flows
 ovecc audit                   # offline OSV dependency vulnerabilities
 ovecc impact Billing          # blast radius of a change
@@ -68,18 +79,23 @@ ovecc hotspots                # churn x coupling x ownership debt ranking
 ovecc dupes                   # duplicated code (clone families), file:line
 ovecc health                  # functions over the complexity thresholds (oxc)
 ovecc deadcode                # unused exports + unreachable files (oxc + reachability)
+ovecc fix                     # apply the mechanical fixes for those findings (dry-run by default)
 ovecc query "cycles"          # actual elementary dependency cycles (A -> B -> A)
 ovecc report                  # one-shot architecture report (markdown or json)
 ovecc gate                    # CI gate: fail a PR on new cycles / violations
 ovecc review                  # the NAMED new defects a change introduced (file:line + cycle witnesses)
 ovecc explain Billing         # offline, deterministic explanation
+ovecc export graph --html     # interactive dependency-graph viewer, one self-contained offline file
 ovecc mcp                     # MCP server over stdio: expose every command as an agent tool
 ovecc index . --exclude "vendored/**"   # built-in excludes (node_modules, .venv, ...) plus your own
 ```
 
 Every command renders as `text`, `json`, `ndjson`, or `markdown` via `--format`
 (plus `sarif` for GitHub code scanning and `codeclimate` for GitLab Code Quality),
-and returns stable exit codes for CI.
+and returns stable exit codes for CI. The full per-command reference, with real
+output excerpts, is in [docs/COMMANDS.md](docs/COMMANDS.md). For pull requests,
+the repo ships a drop-in [GitHub Action](action.yml) that indexes base + head,
+comments the `review` findings on the PR, and gates on severity.
 
 ## For AI agents
 
@@ -196,3 +212,8 @@ Ten library crates and one binary, each documented in its own `README.md`:
   nothing is sent anywhere.
 - **Incremental.** A re-index of an unchanged repository re-parses nothing and
   writes only a new snapshot.
+
+## License
+
+Apache-2.0 — see [LICENSE](LICENSE). Third-party attributions are in
+[THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).

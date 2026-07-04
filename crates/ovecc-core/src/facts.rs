@@ -439,6 +439,9 @@ pub enum FindingKind {
     LongFunction,
     /// A function with too many parameters.
     LongParameterList,
+    /// An `ovecc-ignore` comment that suppresses no finding — it will silently
+    /// swallow the next real finding on its line.
+    StaleSuppression,
 }
 
 /// A machine-actionable fix descriptor attached to a finding so an agent can act
@@ -486,9 +489,10 @@ impl FindingKind {
             ),
             FindingKind::UnlistedDependency => FixSpec::new(
                 "declare_dependency",
-                false,
-                "Add the package to the manifest's dependencies with an explicit version \
-                 (it currently resolves only via hoisting or a transitive install).",
+                true,
+                "Declare the package in the nearest manifest's dependencies, pinning the \
+                 version the lockfile already resolves (it currently works only via \
+                 hoisting or a transitive install).",
             ),
             FindingKind::HighComplexity => FixSpec::new(
                 "reduce_complexity",
@@ -504,6 +508,12 @@ impl FindingKind {
                 "reduce_parameters",
                 false,
                 "Group related parameters into a typed options object.",
+            ),
+            FindingKind::StaleSuppression => FixSpec::new(
+                "remove_stale_suppression",
+                true,
+                "Delete the ovecc-ignore comment: it suppresses nothing and will \
+                 silently swallow the next real finding on this line.",
             ),
             FindingKind::HardcodedSecret => FixSpec::new(
                 "rotate_and_externalize_secret",
@@ -620,6 +630,11 @@ pub struct SecurityPatternFact {
     /// engine treat dangerous calls (`eval`, `exec`) as sinks.
     #[serde(default)]
     pub caller_qualified_name: Option<String>,
+    /// True when the pattern sits in test scaffolding that path-based
+    /// heuristics can't see — Rust's inline `#[cfg(test)] mod` / `#[test]`
+    /// idiom. Findings on such patterns down-rank to Low like test files do.
+    #[serde(default)]
+    pub in_test_code: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

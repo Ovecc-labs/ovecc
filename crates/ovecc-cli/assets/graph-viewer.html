@@ -1,0 +1,402 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>__OVECC_TITLE__ · ovecc graph</title>
+<style>
+  :root {
+    --bg: #fafaf9; --panel: #ffffff; --text: #1c1c1a; --muted: #6b6b66;
+    --border: #e4e2dd; --accent: #b4551d; --edge: 28, 28, 26;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #131312; --panel: #1d1d1b; --text: #ecebe8; --muted: #97958e;
+      --border: #33322f; --accent: #e08a4f; --edge: 236, 235, 232;
+    }
+  }
+  * { box-sizing: border-box; margin: 0; }
+  html, body { height: 100%; }
+  body {
+    background: var(--bg); color: var(--text); overflow: hidden;
+    font: 14px/1.5 -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  }
+  header {
+    display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+    padding: 10px 16px; border-bottom: 1px solid var(--border); background: var(--panel);
+  }
+  .brand { font-weight: 600; white-space: nowrap; }
+  .brand span { color: var(--muted); font-weight: 400; }
+  .seg { display: inline-flex; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+  .seg button {
+    border: 0; background: transparent; color: var(--muted); padding: 6px 14px;
+    font: inherit; cursor: pointer;
+  }
+  .seg button.active { background: var(--accent); color: #fff; }
+  label.chk { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); cursor: pointer; }
+  #search {
+    flex: 1 1 160px; max-width: 280px; padding: 6px 10px; font: inherit;
+    color: var(--text); background: var(--bg); border: 1px solid var(--border); border-radius: 8px;
+  }
+  #search:focus { outline: none; border-color: var(--accent); }
+  #stats { color: var(--muted); white-space: nowrap; margin-left: auto; }
+  main { position: relative; height: calc(100% - 53px); }
+  canvas { display: block; width: 100%; height: 100%; cursor: grab; }
+  canvas.dragging { cursor: grabbing; }
+  #panel {
+    position: absolute; top: 12px; right: 12px; width: 300px; max-height: calc(100% - 24px);
+    overflow-y: auto; background: var(--panel); border: 1px solid var(--border);
+    border-radius: 12px; padding: 14px 16px; display: none;
+  }
+  #panel.open { display: block; }
+  #panel h2 { font-size: 15px; font-weight: 600; word-break: break-all; padding-right: 20px; }
+  #panel .kind { color: var(--muted); font-size: 12px; margin: 2px 0 10px; }
+  #panel dl { display: grid; grid-template-columns: auto 1fr; gap: 2px 10px; font-size: 13px; }
+  #panel dt { color: var(--muted); }
+  #panel dd { text-align: right; word-break: break-all; }
+  #panel h3 { font-size: 12px; font-weight: 600; color: var(--muted); margin: 12px 0 4px; text-transform: lowercase; }
+  #panel ul { list-style: none; font-size: 13px; }
+  #panel li { padding: 2px 0; cursor: pointer; word-break: break-all; }
+  #panel li:hover { color: var(--accent); }
+  #close { position: absolute; top: 10px; right: 12px; border: 0; background: none; color: var(--muted); font-size: 16px; cursor: pointer; }
+  #hint {
+    position: absolute; left: 12px; bottom: 10px; color: var(--muted); font-size: 12px;
+    pointer-events: none;
+  }
+</style>
+</head>
+<body>
+<header>
+  <div class="brand">ovecc <span>· __OVECC_TITLE__</span></div>
+  <div class="seg">
+    <button id="btn-modules" class="active">Modules</button>
+    <button id="btn-files">Files</button>
+  </div>
+  <label class="chk"><input type="checkbox" id="chk-ext"> externals</label>
+  <input id="search" type="search" placeholder="Search nodes..." spellcheck="false">
+  <div id="stats"></div>
+</header>
+<main>
+  <canvas id="canvas"></canvas>
+  <aside id="panel">
+    <button id="close" aria-label="Close">×</button>
+    <h2 id="p-title"></h2>
+    <div class="kind" id="p-kind"></div>
+    <dl id="p-facts"></dl>
+    <h3 id="p-out-h"></h3><ul id="p-out"></ul>
+    <h3 id="p-in-h"></h3><ul id="p-in"></ul>
+  </aside>
+  <div id="hint">drag to pan · scroll to zoom · click a node · drag a node to pin the layout</div>
+</main>
+<script id="ovecc-data" type="application/json">__OVECC_DATA__</script>
+<script>
+(() => {
+  "use strict";
+  const DATA = JSON.parse(document.getElementById("ovecc-data").textContent);
+  const canvas = document.getElementById("canvas");
+  const ctx = canvas.getContext("2d");
+  const panel = document.getElementById("panel");
+  const search = document.getElementById("search");
+  const stats = document.getElementById("stats");
+
+  const PALETTE = ["#7F77DD","#1D9E75","#D85A30","#D4537E","#378ADD","#639922","#EF9F27","#5DCAA5","#993556","#0F6E56","#185FA5","#993C1D"];
+  const EXTERNAL_COLOR = "#8a8a84";
+
+  // Deterministic layout: seeded PRNG, so the same export always opens on
+  // the same picture.
+  function mulberry32(seed) {
+    return () => {
+      seed |= 0; seed = (seed + 0x6D2B79F5) | 0;
+      let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+  function hashString(text) {
+    let h = 2166136261;
+    for (let i = 0; i < text.length; i++) { h ^= text.charCodeAt(i); h = Math.imul(h, 16777619); }
+    return h >>> 0;
+  }
+  const shortLabel = (node) =>
+    node.kind === "file" ? node.label.split("/").pop() : node.label;
+
+  const state = {
+    level: "modules", showExt: false, query: "",
+    nodes: [], edges: [], byId: new Map(),
+    selected: null, hovered: null,
+    tx: 0, ty: 0, k: 1, alpha: 0,
+    dragNode: null, panning: false, lastX: 0, lastY: 0, moved: false,
+  };
+
+  function rebuild(keepView) {
+    const level = DATA[state.level];
+    const nodes = level.nodes
+      .filter((n) => state.showExt || n.kind !== "external")
+      .map((n) => ({ ...n, x: 0, y: 0, vx: 0, vy: 0, in: 0, out: 0, r: 6 }));
+    const byId = new Map(nodes.map((n) => [n.id, n]));
+    const edges = level.edges.filter((e) => byId.has(e.source) && byId.has(e.target));
+    for (const e of edges) { byId.get(e.source).out++; byId.get(e.target).in++; }
+    for (const n of nodes) {
+      if (n.kind === "module") n.r = Math.min(28, 8 + 3 * Math.sqrt(n.files || 1));
+      else if (n.kind === "file") n.r = Math.min(16, 4 + Math.sqrt((n.size_bytes || 256) / 256));
+      else n.r = Math.max(4, Math.min(12, 3 + Math.sqrt(n.in)));
+      const group = n.kind === "external" ? null : (n.module || n.label);
+      n.color = group === null ? EXTERNAL_COLOR : PALETTE[hashString(group) % PALETTE.length];
+    }
+    const rand = mulberry32(42);
+    nodes.forEach((n, i) => {
+      const angle = i * 2.39996323, radius = 26 * Math.sqrt(i + 1);
+      n.x = radius * Math.cos(angle) + 40 * (rand() - 0.5);
+      n.y = radius * Math.sin(angle) + 40 * (rand() - 0.5);
+    });
+    state.nodes = nodes; state.edges = edges; state.byId = byId;
+    state.selected = state.selected && byId.has(state.selected) ? state.selected : null;
+    if (!keepView) fitView();
+    state.alpha = 1;
+    stats.textContent = nodes.length + " nodes · " + edges.length + " edges";
+    renderPanel();
+    tick();
+  }
+
+  function fitView() {
+    const spread = 60 * Math.sqrt(state.nodes.length + 1);
+    const fit = Math.min(canvas.clientWidth, canvas.clientHeight) / (2.4 * spread);
+    state.k = Math.max(0.08, Math.min(1.2, fit));
+    state.tx = canvas.clientWidth / 2;
+    state.ty = canvas.clientHeight / 2;
+  }
+
+  // Plain O(n²) force simulation: repulsion + edge springs + weak gravity.
+  // Fine up to a few thousand nodes, which covers file-level graphs of large
+  // repositories.
+  function step() {
+    const nodes = state.nodes, edges = state.edges;
+    for (let i = 0; i < nodes.length; i++) {
+      const a = nodes[i];
+      for (let j = i + 1; j < nodes.length; j++) {
+        const b = nodes[j];
+        let dx = a.x - b.x, dy = a.y - b.y;
+        let d2 = dx * dx + dy * dy;
+        if (d2 < 1) { d2 = 1; dx = 1; }
+        if (d2 > 250000) continue;
+        const f = (2200 * state.alpha) / d2;
+        const d = Math.sqrt(d2);
+        dx /= d; dy /= d;
+        a.vx += dx * f; a.vy += dy * f;
+        b.vx -= dx * f; b.vy -= dy * f;
+      }
+    }
+    for (const e of edges) {
+      const a = state.byId.get(e.source), b = state.byId.get(e.target);
+      const dx = b.x - a.x, dy = b.y - a.y;
+      const d = Math.max(1, Math.sqrt(dx * dx + dy * dy));
+      const rest = 40 + a.r + b.r;
+      const f = 0.05 * state.alpha * (d - rest) / d;
+      a.vx += dx * f; a.vy += dy * f;
+      b.vx -= dx * f; b.vy -= dy * f;
+    }
+    for (const n of nodes) {
+      if (n === state.dragNode) { n.vx = 0; n.vy = 0; continue; }
+      n.vx -= n.x * 0.004 * state.alpha;
+      n.vy -= n.y * 0.004 * state.alpha;
+      n.vx *= 0.82; n.vy *= 0.82;
+      n.x += n.vx; n.y += n.vy;
+    }
+    state.alpha *= 0.992;
+  }
+
+  function matches(node) {
+    return state.query !== "" && node.label.toLowerCase().includes(state.query);
+  }
+
+  function draw() {
+    const dpr = window.devicePixelRatio || 1;
+    const w = canvas.clientWidth, h = canvas.clientHeight;
+    if (canvas.width !== w * dpr || canvas.height !== h * dpr) {
+      canvas.width = w * dpr; canvas.height = h * dpr;
+    }
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, w, h);
+    ctx.translate(state.tx, state.ty);
+    ctx.scale(state.k, state.k);
+
+    const searching = state.query !== "";
+    const focus = state.selected ? state.byId.get(state.selected) : null;
+    const neighborIds = new Set();
+    if (focus) {
+      neighborIds.add(focus.id);
+      for (const e of state.edges) {
+        if (e.source === focus.id) neighborIds.add(e.target);
+        if (e.target === focus.id) neighborIds.add(e.source);
+      }
+    }
+
+    for (const e of state.edges) {
+      const a = state.byId.get(e.source), b = state.byId.get(e.target);
+      const active = focus && (e.source === focus.id || e.target === focus.id);
+      ctx.beginPath();
+      ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y);
+      ctx.setLineDash(e.kind === "external" ? [4, 4] : []);
+      ctx.lineWidth = (active ? 1.6 : 0.7) / state.k;
+      ctx.strokeStyle = active
+        ? getComputedStyle(document.documentElement).getPropertyValue("--accent")
+        : "rgba(" + getComputedStyle(document.documentElement).getPropertyValue("--edge") + "," + (focus || searching ? 0.06 : 0.16) + ")";
+      ctx.stroke();
+    }
+    ctx.setLineDash([]);
+
+    for (const n of state.nodes) {
+      const dimmed = (focus && !neighborIds.has(n.id)) || (searching && !matches(n));
+      ctx.globalAlpha = dimmed ? 0.15 : 1;
+      ctx.beginPath();
+      ctx.arc(n.x, n.y, n.r, 0, 2 * Math.PI);
+      ctx.fillStyle = n.color;
+      ctx.fill();
+      if (n.id === state.selected || matches(n) || n.id === state.hovered) {
+        ctx.lineWidth = 2 / state.k;
+        ctx.strokeStyle = getComputedStyle(document.documentElement).getPropertyValue("--accent");
+        ctx.stroke();
+      }
+      const showLabel = !dimmed && (state.k >= 1 || n.r >= 13 || n.id === state.selected || n.id === state.hovered || matches(n) || state.nodes.length <= 60);
+      if (showLabel) {
+        ctx.font = (12 / state.k) + "px sans-serif";
+        ctx.fillStyle = getComputedStyle(document.documentElement).getPropertyValue("--text");
+        ctx.textAlign = "center";
+        ctx.fillText(shortLabel(n), n.x, n.y - n.r - 5 / state.k);
+      }
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  let raf = null;
+  function tick() {
+    if (raf) return;
+    const loop = () => {
+      if (state.alpha > 0.02) { step(); raf = requestAnimationFrame(loop); }
+      else raf = null;
+      draw();
+    };
+    raf = requestAnimationFrame(loop);
+  }
+
+  function toWorld(px, py) {
+    return [(px - state.tx) / state.k, (py - state.ty) / state.k];
+  }
+  function nodeAt(px, py) {
+    const [x, y] = toWorld(px, py);
+    let best = null, bestD = Infinity;
+    for (const n of state.nodes) {
+      const d = Math.hypot(n.x - x, n.y - y);
+      if (d < n.r + 4 / state.k && d < bestD) { best = n; bestD = d; }
+    }
+    return best;
+  }
+
+  function renderPanel() {
+    const node = state.selected ? state.byId.get(state.selected) : null;
+    panel.classList.toggle("open", !!node);
+    if (!node) return;
+    document.getElementById("p-title").textContent = node.label;
+    document.getElementById("p-kind").textContent = node.kind;
+    const facts = [];
+    if (node.language) facts.push(["language", node.language]);
+    if (node.module) facts.push(["module", node.module]);
+    if (node.size_bytes != null) facts.push(["size", (node.size_bytes / 1024).toFixed(1) + " KB"]);
+    if (node.files != null) facts.push(["files", node.files]);
+    facts.push(["imports", node.out], ["imported by", node.in]);
+    document.getElementById("p-facts").innerHTML = facts
+      .map(([k, v]) => "<dt>" + k + "</dt><dd>" + String(v).replace(/</g, "&lt;") + "</dd>")
+      .join("");
+    const list = (ids, el) => {
+      el.innerHTML = ids.slice(0, 15)
+        .map((id) => "<li data-id=\"" + id.replace(/"/g, "&quot;").replace(/</g, "&lt;") + "\">" + shortLabel(state.byId.get(id)).replace(/</g, "&lt;") + "</li>")
+        .join("") + (ids.length > 15 ? "<li>… " + (ids.length - 15) + " more</li>" : "");
+    };
+    const out = state.edges.filter((e) => e.source === node.id).map((e) => e.target);
+    const inc = state.edges.filter((e) => e.target === node.id).map((e) => e.source);
+    document.getElementById("p-out-h").textContent = "depends on (" + out.length + ")";
+    document.getElementById("p-in-h").textContent = "depended on by (" + inc.length + ")";
+    list(out, document.getElementById("p-out"));
+    list(inc, document.getElementById("p-in"));
+  }
+
+  panel.addEventListener("click", (event) => {
+    const id = event.target.getAttribute && event.target.getAttribute("data-id");
+    if (id && state.byId.has(id)) { state.selected = id; renderPanel(); draw(); }
+  });
+  document.getElementById("close").addEventListener("click", () => {
+    state.selected = null; renderPanel(); draw();
+  });
+
+  canvas.addEventListener("mousedown", (event) => {
+    const node = nodeAt(event.offsetX, event.offsetY);
+    state.moved = false;
+    state.lastX = event.offsetX; state.lastY = event.offsetY;
+    if (node) { state.dragNode = node; state.alpha = Math.max(state.alpha, 0.25); tick(); }
+    else { state.panning = true; canvas.classList.add("dragging"); }
+  });
+  window.addEventListener("mousemove", (event) => {
+    if (state.dragNode) {
+      const rect = canvas.getBoundingClientRect();
+      const [x, y] = toWorld(event.clientX - rect.left, event.clientY - rect.top);
+      state.dragNode.x = x; state.dragNode.y = y;
+      state.alpha = Math.max(state.alpha, 0.12);
+      state.moved = true; tick();
+    } else if (state.panning) {
+      const rect = canvas.getBoundingClientRect();
+      const px = event.clientX - rect.left, py = event.clientY - rect.top;
+      state.tx += px - state.lastX; state.ty += py - state.lastY;
+      state.lastX = px; state.lastY = py;
+      state.moved = true; draw();
+    }
+  });
+  window.addEventListener("mouseup", () => {
+    if (state.dragNode && !state.moved) { state.selected = state.dragNode.id; renderPanel(); }
+    else if (state.panning && !state.moved) { state.selected = null; renderPanel(); }
+    state.dragNode = null; state.panning = false;
+    canvas.classList.remove("dragging");
+    draw();
+  });
+  canvas.addEventListener("mousemove", (event) => {
+    const node = nodeAt(event.offsetX, event.offsetY);
+    const id = node ? node.id : null;
+    if (id !== state.hovered) { state.hovered = id; canvas.style.cursor = id ? "pointer" : ""; draw(); }
+  });
+  canvas.addEventListener("wheel", (event) => {
+    event.preventDefault();
+    const factor = Math.exp(-event.deltaY * 0.0015);
+    const next = Math.max(0.05, Math.min(6, state.k * factor));
+    const [wx, wy] = toWorld(event.offsetX, event.offsetY);
+    state.tx = event.offsetX - wx * next;
+    state.ty = event.offsetY - wy * next;
+    state.k = next;
+    draw();
+  }, { passive: false });
+
+  document.getElementById("btn-modules").addEventListener("click", () => setLevel("modules"));
+  document.getElementById("btn-files").addEventListener("click", () => setLevel("files"));
+  function setLevel(level) {
+    if (state.level === level) return;
+    state.level = level; state.selected = null;
+    document.getElementById("btn-modules").classList.toggle("active", level === "modules");
+    document.getElementById("btn-files").classList.toggle("active", level === "files");
+    rebuild(false);
+  }
+  document.getElementById("chk-ext").addEventListener("change", (event) => {
+    state.showExt = event.target.checked;
+    rebuild(true);
+  });
+  search.addEventListener("input", () => {
+    state.query = search.value.trim().toLowerCase();
+    draw();
+  });
+  window.addEventListener("resize", draw);
+
+  if (!DATA.files.nodes.length && !DATA.modules.nodes.length) {
+    stats.textContent = "empty graph — run `ovecc index` first";
+  }
+  rebuild(false);
+})();
+</script>
+</body>
+</html>

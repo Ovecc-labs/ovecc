@@ -6,7 +6,7 @@ members = ["crates/*"]
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.96"
-license = "MIT"
+license = "Apache-2.0"
 
 [workspace.dependencies]
 # Internal crates
@@ -38,6 +38,7 @@ sha2 = "0.10"
 tempfile = "3.10"
 thiserror = "2.0"
 toml = "0.8"
+ureq = { version = "2", features = ["json"] }
 tree-sitter = "0.25"
 tree-sitter-javascript = "0.25"
 tree-sitter-typescript = "0.23"

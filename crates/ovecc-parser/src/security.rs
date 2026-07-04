@@ -33,7 +33,12 @@ pub fn provider_secret(value: &str) -> Option<&'static str> {
         16,
         is_aws_tail,
     ) {
-        return Some("AWS access key");
+        // AWS's own documented example keys appear in docs, tests, and SDK
+        // samples everywhere; by definition they are not credentials.
+        const AWS_DOC_KEYS: [&str; 2] = ["AKIAIOSFODNN7EXAMPLE", "AKIAI44QH8DHBEXAMPLE"];
+        if !AWS_DOC_KEYS.iter().any(|key| value.contains(key)) {
+            return Some("AWS access key");
+        }
     }
     if contains_token(
         value,
@@ -181,6 +186,7 @@ fn convert(
         line,
         detail: Some(detail.to_string()),
         caller_qualified_name: caller,
+        in_test_code: false,
     }
 }
 
@@ -293,9 +299,11 @@ mod tests {
     #[test]
     fn matches_provider_patterns() {
         assert_eq!(
-            provider_secret("AKIAIOSFODNN7EXAMPLE"),
+            provider_secret("AKIAIOSFODNN7EXAMPLB"),
             Some("AWS access key")
         );
+        // AWS's own documented example key is allowlisted, never a finding.
+        assert_eq!(provider_secret("AKIAIOSFODNN7EXAMPLE"), None);
         assert_eq!(
             provider_secret("ghp_1234567890abcdef1234567890abcdef1234"),
             Some("GitHub token")
