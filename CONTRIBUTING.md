@@ -6,7 +6,7 @@ is deliberately light.
 ## Building
 
 Stable Rust. On Linux/macOS a plain build works out of the box; on Windows use
-the GNU toolchain — the full walkthrough is in
+the GNU toolchain; the full walkthrough is in
 [docs/dev/SETUP.md](docs/dev/SETUP.md). The first build compiles bundled DuckDB
 from source and takes a while; later builds are incremental.
 
@@ -37,7 +37,7 @@ sure your change doesn't introduce new findings on ovecc itself.
 - **The JSON envelope is a contract.** Additive changes only; never rename or
   remove fields without discussion.
 - New analysis belongs behind the existing crate boundaries (see the workspace
-  table in the [README](README.md)) — the CLI crate stays thin.
+  table in the [README](README.md)); the CLI crate stays thin.
 
 ## Bugs and ideas
 

@@ -29,11 +29,11 @@ persistent model of a repository and answers architectural questions about
 structure, change impact, coupling, drift, ownership, security, and long-term
 maintainability.
 
-The focus is not code generation, chat, or dashboards. It is a reliable
-architecture database and a set of deterministic analysis commands that make
-architecture observable, queryable, measurable, and governable — built for an era
-where AI-assisted coding raises both code output and the risk of architectural
-erosion. An LLM may consume Ovecc's output, but it is never the source of truth.
+Ovecc is not a code generator, a chat tool, or a dashboard. It is an
+architecture database plus deterministic analysis commands that make
+architecture queryable and enforceable. AI-assisted coding raises both code
+output and the risk of architectural erosion; Ovecc exists for that problem.
+An LLM may consume Ovecc's output, but it is never the source of truth.
 
 ```text
 Repository -> deterministic analysis -> architecture database -> insights -> optional AI explanation
@@ -43,7 +43,7 @@ Repository -> deterministic analysis -> architecture database -> insights -> opt
   <source media="(prefers-color-scheme: dark)" srcset="docs/img/graph-viewer-dark.png">
   <img src="docs/img/graph-viewer-light.png" alt="ovecc's own dependency graph in the interactive viewer" width="100%">
 </picture>
-<p align="center"><i>ovecc's own dependency graph — <code>ovecc export graph --html</code>, one self-contained offline file.</i></p>
+<p align="center"><i>ovecc's own dependency graph, rendered by <code>ovecc export graph --html</code> into one self-contained offline file.</i></p>
 
 The full design is in [ARCHITECTURE.md](ARCHITECTURE.md). Measured performance on
 real repositories is in [docs/benchmark/BENCHMARKS.md](docs/benchmark/BENCHMARKS.md).
@@ -51,7 +51,7 @@ real repositories is in [docs/benchmark/BENCHMARKS.md](docs/benchmark/BENCHMARKS
 ## Install
 
 Grab a prebuilt binary from the rolling
-[**latest** release](../../releases/latest) — CI publishes fresh Linux and
+[**latest** release](../../releases/latest): CI publishes fresh Linux and
 Windows x86_64 builds on every push to `main`. Drop it on your `PATH` and run
 `ovecc index .`; there is nothing else to install (DuckDB is bundled, no
 runtime, fully offline).
@@ -59,8 +59,8 @@ runtime, fully offline).
 ### Build from source
 
 The workspace builds with stable Rust (on Windows use the `windows-gnu`
-toolchain; DuckDB is bundled and compiled from source on the first build —
-the step-by-step Windows toolchain setup is in
+toolchain; DuckDB is bundled and compiled from source on the first build; the
+step-by-step Windows toolchain setup is in
 [docs/dev/SETUP.md](docs/dev/SETUP.md)).
 
 ```sh
@@ -113,7 +113,7 @@ ovecc capabilities --format json
 
 It returns every command, the metrics and rules they emit (each with a
 definition), the severity vocabulary, the exit-code contract, and the output
-formats — enough to drive an end-to-end audit without reading these docs.
+formats: enough to drive an end-to-end audit without reading these docs.
 
 ### MCP server
 
@@ -184,7 +184,7 @@ line; the finding is dropped at index time.
 ## Languages
 
 The JavaScript/TypeScript family is parsed with tree-sitter and enriched by the
-pure-Rust **oxc** stack behind the parser boundary — real `tsconfig`
+pure-Rust **oxc** stack behind the parser boundary: real `tsconfig`
 paths/`exports` module resolution (`oxc_resolver`), plus per-function complexity
 and exports (`oxc_parser`/`oxc_semantic`). A single specification-driven
 tree-sitter adapter covers Python, Go, Rust, and C++. All feed the same
@@ -221,5 +221,5 @@ Ten library crates and one binary, each documented in its own `README.md`:
 
 ## License
 
-Apache-2.0 — see [LICENSE](LICENSE). Third-party attributions are in
+Apache-2.0; see [LICENSE](LICENSE). Third-party attributions are in
 [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).

@@ -8,7 +8,7 @@ and the Windows Restart Manager import library). Follow the steps below for a cl
 from-scratch build.
 
 > **Result:** a self-contained `target/release/ovecc.exe` (~95 MB) that runs on any
-> Windows machine — no MSYS2 on PATH required at runtime.
+> Windows machine; no MSYS2 on PATH required at runtime.
 
 ---
 
@@ -20,7 +20,7 @@ from-scratch build.
 
 ---
 
-## 1. Rust — GNU toolchain
+## 1. Rust (GNU toolchain)
 
 ```sh
 rustup update
@@ -51,11 +51,11 @@ pacman -S --needed mingw-w64-x86_64-gcc
 ```
 
 This provides `gcc`, `g++`, the assembler (`as`, with `-mbig-obj`), the MinGW runtime,
-and the Windows import libraries — including `librstrtmgr.a`, which DuckDB needs. The
+and the Windows import libraries, including `librstrtmgr.a`, which DuckDB needs. The
 full `mingw-w64-x86_64-toolchain` group also works but is larger.
 
 > **Mirror timeouts?** If a download stalls (`error: ... Operation too slow ...`), just
-> re-run the `pacman -S` command — it resumes from the package cache.
+> re-run the `pacman -S` command; it resumes from the package cache.
 
 ## 3. Add MinGW to PATH
 
@@ -84,7 +84,7 @@ cargo build --release
 cargo test --workspace
 ```
 
-- The **first build takes ~15–20 min** — DuckDB's C++ amalgamation compiles from source.
+- The **first build takes ~15–20 min**: DuckDB's C++ amalgamation compiles from source.
   Subsequent builds are incremental and fast.
 - Smoke-test the binary:
   ```sh
@@ -101,12 +101,12 @@ The binary is `ovecc` (from `crates/ovecc-cli`).
 
 - **Link error `ld: cannot find -lssp` / `-lwinpthread` / `-lrstrtmgr`?** An older MinGW on
   your PATH (typically a legacy `C:\MinGW` from MinGW.org) is shadowing the MSYS2 toolchain.
-  The libraries *are* installed — confirm with
+  The libraries *are* installed; confirm with
   `x86_64-w64-mingw32-gcc -print-file-name=librstrtmgr.a`, which should print a path under
   `C:\msys64\mingw64\lib`. Fix: ensure `C:\msys64\mingw64\bin` is first on PATH **and remove
   the old MinGW entry**, then open a fresh terminal. (This commonly surfaces on `cargo test`,
   since that links extra test executables that a plain `cargo build` does not.)
-- **Don't edit the `C(XX)FLAGS` in `.cargo/config.toml`** unless necessary — changing them
+- **Don't edit the `C(XX)FLAGS` in `.cargo/config.toml`** unless necessary: changing them
   invalidates the `libduckdb-sys` cache and forces a full ~10-min C++ rebuild.
 - The GNU-specific settings in `.cargo/config.toml` (scoped to `x86_64-pc-windows-gnu`)
   handle DuckDB's oversized objects (`-Wa,-mbig-obj`) and statically link
@@ -121,6 +121,6 @@ The workspace is wired for GNU. To build with MSVC you must:
 1. Widen the Restart Manager link in `crates/ovecc-db/build.rs` from
    `target_env == "gnu"` to `target_os == "windows"` (`libduckdb-sys` does not emit the
    import library for MSVC).
-2. Use the **VS 2022 (MSVC 14.41)** toolset — **not** VS 2026 / 14.51, which removed
+2. Use the **VS 2022 (MSVC 14.41)** toolset, **not** VS 2026 / 14.51, which removed
    `stdext::checked_array_iterator`, a symbol DuckDB's bundled `fmt` still uses. Build
    from the *"x64 Native Tools Command Prompt for VS 2022"*.

@@ -1,6 +1,6 @@
 # Command reference
 
-Every ovecc command, what question it answers, and what it returns — with real
+Every ovecc command, what question it answers, and what it returns, with real
 output excerpts. All commands:
 
 - take `--repo <path>` (default: the current directory) and read the model that
@@ -58,7 +58,7 @@ Risk score: Low
 ### `ovecc report`
 
 The assembled architecture report (summary + hotspots + violations + drift) in
-one call — the dashboard payload. Best consumed as `--format markdown|json`.
+one call: the dashboard payload. Best consumed as `--format markdown|json`.
 
 ---
 
@@ -66,7 +66,7 @@ one call — the dashboard payload. Best consumed as `--format markdown|json`.
 
 ### `ovecc diagnose`
 
-Named architectural smells at component (directory) granularity — cycles with
+Named architectural smells at component (directory) granularity: cycles with
 per-hop `file:line` witness edges, hub-like and god components, zone of pain
 (Martin distance), dense structure, hotspots, unstable interfaces, change
 coupling, modularity violations. Every finding carries evidence, the design
@@ -98,9 +98,9 @@ plus repo-wide coupling density. The trendable numbers behind `diagnose`.
 
 ### `ovecc explain <target>`
 
-A deterministic, offline explanation of an element's role — coupling
+A deterministic, offline explanation of an element's role: coupling
 characterization (isolated / entry-point / foundational / intermediary), blast
-radius, findings — every sentence backed by a fact from the context slice.
+radius, findings. Every sentence is backed by a fact from the context slice.
 
 ```
 versions.ts is foundational: 90 components depend on it.
@@ -108,18 +108,18 @@ versions.ts is foundational: 90 components depend on it.
 
 ### `ovecc export context <target>`
 
-The same context slice as raw JSON — the clean, deterministic input for an
+The same context slice as raw JSON: the clean, deterministic input for an
 external LLM or tool. Nothing is sent anywhere; it just prints.
 
 ### `ovecc export graph [--html [path]]`
 
 The whole dependency graph as data: module-level and file-level nodes and
-edges, sorted so an unchanged database exports byte-identical output — ready
+edges, sorted so an unchanged database exports byte-identical output, ready
 for Graphviz, d3, or any external tool. With `--html`, writes a
 self-contained interactive viewer instead (default `ovecc-graph.html`):
 force-directed canvas, module/file views, search, external-dependency toggle,
-per-node detail panel. The renderer ships inside the binary — no CDN, no
-runtime dependency; the file opens offline.
+per-node detail panel. The renderer ships inside the binary (no CDN, no
+runtime dependency); the file opens offline.
 
 ```
 { "html": "ovecc-graph.html", "bytes": 158014, "modules": 209, "files": 252, "file_edges": 535 }
@@ -144,7 +144,7 @@ score. "What breaks if I touch this?"
 ### `ovecc violations`
 
 Every architecture + rule finding: boundary violations, banned imports,
-circular dependencies, security patterns, complexity, dead code, unit size —
+circular dependencies, security patterns, complexity, dead code, unit size,
 with `file:line` evidence and a machine `fix` per finding. The CI artifact
 (`--format sarif` for GitHub code scanning, `codeclimate` for GitLab).
 
@@ -169,7 +169,7 @@ Security findings: 15    secrets 8, insecure 7, tainted-flows 0
 OSV audit: declared dependencies checked against the local vulnerability
 database in `.ovecc/osv/`. Reads npm `package-lock.json` today (other lockfile
 formats are planned). Offline by default; `--fetch` first downloads the
-advisories for the discovered packages — the **only** ovecc operation that
+advisories for the discovered packages. This is the **only** ovecc operation that
 ever touches the network, and only with this flag.
 
 ```
@@ -218,7 +218,7 @@ Fix plan: 5 change(s), 0 skipped — dry-run (pass --apply to write)
 
 ### `ovecc dupes [--min-tokens]`
 
-Clone families over a normalized token stream, with `file:line` ranges —
+Clone families over a normalized token stream, with `file:line` ranges:
 duplicated logic before it propagates.
 
 ### `ovecc hotspots [--limit]`
@@ -252,7 +252,7 @@ review: FAIL (2 new finding(s) at or above 'any')
 ### `ovecc gate [base] [head]`
 
 The pass/fail CI verdict behind `review`: fails on new cycles, violations, or
-quality regressions (security / dead code / complexity counts). Counts only —
+quality regressions (security / dead code / complexity counts). Counts only;
 use `review` for the names.
 
 ### `ovecc diff <base> <head>`
@@ -267,7 +267,7 @@ metrics versus an earlier snapshot. "Is the codebase getting worse?"
 
 ### `ovecc history [metric] [--limit N]`
 
-One metric across *every* snapshot — per-index values, deltas, and a
+One metric across *every* snapshot: per-index values, deltas, and a
 sparkline. Without a metric, lists everything trendable (25+ metrics are
 recorded at each `ovecc index`).
 

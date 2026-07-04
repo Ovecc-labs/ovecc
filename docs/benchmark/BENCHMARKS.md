@@ -9,8 +9,8 @@ from a few files to several thousand.
 
 - **Binary**: release build (`cargo build --release`), the `ovecc` CLI.
 - **Command**: `ovecc index <repo> --no-git --stats`. Git ingestion is excluded so
-  the timing reflects the analysis pipeline itself — discovery, parse, resolve,
-  analyze, persist — rather than history walking.
+  the timing reflects the analysis pipeline itself (discovery, parse, resolve,
+  analyze, persist) rather than history walking.
 - **Timing**: the `total` line from `--stats` (end-to-end wall-clock of the run),
   one cold run per repository (empty parse cache, no prior `.ovecc`).
 - **Memory**: peak heap as reported by the tracking allocator. This counts the
@@ -26,7 +26,7 @@ total.
 
 ## Large repositories
 
-These are the stress cases — industrial codebases with tens of thousands of
+These are the stress cases: industrial codebases with tens of thousands of
 symbols and call edges.
 
 | Repository | Lang | Files | Modules | Deps | Symbols | Call edges | APIs / Tables | Findings | Risk | Time | Peak heap |
@@ -44,7 +44,7 @@ the second-largest symbol count.
 
 ## AI-assisted ("vibe-coded") repositories
 
-Small projects generated quickly with AI assistance — the workload Ovecc is
+Small projects generated quickly with AI assistance: the workload Ovecc is
 designed to keep honest.
 
 | Repository | Lang | Files | Deps | Symbols | Findings | Risk | Time | Peak heap |
@@ -68,7 +68,7 @@ build scripts, developer tooling, and tests.
 
 A note on interpretation: the command-execution and eval findings in these
 projects are concentrated in management commands, autoreload utilities, code
-generators, and test suites — not in remotely reachable request paths. The Vue
+generators, and test suites, not in remotely reachable request paths. The Vue
 `new Function` findings sit in the runtime template compiler, where they are only
 a concern if untrusted input reaches client-side compilation. Ovecc reports the
 flow; judging exploitability is the reviewer's call. The single Hugo secret is a
