@@ -93,9 +93,7 @@ fn grammar_for(language: SourceLanguage) -> Option<tree_sitter::Language> {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Walk state
-// ---------------------------------------------------------------------------
+// ---- Walk state ----
 
 /// One enclosing scope on the qualified-name stack.
 struct Frame {
@@ -1110,9 +1108,7 @@ impl<'a> Walk<'a> {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Free helpers
-// ---------------------------------------------------------------------------
+// ---- Free helpers ----
 
 fn span_of(node: Node<'_>) -> Span {
     Span {
@@ -1593,12 +1589,19 @@ mod tests {
         assert!(specifiers.contains(&"self::cli"), "{specifiers:?}");
         assert!(specifiers.contains(&"self::harness"), "{specifiers:?}");
         // …but an inline module has a body and references no file.
-        assert!(!specifiers.iter().any(|s| s.contains("inline")), "{specifiers:?}");
+        assert!(
+            !specifiers.iter().any(|s| s.contains("inline")),
+            "{specifiers:?}"
+        );
 
         // From a non-root module file, the child sits under the module's own
         // directory (2018 layout): `bar.rs` + `mod foo;` -> `bar/foo.rs`.
         let nested = extract_at("crates/tool/src/bar.rs", "mod foo;\n");
-        let nested_specs: Vec<&str> = nested.imports.iter().map(|i| i.specifier.as_str()).collect();
+        let nested_specs: Vec<&str> = nested
+            .imports
+            .iter()
+            .map(|i| i.specifier.as_str())
+            .collect();
         assert!(nested_specs.contains(&"self::bar::foo"), "{nested_specs:?}");
 
         // A `src/bin/` target is a crate root again: siblings.

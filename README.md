@@ -39,6 +39,12 @@ erosion. An LLM may consume Ovecc's output, but it is never the source of truth.
 Repository -> deterministic analysis -> architecture database -> insights -> optional AI explanation
 ```
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/img/graph-viewer-dark.png">
+  <img src="docs/img/graph-viewer-light.png" alt="ovecc's own dependency graph in the interactive viewer" width="100%">
+</picture>
+<p align="center"><i>ovecc's own dependency graph — <code>ovecc export graph --html</code>, one self-contained offline file.</i></p>
+
 The full design is in [ARCHITECTURE.md](ARCHITECTURE.md). Measured performance on
 real repositories is in [docs/benchmark/BENCHMARKS.md](docs/benchmark/BENCHMARKS.md).
 

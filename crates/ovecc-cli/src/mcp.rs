@@ -161,6 +161,10 @@ fn run_tool(name: &str, arguments: &Value, exe: &Path) -> Value {
     ];
     argv.extend(sub_argv);
 
+    // The MCP server IS a subprocess launcher by design: each tool call re-runs
+    // this same binary (`exe` = std::env::current_exe), never a caller-supplied
+    // program, and argv is built above from the tool schema — nothing to inject.
+    // ovecc-ignore-next-line
     match std::process::Command::new(exe).args(&argv).output() {
         Ok(output) => {
             let code = output.status.code().unwrap_or(-1);

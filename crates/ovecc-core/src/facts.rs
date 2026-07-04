@@ -21,9 +21,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-// ---------------------------------------------------------------------------
-// Shared value types
-// ---------------------------------------------------------------------------
+// ---- Shared value types ----
 
 /// Severity grading shared by rules, findings, and risk mapping.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -72,9 +70,7 @@ pub struct EntityRef {
     pub id: String,
 }
 
-// ---------------------------------------------------------------------------
-// Normalized records (persisted; mirror database tables)
-// ---------------------------------------------------------------------------
+// ---- Normalized records (persisted; mirror database tables) ----
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RepositoryRecord {
@@ -573,9 +569,7 @@ impl FindingKind {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Raw extraction facts (language adapter output, pre-resolution)
-// ---------------------------------------------------------------------------
+// ---- Raw extraction facts (language adapter output, pre-resolution) ----
 
 /// In-memory source file handed to language adapters.
 #[derive(Debug, Clone, Serialize, Deserialize)]

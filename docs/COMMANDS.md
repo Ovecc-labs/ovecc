@@ -166,10 +166,11 @@ Security findings: 15    secrets 8, insecure 7, tainted-flows 0
 
 ### `ovecc audit [--fetch]`
 
-OSV audit: declared dependencies (lockfiles) checked against the local
-vulnerability database in `.ovecc/osv/`. Offline by default; `--fetch` first
-downloads the advisories for the discovered packages — the **only** ovecc
-operation that ever touches the network, and only with this flag.
+OSV audit: declared dependencies checked against the local vulnerability
+database in `.ovecc/osv/`. Reads npm `package-lock.json` today (other lockfile
+formats are planned). Offline by default; `--fetch` first downloads the
+advisories for the discovered packages — the **only** ovecc operation that
+ever touches the network, and only with this flag.
 
 ```
 Fetched 27 new advisory(ies) for 1 package(s).

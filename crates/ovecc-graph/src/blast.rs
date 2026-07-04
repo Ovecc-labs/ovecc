@@ -216,7 +216,7 @@ pub fn blast_radius(
     }
 
     // Impacted files weigh like symbols (1 each) in the risk score, so a file
-    // with many dependents no longer scores Low just because no module is crossed.
+    // with many dependents doesn't score Low just because no module is crossed.
     let (risk_value, risk) = risk_score(modules, apis, tables, symbols + files, false);
     let mut impacted_labels: Vec<String> = visited
         .iter()

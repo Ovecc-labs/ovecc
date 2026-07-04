@@ -124,7 +124,7 @@
     level: "modules", showExt: false, query: "",
     nodes: [], edges: [], byId: new Map(),
     selected: null, hovered: null,
-    tx: 0, ty: 0, k: 1, alpha: 0,
+    tx: 0, ty: 0, k: 1, alpha: 0, autoFit: true,
     dragNode: null, panning: false, lastX: 0, lastY: 0, moved: false,
   };
 
@@ -151,7 +151,7 @@
     });
     state.nodes = nodes; state.edges = edges; state.byId = byId;
     state.selected = state.selected && byId.has(state.selected) ? state.selected : null;
-    if (!keepView) fitView();
+    if (!keepView) { fitView(); state.autoFit = true; }
     state.alpha = 1;
     stats.textContent = nodes.length + " nodes · " + edges.length + " edges";
     renderPanel();
@@ -164,6 +164,25 @@
     state.k = Math.max(0.08, Math.min(1.2, fit));
     state.tx = canvas.clientWidth / 2;
     state.ty = canvas.clientHeight / 2;
+  }
+
+  // Keeps the whole graph in view while the layout settles (gravity shrinks it
+  // well below fitView's pre-layout estimate). Hands off for good on the first
+  // pan, zoom, or drag.
+  function fitToBounds() {
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    for (const n of state.nodes) {
+      minX = Math.min(minX, n.x - n.r); maxX = Math.max(maxX, n.x + n.r);
+      minY = Math.min(minY, n.y - n.r); maxY = Math.max(maxY, n.y + n.r);
+    }
+    if (minX > maxX) return;
+    const w = canvas.clientWidth, h = canvas.clientHeight, pad = 70;
+    const k = Math.min(2,
+      (w - 2 * pad) / Math.max(1, maxX - minX),
+      (h - 2 * pad) / Math.max(1, maxY - minY));
+    state.k = Math.max(0.05, k);
+    state.tx = w / 2 - state.k * (minX + maxX) / 2;
+    state.ty = h / 2 - state.k * (minY + maxY) / 2;
   }
 
   // Plain O(n²) force simulation: repulsion + edge springs + weak gravity.
@@ -272,8 +291,11 @@
   function tick() {
     if (raf) return;
     const loop = () => {
-      if (state.alpha > 0.02) { step(); raf = requestAnimationFrame(loop); }
-      else raf = null;
+      if (state.alpha > 0.02) {
+        step();
+        if (state.autoFit) fitToBounds();
+        raf = requestAnimationFrame(loop);
+      } else raf = null;
       draw();
     };
     raf = requestAnimationFrame(loop);
@@ -330,6 +352,7 @@
 
   canvas.addEventListener("mousedown", (event) => {
     const node = nodeAt(event.offsetX, event.offsetY);
+    state.autoFit = false;
     state.moved = false;
     state.lastX = event.offsetX; state.lastY = event.offsetY;
     if (node) { state.dragNode = node; state.alpha = Math.max(state.alpha, 0.25); tick(); }
@@ -364,6 +387,7 @@
   });
   canvas.addEventListener("wheel", (event) => {
     event.preventDefault();
+    state.autoFit = false;
     const factor = Math.exp(-event.deltaY * 0.0015);
     const next = Math.max(0.05, Math.min(6, state.k * factor));
     const [wx, wy] = toWorld(event.offsetX, event.offsetY);

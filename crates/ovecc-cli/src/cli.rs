@@ -81,7 +81,7 @@ fn meta_for(command: &str) -> Meta {
 }
 
 #[derive(Debug, Parser)]
-#[command(name = "ovecc")]
+#[command(name = "ovecc", version)]
 #[command(about = "Deterministic architecture intelligence for repositories")]
 pub struct Cli {
     #[arg(long, global = true, value_name = "PATH")]
@@ -1463,9 +1463,7 @@ fn render_hotspots(report: &HotspotsReport, format: OutputFormat) -> Result<()> 
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// ovecc diagnose / advise / metrics
-// ---------------------------------------------------------------------------
+// ---- ovecc diagnose / advise / metrics ----
 
 /// Assembles the per-module graph inputs the diagnosis engine consumes: module
 /// names, the dependency records, churn, and aggregate complexity. Mirrors the
@@ -2302,9 +2300,7 @@ fn format_evidence(evidence: &ovecc_core::facts::Evidence) -> String {
     text
 }
 
-// ---------------------------------------------------------------------------
-// ovecc capabilities
-// ---------------------------------------------------------------------------
+// ---- ovecc capabilities ----
 
 /// Renders the capability manifest: JSON for agents (the primary consumer), a
 /// readable catalog for humans. Needs no database — it is pure contract.
@@ -2357,9 +2353,7 @@ fn render_capabilities(format: OutputFormat) -> Result<()> {
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// ovecc security
-// ---------------------------------------------------------------------------
+// ---- ovecc security ----
 
 /// The finding kinds the `security` command surfaces (dependency vulnerabilities
 /// are surfaced by `audit` instead).
@@ -2467,9 +2461,7 @@ fn render_security(report: &SecurityReport, format: OutputFormat) -> Result<()> 
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// ovecc audit (OSV dependency vulnerabilities)
-// ---------------------------------------------------------------------------
+// ---- ovecc audit (OSV dependency vulnerabilities) ----
 
 /// OSV audit result with explicit scanned counts (packages, advisories) so a
 /// clean result is stated, not silent.
@@ -2524,9 +2516,7 @@ fn render_audit(report: &AuditReport, format: OutputFormat) -> Result<()> {
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// ovecc gate (CI gate over diff/drift)
-// ---------------------------------------------------------------------------
+// ---- ovecc gate (CI gate over diff/drift) ----
 
 /// CI gate verdict and the signals (new cycles/structure/risk) behind it.
 #[derive(serde::Serialize)]
@@ -2656,9 +2646,7 @@ fn render_gate(report: &GateReport, format: OutputFormat) -> Result<()> {
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// ovecc review (change-scoped, named new defects)
-// ---------------------------------------------------------------------------
+// ---- ovecc review (change-scoped, named new defects) ----
 
 /// The named defects a change introduced between two snapshots: the actionable,
 /// change-scoped report that `gate` (counts only) cannot give.
@@ -3094,9 +3082,7 @@ fn render_review(report: &ReviewReport, format: OutputFormat) -> Result<()> {
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// ovecc report (one-shot composite)
-// ---------------------------------------------------------------------------
+// ---- ovecc report (one-shot composite) ----
 
 /// First evidence location of a finding, formatted as ` (path:line)`, or empty.
 fn first_evidence(finding: &FindingRecord) -> String {
@@ -3222,9 +3208,7 @@ fn render_full_report(paths: &ProjectPaths, format: OutputFormat) -> Result<()> 
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// ovecc dupes (clone detection)
-// ---------------------------------------------------------------------------
+// ---- ovecc dupes (clone detection) ----
 
 /// Duplication report: scan parameters and the clone families found.
 #[derive(serde::Serialize)]
@@ -3311,9 +3295,7 @@ fn render_dupes(report: &DupesReport, format: OutputFormat) -> Result<()> {
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// ovecc health (complexity hotspots)
-// ---------------------------------------------------------------------------
+// ---- ovecc health (complexity hotspots) ----
 
 /// Code-health report: functions over the complexity thresholds.
 #[derive(serde::Serialize)]
@@ -3584,9 +3566,7 @@ fn render_health(report: &HealthReport, format: OutputFormat) -> Result<()> {
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// ovecc deadcode (unused exports / files)
-// ---------------------------------------------------------------------------
+// ---- ovecc deadcode (unused exports / files) ----
 
 /// Dead-code report: unused exports and unreachable files.
 #[derive(serde::Serialize)]

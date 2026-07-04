@@ -495,9 +495,9 @@ impl<'a> Extractor<'a> {
             "identifier" => {
                 let callee = self.text(function_node).to_string();
                 // Weak hash via a *destructured* import — `createHash("md5")` after
-                // `import { createHash } from "crypto"` — which is at least as
-                // common as the `crypto.createHash(...)` member form handled in
-                // extract_member_call, and was previously missed.
+                // `import { createHash } from "crypto"` — at least as common as
+                // the `crypto.createHash(...)` member form handled in
+                // extract_member_call.
                 if matches!(callee.as_str(), "createHash" | "createHmac")
                     && let Some(algo) = self
                         .first_string_argument(node)
