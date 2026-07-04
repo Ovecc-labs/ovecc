@@ -21,9 +21,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-// ---------------------------------------------------------------------------
-// Shared value types
-// ---------------------------------------------------------------------------
+// ---- Shared value types ----
 
 /// Severity grading shared by rules, findings, and risk mapping.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -72,9 +70,7 @@ pub struct EntityRef {
     pub id: String,
 }
 
-// ---------------------------------------------------------------------------
-// Normalized records (persisted; mirror database tables)
-// ---------------------------------------------------------------------------
+// ---- Normalized records (persisted; mirror database tables) ----
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RepositoryRecord {
@@ -431,7 +427,17 @@ pub enum FindingKind {
     UnusedExport,
     UnusedFile,
     UnusedDependency,
+    /// An imported package missing from every `package.json` (a phantom
+    /// dependency that only works via hoisting or a transitive install).
+    UnlistedDependency,
     HighComplexity,
+    /// A function long enough (source lines) to be a maintainability risk.
+    LongFunction,
+    /// A function with too many parameters.
+    LongParameterList,
+    /// An `ovecc-ignore` comment that suppresses no finding — it will silently
+    /// swallow the next real finding on its line.
+    StaleSuppression,
 }
 
 /// A machine-actionable fix descriptor attached to a finding so an agent can act
@@ -477,10 +483,33 @@ impl FindingKind {
                 true,
                 "Remove this dependency from the manifest; no indexed file imports it.",
             ),
+            FindingKind::UnlistedDependency => FixSpec::new(
+                "declare_dependency",
+                true,
+                "Declare the package in the nearest manifest's dependencies, pinning the \
+                 version the lockfile already resolves (it currently works only via \
+                 hoisting or a transitive install).",
+            ),
             FindingKind::HighComplexity => FixSpec::new(
                 "reduce_complexity",
                 false,
                 "Extract functions and reduce nesting to lower cognitive complexity.",
+            ),
+            FindingKind::LongFunction => FixSpec::new(
+                "split_long_function",
+                false,
+                "Extract cohesive sections into named helper functions.",
+            ),
+            FindingKind::LongParameterList => FixSpec::new(
+                "reduce_parameters",
+                false,
+                "Group related parameters into a typed options object.",
+            ),
+            FindingKind::StaleSuppression => FixSpec::new(
+                "remove_stale_suppression",
+                true,
+                "Delete the ovecc-ignore comment: it suppresses nothing and will \
+                 silently swallow the next real finding on this line.",
             ),
             FindingKind::HardcodedSecret => FixSpec::new(
                 "rotate_and_externalize_secret",
@@ -540,9 +569,7 @@ impl FindingKind {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Raw extraction facts (language adapter output, pre-resolution)
-// ---------------------------------------------------------------------------
+// ---- Raw extraction facts (language adapter output, pre-resolution) ----
 
 /// In-memory source file handed to language adapters.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -597,6 +624,11 @@ pub struct SecurityPatternFact {
     /// engine treat dangerous calls (`eval`, `exec`) as sinks.
     #[serde(default)]
     pub caller_qualified_name: Option<String>,
+    /// True when the pattern sits in test scaffolding that path-based
+    /// heuristics can't see — Rust's inline `#[cfg(test)] mod` / `#[test]`
+    /// idiom. Findings on such patterns down-rank to Low like test files do.
+    #[serde(default)]
+    pub in_test_code: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -810,7 +842,7 @@ mod tests {
 
     #[test]
     fn confidence_thresholds_are_ordered_constants() {
-        assert!(Confidence::REPORT_THRESHOLD < Confidence::VIOLATION_THRESHOLD);
+        const { assert!(Confidence::REPORT_THRESHOLD < Confidence::VIOLATION_THRESHOLD) };
         assert_eq!(Confidence::REPORT_THRESHOLD, 0.70);
         assert_eq!(Confidence::VIOLATION_THRESHOLD, 0.85);
     }

@@ -319,10 +319,22 @@ impl<'a> Extractor<'a> {
         let Some(specifier) = string_literal_value(self.text(source_node)) else {
             return;
         };
+        // `export type { X } from '...'` is erased at runtime, exactly like
+        // `import type` — it must not witness a cycle. Dead-code forwarding is
+        // unaffected: those edges are built from the dependency rows (any
+        // kind) plus the export facts' own re-export provenance.
+        let type_only = node
+            .child(1)
+            .map(|child| self.text(child) == "type")
+            .unwrap_or(false);
         self.imports.push(ImportFact {
             specifier,
             line: self.line(node),
-            kind: ImportFactKind::ReExport,
+            kind: if type_only {
+                ImportFactKind::TypeOnly
+            } else {
+                ImportFactKind::ReExport
+            },
             imported_names: self.collect_imported_names(node),
         });
     }
@@ -483,9 +495,9 @@ impl<'a> Extractor<'a> {
             "identifier" => {
                 let callee = self.text(function_node).to_string();
                 // Weak hash via a *destructured* import — `createHash("md5")` after
-                // `import { createHash } from "crypto"` — which is at least as
-                // common as the `crypto.createHash(...)` member form handled in
-                // extract_member_call, and was previously missed.
+                // `import { createHash } from "crypto"` — at least as common as
+                // the `crypto.createHash(...)` member form handled in
+                // extract_member_call.
                 if matches!(callee.as_str(), "createHash" | "createHmac")
                     && let Some(algo) = self
                         .first_string_argument(node)
@@ -728,19 +740,13 @@ impl<'a> Extractor<'a> {
         }
     }
 
-    /// Records an inline suppression comment:
+    /// Records an inline suppression comment. The marker must lead the
+    /// comment (see [`crate::suppression_offset`]):
     /// `// ovecc-ignore-next-line` suppresses the following line, a bare
     /// `// ovecc-ignore` suppresses the comment's own line (trailing form).
     fn extract_suppression(&mut self, node: Node<'_>) {
-        let text = self.text(node);
-        if !text.contains("ovecc-ignore") {
-            return;
-        }
-        let line = self.line(node);
-        if text.contains("ovecc-ignore-next-line") {
-            self.suppressed.push(line + 1);
-        } else {
-            self.suppressed.push(line);
+        if let Some(offset) = crate::suppression_offset(self.text(node)) {
+            self.suppressed.push(self.line(node) + offset);
         }
     }
 
@@ -1296,7 +1302,7 @@ function scan(re, s) { re.exec(s); }
     #[test]
     fn detects_inline_suppressions() {
         let facts = extract(
-            "// ovecc-ignore-next-line\nconst apiKey = \"AKIAIOSFODNN7EXAMPLE\";\neval(x); // ovecc-ignore\n",
+            "// ovecc-ignore-next-line\nconst apiKey = \"AKIAIOSFODNN7EXAMPLB\";\neval(x); // ovecc-ignore\n",
             SourceLanguage::TypeScript,
         );
         // next-line comment (line 1) suppresses the secret on line 2.

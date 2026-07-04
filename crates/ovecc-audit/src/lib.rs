@@ -119,6 +119,76 @@ pub fn discover_packages(root: &Path) -> Vec<Package> {
     }
 }
 
+/// Downloads the OSV advisories affecting `packages` into `osv_dir` — the
+/// ONLY ovecc code path that ever touches the network, and only behind the
+/// explicit `audit --fetch` flag. One `querybatch` call per 500 packages,
+/// then each advisory is fetched once; files already on disk are kept, so
+/// re-runs are incremental. Returns (advisories written, packages queried).
+pub fn fetch_advisories(packages: &[Package], osv_dir: &Path) -> anyhow::Result<(usize, usize)> {
+    use serde_json::json;
+    std::fs::create_dir_all(osv_dir)?;
+    let agent = ureq::AgentBuilder::new()
+        .timeout(std::time::Duration::from_secs(30))
+        .build();
+
+    let mut ids: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for chunk in packages.chunks(500) {
+        let queries: Vec<serde_json::Value> = chunk
+            .iter()
+            .map(|package| {
+                json!({
+                    "package": { "name": package.name, "ecosystem": package.ecosystem },
+                    "version": package.version,
+                })
+            })
+            .collect();
+        let response: serde_json::Value = agent
+            .post("https://api.osv.dev/v1/querybatch")
+            .send_json(json!({ "queries": queries }))?
+            .into_json()?;
+        for result in response
+            .get("results")
+            .and_then(|r| r.as_array())
+            .into_iter()
+            .flatten()
+        {
+            for vuln in result
+                .get("vulns")
+                .and_then(|v| v.as_array())
+                .into_iter()
+                .flatten()
+            {
+                if let Some(id) = vuln.get("id").and_then(|i| i.as_str()) {
+                    ids.insert(id.to_string());
+                }
+            }
+        }
+    }
+
+    let mut written = 0usize;
+    for id in &ids {
+        // Advisory ids are [A-Za-z0-9-]; guard anyway so a hostile response
+        // can never write outside the OSV directory.
+        if !id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.')
+        {
+            continue;
+        }
+        let path = osv_dir.join(format!("{id}.json"));
+        if path.exists() {
+            continue;
+        }
+        let body = agent
+            .get(&format!("https://api.osv.dev/v1/vulns/{id}"))
+            .call()?
+            .into_string()?;
+        std::fs::write(&path, body)?;
+        written += 1;
+    }
+    Ok((written, packages.len()))
+}
+
 /// Loads every OSV JSON entry from a directory (non-recursive). Missing
 /// directory or unreadable/invalid files yield no entries — the audit simply
 /// finds nothing rather than failing.

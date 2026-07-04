@@ -270,6 +270,23 @@ pub struct DiagnoseConfig {
     pub min_confidence: f64,
     /// Minimum co-change count for a Change Coupling / Modularity Violation.
     pub change_coupling_min: usize,
+    /// Absolute churn floor for a Hotspot: a component below this many
+    /// history-weighted file touches cannot be a hotspot, whatever its
+    /// normalized score (relative normalization makes everything "hot" on a
+    /// near-empty history).
+    pub hotspot_min_churn: f64,
+    /// Absolute complexity floor for a Hotspot (same rationale: a component
+    /// with trivial complexity is not debt no matter how often it changes).
+    pub hotspot_min_complexity: f64,
+    /// Minimum total churn mass (sum of history-weighted file touches across
+    /// the repo) before the evolutionary detectors (hotspot, unstable
+    /// interface, change coupling) run at all. One or two commits of history
+    /// cannot witness evolution; below this floor they stay silent.
+    pub evolutionary_min_history: f64,
+    /// Minimum component count before the repo-level Dense Structure finding
+    /// can fire — tiny graphs are naturally dense and the density ratio is
+    /// meaningless there.
+    pub dense_min_components: usize,
     /// Minimum distance from the main sequence `D = |A + I − 1|` for a Zone of
     /// Pain finding (0..1).
     pub zone_distance: f64,
@@ -280,6 +297,11 @@ pub struct DiagnoseConfig {
     /// vendored). A token with `.` matches the filename as a substring; else it
     /// matches a whole path segment. Case-insensitive.
     pub exclude: Vec<String>,
+    /// Manifest directories (Cargo crates, npm packages) whose conventional
+    /// `src/` segment is transparent for component derivation, so a crate's
+    /// `build.rs` and its `src/` land in one component. Filled automatically
+    /// from the repository's manifests; overridable here.
+    pub component_roots: Vec<String>,
 }
 
 impl Default for DiagnoseConfig {
@@ -293,6 +315,10 @@ impl Default for DiagnoseConfig {
             dense_medium: 0.15,
             dense_high: 0.35,
             hotspot_limit: 10,
+            hotspot_min_churn: 3.0,
+            hotspot_min_complexity: 10.0,
+            evolutionary_min_history: 30.0,
+            dense_min_components: 10,
             min_confidence: 0.5,
             change_coupling_min: 4,
             zone_distance: 0.7,
@@ -327,6 +353,7 @@ impl Default for DiagnoseConfig {
             .iter()
             .map(|s| s.to_string())
             .collect(),
+            component_roots: Vec::new(),
         }
     }
 }

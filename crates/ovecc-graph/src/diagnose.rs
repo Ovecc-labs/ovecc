@@ -17,6 +17,7 @@
 //! See `docs/dev/DIAGNOSE.md` for the design and the research basis of each
 //! detector.
 
+use crate::cycles;
 use crate::instability;
 use ovecc_core::facts::Severity;
 use petgraph::algo::kosaraju_scc;
@@ -48,6 +49,44 @@ fn is_excluded(path: &str, exclude: &[String]) -> bool {
     false
 }
 
+/// The component a file belongs to under this config: manifest roots make the
+/// conventional `src/` layer transparent first, then the standard depth rule
+/// applies.
+pub fn component_for(path: &str, config: &DiagnoseConfig) -> String {
+    component_of(
+        &canonical_component_path(path, &config.component_roots),
+        config.component_depth,
+    )
+}
+
+/// Canonicalizes a path for component derivation: inside a manifest root
+/// (a Cargo crate or npm package directory) the `src/` layer is dropped —
+/// `crates/db/src/lib.rs` → `crates/db/lib.rs`, `crates/db/src/sub/x.rs` →
+/// `crates/db/sub/x.rs` — so a crate's `build.rs` and its `src/` land in one
+/// component while deeper structure stays distinct. Reported file paths are
+/// untouched; only component derivation sees the canonical form.
+pub fn canonical_component_path(path: &str, roots: &[String]) -> String {
+    let norm = path.replace('\\', "/");
+    // Most specific (longest) matching root wins for nested packages.
+    let mut best: Option<&str> = None;
+    for root in roots {
+        if norm.len() > root.len() + 1
+            && norm.starts_with(root.as_str())
+            && norm.as_bytes()[root.len()] == b'/'
+            && best.is_none_or(|b| root.len() > b.len())
+        {
+            best = Some(root);
+        }
+    }
+    let Some(root) = best else {
+        return norm;
+    };
+    match norm[root.len() + 1..].strip_prefix("src/") {
+        Some(stripped) => format!("{root}/{stripped}"),
+        None => norm,
+    }
+}
+
 /// The component a file belongs to. `depth == 0` => the parent directory;
 /// `depth > 0` => the first `depth` path segments. Paths are normalised to
 /// POSIX separators. A file at the repo root maps to `"<root>"`.
@@ -71,6 +110,31 @@ pub fn component_of(path: &str, depth: usize) -> String {
     }
 }
 
+/// A file→file dependency edge with its import evidence, so detectors can cite
+/// concrete `file:line` witnesses (not just aggregate metrics).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileDep {
+    pub source: String,
+    pub target: String,
+    pub specifier: String,
+    pub line: usize,
+    /// `import type` — counts as coupling but can never form a runtime cycle.
+    pub type_only: bool,
+}
+
+impl FileDep {
+    /// Convenience constructor for callers (and tests) without edge evidence.
+    pub fn bare(source: impl Into<String>, target: impl Into<String>) -> Self {
+        Self {
+            source: source.into(),
+            target: target.into(),
+            specifier: String::new(),
+            line: 1,
+            type_only: false,
+        }
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct DiagEvidence {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -81,6 +145,9 @@ pub struct DiagEvidence {
     pub value: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub threshold: Option<f64>,
+    /// Human-readable qualifier (e.g. the import edge a cycle hop witnesses).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
 }
 
 impl DiagEvidence {
@@ -91,6 +158,7 @@ impl DiagEvidence {
             metric: metric.to_string(),
             value,
             threshold: Some(threshold),
+            detail: None,
         }
     }
     fn bare(metric: &str, value: f64) -> Self {
@@ -100,6 +168,21 @@ impl DiagEvidence {
             metric: metric.to_string(),
             value,
             threshold: None,
+            detail: None,
+        }
+    }
+    /// One witnessed cycle hop: `from_file:line — cycle_edge=<hop> (from -> to: specifier)`.
+    fn cycle_edge(hop: usize, edge: &cycles::WitnessEdge) -> Self {
+        Self {
+            file: Some(edge.from_file.clone()),
+            line: Some(edge.line as u32),
+            metric: "cycle_edge".to_string(),
+            value: hop as f64,
+            threshold: None,
+            detail: Some(format!(
+                "{} -> {}: {}",
+                edge.from_module, edge.to_module, edge.specifier
+            )),
         }
     }
 }
@@ -201,6 +284,9 @@ pub struct MetricsReport {
 struct ComponentGraph {
     components: BTreeSet<String>,
     edges: BTreeSet<(String, String)>,
+    /// The subset of `edges` witnessed by at least one non-type-only file
+    /// dependency — the only edges that can form a *runtime* cycle.
+    runtime_edges: BTreeSet<(String, String)>,
     fan_in: HashMap<String, usize>,
     fan_out: HashMap<String, usize>,
     files: HashMap<String, usize>,
@@ -228,13 +314,12 @@ impl ComponentGraph {
 /// Aggregates the file-level facts to components at the configured granularity.
 fn build_graph(
     files: &[String],
-    file_deps: &[(String, String)],
+    file_deps: &[FileDep],
     file_churn: &HashMap<String, f64>,
     file_complexity: &HashMap<String, f64>,
     file_abstractness: &HashMap<String, (f64, f64)>,
     config: &DiagnoseConfig,
 ) -> ComponentGraph {
-    let depth = config.component_depth;
     let excluded = |path: &str| is_excluded(path, &config.exclude);
     let mut components = BTreeSet::<String>::new();
     let mut file_count = HashMap::<String, usize>::new();
@@ -247,7 +332,7 @@ fn build_graph(
         if excluded(path) {
             continue;
         }
-        let c = component_of(path, depth);
+        let c = component_for(path, config);
         components.insert(c.clone());
         *file_count.entry(c.clone()).or_default() += 1;
         *churn.entry(c.clone()).or_default() += file_churn.get(path).copied().unwrap_or(0.0);
@@ -260,16 +345,20 @@ fn build_graph(
     }
 
     let mut edges = BTreeSet::<(String, String)>::new();
-    for (src, tgt) in file_deps {
-        if excluded(src) || excluded(tgt) {
+    let mut runtime_edges = BTreeSet::<(String, String)>::new();
+    for dep in file_deps {
+        if excluded(&dep.source) || excluded(&dep.target) {
             continue;
         }
-        let cs = component_of(src, depth);
-        let ct = component_of(tgt, depth);
+        let cs = component_for(&dep.source, config);
+        let ct = component_for(&dep.target, config);
         // Ensure endpoints exist even if they had no indexed files.
         components.insert(cs.clone());
         components.insert(ct.clone());
         if cs != ct {
+            if !dep.type_only {
+                runtime_edges.insert((cs.clone(), ct.clone()));
+            }
             edges.insert((cs, ct));
         }
     }
@@ -284,6 +373,7 @@ fn build_graph(
     ComponentGraph {
         components,
         edges,
+        runtime_edges,
         fan_in,
         fan_out,
         files: file_count,
@@ -338,7 +428,7 @@ fn percentile(values: &[f64], p: f64) -> f64 {
 /// Builds the per-component metrics report.
 pub fn metrics(
     files: &[String],
-    file_deps: &[(String, String)],
+    file_deps: &[FileDep],
     file_churn: &HashMap<String, f64>,
     file_complexity: &HashMap<String, f64>,
     file_abstractness: &HashMap<String, (f64, f64)>,
@@ -397,7 +487,7 @@ pub fn metrics(
 /// Runs every enabled Phase-1 detector and returns a ranked report.
 pub fn diagnose(
     files: &[String],
-    file_deps: &[(String, String)],
+    file_deps: &[FileDep],
     file_churn: &HashMap<String, f64>,
     file_complexity: &HashMap<String, f64>,
     file_abstractness: &HashMap<String, (f64, f64)>,
@@ -414,7 +504,7 @@ pub fn diagnose(
     );
     let mut findings: Vec<Diagnosis> = Vec::new();
 
-    detect_cyclic_dependency(&g, &mut findings);
+    detect_cyclic_dependency(&g, file_deps, config, &mut findings);
     detect_file_cycle(files, file_deps, config, &mut findings);
     detect_hub_like(&g, config, &mut findings);
     detect_unstable_dependency(&g, config, &mut findings);
@@ -432,8 +522,34 @@ pub fn diagnose(
 
 // --- detectors -------------------------------------------------------------
 
-fn detect_cyclic_dependency(g: &ComponentGraph, out: &mut Vec<Diagnosis>) {
-    for component in strongly_connected(&g.components, &g.edges) {
+fn detect_cyclic_dependency(
+    g: &ComponentGraph,
+    file_deps: &[FileDep],
+    config: &DiagnoseConfig,
+    out: &mut Vec<Diagnosis>,
+) {
+    // Component-granularity file edges, so each cycle hop carries a concrete
+    // `file:line` import witness — picked by the same connected-walk algorithm
+    // `review` and the circular-dependency finding use.
+    let group_edges: Vec<cycles::GroupFileEdge> = file_deps
+        .iter()
+        .filter(|dep| {
+            !dep.type_only
+                && !is_excluded(&dep.source, &config.exclude)
+                && !is_excluded(&dep.target, &config.exclude)
+        })
+        .map(|dep| cycles::GroupFileEdge {
+            from_group: component_for(&dep.source, config),
+            to_group: component_for(&dep.target, config),
+            from_file: dep.source.clone(),
+            to_file: Some(dep.target.clone()),
+            specifier: dep.specifier.clone(),
+            line: dep.line,
+        })
+        .collect();
+    let candidates = cycles::group_candidates(&group_edges);
+
+    for component in strongly_connected(&g.components, &g.runtime_edges) {
         let size = component.len();
         let severity = if size >= 3 {
             Severity::High
@@ -451,13 +567,31 @@ fn detect_cyclic_dependency(g: &ComponentGraph, out: &mut Vec<Diagnosis>) {
                 size - 4
             )
         };
+        // Witness one representative elementary loop inside the tangle (the
+        // canonical shortest cycle), hop by hop with file:line evidence.
+        let members: BTreeSet<&str> = component.iter().map(String::as_str).collect();
+        let scc_edges: Vec<(String, String)> = g
+            .runtime_edges
+            .iter()
+            .filter(|(s, t)| members.contains(s.as_str()) && members.contains(t.as_str()))
+            .cloned()
+            .collect();
+        let mut evidence = vec![DiagEvidence::metric("cycle_size", size as f64, 1.0)];
+        if let Some(cycle) = cycles::module_cycles(&component, &scc_edges)
+            .into_iter()
+            .next()
+        {
+            for (hop, edge) in cycles::witness_walk(&cycle, &candidates).iter().enumerate() {
+                evidence.push(DiagEvidence::cycle_edge(hop + 1, edge));
+            }
+        }
         out.push(Diagnosis {
             detector: "cyclic_dependency".to_string(),
             title: "Cyclic Dependency".to_string(),
             family: "structural".to_string(),
             target_kind: "component-group".to_string(),
             target,
-            evidence: vec![DiagEvidence::metric("cycle_size", size as f64, 1.0)],
+            evidence,
             principle: "Acyclic Dependencies Principle".to_string(),
             severity,
             confidence: 1.0,
@@ -475,25 +609,41 @@ fn detect_cyclic_dependency(g: &ComponentGraph, out: &mut Vec<Diagnosis>) {
 /// Deterministic; full confidence (a cycle is a fact, not a heuristic).
 fn detect_file_cycle(
     files: &[String],
-    file_deps: &[(String, String)],
+    file_deps: &[FileDep],
     config: &DiagnoseConfig,
     out: &mut Vec<Diagnosis>,
 ) {
     let _ = files; // cyclic files always appear as dependency endpoints.
-    let depth = config.component_depth;
     let mut nodes = BTreeSet::<String>::new();
     let mut edges = BTreeSet::<(String, String)>::new();
-    for (src, tgt) in file_deps {
-        if src == tgt || is_excluded(src, &config.exclude) || is_excluded(tgt, &config.exclude) {
+    // File-granularity witness edges: each file is its own group, so the same
+    // witness walk yields per-hop `file:line` evidence for the loop.
+    let mut group_edges: Vec<cycles::GroupFileEdge> = Vec::new();
+    for dep in file_deps {
+        // Type-only imports are erased at runtime: no file-level cycle either.
+        if dep.type_only
+            || dep.source == dep.target
+            || is_excluded(&dep.source, &config.exclude)
+            || is_excluded(&dep.target, &config.exclude)
+        {
             continue;
         }
-        nodes.insert(src.clone());
-        nodes.insert(tgt.clone());
-        edges.insert((src.clone(), tgt.clone()));
+        nodes.insert(dep.source.clone());
+        nodes.insert(dep.target.clone());
+        edges.insert((dep.source.clone(), dep.target.clone()));
+        group_edges.push(cycles::GroupFileEdge {
+            from_group: dep.source.clone(),
+            to_group: dep.target.clone(),
+            from_file: dep.source.clone(),
+            to_file: Some(dep.target.clone()),
+            specifier: dep.specifier.clone(),
+            line: dep.line,
+        });
     }
+    let candidates = cycles::group_candidates(&group_edges);
     for scc in strongly_connected(&nodes, &edges) {
-        let comp = component_of(&scc[0], depth);
-        if !scc.iter().all(|f| component_of(f, depth) == comp) {
+        let comp = component_for(&scc[0], config);
+        if !scc.iter().all(|f| component_for(f, config) == comp) {
             continue; // inter-component cycle: already covered by cyclic_dependency.
         }
         let size = scc.len();
@@ -507,13 +657,25 @@ fn detect_file_cycle(
         } else {
             format!("{} … (+{} more files)", scc[..4].join(" <-> "), size - 4)
         };
+        let scc_set: BTreeSet<&str> = scc.iter().map(String::as_str).collect();
+        let scc_edges: Vec<(String, String)> = edges
+            .iter()
+            .filter(|(s, t)| scc_set.contains(s.as_str()) && scc_set.contains(t.as_str()))
+            .cloned()
+            .collect();
+        let mut evidence = vec![DiagEvidence::metric("cycle_size", size as f64, 1.0)];
+        if let Some(cycle) = cycles::module_cycles(&scc, &scc_edges).into_iter().next() {
+            for (hop, edge) in cycles::witness_walk(&cycle, &candidates).iter().enumerate() {
+                evidence.push(DiagEvidence::cycle_edge(hop + 1, edge));
+            }
+        }
         out.push(Diagnosis {
             detector: "file_cycle".to_string(),
             title: "File Cycle".to_string(),
             family: "structural".to_string(),
             target_kind: "file-group".to_string(),
             target,
-            evidence: vec![DiagEvidence::metric("cycle_size", size as f64, 1.0)],
+            evidence,
             principle: "Acyclic Dependencies Principle".to_string(),
             severity,
             confidence: 1.0,
@@ -704,6 +866,11 @@ fn detect_god_component(g: &ComponentGraph, config: &DiagnoseConfig, out: &mut V
 
 fn detect_dense_structure(g: &ComponentGraph, config: &DiagnoseConfig, out: &mut Vec<Diagnosis>) {
     let n = g.components.len();
+    // Tiny graphs are naturally dense; the density ratio only means something
+    // once there are enough components for sparse wiring to be possible.
+    if n < config.dense_min_components {
+        return;
+    }
     let possible = n.saturating_mul(n.saturating_sub(1));
     if possible == 0 {
         return;
@@ -738,6 +905,11 @@ fn detect_dense_structure(g: &ComponentGraph, config: &DiagnoseConfig, out: &mut
 /// Hotspot: a component that is both complex and frequently changed (Tornhill's
 /// intersection). A prioritisation signal (low), not a defect in itself.
 fn detect_hotspots(g: &ComponentGraph, config: &DiagnoseConfig, out: &mut Vec<Diagnosis>) {
+    // A near-empty history cannot witness evolution: with one or two commits
+    // the relative normalization below makes everything look "hot".
+    if g.churn.values().sum::<f64>() < config.evolutionary_min_history {
+        return;
+    }
     let max_churn = g.churn.values().copied().fold(0.0_f64, f64::max).max(1.0);
     let max_cx = g
         .complexity
@@ -751,7 +923,10 @@ fn detect_hotspots(g: &ComponentGraph, config: &DiagnoseConfig, out: &mut Vec<Di
         .filter_map(|c| {
             let churn = *g.churn.get(c).unwrap_or(&0.0);
             let cx = *g.complexity.get(c).unwrap_or(&0.0);
-            if churn <= 0.0 || cx <= 0.0 {
+            // Absolute floors: trivial complexity is not debt however often it
+            // changes, and a barely-touched component is not a hotspot however
+            // complex it is.
+            if churn < config.hotspot_min_churn || cx < config.hotspot_min_complexity {
                 return None;
             }
             let score = (churn / max_churn * 0.5 + cx / max_cx * 0.5) * 100.0;
@@ -795,6 +970,10 @@ fn detect_unstable_interface(
     config: &DiagnoseConfig,
     out: &mut Vec<Diagnosis>,
 ) {
+    // Churn thresholds are meaningless on a near-empty history (see hotspots).
+    if g.churn.values().sum::<f64>() < config.evolutionary_min_history {
+        return;
+    }
     let fins: Vec<f64> = g
         .components
         .iter()
@@ -845,15 +1024,25 @@ fn detect_change_coupling(
     if co_change.is_empty() {
         return;
     }
-    let depth = config.component_depth;
+    // Same history floor as the other evolutionary detectors: a handful of
+    // commits co-touching files is not an architectural signal yet.
+    if g.churn.values().sum::<f64>() < config.evolutionary_min_history {
+        return;
+    }
     let mut pairs: BTreeMap<(String, String), f64> = BTreeMap::new();
     for (a, b, n) in co_change {
         if is_excluded(a, &config.exclude) || is_excluded(b, &config.exclude) {
             continue;
         }
-        let ca = component_of(a, depth);
-        let cb = component_of(b, depth);
+        let ca = component_for(a, config);
+        let cb = component_for(b, config);
         if ca == cb {
+            continue;
+        }
+        // `<root>` is not a real component: repo-root files (manifests,
+        // lockfiles, stray scripts) co-change with everything at release
+        // time — that's process noise, not architecture.
+        if ca == "<root>" || cb == "<root>" {
             continue;
         }
         // Both endpoints must be real *source* components (i.e. directories that
@@ -1074,8 +1263,8 @@ mod tests {
     fn detects_a_component_cycle_with_full_confidence() {
         let files = vec!["a/x.ts".to_string(), "b/y.ts".to_string()];
         let deps = vec![
-            ("a/x.ts".to_string(), "b/y.ts".to_string()),
-            ("b/y.ts".to_string(), "a/x.ts".to_string()),
+            FileDep::bare("a/x.ts", "b/y.ts"),
+            FileDep::bare("b/y.ts", "a/x.ts"),
         ];
         let report = diagnose(
             &files,
@@ -1092,7 +1281,15 @@ mod tests {
             .find(|f| f.detector == "cyclic_dependency")
             .expect("cycle detected");
         assert_eq!(cycle.confidence, 1.0);
-        assert!(!cycle.evidence.is_empty());
+        // Aggregate metric plus one witnessed file:line edge per hop.
+        assert!(cycle.evidence.iter().any(|e| e.metric == "cycle_size"));
+        let hops: Vec<_> = cycle
+            .evidence
+            .iter()
+            .filter(|e| e.metric == "cycle_edge")
+            .collect();
+        assert_eq!(hops.len(), 2);
+        assert!(hops.iter().all(|e| e.file.is_some() && e.line.is_some()));
     }
 
     #[test]
@@ -1102,8 +1299,8 @@ mod tests {
         // catches it.
         let files = vec!["pkg/a.py".to_string(), "pkg/b.py".to_string()];
         let deps = vec![
-            ("pkg/a.py".to_string(), "pkg/b.py".to_string()),
-            ("pkg/b.py".to_string(), "pkg/a.py".to_string()),
+            FileDep::bare("pkg/a.py", "pkg/b.py"),
+            FileDep::bare("pkg/b.py", "pkg/a.py"),
         ];
         let report = diagnose(
             &files,
@@ -1127,7 +1324,7 @@ mod tests {
     #[test]
     fn metrics_report_abstractness_and_distance() {
         let files = vec!["core/a.ts".to_string()];
-        let deps: Vec<(String, String)> = vec![];
+        let deps: Vec<FileDep> = vec![];
         // 1 abstract type of 4 total → A = 0.25; no edges → I = 0 → D = |0.25+0-1| = 0.75.
         let abst: HashMap<String, (f64, f64)> = [("core/a.ts".to_string(), (1.0, 4.0))]
             .into_iter()
@@ -1160,9 +1357,9 @@ mod tests {
             "c3/x.ts".to_string(),
         ];
         let deps = vec![
-            ("c1/x.ts".to_string(), "core/a.ts".to_string()),
-            ("c2/x.ts".to_string(), "core/a.ts".to_string()),
-            ("c3/x.ts".to_string(), "core/a.ts".to_string()),
+            FileDep::bare("c1/x.ts", "core/a.ts"),
+            FileDep::bare("c2/x.ts", "core/a.ts"),
+            FileDep::bare("c3/x.ts", "core/a.ts"),
         ];
         let abst: HashMap<String, (f64, f64)> = [("core/a.ts".to_string(), (0.0, 5.0))]
             .into_iter()
@@ -1186,6 +1383,82 @@ mod tests {
     }
 
     #[test]
+    fn manifest_roots_make_src_transparent_for_components() {
+        let roots = vec!["crates/db".to_string(), "packages/zod".to_string()];
+        // The crate's src/ layer folds into the crate root…
+        assert_eq!(
+            canonical_component_path("crates/db/src/lib.rs", &roots),
+            "crates/db/lib.rs"
+        );
+        // …so build.rs and src/ land in one component…
+        let cfg = DiagnoseConfig {
+            component_roots: roots.clone(),
+            ..DiagnoseConfig::default()
+        };
+        assert_eq!(component_for("crates/db/build.rs", &cfg), "crates/db");
+        assert_eq!(component_for("crates/db/src/lib.rs", &cfg), "crates/db");
+        // …while deeper structure stays distinct.
+        assert_eq!(
+            component_for("packages/zod/src/v4/core/x.ts", &cfg),
+            "packages/zod/v4/core"
+        );
+        // Outside any root, nothing changes.
+        assert_eq!(
+            canonical_component_path("tools/src/gen.rs", &roots),
+            "tools/src/gen.rs"
+        );
+    }
+
+    #[test]
+    fn root_component_is_excluded_from_change_coupling_pairs() {
+        // A stray script at the repo root makes `<root>` a source component,
+        // and root manifests/lockfiles co-change with everything — that pair
+        // must stay silent while a real cross-component pair still fires.
+        let files = vec![
+            "tool.py".to_string(),
+            "app/x.ts".to_string(),
+            "lib/y.ts".to_string(),
+        ];
+        let deps: Vec<FileDep> = vec![];
+        let churn: HashMap<String, f64> = [
+            ("tool.py".to_string(), 12.0),
+            ("app/x.ts".to_string(), 12.0),
+            ("lib/y.ts".to_string(), 12.0),
+        ]
+        .into_iter()
+        .collect();
+        let co_change = vec![
+            ("tool.py".to_string(), "app/x.ts".to_string(), 10.0),
+            ("app/x.ts".to_string(), "lib/y.ts".to_string(), 10.0),
+        ];
+        let report = diagnose(
+            &files,
+            &deps,
+            &churn,
+            &HashMap::new(),
+            &HashMap::new(),
+            &co_change,
+            &DiagnoseConfig::default(),
+        );
+        let pair_targets: Vec<&str> = report
+            .findings
+            .iter()
+            .filter(|f| f.detector == "modularity_violation" || f.detector == "change_coupling")
+            .map(|f| f.target.as_str())
+            .collect();
+        assert!(
+            pair_targets.iter().all(|t| !t.contains("<root>")),
+            "{pair_targets:?}"
+        );
+        assert!(
+            pair_targets
+                .iter()
+                .any(|t| t.contains("app") && t.contains("lib")),
+            "the real pair must still be reported: {pair_targets:?}"
+        );
+    }
+
+    #[test]
     fn is_deterministic() {
         let files = vec![
             "a/x.ts".to_string(),
@@ -1193,9 +1466,9 @@ mod tests {
             "c/z.ts".to_string(),
         ];
         let deps = vec![
-            ("a/x.ts".to_string(), "b/y.ts".to_string()),
-            ("b/y.ts".to_string(), "a/x.ts".to_string()),
-            ("c/z.ts".to_string(), "a/x.ts".to_string()),
+            FileDep::bare("a/x.ts", "b/y.ts"),
+            FileDep::bare("b/y.ts", "a/x.ts"),
+            FileDep::bare("c/z.ts", "a/x.ts"),
         ];
         let cfg = DiagnoseConfig::default();
         let one = diagnose(

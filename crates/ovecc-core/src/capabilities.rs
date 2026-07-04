@@ -29,6 +29,13 @@ pub struct CommandSpec {
 /// Every command Ovecc exposes. Ordered for a natural audit flow.
 pub const COMMANDS: &[CommandSpec] = &[
     CommandSpec {
+        name: "init",
+        summary: "Set up ovecc in a repository: write a commented .ovecc/config.toml, git-ignore the local state, and print the first commands to run.",
+        key_params: &["--force"],
+        output: "The files written and the suggested next commands.",
+        read_only: false,
+    },
+    CommandSpec {
         name: "index",
         summary: "Build or update the local architecture database from a repository.",
         key_params: &["path", "--no-git", "--exclude <glob>", "--include <glob>"],
@@ -77,6 +84,7 @@ pub const COMMANDS: &[CommandSpec] = &[
             "--fail-on medium|high|any",
             "--baseline",
             "--write-baseline",
+            "--changed-since <ref>",
         ],
         output: "Findings with kind, severity, rule, and file:line evidence.",
         read_only: true,
@@ -90,8 +98,8 @@ pub const COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         name: "audit",
-        summary: "Audit declared dependencies against the offline OSV database for known vulnerabilities.",
-        key_params: &["--fail-on medium|high|any"],
+        summary: "Audit declared dependencies against the offline OSV database for known vulnerabilities. `--fetch` first downloads the advisories for the discovered packages (the only networked operation, opt-in).",
+        key_params: &["--fail-on medium|high|any", "--fetch (network, opt-in)"],
         output: "Vulnerable-dependency findings with package, version, advisory id, and counts scanned.",
         read_only: true,
     },
@@ -119,9 +127,16 @@ pub const COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         name: "deadcode",
         summary: "Report likely dead code: unused exports and unreachable files (oxc exports + entry-point reachability).",
-        key_params: &["--fail-on medium|high|any"],
+        key_params: &["--fail-on medium|high|any", "--changed-since <ref>"],
         output: "Unused-export and unused-file findings with file:line, plus counts.",
         read_only: true,
+    },
+    CommandSpec {
+        name: "fix",
+        summary: "Apply the mechanical fixes for auto-fixable findings: delete unused files, drop the export keyword on unused exports, remove unused manifest dependencies. Dry-run by default; every edit re-verifies the file against the index and skips stale entries.",
+        key_params: &["--apply", "--rule <rule>"],
+        output: "Per-action plan/result: fix kind, file:line, change preview or skip reason, and applied/skipped counts.",
+        read_only: false,
     },
     CommandSpec {
         name: "diagnose",
@@ -166,6 +181,13 @@ pub const COMMANDS: &[CommandSpec] = &[
         read_only: true,
     },
     CommandSpec {
+        name: "history",
+        summary: "Trend one snapshot metric across every index run: values, deltas, and a sparkline. Without a metric, lists everything trendable.",
+        key_params: &["metric", "--limit <n>"],
+        output: "Per-snapshot points (when, commit, value, delta), first->last change, sparkline.",
+        read_only: true,
+    },
+    CommandSpec {
         name: "gate",
         summary: "CI gate: fail when a change introduces new cycles, violations, or risk above a threshold.",
         key_params: &["--base", "--head", "--fail-on medium|high|any"],
@@ -191,6 +213,13 @@ pub const COMMANDS: &[CommandSpec] = &[
         summary: "Export a compact deterministic context slice for an element (for external tools/AI).",
         key_params: &["target"],
         output: "Dependencies, dependents, call paths, apis, schemas, and findings for the target.",
+        read_only: true,
+    },
+    CommandSpec {
+        name: "export graph",
+        summary: "Export the dependency graph (module + file levels) as JSON, or as a self-contained offline HTML viewer via --html.",
+        key_params: &["--html"],
+        output: "Sorted nodes and edges per level; with --html, the path of the written viewer file.",
         read_only: true,
     },
     CommandSpec {
@@ -465,6 +494,62 @@ pub fn rule_definitions() -> BTreeMap<String, MetaRule> {
             rule(
                 "A file is reachable from no entry point and imported by nothing.",
                 "low",
+            ),
+        ),
+        (
+            "unused-type".to_string(),
+            rule(
+                "A type-only export (interface/type alias) never imported by a reachable module.",
+                "low",
+            ),
+        ),
+        (
+            "unused-dependency".to_string(),
+            rule(
+                "A manifest dependency never imported by an indexed file (opt-in: [index] detect_unused_deps).",
+                "low",
+            ),
+        ),
+        (
+            "unlisted-dependency".to_string(),
+            rule(
+                "An imported package missing from every package.json — a phantom dependency.",
+                "medium",
+            ),
+        ),
+        (
+            "stale-suppression".to_string(),
+            rule(
+                "An ovecc-ignore comment that suppresses no finding; it will silently swallow the next real finding on its line.",
+                "low",
+            ),
+        ),
+        (
+            "unused-dev-dependency".to_string(),
+            rule(
+                "A devDependency never imported, invoked by a script, or config-loaded (opt-in: [index] detect_unused_deps).",
+                "low",
+            ),
+        ),
+        (
+            "unused-optional-dependency".to_string(),
+            rule(
+                "An optionalDependency never imported or invoked by a script (opt-in: [index] detect_unused_deps).",
+                "low",
+            ),
+        ),
+        (
+            "long-function".to_string(),
+            rule(
+                "A function whose source-line count exceeds the unit-size thresholds (75 low / 150 medium).",
+                "low/medium",
+            ),
+        ),
+        (
+            "long-parameter-list".to_string(),
+            rule(
+                "A function with too many parameters (7 low / 10 medium).",
+                "low/medium",
             ),
         ),
         (

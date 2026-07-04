@@ -195,9 +195,7 @@ pub struct SnapshotRef {
     pub created_at: DateTime<Utc>,
 }
 
-// ---------------------------------------------------------------------------
-// ovecc index
-// ---------------------------------------------------------------------------
+// ---- ovecc index ----
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IndexReport {
@@ -221,9 +219,7 @@ pub struct IndexReport {
     pub timings: Option<IndexTimings>,
 }
 
-// ---------------------------------------------------------------------------
-// ovecc summary
-// ---------------------------------------------------------------------------
+// ---- ovecc summary ----
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SummaryReport {
@@ -259,9 +255,7 @@ pub struct HotspotsReport {
     pub hotspots: Vec<HotspotEntry>,
 }
 
-// ---------------------------------------------------------------------------
-// ovecc impact
-// ---------------------------------------------------------------------------
+// ---- ovecc impact ----
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ImpactReport {
@@ -282,9 +276,7 @@ pub struct ImpactReport {
     pub risk: RiskScore,
 }
 
-// ---------------------------------------------------------------------------
-// ovecc diff
-// ---------------------------------------------------------------------------
+// ---- ovecc diff ----
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DiffReport {
@@ -376,9 +368,7 @@ pub struct BlastRadiusDelta {
     pub head_size: usize,
 }
 
-// ---------------------------------------------------------------------------
-// ovecc drift
-// ---------------------------------------------------------------------------
+// ---- ovecc drift ----
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DriftReport {
@@ -397,9 +387,7 @@ pub struct MetricDelta {
     pub delta_percent: Option<f64>,
 }
 
-// ---------------------------------------------------------------------------
-// ovecc violations / conventions
-// ---------------------------------------------------------------------------
+// ---- ovecc violations / conventions ----
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ViolationsReport {
@@ -454,9 +442,7 @@ pub struct IndexTimings {
     pub total_ms: u64,
 }
 
-// ---------------------------------------------------------------------------
-// ovecc review (change-scoped, named new defects)
-// ---------------------------------------------------------------------------
+// ---- ovecc review (change-scoped, named new defects) ----
 
 /// Files that changed between two snapshots, classified by content hash. Lets
 /// the change review scope analyses (e.g. duplication) to what a change touched.
@@ -488,9 +474,7 @@ pub struct FindingDiff {
     pub resolved: Vec<FindingRecord>,
 }
 
-// ---------------------------------------------------------------------------
-// ovecc export context / explain
-// ---------------------------------------------------------------------------
+// ---- ovecc export context / explain ----
 
 /// Compact deterministic architecture slice for external tools and optional
 /// AI consumers. This is the ONLY input an LLM ever receives.

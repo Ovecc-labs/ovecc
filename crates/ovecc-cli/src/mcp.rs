@@ -161,6 +161,10 @@ fn run_tool(name: &str, arguments: &Value, exe: &Path) -> Value {
     ];
     argv.extend(sub_argv);
 
+    // The MCP server IS a subprocess launcher by design: each tool call re-runs
+    // this same binary (`exe` = std::env::current_exe), never a caller-supplied
+    // program, and argv is built above from the tool schema — nothing to inject.
+    // ovecc-ignore-next-line
     match std::process::Command::new(exe).args(&argv).output() {
         Ok(output) => {
             let code = output.status.code().unwrap_or(-1);
@@ -197,12 +201,49 @@ fn build_argv(name: &str, args: &Value) -> Option<Vec<String>> {
                 argv.push(path.into());
             }
         }
+        "ovecc_init" => {
+            argv.push("init".into());
+            if flag("force") {
+                argv.push("--force".into());
+            }
+        }
+        "ovecc_history" => {
+            argv.push("history".into());
+            if let Some(metric) = s("metric") {
+                argv.push(metric.into());
+            }
+            if let Some(limit) = n("limit") {
+                argv.push("--limit".into());
+                argv.push(limit.to_string());
+            }
+        }
         "ovecc_capabilities" => argv.push("capabilities".into()),
         "ovecc_summary" => argv.push("summary".into()),
         "ovecc_report" => argv.push("report".into()),
         "ovecc_health" => argv.push("health".into()),
-        "ovecc_deadcode" => argv.push("deadcode".into()),
-        "ovecc_audit" => argv.push("audit".into()),
+        "ovecc_deadcode" => {
+            argv.push("deadcode".into());
+            if let Some(reference) = s("changed_since") {
+                argv.push("--changed-since".into());
+                argv.push(reference.into());
+            }
+        }
+        "ovecc_fix" => {
+            argv.push("fix".into());
+            if flag("apply") {
+                argv.push("--apply".into());
+            }
+            if let Some(rule) = s("rule") {
+                argv.push("--rule".into());
+                argv.push(rule.into());
+            }
+        }
+        "ovecc_audit" => {
+            argv.push("audit".into());
+            if flag("fetch") {
+                argv.push("--fetch".into());
+            }
+        }
         "ovecc_conventions" => argv.push("conventions".into()),
         "ovecc_impact" => {
             argv.push("impact".into());
@@ -224,6 +265,10 @@ fn build_argv(name: &str, args: &Value) -> Option<Vec<String>> {
             }
             if flag("baseline") {
                 argv.push("--baseline".into());
+            }
+            if let Some(reference) = s("changed_since") {
+                argv.push("--changed-since".into());
+                argv.push(reference.into());
             }
         }
         "ovecc_security" => {
@@ -259,6 +304,14 @@ fn build_argv(name: &str, args: &Value) -> Option<Vec<String>> {
             argv.push("export".into());
             argv.push("context".into());
             argv.push(s("target")?.into());
+        }
+        "ovecc_export_graph" => {
+            argv.push("export".into());
+            argv.push("graph".into());
+            if let Some(path) = s("html") {
+                argv.push("--html".into());
+                argv.push(path.into());
+            }
         }
         "ovecc_drift" => {
             argv.push("drift".into());
@@ -349,20 +402,24 @@ fn tool_specs() -> Value {
         {"name": "ovecc_report", "description": "One-shot architecture report: summary + cycles + violations + security + hotspots.", "inputSchema": obj(json!({"repo": repo}), json!([]))},
         {"name": "ovecc_impact", "description": "Blast radius of changing a target (module, table:NAME, api:METHOD:/path): the impacted nodes and the paths that reach them.", "inputSchema": obj(json!({"repo": repo, "target": {"type": "string", "description": "Element to analyze, e.g. Billing, table:customers, api:GET:/x."}, "direction": {"type": "string", "enum": ["downstream", "upstream", "both"], "description": "Traversal direction (default downstream)."}, "max_depth": {"type": "integer", "description": "Maximum traversal depth (default 6)."}}), json!(["target"]))},
         {"name": "ovecc_query", "description": "Structured architecture query. Verbs: deps X, rdeps X, paths X, module X, 'a -> b', hotspots, violations, cycles.", "inputSchema": obj(json!({"repo": repo, "query": {"type": "string", "description": "Query expression, e.g. 'cycles' or 'deps Billing'."}}), json!(["query"]))},
-        {"name": "ovecc_violations", "description": "Architecture and rule findings (boundaries, banned imports, cycles), with optional severity filter and baseline.", "inputSchema": obj(json!({"repo": repo, "severity": severity, "baseline": {"type": "boolean", "description": "Hide findings recorded in the baseline (show only new ones)."}}), json!([]))},
+        {"name": "ovecc_violations", "description": "Architecture and rule findings (boundaries, banned imports, cycles), with optional severity filter and baseline.", "inputSchema": obj(json!({"repo": repo, "severity": severity, "baseline": {"type": "boolean", "description": "Hide findings recorded in the baseline (show only new ones)."}, "changed_since": {"type": "string", "description": "Only findings touching files changed since this Git ref (progressive adoption)."}}), json!([]))},
         {"name": "ovecc_security", "description": "Security findings: hardcoded secrets, insecure patterns, weak crypto, tainted source->sink flows.", "inputSchema": obj(json!({"repo": repo, "severity": severity}), json!([]))},
-        {"name": "ovecc_audit", "description": "Offline OSV audit of declared dependencies against the local vulnerability database.", "inputSchema": obj(json!({"repo": repo}), json!([]))},
+        {"name": "ovecc_audit", "description": "OSV audit of declared dependencies against the local vulnerability database (offline). Set fetch=true to first download the advisories for the discovered packages — the only ovecc operation that touches the network.", "inputSchema": obj(json!({"repo": repo, "fetch": {"type": "boolean", "description": "Download OSV advisories into .ovecc/osv/ before auditing (network, opt-in)."}}), json!([]))},
         {"name": "ovecc_health", "description": "Functions over the cyclomatic/cognitive complexity thresholds (oxc TS/JS extractor).", "inputSchema": obj(json!({"repo": repo}), json!([]))},
-        {"name": "ovecc_deadcode", "description": "Likely dead code: unused exports and unreachable files, from exports + entry-point reachability.", "inputSchema": obj(json!({"repo": repo}), json!([]))},
+        {"name": "ovecc_deadcode", "description": "Likely dead code: unused exports and unreachable files, from exports + entry-point reachability.", "inputSchema": obj(json!({"repo": repo, "changed_since": {"type": "string", "description": "Only findings touching files changed since this Git ref (progressive adoption)."}}), json!([]))},
+        {"name": "ovecc_fix", "description": "Apply the mechanical fixes for auto-fixable findings: delete unused files, drop the export keyword on unused exports, remove unused manifest dependencies. Dry-run unless apply=true; every edit re-verifies the file against the index first and skips stale entries with a reason. After apply=true, call ovecc_index to refresh the model.", "inputSchema": obj(json!({"repo": repo, "apply": {"type": "boolean", "description": "Write the changes (default false = dry-run preview)."}, "rule": {"type": "string", "description": "Only fix findings from this rule, e.g. unused-export, unused-file."}}), json!([]))},
         {"name": "ovecc_dupes", "description": "Duplicated code (clone families) over a normalized token stream.", "inputSchema": obj(json!({"repo": repo, "min_tokens": {"type": "integer", "description": "Minimum shared token run to report (default 50)."}}), json!([]))},
         {"name": "ovecc_hotspots", "description": "Technical-debt hotspot ranking: churn x coupling x ownership.", "inputSchema": obj(json!({"repo": repo, "limit": {"type": "integer", "description": "Number of hotspots to return (default 10)."}}), json!([]))},
         {"name": "ovecc_conventions", "description": "Learned repository conventions and their deviations.", "inputSchema": obj(json!({"repo": repo}), json!([]))},
         {"name": "ovecc_drift", "description": "Architecture drift over time versus a previous snapshot or Git ref.", "inputSchema": obj(json!({"repo": repo, "since": {"type": "string", "description": "Git ref or snapshot to compare against, e.g. main or v1.0.0."}}), json!([]))},
+        {"name": "ovecc_history", "description": "Trend one snapshot metric across every index run (values, deltas, sparkline). Without a metric, lists everything trendable.", "inputSchema": obj(json!({"repo": repo, "metric": {"type": "string", "description": "Metric to trend, e.g. coupling_density, high_complexity_functions."}, "limit": {"type": "integer", "description": "Most recent N snapshots to keep (default 20)."}}), json!([]))},
+        {"name": "ovecc_init", "description": "Set up ovecc in a repository: write a commented .ovecc/config.toml, git-ignore the local state, and return the suggested first commands.", "inputSchema": obj(json!({"repo": repo, "force": {"type": "boolean", "description": "Overwrite an existing config."}}), json!([]))},
         {"name": "ovecc_review", "description": "Change review (lead with this for PR review): the NAMED new defects a change introduced between base and head — new findings (security/dead-code/complexity) with file:line, new dependency cycles WITH their concrete import witness edges, and the duplications the change added (scoped to touched files). One deterministic call; the actionable companion to ovecc_gate, which reports only counts.", "inputSchema": obj(json!({"repo": repo, "base": base, "head": head, "fail_on": fail_on}), json!([]))},
         {"name": "ovecc_gate", "description": "CI gate: fail when a change introduces new cycles, violations, or quality regressions (security/dead-code/complexity) versus a base snapshot or Git ref. Returns a pass/fail verdict and the signals behind it. For the named defects behind the verdict, use ovecc_review.", "inputSchema": obj(json!({"repo": repo, "base": base, "head": head, "fail_on": fail_on}), json!([]))},
         {"name": "ovecc_diff", "description": "Compare two stored architecture snapshots (or Git refs): added/removed modules and dependency edges, plus the overall diff risk score.", "inputSchema": obj(json!({"repo": repo, "base": base, "head": head, "fail_on": fail_on}), json!([]))},
         {"name": "ovecc_explain", "description": "Offline, deterministic architectural explanation of a target from its context slice.", "inputSchema": obj(json!({"repo": repo, "target": {"type": "string", "description": "Element to explain, e.g. Billing."}}), json!(["target"]))},
         {"name": "ovecc_context", "description": "Deterministic ContextSlice for a target as JSON, for feeding other tools or agents.", "inputSchema": obj(json!({"repo": repo, "target": {"type": "string", "description": "Element to slice, e.g. Billing."}}), json!(["target"]))},
+        {"name": "ovecc_export_graph", "description": "The dependency graph as data: module- and file-level nodes and edges, sorted and deterministic. Pass html to instead write a self-contained offline HTML viewer for the human in the loop.", "inputSchema": obj(json!({"repo": repo, "html": {"type": "string", "description": "Optional path: write the interactive HTML viewer there instead of returning JSON."}}), json!([]))},
         {"name": "ovecc_diagnose", "description": "Deterministic architectural diagnosis: cycles, hub-like (crossing), unstable and god components, dense structure, and hotspots — each with evidence, the design principle it breaks, and an established remediation. Components are directories; no design patterns are invented.", "inputSchema": obj(json!({"repo": repo, "target": {"type": "string", "description": "Scope to findings touching this file or component (substring)."}, "severity": severity}), json!([]))},
         {"name": "ovecc_advise", "description": "Advise on one file, module, or component: the findings touching it and the established fix for each. Call before editing that area.", "inputSchema": obj(json!({"repo": repo, "target": {"type": "string", "description": "File, module, or component to advise on."}}), json!(["target"]))},
         {"name": "ovecc_metrics", "description": "Per-component architecture metrics: fan-in/out, coupling, Martin instability, aggregate complexity, churn, and repository coupling density.", "inputSchema": obj(json!({"repo": repo, "target": {"type": "string", "description": "Scope to a single component (substring)."}}), json!([]))}
@@ -401,6 +458,14 @@ mod tests {
         assert_eq!(
             build_argv("ovecc_context", &json!({"target": "Billing"})).unwrap(),
             vec!["export", "context", "Billing"]
+        );
+        assert_eq!(
+            build_argv("ovecc_export_graph", &json!({})).unwrap(),
+            vec!["export", "graph"]
+        );
+        assert_eq!(
+            build_argv("ovecc_export_graph", &json!({"html": "graph.html"})).unwrap(),
+            vec!["export", "graph", "--html", "graph.html"]
         );
         assert_eq!(
             build_argv("ovecc_security", &json!({"severity": "high"})).unwrap(),

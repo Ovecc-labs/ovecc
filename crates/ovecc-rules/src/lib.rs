@@ -267,15 +267,32 @@ fn boundary_rules(input: &RuleInput<'_>) -> Vec<FindingRecord> {
 /// `A -> B -> C -> A`, not just the strongly-connected component), each carrying
 /// file:line evidence for every hop so the loop is traceable to source.
 fn circular_dependency_rule(input: &RuleInput<'_>) -> Vec<FindingRecord> {
-    ovecc_graph::cycles::elementary_cycles(input.modules, input.dependencies)
+    // The witness edges come from the same connected file-level walk `review`
+    // reports (`elementary_cycles_with_witness`), so every surface — findings,
+    // violations, review — cites the identical evidence for a given cycle.
+    ovecc_graph::cycles::elementary_cycles_with_witness(input.modules, input.dependencies)
         .into_iter()
-        .map(|members| {
+        .map(|cycle| {
+            let members = cycle.modules;
             // Render the loop closing back to its first module: A -> B -> A.
             let mut closed = members.clone();
             if let Some(first) = members.first() {
                 closed.push(first.clone());
             }
             let label = closed.join(" -> ");
+            let evidence = cycle
+                .edges
+                .iter()
+                .map(|edge| Evidence {
+                    file_path: edge.from_file.clone(),
+                    line: Some(edge.line as u32),
+                    symbol: None,
+                    detail: Some(format!(
+                        "{} -> {}: {}",
+                        edge.from_module, edge.to_module, edge.specifier
+                    )),
+                })
+                .collect();
             FindingRecord {
                 id: FindingId::from_parts(&[input.repository_id, "cycle", &members.join(",")]),
                 repository_id: RepositoryId::from_raw(input.repository_id),
@@ -293,35 +310,9 @@ fn circular_dependency_rule(input: &RuleInput<'_>) -> Vec<FindingRecord> {
                      inverting or extracting one of its edges.",
                     members.len()
                 ),
-                evidence: cycle_evidence(&members, input.dependencies),
+                evidence,
                 created_at: Utc::now(),
             }
-        })
-        .collect()
-}
-
-/// One evidence row per cycle hop (`X -> Y`), each pointing at a representative
-/// import edge with its file:line, so the cycle is traceable to source. The
-/// representative is the first edge in (deterministic) dependency order.
-fn cycle_evidence(members: &[String], dependencies: &[DependencyRecord]) -> Vec<Evidence> {
-    let len = members.len();
-    (0..len)
-        .filter_map(|i| {
-            let source = &members[i];
-            let target = &members[(i + 1) % len];
-            dependencies
-                .iter()
-                .find(|dependency| {
-                    !dependency.is_external
-                        && &dependency.source_module == source
-                        && &dependency.target_module == target
-                })
-                .map(|edge| Evidence {
-                    file_path: edge.source_file_path.clone(),
-                    line: Some(edge.evidence_line as u32),
-                    symbol: None,
-                    detail: Some(format!("{source} -> {target}: {}", edge.specifier)),
-                })
         })
         .collect()
 }
@@ -419,6 +410,7 @@ mod tests {
                     line: 4,
                     detail: Some("AWS access key".to_string()),
                     caller_qualified_name: None,
+                    in_test_code: false,
                 },
             ),
             (
@@ -428,6 +420,7 @@ mod tests {
                     line: 9,
                     detail: Some("MD5".to_string()),
                     caller_qualified_name: None,
+                    in_test_code: false,
                 },
             ),
         ];

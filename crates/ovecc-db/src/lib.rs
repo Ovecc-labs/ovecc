@@ -6,7 +6,7 @@
 //! Metric values and the commit SHA are computed upstream (indexer) and
 //! passed in, so `ovecc-db` only depends on `ovecc-core`.
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result};
 use chrono::Utc;
 use duckdb::{Connection, Transaction, params};
 use ovecc_core::facts::{
@@ -1053,413 +1053,14 @@ impl ArchitectureStore {
 
         mark("graph+rows");
         // ---- code-level facts: symbols, calls, APIs, schema objects ----
-        // Diffed by stable ID like the module-level tables. Unchanged files
-        // keep identical IDs (same content → same spans), so re-indexing them
-        // is a no-op; a changed file replaces only its own rows.
-        {
-            let prior_symbols = existing_ids(&tx, "symbols", repository_id)?;
-            let prior_calls = existing_ids(&tx, "calls", repository_id)?;
-            let prior_apis = existing_ids(&tx, "apis", repository_id)?;
-            let prior_schema = existing_ids(&tx, "schema_objects", repository_id)?;
-
-            let new_symbols: HashSet<&str> = code.symbols.iter().map(|s| s.id.as_str()).collect();
-            let new_calls: HashSet<&str> = code.calls.iter().map(|c| c.id.as_str()).collect();
-            let new_apis: HashSet<&str> = code.apis.iter().map(|a| a.id.as_str()).collect();
-            let new_schema: HashSet<&str> =
-                code.schema_objects.iter().map(|s| s.id.as_str()).collect();
-
-            // edges.
-            // Scoped so these prepared statements drop before the bulk appenders
-            // below claim the connection.
-            {
-                let mut delete_edge = tx.prepare("DELETE FROM graph_edges WHERE id = ?")?;
-                let mut delete_node = tx.prepare("DELETE FROM graph_nodes WHERE id = ?")?;
-                for (table, prior, current) in [
-                    ("symbols", &prior_symbols, &new_symbols),
-                    ("calls", &prior_calls, &new_calls),
-                    ("apis", &prior_apis, &new_apis),
-                    ("schema_objects", &prior_schema, &new_schema),
-                ] {
-                    let mut delete = tx.prepare(&format!("DELETE FROM {table} WHERE id = ?"))?;
-                    let removed = prior
-                        .iter()
-                        .filter(|id| !current.contains(id.as_str()))
-                        .count();
-                    for id in prior.iter().filter(|id| !current.contains(id.as_str())) {
-                        delete.execute(params![id])?;
-                        match table {
-                            "symbols" => {
-                                delete_edge.execute(params![code_edge_id(
-                                    repository_id,
-                                    id,
-                                    "declares"
-                                )])?;
-                                delete_node.execute(params![id])?;
-                            }
-                            "calls" => {
-                                delete_edge.execute(params![code_edge_id(
-                                    repository_id,
-                                    id,
-                                    "calls"
-                                )])?;
-                            }
-                            "apis" => {
-                                delete_edge.execute(params![code_edge_id(
-                                    repository_id,
-                                    id,
-                                    "exposes"
-                                )])?;
-                                delete_edge.execute(params![code_edge_id(
-                                    repository_id,
-                                    id,
-                                    "handles"
-                                )])?;
-                                delete_node.execute(params![id])?;
-                            }
-                            "schema_objects" => {
-                                delete_node.execute(params![id])?;
-                            }
-                            _ => {}
-                        }
-                    }
-                    match table {
-                        "symbols" => stats.symbols_removed = removed,
-                        "calls" => stats.calls_removed = removed,
-                        "apis" => stats.apis_removed = removed,
-                        _ => stats.schema_objects_removed = removed,
-                    }
-                }
-            }
-
-            // Bulk inserts via DuckDB appenders: one columnar append per
-            // table is far cheaper than per-row INSERTs for the high-volume code
-            // facts (symbols, calls, and their graph nodes/edges). Each appender
-            // is scoped so it flushes (on drop) before the next one opens — only
-            // one may borrow the connection at a time. `start_line`/`end_line`/
-            // `evidence_line` are INTEGER, so they are appended as `i32`.
-            let mut seen_symbols = HashSet::new();
-            let mut seen_calls = HashSet::new();
-            let mut seen_apis = HashSet::new();
-            let mut seen_schema = HashSet::new();
-            {
-                let mut symbols = tx.appender("symbols")?;
-                for symbol in code.symbols {
-                    if prior_symbols.contains(symbol.id.as_str())
-                        || !seen_symbols.insert(symbol.id.as_str())
-                    {
-                        continue;
-                    }
-                    let (start_line, end_line) = match symbol.span {
-                        Some(span) => (Some(span.start_line as i32), Some(span.end_line as i32)),
-                        None => (None, None),
-                    };
-                    symbols.append_row(params![
-                        symbol.id.as_str(),
-                        symbol.repository_id.as_str(),
-                        symbol.file_id.as_str(),
-                        symbol.module_id.as_ref().map(|m| m.as_str()),
-                        symbol.language.as_str(),
-                        enum_str(&symbol.kind),
-                        symbol.name,
-                        symbol.qualified_name,
-                        start_line,
-                        end_line,
-                        symbol.visibility.as_ref().map(enum_str),
-                        symbol.type_signature,
-                    ])?;
-                    stats.symbols_added += 1;
-                }
-            }
-            {
-                let mut calls = tx.appender("calls")?;
-                for call in code.calls {
-                    if prior_calls.contains(call.id.as_str())
-                        || !seen_calls.insert(call.id.as_str())
-                    {
-                        continue;
-                    }
-                    calls.append_row(params![
-                        call.id.as_str(),
-                        call.repository_id.as_str(),
-                        call.caller_symbol_id.as_str(),
-                        call.callee_symbol_id.as_ref().map(|s| s.as_str()),
-                        call.callee_name,
-                        enum_str(&call.kind),
-                        Option::<&str>::None,
-                        call.evidence
-                            .as_ref()
-                            .and_then(|e| e.line)
-                            .map(|l| l as i32),
-                    ])?;
-                    stats.calls_added += 1;
-                }
-            }
-            {
-                let mut apis = tx.appender("apis")?;
-                for api in code.apis {
-                    if prior_apis.contains(api.id.as_str()) || !seen_apis.insert(api.id.as_str()) {
-                        continue;
-                    }
-                    apis.append_row(params![
-                        api.id.as_str(),
-                        api.repository_id.as_str(),
-                        api.module_id.as_ref().map(|m| m.as_str()),
-                        enum_str(&api.kind),
-                        api.method,
-                        api.path,
-                        api.name,
-                        api.handler_symbol_id.as_ref().map(|s| s.as_str()),
-                        api.request_type,
-                        api.response_type,
-                        Option::<&str>::None,
-                        api.evidence.as_ref().and_then(|e| e.line).map(|l| l as i32),
-                    ])?;
-                    stats.apis_added += 1;
-                }
-            }
-            {
-                let mut schema = tx.appender("schema_objects")?;
-                for object in code.schema_objects {
-                    if prior_schema.contains(object.id.as_str())
-                        || !seen_schema.insert(object.id.as_str())
-                    {
-                        continue;
-                    }
-                    schema.append_row(params![
-                        object.id.as_str(),
-                        object.repository_id.as_str(),
-                        enum_str(&object.kind),
-                        object.name,
-                        object.parent_id.as_ref().map(|p| p.as_str()),
-                        Option::<&str>::None,
-                        object
-                            .evidence
-                            .as_ref()
-                            .and_then(|e| e.line)
-                            .map(|l| l as i32),
-                    ])?;
-                    stats.schema_objects_added += 1;
-                }
-            }
-            // Graph nodes mirror the code facts (symbols, APIs, tables) so
-            // blast analysis can classify and label traversed ids.
-            {
-                let mut nodes = tx.appender("graph_nodes")?;
-                let mut seen_nodes = HashSet::new();
-                for symbol in code.symbols {
-                    if prior_symbols.contains(symbol.id.as_str())
-                        || !seen_nodes.insert(symbol.id.as_str())
-                    {
-                        continue;
-                    }
-                    nodes.append_row(params![
-                        symbol.id.as_str(),
-                        repository_id,
-                        "symbol",
-                        symbol.qualified_name,
-                        "{}"
-                    ])?;
-                }
-                for api in code.apis {
-                    if prior_apis.contains(api.id.as_str()) || !seen_nodes.insert(api.id.as_str()) {
-                        continue;
-                    }
-                    nodes.append_row(params![
-                        api.id.as_str(),
-                        repository_id,
-                        "api",
-                        api_label(api),
-                        "{}"
-                    ])?;
-                }
-                for object in code.schema_objects {
-                    if prior_schema.contains(object.id.as_str())
-                        || !seen_nodes.insert(object.id.as_str())
-                    {
-                        continue;
-                    }
-                    nodes.append_row(params![
-                        object.id.as_str(),
-                        repository_id,
-                        enum_str(&object.kind),
-                        object.name,
-                        "{}"
-                    ])?;
-                }
-            }
-            // Graph edges derived from the code facts: a file
-            // `declares` each symbol, a caller `calls` each resolved callee, and
-            // a module `exposes`/`handles` each API.
-            {
-                let mut edges = tx.appender("graph_edges")?;
-                let mut seen_edges = HashSet::new();
-                for symbol in code.symbols {
-                    if prior_symbols.contains(symbol.id.as_str()) {
-                        continue;
-                    }
-                    let edge_id = code_edge_id(repository_id, symbol.id.as_str(), "declares");
-                    if !seen_edges.insert(edge_id.clone()) {
-                        continue;
-                    }
-                    edges.append_row(params![
-                        edge_id,
-                        repository_id,
-                        symbol.file_id.as_str(),
-                        symbol.id.as_str(),
-                        "declares",
-                        1.0_f64,
-                        "{}"
-                    ])?;
-                }
-                for call in code.calls {
-                    if prior_calls.contains(call.id.as_str()) {
-                        continue;
-                    }
-                    // Only resolved calls carry an edge.
-                    if let Some(callee) = &call.callee_symbol_id {
-                        let edge_id = code_edge_id(repository_id, call.id.as_str(), "calls");
-                        if !seen_edges.insert(edge_id.clone()) {
-                            continue;
-                        }
-                        edges.append_row(params![
-                            edge_id,
-                            repository_id,
-                            call.caller_symbol_id.as_str(),
-                            callee.as_str(),
-                            "calls",
-                            1.0_f64,
-                            "{}"
-                        ])?;
-                    }
-                }
-                for api in code.apis {
-                    if prior_apis.contains(api.id.as_str()) {
-                        continue;
-                    }
-                    if let Some(module) = &api.module_id {
-                        let edge_id = code_edge_id(repository_id, api.id.as_str(), "exposes");
-                        if seen_edges.insert(edge_id.clone()) {
-                            edges.append_row(params![
-                                edge_id,
-                                repository_id,
-                                module.as_str(),
-                                api.id.as_str(),
-                                "exposes",
-                                1.0_f64,
-                                "{}"
-                            ])?;
-                        }
-                    }
-                    if let Some(handler) = &api.handler_symbol_id {
-                        let edge_id = code_edge_id(repository_id, api.id.as_str(), "handles");
-                        if seen_edges.insert(edge_id.clone()) {
-                            edges.append_row(params![
-                                edge_id,
-                                repository_id,
-                                api.id.as_str(),
-                                handler.as_str(),
-                                "handles",
-                                1.0_f64,
-                                "{}"
-                            ])?;
-                        }
-                    }
-                }
-            }
-        }
+        Self::sync_code_facts(&tx, repository_id, code, &mut stats)?;
 
         // ---- reads/writes access edges, diffed by their own ID ----
-        {
-            let prior: HashSet<String> = {
-                let mut statement = tx.prepare(
-                    "SELECT id FROM graph_edges WHERE repository_id = ? AND edge_kind IN ('reads', 'writes')",
-                )?;
-                let rows =
-                    statement.query_map(params![repository_id], |row| row.get::<_, String>(0))?;
-                collect_rows::<String>(rows)?.into_iter().collect()
-            };
-            let mut new_ids: HashSet<String> = HashSet::new();
-            let mut insert_access = tx.prepare(
-                "INSERT INTO graph_edges (id, repository_id, source_id, target_id, edge_kind, weight, evidence_json)
-                 VALUES (?, ?, ?, ?, ?, ?, ?)",
-            )?;
-            for edge in code.schema_edges {
-                let id = stable_id(
-                    "edge",
-                    &[repository_id, &edge.source_id, &edge.target_id, &edge.kind],
-                );
-                if !new_ids.insert(id.clone()) || prior.contains(&id) {
-                    continue;
-                }
-                insert_access.execute(params![
-                    id,
-                    repository_id,
-                    edge.source_id,
-                    edge.target_id,
-                    edge.kind,
-                    1.0_f64,
-                    edge.evidence_json,
-                ])?;
-            }
-            let mut delete_access = tx.prepare("DELETE FROM graph_edges WHERE id = ?")?;
-            for id in prior.iter().filter(|id| !new_ids.contains(id.as_str())) {
-                delete_access.execute(params![id])?;
-            }
-        }
+        Self::sync_schema_access_edges(&tx, repository_id, code)?;
 
         mark("code-facts");
-        // ---- code-health facts: per-function complexity and per-file exports.
-        // These are derived current-state, recomputed every run, so a full
-        // replace per repository is simpler than a differential sync. `line`
-        // columns are INTEGER, hence the i32 casts. Ids are deduplicated before
-        // the appender, which would otherwise fail silently on a duplicate PK.
-        tx.execute(
-            "DELETE FROM complexity WHERE repository_id = ?",
-            params![repository_id],
-        )?;
-        tx.execute(
-            "DELETE FROM exports WHERE repository_id = ?",
-            params![repository_id],
-        )?;
-        {
-            let mut seen = HashSet::new();
-            let mut appender = tx.appender("complexity")?;
-            for record in code.complexity {
-                if !seen.insert(record.id.as_str()) {
-                    continue;
-                }
-                appender.append_row(params![
-                    record.id.as_str(),
-                    record.repository_id.as_str(),
-                    record.file_id.as_str(),
-                    record.qualified_name,
-                    record.line as i32,
-                    record.cyclomatic as i32,
-                    record.cognitive as i32,
-                    record.line_count as i32,
-                    record.param_count as i32,
-                ])?;
-            }
-        }
-        {
-            let mut seen = HashSet::new();
-            let mut appender = tx.appender("exports")?;
-            for record in code.exports {
-                if !seen.insert(record.id.as_str()) {
-                    continue;
-                }
-                appender.append_row(params![
-                    record.id.as_str(),
-                    record.repository_id.as_str(),
-                    record.file_id.as_str(),
-                    record.name,
-                    record.line as i32,
-                    record.is_type_only,
-                    record.re_export_source.as_deref(),
-                    record.re_export_name.as_deref(),
-                ])?;
-            }
-        }
+        // ---- code-health facts: complexity + exports (full replace) ----
+        Self::replace_health_facts(&tx, repository_id, code)?;
 
         mark("v4-health");
         // ---- snapshot rows (append-only; bulk via the DuckDB appender) ----
@@ -1521,6 +1122,430 @@ impl ArchitectureStore {
         tx.commit()?;
         mark("commit");
         Ok(stats)
+    }
+
+    /// Diffs and persists the code-level facts (symbols, calls, APIs, schema
+    /// objects) plus the graph nodes/edges mirroring them. Diffed by stable ID
+    /// like the module-level tables: unchanged files keep identical IDs (same
+    /// content -> same spans), so re-indexing them is a no-op; a changed file
+    /// replaces only its own rows.
+    fn sync_code_facts(
+        tx: &Transaction<'_>,
+        repository_id: &str,
+        code: &ResolvedCode<'_>,
+        stats: &mut SyncStats,
+    ) -> Result<()> {
+        let prior_symbols = existing_ids(tx, "symbols", repository_id)?;
+        let prior_calls = existing_ids(tx, "calls", repository_id)?;
+        let prior_apis = existing_ids(tx, "apis", repository_id)?;
+        let prior_schema = existing_ids(tx, "schema_objects", repository_id)?;
+
+        let new_symbols: HashSet<&str> = code.symbols.iter().map(|s| s.id.as_str()).collect();
+        let new_calls: HashSet<&str> = code.calls.iter().map(|c| c.id.as_str()).collect();
+        let new_apis: HashSet<&str> = code.apis.iter().map(|a| a.id.as_str()).collect();
+        let new_schema: HashSet<&str> = code.schema_objects.iter().map(|s| s.id.as_str()).collect();
+
+        // edges.
+        // Scoped so these prepared statements drop before the bulk appenders
+        // below claim the connection.
+        {
+            let mut delete_edge = tx.prepare("DELETE FROM graph_edges WHERE id = ?")?;
+            let mut delete_node = tx.prepare("DELETE FROM graph_nodes WHERE id = ?")?;
+            for (table, prior, current) in [
+                ("symbols", &prior_symbols, &new_symbols),
+                ("calls", &prior_calls, &new_calls),
+                ("apis", &prior_apis, &new_apis),
+                ("schema_objects", &prior_schema, &new_schema),
+            ] {
+                let mut delete = tx.prepare(&format!("DELETE FROM {table} WHERE id = ?"))?;
+                let removed = prior
+                    .iter()
+                    .filter(|id| !current.contains(id.as_str()))
+                    .count();
+                for id in prior.iter().filter(|id| !current.contains(id.as_str())) {
+                    delete.execute(params![id])?;
+                    match table {
+                        "symbols" => {
+                            delete_edge.execute(params![code_edge_id(
+                                repository_id,
+                                id,
+                                "declares"
+                            )])?;
+                            delete_node.execute(params![id])?;
+                        }
+                        "calls" => {
+                            delete_edge.execute(params![code_edge_id(
+                                repository_id,
+                                id,
+                                "calls"
+                            )])?;
+                        }
+                        "apis" => {
+                            delete_edge.execute(params![code_edge_id(
+                                repository_id,
+                                id,
+                                "exposes"
+                            )])?;
+                            delete_edge.execute(params![code_edge_id(
+                                repository_id,
+                                id,
+                                "handles"
+                            )])?;
+                            delete_node.execute(params![id])?;
+                        }
+                        "schema_objects" => {
+                            delete_node.execute(params![id])?;
+                        }
+                        _ => {}
+                    }
+                }
+                match table {
+                    "symbols" => stats.symbols_removed = removed,
+                    "calls" => stats.calls_removed = removed,
+                    "apis" => stats.apis_removed = removed,
+                    _ => stats.schema_objects_removed = removed,
+                }
+            }
+        }
+
+        // Bulk inserts via DuckDB appenders: one columnar append per
+        // table is far cheaper than per-row INSERTs for the high-volume code
+        // facts (symbols, calls, and their graph nodes/edges). Each appender
+        // is scoped so it flushes (on drop) before the next one opens — only
+        // one may borrow the connection at a time. `start_line`/`end_line`/
+        // `evidence_line` are INTEGER, so they are appended as `i32`.
+        let mut seen_symbols = HashSet::new();
+        let mut seen_calls = HashSet::new();
+        let mut seen_apis = HashSet::new();
+        let mut seen_schema = HashSet::new();
+        {
+            let mut symbols = tx.appender("symbols")?;
+            for symbol in code.symbols {
+                if prior_symbols.contains(symbol.id.as_str())
+                    || !seen_symbols.insert(symbol.id.as_str())
+                {
+                    continue;
+                }
+                let (start_line, end_line) = match symbol.span {
+                    Some(span) => (Some(span.start_line as i32), Some(span.end_line as i32)),
+                    None => (None, None),
+                };
+                symbols.append_row(params![
+                    symbol.id.as_str(),
+                    symbol.repository_id.as_str(),
+                    symbol.file_id.as_str(),
+                    symbol.module_id.as_ref().map(|m| m.as_str()),
+                    symbol.language.as_str(),
+                    enum_str(&symbol.kind),
+                    symbol.name,
+                    symbol.qualified_name,
+                    start_line,
+                    end_line,
+                    symbol.visibility.as_ref().map(enum_str),
+                    symbol.type_signature,
+                ])?;
+                stats.symbols_added += 1;
+            }
+        }
+        {
+            let mut calls = tx.appender("calls")?;
+            for call in code.calls {
+                if prior_calls.contains(call.id.as_str()) || !seen_calls.insert(call.id.as_str()) {
+                    continue;
+                }
+                calls.append_row(params![
+                    call.id.as_str(),
+                    call.repository_id.as_str(),
+                    call.caller_symbol_id.as_str(),
+                    call.callee_symbol_id.as_ref().map(|s| s.as_str()),
+                    call.callee_name,
+                    enum_str(&call.kind),
+                    Option::<&str>::None,
+                    call.evidence
+                        .as_ref()
+                        .and_then(|e| e.line)
+                        .map(|l| l as i32),
+                ])?;
+                stats.calls_added += 1;
+            }
+        }
+        {
+            let mut apis = tx.appender("apis")?;
+            for api in code.apis {
+                if prior_apis.contains(api.id.as_str()) || !seen_apis.insert(api.id.as_str()) {
+                    continue;
+                }
+                apis.append_row(params![
+                    api.id.as_str(),
+                    api.repository_id.as_str(),
+                    api.module_id.as_ref().map(|m| m.as_str()),
+                    enum_str(&api.kind),
+                    api.method,
+                    api.path,
+                    api.name,
+                    api.handler_symbol_id.as_ref().map(|s| s.as_str()),
+                    api.request_type,
+                    api.response_type,
+                    Option::<&str>::None,
+                    api.evidence.as_ref().and_then(|e| e.line).map(|l| l as i32),
+                ])?;
+                stats.apis_added += 1;
+            }
+        }
+        {
+            let mut schema = tx.appender("schema_objects")?;
+            for object in code.schema_objects {
+                if prior_schema.contains(object.id.as_str())
+                    || !seen_schema.insert(object.id.as_str())
+                {
+                    continue;
+                }
+                schema.append_row(params![
+                    object.id.as_str(),
+                    object.repository_id.as_str(),
+                    enum_str(&object.kind),
+                    object.name,
+                    object.parent_id.as_ref().map(|p| p.as_str()),
+                    Option::<&str>::None,
+                    object
+                        .evidence
+                        .as_ref()
+                        .and_then(|e| e.line)
+                        .map(|l| l as i32),
+                ])?;
+                stats.schema_objects_added += 1;
+            }
+        }
+        // Graph nodes mirror the code facts (symbols, APIs, tables) so
+        // blast analysis can classify and label traversed ids.
+        {
+            let mut nodes = tx.appender("graph_nodes")?;
+            let mut seen_nodes = HashSet::new();
+            for symbol in code.symbols {
+                if prior_symbols.contains(symbol.id.as_str())
+                    || !seen_nodes.insert(symbol.id.as_str())
+                {
+                    continue;
+                }
+                nodes.append_row(params![
+                    symbol.id.as_str(),
+                    repository_id,
+                    "symbol",
+                    symbol.qualified_name,
+                    "{}"
+                ])?;
+            }
+            for api in code.apis {
+                if prior_apis.contains(api.id.as_str()) || !seen_nodes.insert(api.id.as_str()) {
+                    continue;
+                }
+                nodes.append_row(params![
+                    api.id.as_str(),
+                    repository_id,
+                    "api",
+                    api_label(api),
+                    "{}"
+                ])?;
+            }
+            for object in code.schema_objects {
+                if prior_schema.contains(object.id.as_str())
+                    || !seen_nodes.insert(object.id.as_str())
+                {
+                    continue;
+                }
+                nodes.append_row(params![
+                    object.id.as_str(),
+                    repository_id,
+                    enum_str(&object.kind),
+                    object.name,
+                    "{}"
+                ])?;
+            }
+        }
+        // Graph edges derived from the code facts: a file
+        // `declares` each symbol, a caller `calls` each resolved callee, and
+        // a module `exposes`/`handles` each API.
+        {
+            let mut edges = tx.appender("graph_edges")?;
+            let mut seen_edges = HashSet::new();
+            for symbol in code.symbols {
+                if prior_symbols.contains(symbol.id.as_str()) {
+                    continue;
+                }
+                let edge_id = code_edge_id(repository_id, symbol.id.as_str(), "declares");
+                if !seen_edges.insert(edge_id.clone()) {
+                    continue;
+                }
+                edges.append_row(params![
+                    edge_id,
+                    repository_id,
+                    symbol.file_id.as_str(),
+                    symbol.id.as_str(),
+                    "declares",
+                    1.0_f64,
+                    "{}"
+                ])?;
+            }
+            for call in code.calls {
+                if prior_calls.contains(call.id.as_str()) {
+                    continue;
+                }
+                // Only resolved calls carry an edge.
+                if let Some(callee) = &call.callee_symbol_id {
+                    let edge_id = code_edge_id(repository_id, call.id.as_str(), "calls");
+                    if !seen_edges.insert(edge_id.clone()) {
+                        continue;
+                    }
+                    edges.append_row(params![
+                        edge_id,
+                        repository_id,
+                        call.caller_symbol_id.as_str(),
+                        callee.as_str(),
+                        "calls",
+                        1.0_f64,
+                        "{}"
+                    ])?;
+                }
+            }
+            for api in code.apis {
+                if prior_apis.contains(api.id.as_str()) {
+                    continue;
+                }
+                if let Some(module) = &api.module_id {
+                    let edge_id = code_edge_id(repository_id, api.id.as_str(), "exposes");
+                    if seen_edges.insert(edge_id.clone()) {
+                        edges.append_row(params![
+                            edge_id,
+                            repository_id,
+                            module.as_str(),
+                            api.id.as_str(),
+                            "exposes",
+                            1.0_f64,
+                            "{}"
+                        ])?;
+                    }
+                }
+                if let Some(handler) = &api.handler_symbol_id {
+                    let edge_id = code_edge_id(repository_id, api.id.as_str(), "handles");
+                    if seen_edges.insert(edge_id.clone()) {
+                        edges.append_row(params![
+                            edge_id,
+                            repository_id,
+                            api.id.as_str(),
+                            handler.as_str(),
+                            "handles",
+                            1.0_f64,
+                            "{}"
+                        ])?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Reads/writes access edges (symbol -> table), diffed by their own ID.
+    fn sync_schema_access_edges(
+        tx: &Transaction<'_>,
+        repository_id: &str,
+        code: &ResolvedCode<'_>,
+    ) -> Result<()> {
+        let prior: HashSet<String> = {
+            let mut statement = tx.prepare(
+                "SELECT id FROM graph_edges WHERE repository_id = ? AND edge_kind IN ('reads', 'writes')",
+            )?;
+            let rows =
+                statement.query_map(params![repository_id], |row| row.get::<_, String>(0))?;
+            collect_rows::<String>(rows)?.into_iter().collect()
+        };
+        let mut new_ids: HashSet<String> = HashSet::new();
+        let mut insert_access = tx.prepare(
+            "INSERT INTO graph_edges (id, repository_id, source_id, target_id, edge_kind, weight, evidence_json)
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
+        )?;
+        for edge in code.schema_edges {
+            let id = stable_id(
+                "edge",
+                &[repository_id, &edge.source_id, &edge.target_id, &edge.kind],
+            );
+            if !new_ids.insert(id.clone()) || prior.contains(&id) {
+                continue;
+            }
+            insert_access.execute(params![
+                id,
+                repository_id,
+                edge.source_id,
+                edge.target_id,
+                edge.kind,
+                1.0_f64,
+                edge.evidence_json,
+            ])?;
+        }
+        let mut delete_access = tx.prepare("DELETE FROM graph_edges WHERE id = ?")?;
+        for id in prior.iter().filter(|id| !new_ids.contains(id.as_str())) {
+            delete_access.execute(params![id])?;
+        }
+        Ok(())
+    }
+
+    /// Code-health facts: per-function complexity and per-file exports. These
+    /// are derived current-state, recomputed every run, so a full replace per
+    /// repository is simpler than a differential sync. `line` columns are
+    /// INTEGER, hence the i32 casts. Ids are deduplicated before the appender,
+    /// which would otherwise fail silently on a duplicate PK.
+    fn replace_health_facts(
+        tx: &Transaction<'_>,
+        repository_id: &str,
+        code: &ResolvedCode<'_>,
+    ) -> Result<()> {
+        tx.execute(
+            "DELETE FROM complexity WHERE repository_id = ?",
+            params![repository_id],
+        )?;
+        tx.execute(
+            "DELETE FROM exports WHERE repository_id = ?",
+            params![repository_id],
+        )?;
+        {
+            let mut seen = HashSet::new();
+            let mut appender = tx.appender("complexity")?;
+            for record in code.complexity {
+                if !seen.insert(record.id.as_str()) {
+                    continue;
+                }
+                appender.append_row(params![
+                    record.id.as_str(),
+                    record.repository_id.as_str(),
+                    record.file_id.as_str(),
+                    record.qualified_name,
+                    record.line as i32,
+                    record.cyclomatic as i32,
+                    record.cognitive as i32,
+                    record.line_count as i32,
+                    record.param_count as i32,
+                ])?;
+            }
+        }
+        {
+            let mut seen = HashSet::new();
+            let mut appender = tx.appender("exports")?;
+            for record in code.exports {
+                if !seen.insert(record.id.as_str()) {
+                    continue;
+                }
+                appender.append_row(params![
+                    record.id.as_str(),
+                    record.repository_id.as_str(),
+                    record.file_id.as_str(),
+                    record.name,
+                    record.line as i32,
+                    record.is_type_only,
+                    record.re_export_source.as_deref(),
+                    record.re_export_name.as_deref(),
+                ])?;
+            }
+        }
+        Ok(())
     }
 
     pub fn repository_root(&self, repository_id: &str) -> Result<Option<String>> {
@@ -1896,6 +1921,23 @@ impl ArchitectureStore {
         collect_rows(rows)
     }
 
+    /// Everything `export graph` needs per file: path, language, size, module.
+    pub fn current_files(&self, repository_id: &str) -> Result<Vec<FileGraphRow>> {
+        let mut statement = self.conn.prepare(
+            "SELECT path, language, size_bytes, module_name
+             FROM files WHERE repository_id = ? ORDER BY path",
+        )?;
+        let rows = statement.query_map(params![repository_id], |row| {
+            Ok(FileGraphRow {
+                path: row.get::<_, String>(0)?,
+                language: row.get::<_, String>(1)?,
+                size_bytes: row.get::<_, i64>(2)? as u64,
+                module: row.get::<_, String>(3)?,
+            })
+        })?;
+        collect_rows(rows)
+    }
+
     /// Commits touching each file (per-file churn), so callers can aggregate
     /// churn to any component granularity (e.g. directories), not just modules.
     pub fn file_churn(&self, repository_id: &str) -> Result<Vec<(String, f64)>> {
@@ -2064,10 +2106,10 @@ impl ArchitectureStore {
     pub fn diff(&self, repository_id: &str, base: &str, head: &str) -> Result<DiffReport> {
         let base = self
             .resolve_snapshot(repository_id, base)?
-            .ok_or_else(|| anyhow!("could not resolve base snapshot '{base}'"))?;
+            .ok_or_else(|| unresolved_snapshot("base", base))?;
         let head = self
             .resolve_snapshot(repository_id, head)?
-            .ok_or_else(|| anyhow!("could not resolve head snapshot '{head}'"))?;
+            .ok_or_else(|| unresolved_snapshot("head", head))?;
 
         let base_modules = self.snapshot_modules(&base.id)?;
         let head_modules = self.snapshot_modules(&head.id)?;
@@ -2101,12 +2143,14 @@ impl ArchitectureStore {
     /// snapshot keywords (`previous`/`latest`), a snapshot ID, or a commit SHA
     /// (a Git ref resolved upstream).
     pub fn drift(&self, repository_id: &str, base: &str, head: &str) -> Result<DriftReport> {
-        let base = self.resolve_snapshot(repository_id, base)?.ok_or_else(|| {
-            anyhow!("drift requires at least two snapshots; run 'ovecc index' after a change")
-        })?;
+        // The generic message covers both real causes: only one snapshot so
+        // far, or a `--since` ref that no indexed snapshot matches.
+        let base = self
+            .resolve_snapshot(repository_id, base)?
+            .ok_or_else(|| unresolved_snapshot("base", base))?;
         let head = self
             .resolve_snapshot(repository_id, head)?
-            .ok_or_else(|| anyhow!("no head snapshot found; run 'ovecc index' first"))?;
+            .ok_or_else(|| unresolved_snapshot("head", head))?;
 
         let base_modules = self.snapshot_metric_or(&base.id, "modules", 0.0) as isize;
         let head_modules = self.snapshot_metric_or(&head.id, "modules", 0.0) as isize;
@@ -2188,10 +2232,10 @@ impl ArchitectureStore {
     pub fn finding_diff(&self, repository_id: &str, base: &str, head: &str) -> Result<FindingDiff> {
         let base = self
             .resolve_snapshot(repository_id, base)?
-            .ok_or_else(|| anyhow!("could not resolve base snapshot '{base}'"))?;
+            .ok_or_else(|| unresolved_snapshot("base", base))?;
         let head = self
             .resolve_snapshot(repository_id, head)?
-            .ok_or_else(|| anyhow!("could not resolve head snapshot '{head}'"))?;
+            .ok_or_else(|| unresolved_snapshot("head", head))?;
         Ok(FindingDiff {
             new: self.snapshot_findings_minus(repository_id, &head.id, &base.id)?,
             resolved: self.snapshot_findings_minus(repository_id, &base.id, &head.id)?,
@@ -2249,10 +2293,10 @@ impl ArchitectureStore {
     ) -> Result<ChangedFiles> {
         let base = self
             .resolve_snapshot(repository_id, base)?
-            .ok_or_else(|| anyhow!("could not resolve base snapshot '{base}'"))?;
+            .ok_or_else(|| unresolved_snapshot("base", base))?;
         let head = self
             .resolve_snapshot(repository_id, head)?
-            .ok_or_else(|| anyhow!("could not resolve head snapshot '{head}'"))?;
+            .ok_or_else(|| unresolved_snapshot("head", head))?;
         let base_files = self.snapshot_file_hashes(&base.id)?;
         let head_files = self.snapshot_file_hashes(&head.id)?;
 
@@ -2372,6 +2416,51 @@ impl ArchitectureStore {
 
     /// Value of a snapshot metric, or `default` when the snapshot predates it
     /// (drift across versions must not fail on a newly-added metric).
+    /// One metric's value across every snapshot, oldest first — the raw series
+    /// behind `ovecc history`. `limit` keeps only the most recent N points
+    /// (still returned oldest-first for rendering).
+    pub fn metric_history(
+        &self,
+        repository_id: &str,
+        metric_name: &str,
+        limit: usize,
+    ) -> Result<Vec<MetricPoint>> {
+        let mut statement = self.conn.prepare(
+            "SELECT s.id, s.commit_sha, s.created_at, m.value
+             FROM snapshots s
+             JOIN snapshot_metrics m ON m.snapshot_id = s.id
+             WHERE s.repository_id = ? AND m.metric_name = ?
+             ORDER BY s.created_at DESC, s.id DESC
+             LIMIT ?",
+        )?;
+        let rows =
+            statement.query_map(params![repository_id, metric_name, limit as i64], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, f64>(3)?,
+                ))
+            })?;
+        let mut points = collect_rows(rows)?;
+        points.reverse(); // oldest first
+        Ok(points)
+    }
+
+    /// Every metric name recorded for this repository, sorted — so `history`
+    /// without an argument can list what is trendable.
+    pub fn metric_names(&self, repository_id: &str) -> Result<Vec<String>> {
+        let mut statement = self.conn.prepare(
+            "SELECT DISTINCT m.metric_name
+             FROM snapshot_metrics m
+             JOIN snapshots s ON s.id = m.snapshot_id
+             WHERE s.repository_id = ?
+             ORDER BY m.metric_name",
+        )?;
+        let rows = statement.query_map(params![repository_id], |row| row.get::<_, String>(0))?;
+        collect_rows(rows)
+    }
+
     fn snapshot_metric_or(&self, snapshot_id: &str, metric_name: &str, default: f64) -> f64 {
         self.conn
             .query_row(
@@ -2413,6 +2502,31 @@ fn optional_snapshot(
 
 fn collect_rows<T>(rows: impl Iterator<Item = duckdb::Result<T>>) -> Result<Vec<T>> {
     rows.collect::<duckdb::Result<Vec<_>>>().map_err(Into::into)
+}
+
+/// One `ovecc history` data point: (snapshot id, commit sha, created_at, value).
+pub type MetricPoint = (String, Option<String>, String, f64);
+
+/// One indexed file as `export graph` consumes it.
+#[derive(Debug, Clone)]
+pub struct FileGraphRow {
+    pub path: String,
+    pub language: String,
+    pub size_bytes: u64,
+    pub module: String,
+}
+
+/// A snapshot reference that resolved to nothing: the comparison needs both a
+/// base and a head snapshot. Typed as an index error so the CLI exits 4
+/// (index/db), not 7 (internal).
+fn unresolved_snapshot(role: &str, reference: &str) -> anyhow::Error {
+    ovecc_core::error::OveccError::Index {
+        message: format!(
+            "could not resolve {role} snapshot '{reference}'; run 'ovecc index' so both comparison ends exist"
+        ),
+        source: None,
+    }
+    .into()
 }
 
 fn difference(left: &BTreeSet<String>, right: &BTreeSet<String>) -> Vec<String> {

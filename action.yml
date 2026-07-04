@@ -1,0 +1,145 @@
+# Ovecc Review — drop-in PR gate.
+#
+# Indexes the PR's base and head, runs `ovecc review` (the NAMED new defects
+# the change introduces: findings with file:line, new dependency cycles with
+# their concrete import witness edges, added duplication), posts the report as
+# a PR comment, and fails the job when the change crosses `fail-on`.
+#
+# Usage (in the caller repository):
+#
+#   name: ovecc
+#   on: pull_request
+#   permissions:
+#     contents: read
+#     pull-requests: write   # for the PR comment
+#   jobs:
+#     review:
+#       runs-on: ubuntu-latest
+#       steps:
+#         - uses: actions/checkout@v4
+#           with:
+#             fetch-depth: 0        # review needs the base commit
+#         - uses: gitvonBS/ovecc@main
+#           with:
+#             fail-on: high
+#
+name: "Ovecc Review"
+description: >-
+  Deterministic, offline architecture review for pull requests: names the new
+  defects a change introduces (file:line + cycle witness edges), comments on
+  the PR, and gates on severity. No code leaves the runner.
+branding:
+  icon: "eye"
+  color: "purple"
+
+inputs:
+  fail-on:
+    description: "Fail the job when the change introduces a finding at or above this severity: medium | high | any."
+    default: "high"
+  comment:
+    description: "Post (and update) the review as a PR comment."
+    default: "true"
+  github-token:
+    description: "Token used to download the binary and post the PR comment."
+    default: ${{ github.token }}
+  base:
+    description: "Base ref/SHA to review against. Defaults to the PR base, then HEAD~1."
+    default: ""
+  binary-repo:
+    description: "Repository whose rolling release provides the ovecc binaries."
+    default: "gitvonBS/ovecc"
+  binary-version:
+    description: "Release tag to download the binary from."
+    default: "latest"
+
+outputs:
+  verdict:
+    description: "pass | fail — whether the change stayed under the fail-on threshold."
+    value: ${{ steps.review.outputs.verdict }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Download ovecc
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+      run: |
+        set -euo pipefail
+        case "$RUNNER_OS" in
+          Windows) asset="ovecc-windows-x86_64.exe"; bin="ovecc.exe" ;;
+          *)       asset="ovecc-linux-x86_64";       bin="ovecc" ;;
+        esac
+        dest="$RUNNER_TEMP/ovecc-bin"
+        mkdir -p "$dest"
+        gh release download "${{ inputs.binary-version }}" \
+          --repo "${{ inputs.binary-repo }}" \
+          --pattern "$asset" \
+          --output "$dest/$bin"
+        chmod +x "$dest/$bin"
+        echo "$dest" >> "$GITHUB_PATH"
+
+    - name: Index base and head
+      shell: bash
+      run: |
+        set -euo pipefail
+        BASE="${{ inputs.base }}"
+        if [ -z "$BASE" ]; then
+          BASE="${{ github.event.pull_request.base.sha }}"
+        fi
+        if [ -z "$BASE" ]; then
+          BASE="$(git rev-parse HEAD~1)"
+        fi
+        HEAD_SHA="$(git rev-parse HEAD)"
+        # Shallow checkouts may not have the base commit yet.
+        git rev-parse --verify --quiet "$BASE^{commit}" >/dev/null \
+          || git fetch --no-tags --depth=1 origin "$BASE"
+        echo "Reviewing $BASE..$HEAD_SHA"
+        git checkout --quiet "$BASE"
+        ovecc index .
+        git checkout --quiet "$HEAD_SHA"
+        ovecc index .
+
+    - name: Review the change
+      id: review
+      shell: bash
+      run: |
+        set +e
+        ovecc review --fail-on "${{ inputs.fail-on }}" --format markdown \
+          > "$RUNNER_TEMP/ovecc-review.md"
+        code=$?
+        set -euo pipefail
+        echo "exit-code=$code" >> "$GITHUB_OUTPUT"
+        if [ "$code" -eq 1 ]; then verdict=fail; else verdict=pass; fi
+        echo "verdict=$verdict" >> "$GITHUB_OUTPUT"
+        cat "$RUNNER_TEMP/ovecc-review.md" >> "$GITHUB_STEP_SUMMARY"
+        # Tool errors (codes 2..7) fail immediately; a fail verdict is
+        # enforced only after the comment step had its chance to post.
+        if [ "$code" -ne 0 ] && [ "$code" -ne 1 ]; then
+          echo "ovecc review failed with exit code $code" >&2
+          exit "$code"
+        fi
+
+    - name: Comment on the PR
+      if: ${{ inputs.comment == 'true' && github.event_name == 'pull_request' }}
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+      run: |
+        set -euo pipefail
+        # Update our previous review comment instead of stacking new ones.
+        gh pr comment "${{ github.event.pull_request.number }}" \
+          --repo "${{ github.repository }}" \
+          --edit-last \
+          --body-file "$RUNNER_TEMP/ovecc-review.md" \
+        || gh pr comment "${{ github.event.pull_request.number }}" \
+          --repo "${{ github.repository }}" \
+          --body-file "$RUNNER_TEMP/ovecc-review.md"
+
+    - name: Enforce the verdict
+      shell: bash
+      run: |
+        if [ "${{ steps.review.outputs.verdict }}" = "fail" ]; then
+          echo "ovecc review: the change crosses the '${{ inputs.fail-on }}' threshold (see the PR comment / job summary)." >&2
+          exit 1
+        fi

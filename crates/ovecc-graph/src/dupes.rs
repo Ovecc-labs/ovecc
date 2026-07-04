@@ -162,10 +162,7 @@ pub fn detect(
         // Extend in lock-step while every member's next window agrees — this
         // grows the shared run to its maximal common length.
         let mut windows = 1usize;
-        loop {
-            let Some(expected) = fps[members[0].0].get(members[0].1 + windows).copied() else {
-                break;
-            };
+        while let Some(expected) = fps[members[0].0].get(members[0].1 + windows).copied() {
             let all_match = members
                 .iter()
                 .all(|(file, pos)| fps[*file].get(pos + windows).copied() == Some(expected));
@@ -286,7 +283,7 @@ mod tests {
         let mut tokens: Vec<(u64, u32)> = (0..5).map(|i| (i as u64 + 1, i as u32 + 1)).collect();
         tokens.extend((0..5).map(|i| (i as u64 + 1, i as u32 + 10)));
         let a = file("a.ts", &tokens);
-        assert!(detect(&[a.clone()], 5, 1, true).is_empty());
+        assert!(detect(std::slice::from_ref(&a), 5, 1, true).is_empty());
         // ... but it IS a family when intra-file clones are allowed.
         assert_eq!(detect(&[a], 5, 1, false).len(), 1);
     }
