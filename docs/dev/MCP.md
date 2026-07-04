@@ -21,7 +21,7 @@ thin wrapper that re-invokes the same `ovecc` binary for each tool call
   port, no daemon. The client launches `ovecc mcp` as a child process and exits it by
   closing stdin.
 - **Tools = the CLI:** a `tools/call` runs `ovecc --repo <path> --format json <subcommand>`
-  and returns its stdout. No new analysis lives in the server — every tool maps 1:1
+  and returns its stdout. No new analysis lives in the server: every tool maps 1:1
   onto a CLI command described by `ovecc capabilities`.
 - **Stateless between calls:** because each call is a fresh subprocess, the server
   keeps nothing in memory. All state lives on disk in the repo's `.ovecc/` database,
@@ -33,7 +33,7 @@ thin wrapper that re-invokes the same `ovecc` binary for each tool call
 
 ## Prerequisites
 
-- A built `target/release/ovecc.exe` — see [SETUP.md](./SETUP.md).
+- A built `target/release/ovecc.exe`; see [SETUP.md](./SETUP.md).
 - An MCP client (Claude Code, Claude Desktop, Cursor, or any MCP-capable agent).
 - The target repository you want analyzed (TS/JS is the MVP focus).
 
@@ -46,7 +46,7 @@ cargo build --release
 ./target/release/ovecc.exe --help     # smoke test
 ```
 
-The binary is self-contained; note its absolute path — the MCP client needs it.
+The binary is self-contained. Note its absolute path: the MCP client needs it.
 
 ## 2. Index the repository once
 
@@ -68,7 +68,7 @@ server's working directory. Point the client at the binary with `mcp` as the arg
 ### Claude Code (CLI)
 
 ```sh
-claude mcp add ovecc -- "C:\Users\Boch\Desktop\inscrition ENSIIE\ovecc\app\target\release\ovecc.exe" mcp
+claude mcp add ovecc -- "C:\path\to\ovecc\target\release\ovecc.exe" mcp
 ```
 
 Then `claude mcp list` should show `ovecc`, and the tools appear as `ovecc_*`.
@@ -81,7 +81,7 @@ In `claude_desktop_config.json` (or a project `.mcp.json`):
 {
   "mcpServers": {
     "ovecc": {
-      "command": "C:\\Users\\Boch\\Desktop\\inscrition ENSIIE\\ovecc\\app\\target\\release\\ovecc.exe",
+      "command": "C:\\path\\to\\ovecc\\target\\release\\ovecc.exe",
       "args": ["mcp"]
     }
   }
@@ -99,7 +99,7 @@ args = `["mcp"]`.
 
 ## 4. Verify it works (manual smoke test)
 
-You can drive the server by hand without an agent — pipe JSON-RPC frames into it.
+You can drive the server by hand without an agent: pipe JSON-RPC frames into it.
 
 **bash / Git Bash:**
 
@@ -130,7 +130,7 @@ printf '%s\n' \
 
 The result's `content[0].text` is the JSON envelope (`schema_version`, `command`,
 `meta`, `data`). The protocol-level `initialize` handshake is sent by the client
-automatically — you only send it by hand in this manual test.
+automatically; you only send it by hand in this manual test.
 
 ---
 
@@ -140,7 +140,7 @@ All 27 tools (every one takes an optional `repo`; `*` marks required arguments):
 
 | Tool | Maps to | Key arguments |
 | --- | --- | --- |
-| `ovecc_init` | `init` | `force` — write the starter config, git-ignore `.ovecc/` |
+| `ovecc_init` | `init` | `force`: write the starter config, git-ignore `.ovecc/` |
 | `ovecc_capabilities` | `capabilities` | — (call first: the full contract) |
 | `ovecc_index` | `index` | `path` |
 | `ovecc_summary` | `summary` | — |
@@ -152,12 +152,12 @@ All 27 tools (every one takes an optional `repo`; `*` marks required arguments):
 | `ovecc_audit` | `audit` | — |
 | `ovecc_health` | `health` | — |
 | `ovecc_deadcode` | `deadcode` | — |
-| `ovecc_fix` | `fix` | `apply` (write; default dry-run), `rule` — mechanical fixes for auto-fixable findings |
+| `ovecc_fix` | `fix` | `apply` (write; default dry-run), `rule`: mechanical fixes for auto-fixable findings |
 | `ovecc_dupes` | `dupes` | `min_tokens` |
 | `ovecc_hotspots` | `hotspots` | `limit` |
 | `ovecc_conventions` | `conventions` | — |
 | `ovecc_drift` | `drift` | `since` (git ref / snapshot) |
-| `ovecc_history` | `history` | `metric`, `limit` — trend one snapshot metric (values, deltas, sparkline) |
+| `ovecc_history` | `history` | `metric`, `limit`: trend one snapshot metric (values, deltas, sparkline) |
 | `ovecc_review` | `review` | `base`, `head`, `fail_on` (lead with this for PR review) |
 | `ovecc_diagnose` | `diagnose` | `target`, `severity` (architectural smells + remediation) |
 | `ovecc_advise` | `advise` | `target*` (findings touching one file/component + the fix) |
@@ -166,7 +166,7 @@ All 27 tools (every one takes an optional `repo`; `*` marks required arguments):
 | `ovecc_diff` | `diff` | `base`, `head`, `fail_on` |
 | `ovecc_explain` | `explain` | `target*` |
 | `ovecc_context` | `export context` | `target*` |
-| `ovecc_export_graph` | `export graph` | `html` — nodes/edges as JSON, or a self-contained offline HTML viewer |
+| `ovecc_export_graph` | `export graph` | `html`: nodes/edges as JSON, or a self-contained offline HTML viewer |
 
 ---
 
@@ -174,12 +174,12 @@ All 27 tools (every one takes an optional `repo`; `*` marks required arguments):
 
 **Audit a repository (flag issues now):**
 
-1. `ovecc_capabilities` — learn the commands, metrics, rules, exit codes.
-2. `ovecc_index` — build `.ovecc/` (once).
-3. `ovecc_summary` / `ovecc_report` — overall health.
+1. `ovecc_capabilities`: learn the commands, metrics, rules, exit codes.
+2. `ovecc_index`: build `.ovecc/` (once).
+3. `ovecc_summary` / `ovecc_report`: overall health.
 4. `ovecc_violations`, `ovecc_security`, `ovecc_audit`, `ovecc_deadcode`,
-   `ovecc_health` — specific findings.
-5. `ovecc_impact` / `ovecc_query` — reason about blast radius and dependencies.
+   `ovecc_health`: specific findings.
+5. `ovecc_impact` / `ovecc_query`: reason about blast radius and dependencies.
 
 **Detect what a change introduced (the MVP regression loop):**
 
@@ -198,7 +198,7 @@ All 27 tools (every one takes an optional `repo`; `*` marks required arguments):
 The server follows the MCP convention of reporting tool failures *in-band*:
 
 - Underlying CLI exit **0** (clean) or **1** (a `--fail-on` / gate threshold was
-  crossed — a signal, not a crash) → normal result, `isError: false`. So a *failing*
+  crossed: a signal, not a crash) → normal result, `isError: false`. So a *failing*
   gate still returns its verdict payload for the agent to read.
 - Exit **≥ 2** (usage, repo/config, DB, parser, internal) → `isError: true` with the
   stderr message.
@@ -215,11 +215,11 @@ The server follows the MCP convention of reporting tool failures *in-band*:
   base exists, or pass an explicit `base`/`since` git ref.
 - **Empty or stale results:** the repo was never indexed, or was changed since the
   last index. Re-run `ovecc_index`.
-- **Tool returns `isError` with no detail:** check the CLI directly —
-  `ovecc --repo <path> --format json <subcommand>` — to see the real error; the server
+- **Tool returns `isError` with no detail:** check the CLI directly
+  (`ovecc --repo <path> --format json <subcommand>`) to see the real error; the server
   just forwards it.
 - **Client shows no tools:** confirm the `command` path is correct and absolute, and
-  that `ovecc.exe mcp` runs from a terminal (it will block waiting on stdin — that's
+  that `ovecc.exe mcp` runs from a terminal (it will block waiting on stdin; that's
   expected). Diagnostics go to **stderr**, so they never corrupt the protocol stream.
 - **Agent skips indexing:** the server's `initialize` instructions tell it to call
   `ovecc_capabilities` first and `ovecc_index` once; if your client ignores
