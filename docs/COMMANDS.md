@@ -12,6 +12,8 @@ output excerpts. All commands:
 
 Exit codes are stable: `0` ok · `1` a `--fail-on` threshold crossed · `2` usage
 · `3` repository/config · `4` index/db · `5` parser · `6` git · `7` internal.
+A downstream reader closing the pipe early (`ovecc report | head`, quitting a
+pager) is not an error: output stops quietly and the exit code is `0`.
 
 ---
 
@@ -88,7 +90,16 @@ family|severity|component`, `--fail-on`. Formats: + `sarif`, `codeclimate`.
 ### `ovecc advise <target>`
 
 The agent surface: every finding touching one file/module/component, each with
-its established fix. Call it before editing something.
+its established fix. Call it before editing something. Two parts: the persisted
+findings whose evidence touches the target (what `violations` would attribute
+to it), then the component-level design smells around it.
+
+```
+Advise for src/utils/helpers.ts: 3 finding(s), 1 design smell(s)
+[Medium] Unused export: formatEuros
+  Evidence: src/utils/helpers.ts:24
+  Fix: Remove the export keyword... (auto-fixable: yes)
+```
 
 ### `ovecc metrics [--target]`
 
@@ -101,6 +112,8 @@ plus repo-wide coupling density. The trendable numbers behind `diagnose`.
 A deterministic, offline explanation of an element's role: coupling
 characterization (isolated / entry-point / foundational / intermediary), blast
 radius, findings. Every sentence is backed by a fact from the context slice.
+Dependencies/Dependents list the *direct* edges; change-impact paths follow
+the reverse-dependency direction (who is affected), up to three hops.
 
 ```
 versions.ts is foundational: 90 components depend on it.
@@ -133,9 +146,10 @@ Structured graph queries: `deps X`, `rdeps X`, `paths X`, `module X`,
 
 ### `ovecc impact <target> [--direction] [--max-depth]`
 
-Blast radius of changing a module, symbol, `table:NAME`, or
-`api:METHOD:/path`: the impacted nodes, the paths that reach them, and a risk
-score. "What breaks if I touch this?"
+Blast radius of changing a module, symbol, `table:NAME`, or `api:<route>`: the
+impacted nodes, the paths that reach them, and a risk score. "What breaks if I
+touch this?" API labels have the form `GET /users/:id`, and `api:` matches by
+substring — `api:/users` or `api:GET /users` both resolve.
 
 ---
 
@@ -154,10 +168,12 @@ Key flags: `--severity`, `--fail-on`, `--write-baseline` / `--baseline`
 ### `ovecc security`
 
 The security slice: hardcoded secrets (provider patterns + entropy), dynamic
-eval, command execution, weak crypto, permissive CORS, and tainted
-source→sink flows (HTTP route → SQL/eval/exec). Deterministic, offline, no
-LLM. Findings in test code (test dirs *and* Rust inline `#[cfg(test)]`) are
-down-ranked to Low, not hidden.
+eval, command execution, weak crypto, permissive CORS (both the middleware
+`origin: "*"` form and raw `setHeader("Access-Control-Allow-Origin", "*")`),
+and tainted source→sink flows (HTTP route → SQL/eval/exec — named *and*
+inline arrow handlers, with `file:line` evidence for the sink and the route).
+Deterministic, offline, no LLM. Findings in test code (test dirs *and* Rust
+inline `#[cfg(test)]`) are down-ranked to Low, not hidden.
 
 ```
 Security findings: 15    secrets 8, insecure 7, tainted-flows 0
@@ -219,7 +235,9 @@ Fix plan: 5 change(s), 0 skipped — dry-run (pass --apply to write)
 ### `ovecc dupes [--min-tokens]`
 
 Clone families over a normalized token stream, with `file:line` ranges:
-duplicated logic before it propagates.
+duplicated logic before it propagates. Same-file duplication is reported by
+default (copy-paste within one file is still duplication); pass
+`--cross-file-only` to keep only families spanning at least two files.
 
 ### `ovecc hotspots [--limit]`
 
@@ -240,7 +258,9 @@ below the evidence thresholds.
 
 The named, new defects a change introduced between two snapshots: new findings
 with `file:line`, new dependency cycles **with their concrete import witness
-edges**, and added duplication. The actionable PR artifact
+edges**, and added duplication. Findings are matched by content identity
+(enclosing symbol / pattern), not by line, so a pre-existing finding that
+merely moved is not blamed on the change. The actionable PR artifact
 (`--format markdown` is a ready-to-post PR comment). Defaults:
 `previous → latest`.
 
@@ -264,6 +284,9 @@ dependency edges, metric deltas, and a diff risk score.
 
 Trend over time: coupling, complexity, security, dead-code and ownership
 metrics versus an earlier snapshot. "Is the codebase getting worse?"
+`security_findings` counts *code* findings only; OSV advisories are tracked
+separately as `dependency_advisories`, so running `audit --fetch` never reads
+as a code-quality regression.
 
 ### `ovecc history [metric] [--limit N]`
 

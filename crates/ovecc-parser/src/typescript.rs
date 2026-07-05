@@ -104,6 +104,9 @@ struct Extractor<'a> {
     security: Vec<SecurityPatternFact>,
     suppressed: Vec<u32>,
     local_types: Vec<(String, String)>,
+    /// AST node id → synthetic handler name, for inline route handlers whose
+    /// body must be visited inside its own callable frame.
+    pending_handlers: std::collections::HashMap<usize, String>,
 }
 
 impl<'a> Extractor<'a> {
@@ -119,6 +122,7 @@ impl<'a> Extractor<'a> {
             security: Vec::new(),
             suppressed: Vec::new(),
             local_types: Vec::new(),
+            pending_handlers: std::collections::HashMap::new(),
         }
     }
 
@@ -214,6 +218,13 @@ impl<'a> Extractor<'a> {
     }
 
     fn visit(&mut self, node: Node<'_>, exported: bool) {
+        // An inline route handler registered by `try_http_route`: visit its
+        // body inside the synthetic callable frame so calls, SQL accesses,
+        // and security sinks attribute to the handler, not the module scope.
+        if let Some(name) = self.pending_handlers.remove(&node.id()) {
+            self.recurse_pushed(node, &name, true);
+            return;
+        }
         match node.kind() {
             "export_statement" => {
                 // A re-export `export { x } from './y'` / `export * from './y'`
@@ -565,6 +576,24 @@ impl<'a> Extractor<'a> {
                 .push(security::weak_hash_fact(self.line(call), algo));
         }
 
+        // Permissive CORS via a raw header write — the common no-middleware
+        // form: `res.setHeader("Access-Control-Allow-Origin", "*")`, plus the
+        // Express aliases `res.set(...)` / `res.header(...)`. The header name
+        // is distinctive enough that no receiver check is needed.
+        if matches!(property.as_str(), "setHeader" | "set" | "header") {
+            let args = self.string_arguments(call);
+            if args
+                .first()
+                .is_some_and(|name| name.eq_ignore_ascii_case("access-control-allow-origin"))
+                && args.get(1).map(String::as_str) == Some("*")
+            {
+                self.security.push(security::cors_fact(
+                    self.line(call),
+                    "Access-Control-Allow-Origin: *",
+                ));
+            }
+        }
+
         // OS command execution: `child_process.exec(...)` and friends. The
         // receiver must denote child_process so `regex.exec` is not flagged.
         if security::COMMAND_EXEC_METHODS.contains(&property.as_str()) {
@@ -594,17 +623,28 @@ impl<'a> Extractor<'a> {
 
     /// Value of the first string-literal argument of a call, if any.
     fn first_string_argument(&self, call: Node<'_>) -> Option<String> {
-        let arguments = call.child_by_field_name("arguments")?;
-        let mut cursor = arguments.walk();
-        for child in arguments.children(&mut cursor) {
-            if child.kind() == "string" {
-                return string_literal_value(self.text(child));
-            }
-        }
-        None
+        self.string_arguments(call).into_iter().next()
     }
 
-    fn try_http_route(&self, call: Node<'_>, verb: &str) -> Option<ApiFact> {
+    /// Values of every string-literal argument of a call, in order
+    /// (non-string arguments are skipped).
+    fn string_arguments(&self, call: Node<'_>) -> Vec<String> {
+        let Some(arguments) = call.child_by_field_name("arguments") else {
+            return Vec::new();
+        };
+        let mut values = Vec::new();
+        let mut cursor = arguments.walk();
+        for child in arguments.children(&mut cursor) {
+            if child.kind() == "string"
+                && let Some(value) = string_literal_value(self.text(child))
+            {
+                values.push(value);
+            }
+        }
+        values
+    }
+
+    fn try_http_route(&mut self, call: Node<'_>, verb: &str) -> Option<ApiFact> {
         let arguments = call.child_by_field_name("arguments")?;
         let mut args = Vec::new();
         let mut cursor = arguments.walk();
@@ -621,9 +661,15 @@ impl<'a> Extractor<'a> {
         if !path.starts_with('/') {
             return None;
         }
-        // Handler = last named argument, when it is an identifier reference.
+        // Handler = last named argument. A named identifier is referenced
+        // directly; an inline function/arrow — the dominant Express style —
+        // gets a synthetic handler symbol so the route stays connected to the
+        // call graph (and therefore to taint analysis).
         let handler_name = args.last().and_then(|last| match last.kind() {
             "identifier" => Some(self.text(*last).to_string()),
+            "arrow_function" | "function_expression" | "function" => {
+                Some(self.synthesize_inline_handler(*last, verb, &path))
+            }
             _ => None,
         });
         Some(ApiFact {
@@ -636,6 +682,23 @@ impl<'a> Extractor<'a> {
             response_type: None,
             line: self.line(call),
         })
+    }
+
+    /// Records an inline route handler (`app.get("/x", (req, res) => …)`) as
+    /// a synthetic function symbol and schedules its body to be visited inside
+    /// that callable frame. Returns the name the [`ApiFact`] links to.
+    fn synthesize_inline_handler(&mut self, handler: Node<'_>, verb: &str, path: &str) -> String {
+        let name = format!("<{} {} handler>", verb.to_ascii_uppercase(), path);
+        self.symbols.push(SymbolFact {
+            qualified_name: self.qualified(&name),
+            name: name.clone(),
+            kind: SymbolKind::Function,
+            span: self.span(handler),
+            visibility: Some(Visibility::Internal),
+            type_signature: None,
+        });
+        self.pending_handlers.insert(handler.id(), name.clone());
+        name
     }
 
     fn extract_new(&mut self, node: Node<'_>) {
@@ -764,7 +827,8 @@ impl<'a> Extractor<'a> {
             return;
         };
         if string_literal_value(self.text(value)).as_deref() == Some("*") {
-            self.security.push(security::cors_fact(self.line(node)));
+            self.security
+                .push(security::cors_fact(self.line(node), "origin: \"*\""));
         }
     }
 
@@ -1217,7 +1281,9 @@ app.post("/users", (req, res) => { res.send("ok"); });
             .find(|a| a.method.as_deref() == Some("POST"))
             .unwrap();
         assert_eq!(post.path.as_deref(), Some("/users"));
-        assert_eq!(post.handler_name, None); // anonymous handler
+        // An anonymous handler gets a synthetic symbol so the route stays
+        // connected to the call graph.
+        assert_eq!(post.handler_name.as_deref(), Some("<POST /users handler>"));
     }
 
     #[test]

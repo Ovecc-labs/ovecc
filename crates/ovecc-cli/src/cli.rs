@@ -302,9 +302,11 @@ pub enum Command {
         /// Minimum line span for a clone region.
         #[arg(long, default_value_t = 5)]
         min_lines: usize,
-        /// Also report clones confined to a single file (off by default).
+        /// Only report clones spanning at least two files. By default,
+        /// same-file duplication is reported too — copy-paste within one
+        /// file is still duplication.
         #[arg(long)]
-        include_intra_file: bool,
+        cross_file_only: bool,
     },
     /// Report code-health hotspots: functions over the complexity thresholds
     /// (cyclomatic / cognitive), computed by the oxc TS/JS extractor.
@@ -738,13 +740,13 @@ pub fn run() -> Result<u8> {
         Command::Dupes {
             min_tokens,
             min_lines,
-            include_intra_file,
+            cross_file_only,
         } => {
             let paths = ProjectPaths::resolve(cli.repo.unwrap_or_else(|| PathBuf::from(".")))?;
             let config = load_config(&paths, format_override)?;
             let files = ovecc_indexer::collect_file_tokens(&paths, &config)?;
             let families =
-                ovecc_graph::dupes::detect(&files, min_tokens, min_lines, !include_intra_file);
+                ovecc_graph::dupes::detect(&files, min_tokens, min_lines, cross_file_only);
             let duplicated_lines: u32 = families.iter().map(|family| family.line_span).sum();
             let report = DupesReport {
                 files_scanned: files.len(),
@@ -895,10 +897,19 @@ pub fn run() -> Result<u8> {
         Command::Advise { target } => {
             let paths = ProjectPaths::resolve(cli.repo.unwrap_or_else(|| PathBuf::from(".")))?;
             let config = load_config(&paths, format_override)?;
+            let store = open_store(&paths)?;
             let diagnose_config = diagnose_config_for(&paths, &config);
-            // Advise is diagnose focused on a single target.
+            // Advise = every persisted finding touching the target (what
+            // `violations` would attribute to it), plus the component-level
+            // design smells around it.
+            let needle = normalize_target(&target);
+            let findings: Vec<FindingRecord> = store
+                .findings(&paths.repository_id().0, None)?
+                .into_iter()
+                .filter(|finding| finding_touches(finding, &needle))
+                .collect();
             let report = run_diagnose(&paths, Some(&target), None, &diagnose_config)?;
-            render_diagnose(&report, config.output.default_format, None)?;
+            render_advise(&target, &findings, &report, config.output.default_format)?;
             Ok(0)
         }
         Command::Metrics { target } => {
@@ -1200,19 +1211,26 @@ fn build_context_slice(
         None => (target.to_string(), None),
     };
 
-    let radius = |direction| {
-        target_id.as_ref().and_then(|id| {
-            blast::blast_radius(&nodes, &edges, id, direction, blast::DEFAULT_MAX_DEPTH)
-        })
+    let radius = |direction, depth| {
+        target_id
+            .as_ref()
+            .and_then(|id| blast::blast_radius(&nodes, &edges, id, direction, depth))
     };
-    let dependencies = radius(ImpactDirection::Upstream)
+    // Depth 1: "dependencies"/"dependents" must mean the direct edges, not the
+    // transitive closure — a file two imports away is not a dependency of the
+    // target, and narrating it as one is actively misleading.
+    let dependencies = radius(ImpactDirection::Upstream, 1)
         .map(|r| r.impacted_labels)
         .unwrap_or_default();
-    let both = radius(ImpactDirection::Both);
-    let reverse_dependencies = radius(ImpactDirection::Downstream)
+    let reverse_dependencies = radius(ImpactDirection::Downstream, 1)
         .map(|r| r.impacted_labels)
         .unwrap_or_default();
-    let call_paths = both.map(|r| r.paths).unwrap_or_default();
+    // Impact paths follow the reverse-dependency direction only. A `Both`
+    // walk stitches forward and backward hops into a single path, producing
+    // "impact" chains through the target's own dependencies.
+    let call_paths = radius(ImpactDirection::Downstream, blast::DEFAULT_MAX_DEPTH)
+        .map(|r| r.paths)
+        .unwrap_or_default();
 
     // Findings whose target matches (by id or label).
     let needle = label.to_ascii_lowercase();
@@ -1558,12 +1576,169 @@ fn run_diagnose(
     if let Some(min) = min_severity {
         findings.retain(|finding| finding.severity >= min);
     }
-    if let Some(needle) = target.map(|t| t.to_ascii_lowercase()) {
-        findings.retain(|finding| finding.target.to_ascii_lowercase().contains(&needle));
+    if let Some(needle) = target.map(normalize_target) {
+        // A target names a component *or* a file inside one: match the
+        // finding's target and its evidence files, so `diagnose --target
+        // src/foo.ts` surfaces the smells whose evidence cites that file.
+        findings.retain(|finding| {
+            finding.target.to_ascii_lowercase().contains(&needle)
+                || finding.evidence.iter().any(|evidence| {
+                    evidence
+                        .file
+                        .as_deref()
+                        .is_some_and(|file| file.to_ascii_lowercase().contains(&needle))
+                })
+        });
     }
     Ok(ovecc_graph::diagnose::DiagnoseReport::new(
         components, findings,
     ))
+}
+
+/// Canonical form for user-supplied targets: '/'-separated and lowercase, so
+/// Windows-style `src\utils\helpers.ts` matches the stored '/'-normalized paths.
+fn normalize_target(target: &str) -> String {
+    target.replace('\\', "/").to_ascii_lowercase()
+}
+
+/// Whether a persisted finding touches the given (normalized) target: any
+/// evidence file, evidence symbol, or the finding's target entity matches.
+fn finding_touches(finding: &FindingRecord, needle: &str) -> bool {
+    let matches = |text: &str| {
+        text.replace('\\', "/")
+            .to_ascii_lowercase()
+            .contains(needle)
+    };
+    finding.evidence.iter().any(|evidence| {
+        matches(&evidence.file_path) || evidence.symbol.as_deref().is_some_and(matches)
+    }) || finding.target.as_ref().is_some_and(|t| matches(&t.id))
+}
+
+/// Renders `advise`: the persisted findings touching the target first (the
+/// actionable list), then the component-level design smells around it. Each
+/// finding carries its established fix.
+fn render_advise(
+    target: &str,
+    findings: &[FindingRecord],
+    smells: &ovecc_graph::diagnose::DiagnoseReport,
+    format: OutputFormat,
+) -> Result<()> {
+    match format {
+        // SARIF/CodeClimate degrade to the JSON envelope: advise is the agent
+        // surface, not a CI feed.
+        OutputFormat::Json | OutputFormat::Sarif | OutputFormat::Codeclimate => {
+            let mut findings_value =
+                serde_json::to_value(findings).unwrap_or(serde_json::Value::Null);
+            enrich_findings_with_fix(&mut findings_value);
+            let smell_values: Vec<serde_json::Value> =
+                smells.findings.iter().map(diagnosis_value).collect();
+            let data = serde_json::json!({
+                "target": target,
+                "findings": findings_value,
+                "smells": smell_values,
+                "total": findings.len() + smells.findings.len(),
+            });
+            emit_json("advise", &data, meta_for("advise"))?;
+        }
+        OutputFormat::Ndjson => {
+            emit_ndjson_meta("advise", &meta_for("advise"))?;
+            for finding in findings {
+                println!("{}", ndjson_line("violation", finding)?);
+            }
+            for smell in &smells.findings {
+                println!("{}", ndjson_line("diagnosis", &diagnosis_value(smell))?);
+            }
+        }
+        OutputFormat::Markdown => {
+            println!("# Advise: `{target}`");
+            println!();
+            println!(
+                "{} finding(s), {} design smell(s)",
+                findings.len(),
+                smells.findings.len()
+            );
+            for finding in findings {
+                let fix = finding.kind.fix_spec();
+                println!();
+                println!("## [{:?}] {}", finding.severity, finding.title);
+                if let Some(rule) = &finding.rule_name {
+                    println!("- Rule: `{rule}`");
+                }
+                println!("- {}", finding.description);
+                for evidence in &finding.evidence {
+                    println!("- Evidence: `{}`", format_evidence(evidence));
+                }
+                println!(
+                    "- Fix: {} (`{}`, auto-fixable: {})",
+                    fix.instruction,
+                    fix.kind,
+                    if fix.auto_fixable { "yes" } else { "no" }
+                );
+            }
+            for smell in &smells.findings {
+                println!();
+                println!(
+                    "## [{:?}] {} — `{}`",
+                    smell.severity, smell.title, smell.target
+                );
+                println!("- Principle: {}", smell.principle);
+                for evidence in &smell.evidence {
+                    println!("- Evidence: `{}`", fmt_diag_evidence(evidence));
+                }
+                println!(
+                    "- Fix: {} ({})",
+                    smell.remediation.summary, smell.remediation.refactoring
+                );
+                if let Some(note) = &smell.remediation.when_not_to_act {
+                    println!("- When not to act: {note}");
+                }
+            }
+            if findings.is_empty() && smells.findings.is_empty() {
+                println!();
+                println!("Nothing touches `{target}` — safe to edit.");
+            }
+        }
+        OutputFormat::Text => {
+            println!(
+                "Advise for {target}: {} finding(s), {} design smell(s)",
+                findings.len(),
+                smells.findings.len()
+            );
+            for finding in findings {
+                let fix = finding.kind.fix_spec();
+                println!();
+                println!("[{:?}] {}", finding.severity, finding.title);
+                if let Some(rule) = &finding.rule_name {
+                    println!("  Rule: {rule}");
+                }
+                for evidence in &finding.evidence {
+                    println!("  Evidence: {}", format_evidence(evidence));
+                }
+                println!(
+                    "  Fix: {} (auto-fixable: {})",
+                    fix.instruction,
+                    if fix.auto_fixable { "yes" } else { "no" }
+                );
+            }
+            for smell in &smells.findings {
+                println!();
+                println!(
+                    "[{:?}] {} — {}  (confidence {:.2})",
+                    smell.severity, smell.title, smell.target, smell.confidence
+                );
+                let evidence: Vec<String> = smell.evidence.iter().map(fmt_diag_evidence).collect();
+                println!("  Evidence: {}", evidence.join(", "));
+                println!(
+                    "  Fix: {} [{}]",
+                    smell.remediation.summary, smell.remediation.refactoring
+                );
+            }
+            if findings.is_empty() && smells.findings.is_empty() {
+                println!("  (nothing touches this target — safe to edit)");
+            }
+        }
+    }
+    Ok(())
 }
 
 /// CI exit code for `diagnose`: 1 when a finding crosses the threshold, else 0.
@@ -2761,7 +2936,9 @@ fn build_review_report(
         Vec::new()
     } else {
         ovecc_indexer::collect_file_tokens(paths, config)
-            .map(|files| graph::dupes::detect(&files, 50, 5, true))
+            // Same-file families count too: a PR that pastes a block twice
+            // into one file is still introducing duplication.
+            .map(|files| graph::dupes::detect(&files, 50, 5, false))
             .unwrap_or_default()
             .into_iter()
             .filter(|family| {

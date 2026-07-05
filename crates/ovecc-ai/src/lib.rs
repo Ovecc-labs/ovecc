@@ -162,7 +162,8 @@ fn change_impact(out: &mut String, target: &str, slice: &ContextSlice) {
     } else {
         let _ = writeln!(
             out,
-            "Modifying `{target}` can affect up to {reach} component(s) downstream."
+            "Modifying `{target}` directly affects {reach} dependent(s); \
+             change can propagate along:"
         );
         // Show representative internal paths, skipping external dependency nodes
         // (which have opaque IDs less useful in a narrative). Capped for readability.
