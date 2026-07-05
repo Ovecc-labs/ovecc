@@ -410,7 +410,15 @@ pub fn metric_definitions() -> BTreeMap<String, MetaMetric> {
         (
             "security_findings".to_string(),
             metric(
-                "Security findings: secrets, insecure patterns, weak crypto, vulnerable deps, tainted flows.",
+                "Code security findings: secrets, insecure patterns, weak crypto, tainted flows. Dependency advisories are tracked separately.",
+                "[0, inf)",
+                "lower is better",
+            ),
+        ),
+        (
+            "dependency_advisories".to_string(),
+            metric(
+                "Known vulnerabilities (OSV) in dependencies; depends on when advisories were last fetched.",
                 "[0, inf)",
                 "lower is better",
             ),

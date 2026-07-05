@@ -158,9 +158,14 @@ impl FindingRow {
 /// Stable, snapshot-independent content identity of a finding, so the *same*
 /// defect in two snapshots collapses to one key and a set-difference yields the
 /// genuinely new ones. Keyed by kind + first-evidence location (path, then the
-/// enclosing symbol when known, else the line) + rule — stable across unrelated
-/// edits elsewhere in the repo, where the volatile per-run `FindingId` is not.
-fn finding_identity(finding: &FindingRecord) -> String {
+/// enclosing symbol when known, else the pattern detail, else the line) + rule
+/// — stable across unrelated edits elsewhere in the repo, where the volatile
+/// per-run `FindingId` is not. Line numbers are the locator of last resort:
+/// identifying by line blames a finding that merely *moved* (an edit above it)
+/// on the change under review. `ordinal` disambiguates several otherwise
+/// identical findings (e.g. two `eval` calls in one file), so only the extra
+/// occurrence reads as new.
+fn finding_identity(finding: &FindingRecord, ordinal: usize) -> String {
     let kind = enum_str(&finding.kind);
     let rule = finding.rule_name.clone().unwrap_or_default();
     let (path, locator) = match finding.evidence.first() {
@@ -168,6 +173,7 @@ fn finding_identity(finding: &FindingRecord) -> String {
             let locator = evidence
                 .symbol
                 .clone()
+                .or_else(|| evidence.detail.clone())
                 .or_else(|| evidence.line.map(|line| line.to_string()))
                 .unwrap_or_default();
             (evidence.file_path.clone(), locator)
@@ -182,7 +188,10 @@ fn finding_identity(finding: &FindingRecord) -> String {
             finding.title.clone(),
         ),
     };
-    stable_id("finding-identity", &[&kind, &path, &locator, &rule])
+    stable_id(
+        "finding-identity",
+        &[&kind, &path, &locator, &rule, &ordinal.to_string()],
+    )
 }
 
 /// IDs of every row of `table` already persisted for the repository.
@@ -1699,15 +1708,27 @@ impl ArchitectureStore {
             // review can diff base→head findings by stable identity and report
             // the *named* new ones, not just a count delta. The current-state
             // `findings` table above still backs the point-in-time commands.
+            // Ordinals count repeated content identities within the snapshot
+            // (findings arrive in deterministic order), so duplicates stay
+            // distinct without falling back to volatile line numbers.
             let mut appender = tx.appender("snapshot_findings")?;
+            let mut identity_counts: HashMap<String, usize> = HashMap::new();
             for finding in findings {
                 let Some(snapshot_id) = finding.snapshot_id.as_ref() else {
                     continue;
                 };
+                let base_identity = finding_identity(finding, 0);
+                let seen = identity_counts.entry(base_identity.clone()).or_insert(0);
+                let identity = if *seen == 0 {
+                    base_identity
+                } else {
+                    finding_identity(finding, *seen)
+                };
+                *seen += 1;
                 let evidence_json = serde_json::to_string(&finding.evidence).unwrap_or_default();
                 appender.append_row(params![
                     snapshot_id.as_str(),
-                    finding_identity(finding),
+                    identity,
                     finding.id.as_str(),
                     enum_str(&finding.kind),
                     enum_str(&finding.severity),
@@ -2185,6 +2206,7 @@ impl ArchitectureStore {
             "coupling_density",
             "boundary_violations",
             "security_findings",
+            "dependency_advisories",
             "ownership_fragmented_files",
             "max_file_churn",
             "symbols",

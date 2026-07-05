@@ -50,7 +50,10 @@ const SOURCE_EXTENSIONS: &[&str] = &[
 // test-scoped patterns, so force re-extraction.
 // v14: Rust fully-qualified paths (`other_crate::item`) now emit import facts,
 // so cached v13 facts would miss those dependency edges.
-const PARSE_CACHE_VERSION: &str = "v15";
+// v16: inline route handlers get a synthetic symbol + attributed body facts,
+// and `setHeader("Access-Control-Allow-Origin", "*")` is now a CORS pattern;
+// cached v15 facts would keep those routes disconnected from the taint graph.
+const PARSE_CACHE_VERSION: &str = "v16";
 
 pub fn index_repository(
     paths: &ProjectPaths,
@@ -277,12 +280,34 @@ pub fn index_repository(
         .iter()
         .map(|sink| (sink.symbol_id.clone(), sink.label.clone()))
         .collect();
+    // Endpoint locations so taint findings cite real file:line evidence.
+    let mut flow_locations = ovecc_dataflow::FlowLocations::default();
+    for api in &resolved.apis {
+        if let Some(evidence) = &api.evidence {
+            flow_locations
+                .apis
+                .insert(api.id.0.clone(), evidence.clone());
+        }
+    }
+    for access in &resolved.schema_accesses {
+        flow_locations
+            .db_accesses
+            .entry((access.accessor_symbol_id.clone(), access.table_id.clone()))
+            .or_insert_with(|| access.evidence.clone());
+    }
+    for sink in &resolved.dangerous_sinks {
+        flow_locations
+            .dangerous
+            .entry(sink.symbol_id.clone())
+            .or_insert_with(|| sink.evidence.clone());
+    }
     findings.extend(ovecc_dataflow::analyze(
         &repository_id,
         Some(&snapshot_id),
         &flow_nodes,
         &flow_edges,
         &dangerous_sinks,
+        &flow_locations,
         ovecc_dataflow::DEFAULT_FLOW_DEPTH,
     ));
 
@@ -646,6 +671,10 @@ pub fn index_repository(
             )
         })
         .count();
+    // Code security only: dependency advisories (OSV) are counted separately —
+    // folding them in would make the trend depend on when advisories were last
+    // fetched, so `drift` would report "worsening" on a commit that merely ran
+    // `audit --fetch`.
     let security_findings = findings
         .iter()
         .filter(|finding| {
@@ -655,16 +684,23 @@ pub fn index_repository(
                     | FindingKind::InsecurePattern
                     | FindingKind::WeakCrypto
                     | FindingKind::PermissiveCors
-                    | FindingKind::VulnerableDependency
                     | FindingKind::TaintedFlow
             )
         })
+        .count();
+    let dependency_advisories = findings
+        .iter()
+        .filter(|finding| finding.kind == FindingKind::VulnerableDependency)
         .count();
     metrics.push((
         "boundary_violations".to_string(),
         boundary_violations as f64,
     ));
     metrics.push(("security_findings".to_string(), security_findings as f64));
+    metrics.push((
+        "dependency_advisories".to_string(),
+        dependency_advisories as f64,
+    ));
 
     let external_dependencies = dependencies
         .iter()

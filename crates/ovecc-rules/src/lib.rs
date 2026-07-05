@@ -179,7 +179,10 @@ fn security_rules(input: &RuleInput<'_>) -> Vec<FindingRecord> {
                 evidence: vec![Evidence {
                     file_path: path.clone(),
                     line: Some(pattern.line),
-                    symbol: None,
+                    // The enclosing symbol also anchors the finding's content
+                    // identity, so a pattern that merely moves (an edit above
+                    // it) is not re-reported as new by `review`.
+                    symbol: pattern.caller_qualified_name.clone(),
                     detail: pattern.detail.clone(),
                 }],
                 created_at: Utc::now(),

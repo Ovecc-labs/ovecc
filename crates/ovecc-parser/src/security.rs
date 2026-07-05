@@ -206,13 +206,8 @@ pub fn command_exec_fact(line: u32, detail: &str, caller: Option<String>) -> Sec
 pub fn weak_hash_fact(line: u32, algo: &str) -> SecurityPatternFact {
     convert(SecurityPatternKind::WeakHash, line, algo, None)
 }
-pub fn cors_fact(line: u32) -> SecurityPatternFact {
-    convert(
-        SecurityPatternKind::PermissiveCors,
-        line,
-        "origin: \"*\"",
-        None,
-    )
+pub fn cors_fact(line: u32, detail: &str) -> SecurityPatternFact {
+    convert(SecurityPatternKind::PermissiveCors, line, detail, None)
 }
 
 /// `child_process` methods that execute OS commands.

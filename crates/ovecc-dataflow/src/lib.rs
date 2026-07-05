@@ -34,6 +34,19 @@ use ovecc_graph::blast::{BlastEdge, BlastNode};
 /// bounded to keep the analysis tractable.
 pub const DEFAULT_FLOW_DEPTH: usize = 8;
 
+/// Source locations for flow endpoints, so findings cite real `file:line`
+/// evidence instead of just labels. All maps are optional; a missing entry
+/// degrades to label-only evidence.
+#[derive(Debug, Default, Clone)]
+pub struct FlowLocations {
+    /// API node id → where the route is declared.
+    pub apis: HashMap<String, Evidence>,
+    /// (accessor symbol id, table id) → where the DB access happens.
+    pub db_accesses: HashMap<(String, String), Evidence>,
+    /// Dangerous-call symbol id → where the eval/exec happens.
+    pub dangerous: HashMap<String, Evidence>,
+}
+
 /// Analyzes source→sink reachability and returns one finding per distinct
 /// (source API, sink symbol, table) flow.
 pub fn analyze(
@@ -42,6 +55,7 @@ pub fn analyze(
     nodes: &[BlastNode],
     edges: &[BlastEdge],
     dangerous: &[(String, String)],
+    locations: &FlowLocations,
     max_depth: usize,
 ) -> Vec<FindingRecord> {
     let node_by_id: HashMap<&str, &BlastNode> =
@@ -81,6 +95,7 @@ pub fn analyze(
             &db_access,
             &dangerous_by_id,
             &node_by_id,
+            locations,
             max_depth,
         );
         for flow in flows {
@@ -92,7 +107,7 @@ pub fn analyze(
             if !seen_flows.insert(dedup_key) {
                 continue;
             }
-            findings.push(flow.into_finding(repository_id, snapshot_id, source));
+            findings.push(flow.into_finding(repository_id, snapshot_id, source, locations));
         }
     }
 
@@ -108,6 +123,8 @@ struct Flow {
     sink_label: String,
     /// Node labels from the source through to the sink.
     path: Vec<String>,
+    /// Where the sink statement lives, when known.
+    sink_evidence: Option<Evidence>,
 }
 
 impl Flow {
@@ -116,6 +133,7 @@ impl Flow {
         repository_id: &str,
         snapshot_id: Option<&str>,
         source: &BlastNode,
+        locations: &FlowLocations,
     ) -> FindingRecord {
         // Code/command execution reached from user input is the worst case;
         // a DB write is the classic injection; a read is lower.
@@ -158,12 +176,33 @@ impl Flow {
                 what,
                 self.path.join(" -> ")
             ),
-            evidence: vec![Evidence {
-                file_path: source.label.clone(),
-                line: None,
-                symbol: Some(self.path.join(" -> ")),
-                detail: Some(format!("sink: {}", self.sink_kind)),
-            }],
+            evidence: {
+                // Real locations first: the sink statement, then the route
+                // declaration. Label-only evidence is the fallback when no
+                // location was supplied.
+                let mut evidence = Vec::new();
+                if let Some(sink) = self.sink_evidence {
+                    evidence.push(Evidence {
+                        detail: Some(format!("sink: {}", self.sink_kind)),
+                        ..sink
+                    });
+                }
+                if let Some(api) = locations.apis.get(&source.id) {
+                    evidence.push(Evidence {
+                        detail: Some(format!("source: {}", source.label)),
+                        ..api.clone()
+                    });
+                }
+                if evidence.is_empty() {
+                    evidence.push(Evidence {
+                        file_path: source.label.clone(),
+                        line: None,
+                        symbol: Some(self.path.join(" -> ")),
+                        detail: Some(format!("sink: {}", self.sink_kind)),
+                    });
+                }
+                evidence
+            },
             created_at: Utc::now(),
         }
     }
@@ -177,6 +216,7 @@ fn trace_flows(
     db_access: &HashMap<&str, Vec<(&str, &str)>>,
     dangerous_by_id: &HashMap<&str, &str>,
     node_by_id: &HashMap<&str, &BlastNode>,
+    locations: &FlowLocations,
     max_depth: usize,
 ) -> Vec<Flow> {
     let mut flows = Vec::new();
@@ -200,6 +240,10 @@ fn trace_flows(
                     sink_kind: (*access).to_string(),
                     sink_label: table_label,
                     path: sink_path,
+                    sink_evidence: locations
+                        .db_accesses
+                        .get(&(current.to_string(), (*table_id).to_string()))
+                        .cloned(),
                 });
             }
         }
@@ -210,6 +254,7 @@ fn trace_flows(
                 sink_kind: (*label).to_string(),
                 sink_label: (*label).to_string(),
                 path: path.clone(),
+                sink_evidence: locations.dangerous.get(current).cloned(),
             });
         }
         if depth >= max_depth {
@@ -275,6 +320,7 @@ mod tests {
             &nodes,
             &edges,
             &[],
+            &FlowLocations::default(),
             DEFAULT_FLOW_DEPTH,
         );
         assert_eq!(findings.len(), 1);
@@ -299,7 +345,15 @@ mod tests {
             edge("a:1", "s:handler", "handles"),
             edge("s:repo", "t:customers", "writes"),
         ];
-        let findings = analyze("repo:test", None, &nodes, &edges, &[], DEFAULT_FLOW_DEPTH);
+        let findings = analyze(
+            "repo:test",
+            None,
+            &nodes,
+            &edges,
+            &[],
+            &FlowLocations::default(),
+            DEFAULT_FLOW_DEPTH,
+        );
         assert!(findings.is_empty());
     }
 
@@ -322,6 +376,7 @@ mod tests {
             &nodes,
             &edges,
             &dangerous,
+            &FlowLocations::default(),
             DEFAULT_FLOW_DEPTH,
         );
         assert_eq!(findings.len(), 1);
@@ -340,7 +395,15 @@ mod tests {
             edge("a:1", "s:handler", "handles"),
             edge("s:handler", "t:customers", "reads"),
         ];
-        let findings = analyze("repo:test", None, &nodes, &edges, &[], DEFAULT_FLOW_DEPTH);
+        let findings = analyze(
+            "repo:test",
+            None,
+            &nodes,
+            &edges,
+            &[],
+            &FlowLocations::default(),
+            DEFAULT_FLOW_DEPTH,
+        );
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].severity, Severity::Medium);
     }
@@ -363,9 +426,18 @@ mod tests {
             edge("s:b", "s:c", "calls"),
             edge("s:c", "t:x", "writes"),
         ];
-        assert!(analyze("r", None, &nodes, &edges, &[], 2).is_empty());
+        assert!(analyze("r", None, &nodes, &edges, &[], &FlowLocations::default(), 2).is_empty());
         assert_eq!(
-            analyze("r", None, &nodes, &edges, &[], DEFAULT_FLOW_DEPTH).len(),
+            analyze(
+                "r",
+                None,
+                &nodes,
+                &edges,
+                &[],
+                &FlowLocations::default(),
+                DEFAULT_FLOW_DEPTH
+            )
+            .len(),
             1
         );
     }
@@ -384,7 +456,15 @@ mod tests {
             edge("s:repo", "t:customers", "writes"),
             edge("s:repo", "t:customers", "writes"),
         ];
-        let findings = analyze("r", None, &nodes, &edges, &[], DEFAULT_FLOW_DEPTH);
+        let findings = analyze(
+            "r",
+            None,
+            &nodes,
+            &edges,
+            &[],
+            &FlowLocations::default(),
+            DEFAULT_FLOW_DEPTH,
+        );
         assert_eq!(findings.len(), 1);
     }
 
@@ -402,7 +482,15 @@ mod tests {
             edge("s:h", "t:a", "writes"),
             edge("s:h", "t:b", "reads"),
         ];
-        let findings = analyze("r", None, &nodes, &edges, &[], DEFAULT_FLOW_DEPTH);
+        let findings = analyze(
+            "r",
+            None,
+            &nodes,
+            &edges,
+            &[],
+            &FlowLocations::default(),
+            DEFAULT_FLOW_DEPTH,
+        );
         assert_eq!(findings.len(), 2, "distinct tables are distinct flows");
     }
 }
