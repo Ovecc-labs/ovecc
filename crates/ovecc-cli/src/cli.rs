@@ -908,6 +908,9 @@ pub fn run() -> Result<u8> {
                 .into_iter()
                 .filter(|finding| finding_touches(finding, &needle))
                 .collect();
+            // run_diagnose reopens the database, and DuckDB allows only one
+            // open handle per file — release this one first.
+            drop(store);
             let report = run_diagnose(&paths, Some(&target), None, &diagnose_config)?;
             render_advise(&target, &findings, &report, config.output.default_format)?;
             Ok(0)

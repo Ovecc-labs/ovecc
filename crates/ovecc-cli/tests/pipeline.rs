@@ -284,3 +284,40 @@ fn report_command_produces_composite_payload() {
         assert!(stdout.contains(key), "report json should contain {key}");
     }
 }
+
+/// `advise` lists the persisted findings that touch a target and *also* runs the
+/// component diagnose, which re-opens the same database. DuckDB allows one
+/// handle per file per process, so the command must drop the first before the
+/// second — a regression here crashes instead of reporting. Its own process,
+/// against a freshly indexed fixture.
+#[test]
+fn advise_reports_without_opening_the_database_twice() {
+    let staged = staged_fixture("small-service");
+    let repo = staged.path().to_str().expect("utf8 path").to_string();
+    let bin = env!("CARGO_BIN_EXE_ovecc");
+
+    let indexed = Command::new(bin)
+        .args(["--repo", &repo, "index"])
+        .output()
+        .expect("run ovecc index");
+    assert!(
+        indexed.status.success(),
+        "index failed: {}",
+        String::from_utf8_lossy(&indexed.stderr)
+    );
+
+    let advised = Command::new(bin)
+        .args(["--repo", &repo, "advise", "src/billing/service.ts"])
+        .output()
+        .expect("run ovecc advise");
+    assert!(
+        advised.status.success(),
+        "advise crashed or errored: {}",
+        String::from_utf8_lossy(&advised.stderr)
+    );
+    let stdout = String::from_utf8(advised.stdout).expect("utf8");
+    assert!(
+        stdout.contains("Advise for"),
+        "advise should render its report, got: {stdout}"
+    );
+}
