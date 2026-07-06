@@ -2685,6 +2685,44 @@ mod tests {
     }
 
     #[test]
+    fn moved_finding_keeps_identity_when_anchored_to_a_symbol() {
+        // Anchored on the enclosing symbol, not the line: an edit above a finding
+        // that merely shifts its line must not make `review` report it as new.
+        let before = sample_finding(
+            "snap",
+            ovecc_core::facts::FindingKind::TaintedFlow,
+            "src/a.ts",
+            10,
+            "handler",
+            ovecc_core::facts::Severity::High,
+        );
+        let after = sample_finding(
+            "snap",
+            ovecc_core::facts::FindingKind::TaintedFlow,
+            "src/a.ts",
+            42,
+            "handler",
+            ovecc_core::facts::Severity::High,
+        );
+        assert_eq!(finding_identity(&before, 0), finding_identity(&after, 0));
+    }
+
+    #[test]
+    fn ordinal_disambiguates_otherwise_identical_findings() {
+        // Two identical findings (e.g. two evals on one line): the ordinal keeps
+        // the second one distinct without relying on a volatile line number.
+        let f = sample_finding(
+            "snap",
+            ovecc_core::facts::FindingKind::InsecurePattern,
+            "src/a.ts",
+            7,
+            "run",
+            ovecc_core::facts::Severity::Medium,
+        );
+        assert_ne!(finding_identity(&f, 0), finding_identity(&f, 1));
+    }
+
+    #[test]
     fn finding_diff_reports_named_new_and_resolved_findings() {
         use ovecc_core::facts::{FindingKind, Severity};
         let (_dir, mut store) = temp_store();

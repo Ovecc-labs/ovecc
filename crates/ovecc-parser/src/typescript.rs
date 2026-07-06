@@ -1384,4 +1384,65 @@ function scan(re, s) { re.exec(s); }
             facts.suppressed_lines
         );
     }
+
+    #[test]
+    fn detects_permissive_cors_via_raw_header_write() {
+        use ovecc_core::facts::SecurityPatternKind;
+        let facts = extract(
+            r#"
+function configure(res) {
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.set("access-control-allow-origin", "*");
+    res.header("Access-Control-Allow-Origin", "*");
+    res.setHeader("X-Frame-Options", "DENY");
+    res.setHeader("Access-Control-Allow-Origin", "https://safe.example");
+}
+"#,
+            SourceLanguage::JavaScript,
+        );
+        // The three wildcard writes fire (setHeader plus the set/header aliases,
+        // header name case-insensitive); the unrelated header and the specific
+        // origin do not.
+        let cors = facts
+            .security_patterns
+            .iter()
+            .filter(|p| p.kind == SecurityPatternKind::PermissiveCors)
+            .count();
+        assert_eq!(cors, 3, "{:?}", facts.security_patterns);
+    }
+
+    #[test]
+    fn inline_route_handler_becomes_symbol_that_owns_its_calls() {
+        let facts = extract(
+            r#"
+import express from "express";
+const app = express();
+app.post("/users", (req, res) => {
+    db.run(req.body.name);
+    res.send("ok");
+});
+"#,
+            SourceLanguage::Jsx,
+        );
+
+        // The anonymous handler is materialised as a real function symbol...
+        let handler = facts
+            .symbols
+            .iter()
+            .find(|s| s.name == "<POST /users handler>")
+            .expect("synthetic handler symbol");
+        assert_eq!(handler.kind, SymbolKind::Function);
+
+        // ...and the calls in its body are attributed to it, so taint reaches a
+        // sink from the route through the call graph.
+        let sink = facts
+            .calls
+            .iter()
+            .find(|c| c.callee_name == "run")
+            .expect("call inside the inline handler");
+        assert_eq!(
+            sink.caller_qualified_name.as_deref(),
+            Some("<POST /users handler>")
+        );
+    }
 }
