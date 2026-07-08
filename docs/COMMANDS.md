@@ -148,8 +148,8 @@ Structured graph queries: `deps X`, `rdeps X`, `paths X`, `module X`,
 
 Blast radius of changing a module, symbol, `table:NAME`, or `api:<route>`: the
 impacted nodes, the paths that reach them, and a risk score. "What breaks if I
-touch this?" API labels have the form `GET /users/:id`, and `api:` matches by
-substring — `api:/users` or `api:GET /users` both resolve.
+touch this?" API labels have the form `GET /users/:id`; `api:GET:/users/:id`,
+`api:GET /users/:id`, and the substring form `api:/users` all resolve.
 
 ---
 

@@ -113,11 +113,15 @@ impl TargetSelector {
         } else if let Some(rest) = trimmed.strip_prefix("api:") {
             // `api:GET:/path` or `api:/path` or `api:name`.
             match rest.split_once(':') {
-                Some((method, path)) => Self::Api {
-                    method: Some(method.to_string()),
-                    path: path.to_string(),
-                },
-                None => Self::Api {
+                Some((method, path))
+                    if !method.is_empty() && method.chars().all(|c| c.is_ascii_alphabetic()) =>
+                {
+                    Self::Api {
+                        method: Some(method.to_string()),
+                        path: path.to_string(),
+                    }
+                }
+                _ => Self::Api {
                     method: None,
                     path: rest.to_string(),
                 },
@@ -198,6 +202,13 @@ mod tests {
             TargetSelector::Api {
                 method: Some("GET".to_string()),
                 path: "/users/{id}".to_string()
+            }
+        );
+        assert_eq!(
+            TargetSelector::parse("api:/users/:id"),
+            TargetSelector::Api {
+                method: None,
+                path: "/users/:id".to_string()
             }
         );
         assert_eq!(

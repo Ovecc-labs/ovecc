@@ -96,24 +96,36 @@ pub fn resolve_target<'a>(input: &str, nodes: &'a [BlastNode]) -> Option<&'a Bla
         return Some(node);
     }
 
-    let (kind_filter, needle): (Option<Category>, String) =
+    let (kind_filter, needles): (Option<Category>, Vec<String>) =
         if let Some(rest) = input.strip_prefix("table:") {
-            (Some(Category::Table), rest.to_string())
+            (Some(Category::Table), vec![rest.to_string()])
         } else if let Some(rest) = input.strip_prefix("api:") {
-            (Some(Category::Api), rest.to_string())
+            (Some(Category::Api), api_needles(rest))
         } else {
-            (None, input.to_string())
+            (None, vec![input.to_string()])
         };
-    let needle_lower = needle.to_ascii_lowercase();
+    let lowered: Vec<String> = needles
+        .iter()
+        .map(|needle| needle.to_ascii_lowercase())
+        .collect();
+
+    let in_category = |node: &BlastNode| {
+        kind_filter
+            .map(|category| categorize(&node.kind) == category)
+            .unwrap_or(true)
+    };
+    let exact = |node: &BlastNode| {
+        needles
+            .iter()
+            .any(|needle| node.label.eq_ignore_ascii_case(needle))
+    };
 
     let mut matches = nodes.iter().filter(|node| {
-        if let Some(category) = kind_filter
-            && categorize(&node.kind) != category
-        {
-            return false;
-        }
-        node.label.eq_ignore_ascii_case(&needle)
-            || node.label.to_ascii_lowercase().contains(&needle_lower)
+        in_category(node)
+            && (exact(node) || {
+                let label = node.label.to_ascii_lowercase();
+                lowered.iter().any(|needle| label.contains(needle))
+            })
     });
     let first = matches.next()?;
     // Prefer an exact (case-insensitive) label match if one exists among many.
@@ -122,13 +134,21 @@ pub fn resolve_target<'a>(input: &str, nodes: &'a [BlastNode]) -> Option<&'a Bla
     }
     nodes
         .iter()
-        .find(|node| {
-            kind_filter
-                .map(|c| categorize(&node.kind) == c)
-                .unwrap_or(true)
-                && node.label.eq_ignore_ascii_case(&needle)
-        })
+        .find(|node| in_category(node) && exact(node))
         .or(Some(first))
+}
+
+// An `api:METHOD:/path` target may be labeled "METHOD:/path" or "METHOD /path"
+// in the graph; search with both spellings.
+fn api_needles(rest: &str) -> Vec<String> {
+    let mut needles = vec![rest.to_string()];
+    if let Some((method, path)) = rest.split_once(':')
+        && !method.is_empty()
+        && method.chars().all(|c| c.is_ascii_alphabetic())
+    {
+        needles.push(format!("{method} {path}").trim().to_string());
+    }
+    needles
 }
 
 /// Computes the blast radius of `target_id` over the impact edge kinds.
@@ -378,6 +398,34 @@ mod tests {
             "table"
         );
         assert!(resolve_target("nonexistent", &nodes).is_none());
+    }
+
+    #[test]
+    fn resolves_documented_api_target_forms() {
+        let nodes = vec![
+            node("m:users", "module", "users"),
+            node("a:get", "api", "GET /users/:id"),
+            node("a:post", "api", "POST /users/:id"),
+            node("a:list", "api", "GET /users"),
+        ];
+        assert_eq!(
+            resolve_target("api:GET:/users/:id", &nodes).unwrap().id,
+            "a:get"
+        );
+        assert_eq!(
+            resolve_target("api:post:/users/:id", &nodes).unwrap().id,
+            "a:post"
+        );
+        assert_eq!(
+            resolve_target("api:GET /users/:id", &nodes).unwrap().id,
+            "a:get"
+        );
+        assert_eq!(resolve_target("api:/users", &nodes).unwrap().kind, "api");
+        assert_eq!(
+            resolve_target("api:GET:/users", &nodes).unwrap().id,
+            "a:list"
+        );
+        assert!(resolve_target("api:DELETE:/users", &nodes).is_none());
     }
 
     #[test]

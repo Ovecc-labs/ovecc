@@ -995,7 +995,11 @@ fn render_explanation(slice: &ContextSlice, explanation: &str, format: OutputFor
 fn selector_to_blast(selector: &TargetSelector) -> String {
     match selector {
         TargetSelector::Table(name) => format!("table:{name}"),
-        TargetSelector::Api { path, .. } => format!("api:{path}"),
+        TargetSelector::Api {
+            method: Some(method),
+            path,
+        } => format!("api:{method}:{path}"),
+        TargetSelector::Api { method: None, path } => format!("api:{path}"),
         other => other.needle().to_string(),
     }
 }
