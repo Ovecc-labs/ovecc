@@ -800,7 +800,7 @@ pub fn index_repository(
 
     Ok(IndexReport {
         repository_root: paths.root_display(),
-        database_path: paths.db_path.to_string_lossy().to_string(),
+        database_path: ovecc_core::util::normalize_path(&paths.db_path),
         snapshot_id,
         files_scanned: source_files.len(),
         files_indexed: files.len(),

@@ -202,6 +202,11 @@ fn summary_json_is_byte_identical_across_runs() {
         "index failed: {}",
         String::from_utf8_lossy(&indexed.stderr)
     );
+    let index_stdout = String::from_utf8_lossy(&indexed.stdout);
+    assert!(
+        !index_stdout.contains(r"\\?\"),
+        "index output must not leak the Windows verbatim prefix: {index_stdout}"
+    );
 
     let run_summary = || {
         Command::new(bin)

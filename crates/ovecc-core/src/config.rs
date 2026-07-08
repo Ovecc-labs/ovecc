@@ -443,6 +443,7 @@ impl ProjectPaths {
                 ),
             }
         })?;
+        let root = crate::util::simplify_verbatim(&root).unwrap_or(root);
         let ovecc_dir = root.join(".ovecc");
         Ok(Self {
             config_path: ovecc_dir.join("config.toml"),

@@ -5,7 +5,17 @@
 
 use crate::error::{OveccError, Result};
 use sha2::{Digest, Sha256};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+pub fn simplify_verbatim(path: &Path) -> Option<PathBuf> {
+    const MAX_LEGACY_PATH: usize = 260;
+    let raw = path.to_string_lossy();
+    let rest = raw.strip_prefix(r"\\?\")?;
+    if rest.starts_with(r"UNC\") || rest.len() >= MAX_LEGACY_PATH {
+        return None;
+    }
+    Some(PathBuf::from(rest))
+}
 
 /// Normalizes a path to forward slashes for stable, platform-independent IDs.
 ///
@@ -78,6 +88,30 @@ fn hex_char(nibble: u8) -> char {
 mod tests {
     use super::*;
     use std::path::Path;
+
+    #[test]
+    fn simplify_verbatim_keeps_only_safe_drive_paths() {
+        assert_eq!(
+            simplify_verbatim(Path::new(r"\\?\C:\Users\dev\app")),
+            Some(PathBuf::from(r"C:\Users\dev\app"))
+        );
+        assert_eq!(
+            simplify_verbatim(Path::new(r"\\?\UNC\server\share")),
+            None,
+            "network paths need the verbatim form"
+        );
+        assert_eq!(
+            simplify_verbatim(Path::new(r"C:\already\plain")),
+            None,
+            "non-verbatim paths pass through unchanged"
+        );
+        let deep = format!(r"\\?\C:\{}", "a\\".repeat(140));
+        assert_eq!(
+            simplify_verbatim(Path::new(&deep)),
+            None,
+            "paths past the legacy limit keep the verbatim form"
+        );
+    }
 
     #[test]
     fn normalize_strips_windows_verbatim_and_unc_prefixes() {
