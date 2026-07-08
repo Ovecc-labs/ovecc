@@ -188,7 +188,9 @@ OSV audit: declared dependencies checked against the local vulnerability
 database in `.ovecc/osv/`. Reads npm `package-lock.json` today (other lockfile
 formats are planned). Offline by default; `--fetch` first downloads the
 advisories for the discovered packages. This is the **only** ovecc operation that
-ever touches the network, and only with this flag.
+ever touches the network, and only with this flag. Severity follows the
+advisory's own label (GHSA `LOW`/`MODERATE`/`HIGH`/`CRITICAL`); unlabeled
+advisories default to High.
 
 ```
 Fetched 27 new advisory(ies) for 1 package(s).

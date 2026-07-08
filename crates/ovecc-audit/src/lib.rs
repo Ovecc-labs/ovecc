@@ -35,6 +35,14 @@ pub struct OsvEntry {
     pub details: Option<String>,
     #[serde(default)]
     pub affected: Vec<OsvAffected>,
+    #[serde(default)]
+    pub database_specific: OsvDatabaseSpecific,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct OsvDatabaseSpecific {
+    #[serde(default)]
+    pub severity: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -336,6 +344,22 @@ pub fn audit(
     findings
 }
 
+fn advisory_severity(entry: &OsvEntry) -> Severity {
+    match entry
+        .database_specific
+        .severity
+        .as_deref()
+        .map(str::to_ascii_uppercase)
+        .as_deref()
+    {
+        Some("CRITICAL") => Severity::Critical,
+        Some("HIGH") => Severity::High,
+        Some("MODERATE") | Some("MEDIUM") => Severity::Medium,
+        Some("LOW") => Severity::Low,
+        _ => Severity::High,
+    }
+}
+
 fn finding(
     repository_id: &str,
     snapshot_id: Option<&str>,
@@ -358,8 +382,7 @@ fn finding(
         repository_id: RepositoryId::from_raw(repository_id),
         snapshot_id: snapshot_id.map(SnapshotId::from_raw),
         kind: FindingKind::VulnerableDependency,
-        // Defaulting to High; CVSS-derived severity is a later refinement.
-        severity: Severity::High,
+        severity: advisory_severity(entry),
         rule_name: Some("audit/osv".to_string()),
         target: None,
         title: format!(
@@ -470,9 +493,33 @@ mod tests {
         let findings = audit("repo:test", Some("snap"), &packages, &osv);
         assert_eq!(findings.len(), 1, "only the 4.17.20 install is vulnerable");
         assert_eq!(findings[0].kind, FindingKind::VulnerableDependency);
-        assert_eq!(findings[0].severity, Severity::High);
+        assert_eq!(
+            findings[0].severity,
+            Severity::High,
+            "no advisory label falls back to High"
+        );
         assert!(findings[0].title.contains("lodash@4.17.20"));
         assert!(findings[0].title.contains("GHSA-test-lodash"));
+    }
+
+    #[test]
+    fn advisory_severity_follows_the_database_label() {
+        let with_label = |label: &str| -> OsvEntry {
+            serde_json::from_str(&format!(
+                r#"{{"id":"S","database_specific":{{"severity":"{label}"}}}}"#
+            ))
+            .unwrap()
+        };
+        assert_eq!(
+            advisory_severity(&with_label("CRITICAL")),
+            Severity::Critical
+        );
+        assert_eq!(advisory_severity(&with_label("HIGH")), Severity::High);
+        assert_eq!(advisory_severity(&with_label("MODERATE")), Severity::Medium);
+        assert_eq!(advisory_severity(&with_label("moderate")), Severity::Medium);
+        assert_eq!(advisory_severity(&with_label("LOW")), Severity::Low);
+        assert_eq!(advisory_severity(&with_label("UNRATED")), Severity::High);
+        assert_eq!(advisory_severity(&osv_lodash()), Severity::High);
     }
 
     #[test]
