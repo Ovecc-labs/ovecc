@@ -55,6 +55,36 @@ fn copy_dir(source: &Path, destination: &Path) {
     }
 }
 
+fn ovecc(repo: &str, args: &[&str]) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_ovecc"))
+        .args(["--repo", repo])
+        .args(args)
+        .output()
+        .expect("run ovecc")
+}
+
+fn index_repo(repo: &str) {
+    let indexed = ovecc(repo, &["index"]);
+    assert!(
+        indexed.status.success(),
+        "index failed: {}",
+        String::from_utf8_lossy(&indexed.stderr)
+    );
+}
+
+fn plant_banned_import_rule(root: &Path) {
+    let dir = root.join(".ovecc");
+    fs::create_dir_all(&dir).expect("create .ovecc");
+    fs::write(
+        dir.join("config.toml"),
+        "[[rules.banned_imports]]\n\
+         name = \"no-cross-module-user-imports\"\n\
+         pattern = \"../user/*\"\n\
+         severity = \"medium\"\n",
+    )
+    .expect("write config");
+}
+
 #[test]
 fn typescript_service_indexes_and_resolves_internally() {
     let staged = staged_fixture("small-service");
@@ -335,6 +365,294 @@ fn impact_distinguishes_unknown_target_from_no_impact() {
     assert!(
         stderr.contains("no architecture element matches 'definitely-not-a-target'"),
         "error should name the unmatched target: {stderr}"
+    );
+}
+
+#[test]
+fn exit_codes_follow_the_documented_contract() {
+    let staged = staged_fixture("small-service");
+    let repo = staged.path().to_str().expect("utf8 path").to_string();
+
+    let unindexed = ovecc(&repo, &["summary"]);
+    assert_eq!(
+        unindexed.status.code(),
+        Some(4),
+        "missing index must exit 4 (index error), stderr: {}",
+        String::from_utf8_lossy(&unindexed.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&unindexed.stderr).contains("run 'ovecc index' first"),
+        "missing-index error must say how to recover"
+    );
+
+    let usage = ovecc(&repo, &["impact"]);
+    assert_eq!(
+        usage.status.code(),
+        Some(2),
+        "a missing required argument must exit 2 (usage), stderr: {}",
+        String::from_utf8_lossy(&usage.stderr)
+    );
+
+    plant_banned_import_rule(staged.path());
+    index_repo(&repo);
+
+    let report_only = ovecc(&repo, &["violations"]);
+    assert_eq!(
+        report_only.status.code(),
+        Some(0),
+        "violations without --fail-on only reports, stderr: {}",
+        String::from_utf8_lossy(&report_only.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&report_only.stdout);
+    assert!(
+        stdout.contains("Banned import"),
+        "the planted rule must produce a finding: {stdout}"
+    );
+
+    let gated = ovecc(&repo, &["violations", "--fail-on", "any"]);
+    assert_eq!(
+        gated.status.code(),
+        Some(1),
+        "findings crossing --fail-on must exit 1, stderr: {}",
+        String::from_utf8_lossy(&gated.stderr)
+    );
+}
+
+#[test]
+fn api_targets_resolve_in_every_documented_form() {
+    let staged = staged_fixture("web-api");
+    let repo = staged.path().to_str().expect("utf8 path").to_string();
+    index_repo(&repo);
+
+    for target in ["api:GET:/users/:id", "api:/users/:id", "GET /users/:id"] {
+        let out = ovecc(&repo, &["impact", target]);
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "impact must resolve `{target}`, stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    let explained = ovecc(&repo, &["explain", "api:POST:/charge"]);
+    assert_eq!(
+        explained.status.code(),
+        Some(0),
+        "explain must resolve the colon form, stderr: {}",
+        String::from_utf8_lossy(&explained.stderr)
+    );
+}
+
+#[test]
+fn history_trends_metrics_across_snapshots() {
+    let staged = staged_fixture("small-service");
+    let repo = staged.path().to_str().expect("utf8 path").to_string();
+    index_repo(&repo);
+    index_repo(&repo);
+
+    let listed = ovecc(&repo, &["history"]);
+    assert_eq!(listed.status.code(), Some(0));
+    assert!(
+        String::from_utf8_lossy(&listed.stdout).contains("coupling_density"),
+        "bare history must list trendable metrics"
+    );
+
+    let trended = ovecc(&repo, &["history", "coupling_density"]);
+    assert_eq!(
+        trended.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&trended.stderr)
+    );
+    let stdout = String::from_utf8(trended.stdout).expect("utf8");
+    let header = stdout.lines().next().unwrap_or_default();
+    assert!(
+        header.contains("over 2 snapshot(s)"),
+        "both snapshots must appear: {header}"
+    );
+    assert!(
+        longest_decimal_run(header) <= 3,
+        "values must render human-friendly, not raw floats: {header}"
+    );
+
+    let unknown = ovecc(&repo, &["history", "nope"]);
+    assert_eq!(
+        unknown.status.code(),
+        Some(2),
+        "an unknown metric is a usage error"
+    );
+    assert!(
+        String::from_utf8_lossy(&unknown.stderr).contains("no history for metric 'nope'"),
+        "error must name the unknown metric"
+    );
+}
+
+fn longest_decimal_run(line: &str) -> usize {
+    let bytes = line.as_bytes();
+    let mut longest = 0;
+    for (i, byte) in bytes.iter().enumerate() {
+        if *byte == b'.' {
+            let run = bytes[i + 1..]
+                .iter()
+                .take_while(|c| c.is_ascii_digit())
+                .count();
+            longest = longest.max(run);
+        }
+    }
+    longest
+}
+
+#[test]
+fn diff_reports_added_dependencies_between_snapshots() {
+    let staged = staged_fixture("small-service");
+    let repo = staged.path().to_str().expect("utf8 path").to_string();
+    index_repo(&repo);
+
+    let notify_dir = staged.path().join("src").join("notify");
+    fs::create_dir_all(&notify_dir).expect("create notify module");
+    fs::write(
+        notify_dir.join("index.ts"),
+        "import { getUser } from \"../user/service\";\n\n\
+         export function notifyUser(id: string): string {\n\
+           return `notified-${getUser(id).id}`;\n\
+         }\n",
+    )
+    .expect("write notify module");
+    index_repo(&repo);
+
+    let diffed = ovecc(&repo, &["diff", "--format", "json"]);
+    assert_eq!(
+        diffed.status.code(),
+        Some(0),
+        "one added dependency stays under the default high threshold, stderr: {}",
+        String::from_utf8_lossy(&diffed.stderr)
+    );
+    let payload: serde_json::Value = serde_json::from_slice(&diffed.stdout).expect("diff json");
+    let data = &payload["data"];
+    assert!(
+        data["added_modules"]
+            .as_array()
+            .is_some_and(|modules| modules.iter().any(|m| m == "notify")),
+        "the new module must appear in added_modules: {data}"
+    );
+    let added = data["added_dependencies"]
+        .as_array()
+        .expect("added_dependencies array");
+    assert!(
+        added
+            .iter()
+            .any(|e| e["source_module"] == "notify" && e["target_module"] == "user"),
+        "the new notify -> user dependency must surface: {added:?}"
+    );
+    assert!(
+        added
+            .iter()
+            .all(|e| e["is_external"] == true || e["source_module"] != e["target_module"]),
+        "diff must not surface module self-edges: {added:?}"
+    );
+}
+
+#[test]
+fn init_scaffolds_config_and_preserves_user_edits() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    fs::create_dir(temp.path().join(".git")).expect("fake git dir");
+    fs::create_dir_all(temp.path().join("src")).expect("src dir");
+    fs::write(
+        temp.path().join("src").join("app.ts"),
+        "export const app = 1;\n",
+    )
+    .expect("write source");
+    let repo = temp.path().to_str().expect("utf8 path").to_string();
+
+    let first = ovecc(&repo, &["init"]);
+    assert_eq!(
+        first.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let config_path = temp.path().join(".ovecc").join("config.toml");
+    assert!(config_path.exists(), "init must write the starter config");
+    let gitignore_path = temp.path().join(".gitignore");
+    let gitignore = fs::read_to_string(&gitignore_path).expect("gitignore");
+    assert_eq!(
+        gitignore.matches(".ovecc/").count(),
+        1,
+        "init must ignore .ovecc/ exactly once: {gitignore}"
+    );
+
+    let mut config = fs::read_to_string(&config_path).expect("config");
+    config.push_str("\n# user marker\n");
+    fs::write(&config_path, &config).expect("edit config");
+
+    let second = ovecc(&repo, &["init"]);
+    assert_eq!(second.status.code(), Some(0));
+    assert!(
+        String::from_utf8_lossy(&second.stdout).contains("Already initialized"),
+        "re-init must refuse to overwrite without --force"
+    );
+    assert!(
+        fs::read_to_string(&config_path)
+            .expect("config")
+            .contains("# user marker"),
+        "re-init must not clobber an edited config"
+    );
+    let gitignore = fs::read_to_string(&gitignore_path).expect("gitignore");
+    assert_eq!(
+        gitignore.matches(".ovecc/").count(),
+        1,
+        "re-init must not duplicate the ignore entry: {gitignore}"
+    );
+
+    let indexed = ovecc(&repo, &["index", "--no-git"]);
+    assert!(
+        indexed.status.success(),
+        "the written starter config must load as valid configuration: {}",
+        String::from_utf8_lossy(&indexed.stderr)
+    );
+}
+
+#[test]
+fn ci_output_formats_parse_as_valid_json() {
+    let staged = staged_fixture("small-service");
+    let repo = staged.path().to_str().expect("utf8 path").to_string();
+    plant_banned_import_rule(staged.path());
+    index_repo(&repo);
+
+    let sarif_out = ovecc(&repo, &["violations", "--format", "sarif"]);
+    assert_eq!(
+        sarif_out.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&sarif_out.stderr)
+    );
+    let sarif: serde_json::Value = serde_json::from_slice(&sarif_out.stdout).expect("sarif json");
+    assert_eq!(sarif["version"], "2.1.0", "{sarif}");
+    let results = sarif["runs"][0]["results"]
+        .as_array()
+        .expect("sarif results array");
+    assert!(
+        results
+            .iter()
+            .any(|r| r["ruleId"] == "banned-import/no-cross-module-user-imports"),
+        "the planted finding must appear as a SARIF result: {results:?}"
+    );
+
+    let cc_out = ovecc(&repo, &["violations", "--format", "codeclimate"]);
+    assert_eq!(
+        cc_out.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&cc_out.stderr)
+    );
+    let issues: serde_json::Value =
+        serde_json::from_slice(&cc_out.stdout).expect("codeclimate json");
+    let issues = issues.as_array().expect("codeclimate issue array");
+    assert!(
+        issues
+            .iter()
+            .any(|i| i["type"] == "issue" && i["severity"] == "major"),
+        "the planted medium finding must map to a major issue: {issues:?}"
     );
 }
 
