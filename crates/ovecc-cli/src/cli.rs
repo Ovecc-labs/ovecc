@@ -822,6 +822,21 @@ pub fn run() -> Result<u8> {
             if let Some(reference) = &changed_since {
                 filter_changed_since(&mut findings, &paths.root, reference)?;
             }
+            let repository_id = paths.repository_id().0;
+            let entry_points = store
+                .metric_history(&repository_id, "deadcode_entry_points", 1)?
+                .first()
+                .map(|(_, _, _, value)| *value as usize);
+            let export_analyzable_files = store
+                .current_files(&repository_id)?
+                .iter()
+                .filter(|file| {
+                    matches!(
+                        file.language.as_str(),
+                        "javascript" | "jsx" | "typescript" | "tsx"
+                    )
+                })
+                .count();
             let report = DeadcodeReport {
                 unused_exports: findings
                     .iter()
@@ -839,6 +854,8 @@ pub fn run() -> Result<u8> {
                     .iter()
                     .filter(|f| f.kind == FindingKind::UnlistedDependency)
                     .count(),
+                entry_points,
+                export_analyzable_files,
                 findings,
             };
             render_deadcode(&report, config.output.default_format)?;
@@ -3759,7 +3776,28 @@ struct DeadcodeReport {
     unused_files: usize,
     unused_dependencies: usize,
     unlisted_dependencies: usize,
+    entry_points: Option<usize>,
+    export_analyzable_files: usize,
     findings: Vec<FindingRecord>,
+}
+
+fn deadcode_coverage_note(report: &DeadcodeReport) -> String {
+    match report.entry_points {
+        Some(0) => "analysis skipped: no entry points detected — declare a main/bin/exports \
+                    entry in the package manifest"
+            .to_string(),
+        Some(count) if report.export_analyzable_files == 0 => format!(
+            "none — file reachability checked from {count} entry point(s); unused-export \
+             analysis needs JS/TS sources and none are indexed"
+        ),
+        Some(count) => format!(
+            "none — {count} entry point(s), {} JS/TS file(s) analyzed",
+            report.export_analyzable_files
+        ),
+        None => {
+            "none — or no entry points detected; re-index to record analysis coverage".to_string()
+        }
+    }
 }
 
 fn render_deadcode(report: &DeadcodeReport, format: OutputFormat) -> Result<()> {
@@ -3783,7 +3821,7 @@ fn render_deadcode(report: &DeadcodeReport, format: OutputFormat) -> Result<()> 
             );
             println!();
             if report.findings.is_empty() {
-                println!("_No dead code detected (or no entry points)._");
+                println!("_{}_", deadcode_coverage_note(report));
             }
             for finding in &report.findings {
                 println!(
@@ -3810,7 +3848,7 @@ fn render_deadcode(report: &DeadcodeReport, format: OutputFormat) -> Result<()> 
                 }
             }
             if report.findings.is_empty() {
-                println!("  (none — or no entry points detected)");
+                println!("  ({})", deadcode_coverage_note(report));
             }
         }
     }
@@ -4414,6 +4452,27 @@ mod tests {
             line_span: 8,
             instances: Vec::new(),
         }
+    }
+
+    #[test]
+    fn deadcode_note_states_what_was_analyzed() {
+        let report = |entry_points, export_analyzable_files| DeadcodeReport {
+            unused_exports: 0,
+            unused_files: 0,
+            unused_dependencies: 0,
+            unlisted_dependencies: 0,
+            entry_points,
+            export_analyzable_files,
+            findings: Vec::new(),
+        };
+        assert!(deadcode_coverage_note(&report(Some(0), 9)).starts_with("analysis skipped"));
+        let rust_only = deadcode_coverage_note(&report(Some(3), 0));
+        assert!(rust_only.contains("3 entry point(s)"), "{rust_only}");
+        assert!(rust_only.contains("needs JS/TS sources"), "{rust_only}");
+        let covered = deadcode_coverage_note(&report(Some(2), 14));
+        assert!(covered.contains("2 entry point(s)"), "{covered}");
+        assert!(covered.contains("14 JS/TS file(s)"), "{covered}");
+        assert!(deadcode_coverage_note(&report(None, 5)).contains("re-index"));
     }
 
     #[test]

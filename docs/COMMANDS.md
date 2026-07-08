@@ -210,7 +210,11 @@ Code health: 78 high-complexity function(s), 43 oversized unit(s)
 Likely-dead code from exports + entry-point reachability: unused exports
 (type-only exports tagged `unused-type`), unreachable files, unused manifest
 dependencies (opt-in: `[index] detect_unused_deps = true`), and phantom
-(unlisted) dependencies.
+(unlisted) dependencies. When nothing is flagged the report states its
+coverage — entry points found and JS/TS files analyzed — so a clean result is
+distinguishable from an analysis that never ran (no entry points, or no JS/TS
+sources for the unused-export pass; file reachability itself is
+language-agnostic).
 
 ```
 Dead code: 47 unused export(s), 46 unused file(s), 0 unused dependency(ies), 0 unlisted dependency(ies)

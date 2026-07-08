@@ -514,6 +514,10 @@ pub fn index_repository(
         .count();
     metrics.push(("unused_exports".to_string(), unused_exports as f64));
     metrics.push(("unused_files".to_string(), unused_files as f64));
+    metrics.push((
+        "deadcode_entry_points".to_string(),
+        entry_points.len() as f64,
+    ));
     findings.extend(deadcode_findings);
 
     // Unused dependencies: packages declared in a `package.json` `dependencies`
