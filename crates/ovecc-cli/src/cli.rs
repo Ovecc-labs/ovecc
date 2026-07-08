@@ -499,7 +499,7 @@ pub fn run() -> Result<u8> {
             let paths = ProjectPaths::resolve(cli.repo.unwrap_or_else(|| PathBuf::from(".")))?;
             let config = load_config(&paths, format_override)?;
             let result = load_impact(&paths, &target, direction.into(), max_depth)?;
-            render_blast(&target, result.as_ref(), config.output.default_format)?;
+            render_blast(&result, config.output.default_format)?;
             Ok(0)
         }
         Command::Diff {
@@ -3938,11 +3938,17 @@ fn load_impact(
     target: &str,
     direction: ImpactDirection,
     max_depth: usize,
-) -> Result<Option<BlastResult>> {
+) -> Result<BlastResult> {
     let store = open_store(paths)?;
     let (nodes, edges) = load_graph(&store, &paths.repository_id().0)?;
     let Some(node) = blast::resolve_target(target, &nodes) else {
-        return Ok(None);
+        return Err(OveccError::Usage {
+            message: format!(
+                "no architecture element matches '{target}' — try a module name, a file path, \
+                 or `ovecc query \"module {target}\"` to search"
+            ),
+        }
+        .into());
     };
     // A file target carries no architectural edges of its own — dependency edges
     // are module-level — so a raw file node yields an empty (and falsely
@@ -3957,9 +3963,12 @@ fn load_impact(
     } else {
         node
     };
-    Ok(blast::blast_radius(
-        &nodes, &edges, &node.id, direction, max_depth,
-    ))
+    blast::blast_radius(&nodes, &edges, &node.id, direction, max_depth).ok_or_else(|| {
+        OveccError::Internal {
+            message: format!("resolved target '{target}' vanished from the graph view"),
+        }
+        .into()
+    })
 }
 
 /// One NDJSON line: the serialized payload with an injected `"type"` tag.
@@ -4134,36 +4143,7 @@ fn render_summary_report(report: &SummaryReport, format: OutputFormat) -> Result
     Ok(())
 }
 
-fn render_blast(target: &str, result: Option<&BlastResult>, format: OutputFormat) -> Result<()> {
-    let Some(result) = result else {
-        match format {
-            OutputFormat::Json | OutputFormat::Sarif | OutputFormat::Codeclimate => emit_json(
-                "impact",
-                &serde_json::json!({"target": target, "matched": false}),
-                meta_for("impact"),
-            )?,
-            OutputFormat::Ndjson => {
-                emit_ndjson_meta("impact", &meta_for("impact"))?;
-                println!(
-                    "{}",
-                    serde_json::to_string(
-                        &serde_json::json!({"type": "impact", "target": target, "matched": false})
-                    )?
-                );
-            }
-            OutputFormat::Markdown => {
-                println!("# Impact: {target}");
-                println!();
-                println!("No matching architecture element.");
-            }
-            OutputFormat::Text => {
-                println!("Impact: {target}");
-                println!("No matching architecture element.");
-            }
-        }
-        return Ok(());
-    };
-
+fn render_blast(result: &BlastResult, format: OutputFormat) -> Result<()> {
     match format {
         OutputFormat::Json | OutputFormat::Sarif | OutputFormat::Codeclimate => {
             emit_json("impact", result, meta_for("impact"))?

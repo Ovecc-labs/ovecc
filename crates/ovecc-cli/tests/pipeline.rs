@@ -291,6 +291,49 @@ fn report_command_produces_composite_payload() {
 /// second — a regression here crashes instead of reporting. Its own process,
 /// against a freshly indexed fixture.
 #[test]
+fn impact_distinguishes_unknown_target_from_no_impact() {
+    let staged = staged_fixture("small-service");
+    let repo = staged.path().to_str().expect("utf8 path").to_string();
+    let bin = env!("CARGO_BIN_EXE_ovecc");
+
+    let indexed = Command::new(bin)
+        .args(["--repo", &repo, "index"])
+        .output()
+        .expect("run ovecc index");
+    assert!(
+        indexed.status.success(),
+        "index failed: {}",
+        String::from_utf8_lossy(&indexed.stderr)
+    );
+
+    let hit = Command::new(bin)
+        .args(["--repo", &repo, "impact", "billing"])
+        .output()
+        .expect("run ovecc impact");
+    assert!(
+        hit.status.success(),
+        "impact on a real module failed: {}",
+        String::from_utf8_lossy(&hit.stderr)
+    );
+
+    let miss = Command::new(bin)
+        .args(["--repo", &repo, "impact", "definitely-not-a-target"])
+        .output()
+        .expect("run ovecc impact");
+    assert_eq!(
+        miss.status.code(),
+        Some(2),
+        "unknown target must exit 2, stderr: {}",
+        String::from_utf8_lossy(&miss.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&miss.stderr);
+    assert!(
+        stderr.contains("no architecture element matches 'definitely-not-a-target'"),
+        "error should name the unmatched target: {stderr}"
+    );
+}
+
+#[test]
 fn advise_reports_without_opening_the_database_twice() {
     let staged = staged_fixture("small-service");
     let repo = staged.path().to_str().expect("utf8 path").to_string();

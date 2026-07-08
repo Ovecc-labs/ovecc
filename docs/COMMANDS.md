@@ -149,7 +149,9 @@ Structured graph queries: `deps X`, `rdeps X`, `paths X`, `module X`,
 Blast radius of changing a module, symbol, `table:NAME`, or `api:<route>`: the
 impacted nodes, the paths that reach them, and a risk score. "What breaks if I
 touch this?" API labels have the form `GET /users/:id`; `api:GET:/users/:id`,
-`api:GET /users/:id`, and the substring form `api:/users` all resolve.
+`api:GET /users/:id`, and the substring form `api:/users` all resolve. A target
+that matches nothing is a usage error (exit 2), so scripts can tell a typo
+from a genuinely empty blast radius.
 
 ---
 
