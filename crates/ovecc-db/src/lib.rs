@@ -2139,8 +2139,14 @@ impl ArchitectureStore {
 
         let added_modules = difference(&head_modules, &base_modules);
         let removed_modules = difference(&base_modules, &head_modules);
-        let added_dependencies = dependency_difference(&head_dependencies, &base_dependencies);
-        let removed_dependencies = dependency_difference(&base_dependencies, &head_dependencies);
+        let added_dependencies = without_self_edges(dependency_difference(
+            &head_dependencies,
+            &base_dependencies,
+        ));
+        let removed_dependencies = without_self_edges(dependency_difference(
+            &base_dependencies,
+            &head_dependencies,
+        ));
         let risk_score = if added_dependencies.len() >= 10 {
             RiskLevel::High
         } else if !added_dependencies.is_empty() || !removed_dependencies.is_empty() {
@@ -2563,6 +2569,13 @@ fn dependency_difference(left: &[DependencyEdge], right: &[DependencyEdge]) -> V
         .collect()
 }
 
+fn without_self_edges(edges: Vec<DependencyEdge>) -> Vec<DependencyEdge> {
+    edges
+        .into_iter()
+        .filter(|edge| edge.is_external || edge.source_module != edge.target_module)
+        .collect()
+}
+
 fn dependency_key(edge: &DependencyEdge) -> (String, String, String, bool) {
     (
         edge.source_module.clone(),
@@ -2802,6 +2815,69 @@ mod tests {
         assert!(reversed.new.is_empty());
         assert_eq!(reversed.resolved.len(), 1);
         assert_eq!(reversed.resolved[0].kind, FindingKind::HardcodedSecret);
+    }
+
+    #[test]
+    fn diff_ignores_module_self_edges() {
+        let (_dir, mut store) = temp_store();
+        store.migrate_to_latest().unwrap();
+        let repo = "repo:test";
+        let billing = sample_module(repo, "billing");
+        let user = sample_module(repo, "user");
+        let modules = [billing.clone(), user.clone()];
+        let a = sample_file(repo, "src/billing/a.ts", "h1", &billing);
+        let b = sample_file(repo, "src/billing/b.ts", "h2", &billing);
+        let u = sample_file(repo, "src/user/u.ts", "h3", &user);
+        let files = [a.clone(), b.clone(), u.clone()];
+
+        store
+            .sync_current_index(
+                repo,
+                "/tmp/repo",
+                &modules,
+                &files,
+                &[],
+                "snap-base",
+                None,
+                &[],
+                &ResolvedCode::default(),
+            )
+            .unwrap();
+
+        let intra = sample_dependency(repo, &a, &b, "./b", 1);
+        let cross = sample_dependency(repo, &a, &u, "../user/u", 2);
+        store
+            .sync_current_index(
+                repo,
+                "/tmp/repo",
+                &modules,
+                &files,
+                &[intra, cross],
+                "snap-head",
+                None,
+                &[],
+                &ResolvedCode::default(),
+            )
+            .unwrap();
+
+        let diff = store.diff(repo, "snap-base", "snap-head").unwrap();
+        assert_eq!(
+            diff.added_dependencies.len(),
+            1,
+            "intra-module edge must not surface: {:?}",
+            diff.added_dependencies
+        );
+        assert_eq!(diff.added_dependencies[0].source_module, "billing");
+        assert_eq!(diff.added_dependencies[0].target_module, "user");
+
+        let reversed = store.diff(repo, "snap-head", "snap-base").unwrap();
+        assert_eq!(
+            reversed.removed_dependencies.len(),
+            1,
+            "removed side must skip self-edges too: {:?}",
+            reversed.removed_dependencies
+        );
+        assert_eq!(reversed.removed_dependencies[0].target_module, "user");
     }
 
     #[test]
