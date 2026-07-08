@@ -2202,7 +2202,7 @@ const INIT_CONFIG_TEMPLATE: &str = r#"# ovecc configuration - every key is optio
 # message = "use es-toolkit instead"
 # severity = "medium"
 
-# --- architecture diagnosis thresholds (see docs/dev/DIAGNOSE.md) ---
+# --- architecture diagnosis thresholds (see `ovecc diagnose` in docs/COMMANDS.md) ---
 # [diagnose]
 # min_confidence = 0.5
 "#;
@@ -3552,6 +3552,31 @@ fn sparkline(values: &[f64]) -> String {
         .collect()
 }
 
+/// Human-readable metric value: whole numbers stay whole, ratios round to
+/// three decimals, and values too small to survive rounding keep their raw
+/// form rather than collapsing to a misleading zero. JSON output stays raw.
+fn format_metric_value(value: f64) -> String {
+    if value == 0.0 {
+        return "0".to_string();
+    }
+    if value.fract() == 0.0 {
+        return format!("{value:.0}");
+    }
+    let rounded = format!("{value:.3}");
+    if rounded.trim_start_matches(['-', '0', '.']).is_empty() {
+        return format!("{value}");
+    }
+    rounded
+        .trim_end_matches('0')
+        .trim_end_matches('.')
+        .to_string()
+}
+
+fn format_metric_delta(delta: f64) -> String {
+    let sign = if delta < 0.0 { "-" } else { "+" };
+    format!("{sign}{}", format_metric_value(delta.abs()))
+}
+
 fn build_history_report(
     metric: &str,
     points: &[(String, Option<String>, String, f64)],
@@ -3599,8 +3624,12 @@ fn render_history(
         }
         OutputFormat::Markdown => {
             println!(
-                "# History: `{}` over {} snapshot(s) — {} -> {} ({:+})",
-                report.metric, report.snapshots, report.first, report.last, report.change
+                "# History: `{}` over {} snapshot(s) — {} -> {} ({})",
+                report.metric,
+                report.snapshots,
+                format_metric_value(report.first),
+                format_metric_value(report.last),
+                format_metric_delta(report.change)
             );
             println!();
             println!("`{}`", report.sparkline);
@@ -3616,15 +3645,19 @@ fn render_history(
                         .as_deref()
                         .map(|s| &s[..s.len().min(7)])
                         .unwrap_or("-"),
-                    point.value,
-                    point.delta.map(|d| format!("{d:+}")).unwrap_or_default()
+                    format_metric_value(point.value),
+                    point.delta.map(format_metric_delta).unwrap_or_default()
                 );
             }
         }
         OutputFormat::Text => {
             println!(
-                "History: {} over {} snapshot(s)   {} -> {} ({:+})",
-                report.metric, report.snapshots, report.first, report.last, report.change
+                "History: {} over {} snapshot(s)   {} -> {} ({})",
+                report.metric,
+                report.snapshots,
+                format_metric_value(report.first),
+                format_metric_value(report.last),
+                format_metric_delta(report.change)
             );
             println!("  {}", report.sparkline);
             for point in &report.points {
@@ -3636,8 +3669,8 @@ fn render_history(
                         .as_deref()
                         .map(|s| &s[..s.len().min(7)])
                         .unwrap_or("-"),
-                    point.value,
-                    point.delta.map(|d| format!("{d:+}")).unwrap_or_default()
+                    format_metric_value(point.value),
+                    point.delta.map(format_metric_delta).unwrap_or_default()
                 );
             }
         }
@@ -4473,6 +4506,25 @@ mod tests {
         assert!(covered.contains("2 entry point(s)"), "{covered}");
         assert!(covered.contains("14 JS/TS file(s)"), "{covered}");
         assert!(deadcode_coverage_note(&report(None, 5)).contains("re-index"));
+    }
+
+    #[test]
+    fn history_values_render_for_humans() {
+        assert_eq!(format_metric_value(11.0), "11");
+        assert_eq!(format_metric_value(0.18181818181818182), "0.182");
+        assert_eq!(format_metric_value(0.5), "0.5");
+        assert_eq!(format_metric_value(-2.25), "-2.25");
+        assert_eq!(format_metric_value(0.0001), "0.0001");
+        assert_eq!(format_metric_value(0.0), "0");
+        assert_eq!(format_metric_delta(3.0), "+3");
+        assert_eq!(format_metric_delta(-0.045454545454545456), "-0.045");
+        assert_eq!(format_metric_delta(0.0), "+0");
+    }
+
+    #[test]
+    fn init_template_references_only_existing_docs() {
+        assert!(!INIT_CONFIG_TEMPLATE.contains("DIAGNOSE.md"));
+        assert!(INIT_CONFIG_TEMPLATE.contains("docs/COMMANDS.md"));
     }
 
     #[test]
