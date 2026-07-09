@@ -45,6 +45,34 @@ pub fn relative_path(root: &Path, path: &Path) -> Result<String> {
     Ok(normalize_path(relative))
 }
 
+/// True for paths under a conventional test directory or with a test-file
+/// naming pattern (`.test.`, `.spec.`, `_test.go`, `test_*.py`, …).
+pub fn is_test_path(path: &str) -> bool {
+    const TEST_DIRS: [&str; 7] = [
+        "__tests__/",
+        "__mocks__/",
+        "test-d/",
+        "type-tests/",
+        "type-test/",
+        "tests/",
+        "test/",
+    ];
+    if TEST_DIRS
+        .iter()
+        .any(|dir| path.starts_with(dir) || path.contains(&format!("/{dir}")))
+    {
+        return true;
+    }
+    let name = path.rsplit('/').next().unwrap_or(path);
+    name.contains(".test.")
+        || name.contains(".spec.")
+        || name.ends_with(".test-d.ts")
+        || name.ends_with("_test.go")
+        || name.ends_with("_test.py")
+        || name.ends_with("_test.rs")
+        || name.starts_with("test_")
+}
+
 /// Builds a stable identifier `{prefix}:{hash}` from ordered parts.
 /// Parts are NUL-separated before hashing so `["ab","c"]` != `["a","bc"]`.
 pub fn stable_id(prefix: &str, parts: &[&str]) -> String {

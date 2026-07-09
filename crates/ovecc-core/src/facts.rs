@@ -435,6 +435,12 @@ pub enum FindingKind {
     LongFunction,
     /// A function with too many parameters.
     LongParameterList,
+    /// A function that uses another module's data more than its own.
+    FeatureEnvy,
+    /// A type that concentrates too much state and behavior.
+    LargeClass,
+    /// The same group of parameters recurring across signatures.
+    DataClumps,
     /// An `ovecc-ignore` comment that suppresses no finding — it will silently
     /// swallow the next real finding on its line.
     StaleSuppression,
@@ -504,6 +510,24 @@ impl FindingKind {
                 "reduce_parameters",
                 false,
                 "Group related parameters into a typed options object.",
+            ),
+            FindingKind::FeatureEnvy => FixSpec::new(
+                "move_function",
+                false,
+                "Move the function into the module it predominantly calls, or extract \
+                 the envious section and move that.",
+            ),
+            FindingKind::LargeClass => FixSpec::new(
+                "split_class",
+                false,
+                "Split the class along its responsibilities; extract cohesive method \
+                 groups into collaborating classes.",
+            ),
+            FindingKind::DataClumps => FixSpec::new(
+                "introduce_parameter_object",
+                false,
+                "Introduce a parameter object for the recurring group and pass it \
+                 instead of the individual values.",
             ),
             FindingKind::StaleSuppression => FixSpec::new(
                 "remove_stale_suppression",
@@ -744,6 +768,8 @@ pub struct ComplexityFact {
     pub line_count: u32,
     /// Parameter count (excludes a TypeScript `this` parameter).
     pub param_count: u8,
+    #[serde(default)]
+    pub param_names: Vec<String>,
 }
 
 /// A name a file exports. `re_export` is `Some` for `export … from './src'`.

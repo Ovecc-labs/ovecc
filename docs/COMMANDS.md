@@ -161,8 +161,9 @@ from a genuinely empty blast radius.
 
 Every architecture + rule finding: boundary violations, banned imports,
 circular dependencies, security patterns, complexity, dead code, unit size,
-with `file:line` evidence and a machine `fix` per finding. The CI artifact
-(`--format sarif` for GitHub code scanning, `codeclimate` for GitLab).
+code smells (feature envy, large classes, data clumps), with `file:line`
+evidence and a machine `fix` per finding. The CI artifact (`--format sarif`
+for GitHub code scanning, `codeclimate` for GitLab).
 
 Key flags: `--severity`, `--fail-on`, `--write-baseline` / `--baseline`
 (ratchet: only new findings fail).
@@ -280,8 +281,8 @@ review: FAIL (2 new finding(s) at or above 'any')
 ### `ovecc gate [base] [head]`
 
 The pass/fail CI verdict behind `review`: fails on new cycles, violations, or
-quality regressions (security / dead code / complexity counts). Counts only;
-use `review` for the names.
+quality regressions (security / dead code / complexity / code-smell counts).
+Counts only; use `review` for the names.
 
 ### `ovecc diff <base> <head>`
 

@@ -2776,6 +2776,7 @@ fn build_gate_report(
         ("unused_files", "unused file"),
         ("high_complexity_functions", "high-complexity function"),
         ("boundary_violations", "boundary violation"),
+        ("code_smells", "code smell"),
     ];
     let mut quality_regressed = false;
     for delta in &drift.metric_deltas {
@@ -2879,6 +2880,7 @@ struct ReviewSummary {
     new_security: usize,
     new_dead_code: usize,
     new_complexity: usize,
+    new_smells: usize,
     new_cycles: usize,
     new_duplications: usize,
     /// Findings present in base but gone in head — credit for fixes.
@@ -3000,6 +3002,11 @@ fn build_review_report(
         FindingKind::LongFunction,
         FindingKind::LongParameterList,
     ]);
+    let new_smells = count_kinds(&[
+        FindingKind::FeatureEnvy,
+        FindingKind::LargeClass,
+        FindingKind::DataClumps,
+    ]);
     let max_new_severity = new_findings.iter().map(|finding| finding.severity).max();
 
     let failed = review_crosses_threshold(
@@ -3015,6 +3022,7 @@ fn build_review_report(
         new_security,
         new_complexity,
         new_dead_code,
+        new_smells,
         &new_duplications,
     );
 
@@ -3031,6 +3039,7 @@ fn build_review_report(
             new_security,
             new_dead_code,
             new_complexity,
+            new_smells,
             new_cycles: new_cycles.len(),
             new_duplications: new_duplications.len(),
             resolved_findings: finding_diff.resolved.len(),
@@ -3082,6 +3091,7 @@ fn review_rationale(
     new_security: usize,
     new_complexity: usize,
     new_dead_code: usize,
+    new_smells: usize,
     new_duplications: &[graph::dupes::CloneFamily],
 ) -> Vec<String> {
     let mut rationale = Vec::new();
@@ -3104,6 +3114,11 @@ fn review_rationale(
     }
     if new_dead_code > 0 {
         rationale.push(format!("{new_dead_code} new dead-code finding(s)"));
+    }
+    if new_smells > 0 {
+        rationale.push(format!(
+            "{new_smells} new code smell(s) (feature envy / large class / data clumps)"
+        ));
     }
     if !new_duplications.is_empty() {
         rationale.push(format!("{} new duplication(s)", new_duplications.len()));
@@ -4620,11 +4635,11 @@ mod tests {
 
     #[test]
     fn review_rationale_is_empty_message_when_clean() {
-        let rationale = review_rationale(&[], 0, 0, 0, &[]);
+        let rationale = review_rationale(&[], 0, 0, 0, 0, &[]);
         assert_eq!(rationale.len(), 1);
         assert!(rationale[0].contains("no new defects"));
         // Populated signals are each spelled out for the verdict explanation.
-        let rationale = review_rationale(&[cycle("alpha", "beta")], 2, 1, 3, &[clone_family()]);
+        let rationale = review_rationale(&[cycle("alpha", "beta")], 2, 1, 3, 4, &[clone_family()]);
         assert!(rationale.iter().any(|r| r.contains("alpha ↔ beta")));
         assert!(rationale.iter().any(|r| r.contains("2 new security")));
         assert!(
@@ -4633,6 +4648,7 @@ mod tests {
                 .any(|r| r.contains("1 new high-complexity"))
         );
         assert!(rationale.iter().any(|r| r.contains("3 new dead-code")));
+        assert!(rationale.iter().any(|r| r.contains("4 new code smell")));
         assert!(rationale.iter().any(|r| r.contains("1 new duplication")));
     }
 }

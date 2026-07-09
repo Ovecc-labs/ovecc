@@ -41,8 +41,8 @@ const SOURCE_EXTENSIONS: &[&str] = &[
     "cpp", "cc", "cxx", "c++", "hpp", "hh", "hxx", "h++", "h", "c", "cu", "cuh",
 ];
 
-/// `(variable, type)` bindings; older entries
-/// miss and re-parse.
+// Bump when the extracted fact shape changes, so older cache entries miss and
+// re-parse instead of deserializing into wrong defaults.
 // v12: `export type { X } from` is now classified TypeOnly (was ReExport), so
 // cached facts from v11 would keep witnessing type-only cycles.
 // v13: SecurityPatternFact gains `in_test_code` (Rust inline `#[cfg(test)]`
@@ -53,7 +53,9 @@ const SOURCE_EXTENSIONS: &[&str] = &[
 // v16: inline route handlers get a synthetic symbol + attributed body facts,
 // and `setHeader("Access-Control-Allow-Origin", "*")` is now a CORS pattern;
 // cached v15 facts would keep those routes disconnected from the taint graph.
-const PARSE_CACHE_VERSION: &str = "v16";
+// v17: complexity facts gain `param_names` (data-clumps detection); cached
+// v16 facts would deserialize with empty names and silently skip clumps.
+const PARSE_CACHE_VERSION: &str = "v17";
 
 pub fn index_repository(
     paths: &ProjectPaths,
@@ -553,6 +555,47 @@ pub fn index_repository(
         unlisted_findings.len() as f64,
     ));
     findings.extend(unlisted_findings);
+
+    let module_name_by_id: HashMap<String, String> = module_records
+        .iter()
+        .map(|module| (module.id.clone(), module.name.clone()))
+        .collect();
+    let path_by_file_id: HashMap<String, String> = files
+        .iter()
+        .map(|file| (file.id.clone(), file.path.clone()))
+        .collect();
+    let clump_functions: Vec<ovecc_rules::smells::ClumpFunction> = files
+        .iter()
+        .flat_map(|file| {
+            let language = core_language(file.language);
+            file_facts
+                .get(&file.path)
+                .into_iter()
+                .flat_map(move |facts| {
+                    facts.complexity.iter().map(move |complexity| {
+                        ovecc_rules::smells::ClumpFunction {
+                            path: file.path.clone(),
+                            language,
+                            qualified_name: complexity.qualified_name.clone(),
+                            line: complexity.line,
+                            param_names: complexity.param_names.clone(),
+                        }
+                    })
+                })
+        })
+        .collect();
+    let smell_findings = ovecc_rules::smells::analyze(&ovecc_rules::smells::SmellsInput {
+        repository_id: &repository_id,
+        snapshot_id: Some(&snapshot_id),
+        symbols: &resolved.symbols,
+        calls: &resolved.calls,
+        module_names: &module_name_by_id,
+        file_paths: &path_by_file_id,
+        entry_points: &entry_points,
+        functions: &clump_functions,
+    });
+    metrics.push(("code_smells".to_string(), smell_findings.len() as f64));
+    findings.extend(smell_findings);
 
     // Security findings in test, fixture, and example files are usually test
     // data or deliberate test scaffolding (fake secrets, an `eval` under test,
@@ -2965,29 +3008,7 @@ fn is_framework_entry(path: &str) -> bool {
 /// the `__tests__`/`__mocks__` layout, `.test`/`.spec` files, and the tsd
 /// type-test conventions (`test-d/`, `type-tests/`, `*.test-d.ts`).
 fn is_test_file(path: &str) -> bool {
-    const TEST_DIRS: [&str; 7] = [
-        "__tests__/",
-        "__mocks__/",
-        "test-d/",
-        "type-tests/",
-        "type-test/",
-        "tests/", // Rust/Go/Python integration tests
-        "test/",
-    ];
-    if TEST_DIRS
-        .iter()
-        .any(|dir| path.starts_with(dir) || path.contains(&format!("/{dir}")))
-    {
-        return true;
-    }
-    let name = path.rsplit('/').next().unwrap_or(path);
-    name.contains(".test.")
-        || name.contains(".spec.")
-        || name.ends_with(".test-d.ts")
-        || name.ends_with("_test.go") // Go
-        || name.ends_with("_test.py") // Python
-        || name.ends_with("_test.rs") // Rust
-        || name.starts_with("test_") // Python / pytest
+    ovecc_core::util::is_test_path(path)
 }
 
 #[cfg(test)]

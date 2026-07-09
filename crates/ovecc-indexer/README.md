@@ -22,9 +22,10 @@ other crate. It is also the only place that converts raw `*Fact`s into normalize
    (AST-only resolution, precision over recall). Call resolution is scoped by
    language so a callee never binds across language boundaries.
 4. **Analyze** — compute snapshot metrics and conventions (`ovecc-graph`),
-   evaluate rules (`ovecc-rules`), run taint (`ovecc-dataflow`), audit
-   dependencies (`ovecc-audit`), and ingest Git history (`ovecc-git`). Findings
-   are deduplicated by id and inline-suppressed lines are dropped.
+   evaluate rules, dead code, and code smells — feature envy, large class, data
+   clumps — (`ovecc-rules`), run taint (`ovecc-dataflow`), audit dependencies
+   (`ovecc-audit`), and ingest Git history (`ovecc-git`). Findings are
+   deduplicated by id and inline-suppressed lines are dropped.
 5. **Persist** — write the snapshot, graph, and findings through `ovecc-db` in one
    transaction.
 

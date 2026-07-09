@@ -422,8 +422,8 @@ fn resolve_unique_name(
     }
 }
 
-/// Resolves a method-call callee. A `this.m()` call is resolved within
-/// the enclosing class — precise even when `m` is ambiguous repository-wide,
+/// Resolves a method-call callee. A `this.m()` (or `self.m()`) call is resolved
+/// within the enclosing class — precise even when `m` is ambiguous repository-wide,
 /// which the unique-name rule cannot do (no inheritance tracking yet). Any
 /// other receiver falls back to the unique-name rule.
 fn resolve_method_callee(
@@ -432,8 +432,8 @@ fn resolve_method_callee(
     index: &SymbolIndex,
     var_types: &HashMap<&str, &str>,
 ) -> Option<String> {
-    // `this.m()` → the enclosing class's method.
-    if call.receiver.as_deref() == Some("this")
+    // `this.m()` (or Python `self.m()`) → the enclosing class's method.
+    if matches!(call.receiver.as_deref(), Some("this") | Some("self"))
         && let Some((class, _)) = call
             .caller_qualified_name
             .as_deref()
@@ -703,6 +703,53 @@ mod tests {
             call.callee_symbol_id.as_ref().map(|id| &id.0),
             Some(&a_helper),
             "this.helper() must resolve within class A, not B"
+        );
+    }
+
+    #[test]
+    fn resolves_rust_self_call_within_enclosing_type() {
+        use ovecc_parser::GenericAdapter;
+
+        let file = SourceFile {
+            path: "s.rs".to_string(),
+            absolute_path: PathBuf::from("s.rs"),
+            language: SourceLanguage::Rust,
+            contents: "struct S;\nimpl S {\n    fn run(&self) { self.helper(); }\n    fn helper(&self) {}\n}\n\
+                       struct T;\nimpl T {\n    fn helper(&self) {}\n}\n"
+                .to_string(),
+        };
+        let facts = GenericAdapter::for_language(SourceLanguage::Rust)
+            .expect("adapter")
+            .extract(&file)
+            .expect("extraction");
+        let units = vec![ResolveUnit {
+            file_id: "f:s",
+            repository_id: "repo:test",
+            path: "s.rs",
+            module_id: "m",
+            language: SourceLanguage::Rust,
+            facts: &facts,
+            import_bindings: &[],
+        }];
+        let resolved = resolve_facts(&units);
+
+        let s_helper = resolved
+            .symbols
+            .iter()
+            .find(|s| s.qualified_name == "S.helper")
+            .unwrap()
+            .id
+            .0
+            .clone();
+        let call = resolved
+            .calls
+            .iter()
+            .find(|c| c.callee_name.as_deref() == Some("helper"))
+            .expect("the self.helper() call");
+        assert_eq!(
+            call.callee_symbol_id.as_ref().map(|id| &id.0),
+            Some(&s_helper),
+            "self.helper() must resolve inside S even though T also has helper()"
         );
     }
 

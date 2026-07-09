@@ -12,6 +12,7 @@
 //! `reads`/`writes` schema edges — are intentionally deferred and noted.
 
 pub mod deadcode;
+pub mod smells;
 
 use chrono::Utc;
 use ovecc_core::config::RulesConfig;

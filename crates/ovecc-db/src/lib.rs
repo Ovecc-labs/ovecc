@@ -2226,6 +2226,7 @@ impl ArchitectureStore {
             "max_cognitive",
             "total_cognitive",
             "high_complexity_functions",
+            "code_smells",
             "unused_exports",
             "unused_files",
         ];

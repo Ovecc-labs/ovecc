@@ -82,6 +82,7 @@ struct FunctionFrame {
     cognitive: u16,
     nesting: u16,
     params: u8,
+    param_names: Vec<String>,
 }
 
 struct OxcWalk<'s> {
@@ -158,6 +159,7 @@ impl<'s> OxcWalk<'s> {
             cognitive: 0,
             nesting: 0,
             params: count_params(params),
+            param_names: param_names(params),
         });
     }
 
@@ -172,6 +174,7 @@ impl<'s> OxcWalk<'s> {
                 cognitive: frame.cognitive,
                 line_count: end_line.saturating_sub(line) + 1,
                 param_count: frame.params,
+                param_names: frame.param_names,
             });
         }
         if !self.stack.is_empty() {
@@ -209,6 +212,22 @@ impl<'s> OxcWalk<'s> {
 fn count_params(params: &FormalParameters<'_>) -> u8 {
     let count = params.items.len() + usize::from(params.rest.is_some());
     count.min(u8::MAX as usize) as u8
+}
+
+/// Binding names of the parameters; destructuring patterns yield no name.
+fn param_names(params: &FormalParameters<'_>) -> Vec<String> {
+    let mut names: Vec<String> = params
+        .items
+        .iter()
+        .filter_map(|item| item.pattern.get_binding_identifier())
+        .map(|ident| ident.name.to_string())
+        .collect();
+    if let Some(rest) = &params.rest
+        && let Some(ident) = rest.rest.argument.get_binding_identifier()
+    {
+        names.push(ident.name.to_string());
+    }
+    names
 }
 
 /// Exported names declared by an `export <decl>` (name, is_type_only).
@@ -578,6 +597,18 @@ mod tests {
         assert!(f.cyclomatic >= 4, "cyclomatic {}", f.cyclomatic);
         assert!(f.cognitive >= 2, "cognitive {}", f.cognitive);
         assert_eq!(f.param_count, 1);
+    }
+
+    #[test]
+    fn param_names_keep_identifiers_and_defaults_but_skip_destructuring() {
+        let (_, complexity) = extract(
+            "function f(host, port = 8080, { deep }, [first], ...rest) { return host; }\n",
+            SourceLanguage::TypeScript,
+        )
+        .unwrap();
+        let f = complexity.iter().find(|c| c.qualified_name == "f").unwrap();
+        assert_eq!(f.param_names, vec!["host", "port", "rest"]);
+        assert_eq!(f.param_count, 5, "count still covers every parameter slot");
     }
 
     #[test]

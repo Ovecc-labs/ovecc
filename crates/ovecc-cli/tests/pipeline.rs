@@ -657,6 +657,91 @@ fn ci_output_formats_parse_as_valid_json() {
 }
 
 #[test]
+fn code_smell_rules_flag_envy_large_class_and_clumps() {
+    let staged = staged_fixture("smelly");
+    let repo = staged.path().to_str().expect("utf8 path").to_string();
+    index_repo(&repo);
+
+    let out = ovecc(&repo, &["violations", "--format", "json"]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let envelope: serde_json::Value = serde_json::from_slice(&out.stdout).expect("violations json");
+    let findings = envelope["data"].as_array().expect("findings array");
+    let by_rule = |rule: &str| -> Vec<&serde_json::Value> {
+        findings.iter().filter(|f| f["rule_name"] == rule).collect()
+    };
+
+    let envy = by_rule("feature-envy");
+    assert_eq!(envy.len(), 1, "{envy:#?}");
+    assert!(
+        envy[0]["title"]
+            .as_str()
+            .unwrap()
+            .contains("settleUserInvoices -> billing"),
+        "{}",
+        envy[0]["title"]
+    );
+    assert_eq!(envy[0]["target"]["kind"], "module", "{}", envy[0]["target"]);
+
+    let large = by_rule("large-class");
+    assert_eq!(large.len(), 1, "{large:#?}");
+    assert!(
+        large[0]["title"]
+            .as_str()
+            .unwrap()
+            .contains("Transport (21 methods)"),
+        "{}",
+        large[0]["title"]
+    );
+
+    let clumps = by_rule("data-clumps");
+    assert_eq!(clumps.len(), 1, "{clumps:#?}");
+    assert!(
+        clumps[0]["title"]
+            .as_str()
+            .unwrap()
+            .contains("(host, port, timeout)"),
+        "{}",
+        clumps[0]["title"]
+    );
+    assert_eq!(
+        clumps[0]["evidence"].as_array().map(Vec::len),
+        Some(3),
+        "one evidence entry per participating function"
+    );
+
+    let envious = "\nexport function summarizeUserLedger(userId: string): string {\n  \
+                   const ledger = openLedger(userId);\n  postEntry(ledger);\n  \
+                   auditTrail(ledger);\n  reconcile(ledger);\n  balance(ledger);\n  \
+                   closeLedger(ledger);\n  return ledger;\n}\n";
+    let profile = staged.path().join("src").join("user").join("profile.ts");
+    let mut source = fs::read_to_string(&profile).expect("read profile.ts");
+    source.push_str(envious);
+    fs::write(&profile, source).expect("grow profile.ts");
+    index_repo(&repo);
+
+    let review = ovecc(&repo, &["review", "--format", "json"]);
+    let envelope: serde_json::Value = serde_json::from_slice(&review.stdout).expect("review json");
+    assert_eq!(
+        envelope["data"]["summary"]["new_smells"], 1,
+        "review must scope the smell to the change: {}",
+        envelope["data"]["summary"]
+    );
+    let new_findings = envelope["data"]["new_findings"]
+        .as_array()
+        .expect("new findings");
+    assert!(
+        new_findings.iter().any(|f| f["rule_name"] == "feature-envy"
+            && f["title"].as_str().unwrap().contains("summarizeUserLedger")),
+        "the newly added envious function must be the named new finding: {new_findings:#?}"
+    );
+}
+
+#[test]
 fn advise_reports_without_opening_the_database_twice() {
     let staged = staged_fixture("small-service");
     let repo = staged.path().to_str().expect("utf8 path").to_string();

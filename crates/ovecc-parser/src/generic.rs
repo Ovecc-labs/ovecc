@@ -387,6 +387,7 @@ impl<'a> Walk<'a> {
             cognitive: cognitive.min(u16::MAX as u32) as u16,
             line_count: span.end_line.saturating_sub(span.start_line) + 1,
             param_count: self.count_params(node),
+            param_names: self.param_names(node),
         });
     }
 
@@ -416,8 +417,22 @@ impl<'a> Walk<'a> {
         }
     }
 
+    fn params_node(&self, node: Node<'a>) -> Option<Node<'a>> {
+        if let Some(params) = node.child_by_field_name("parameters") {
+            return Some(params);
+        }
+        let mut declarator = node.child_by_field_name("declarator");
+        while let Some(current) = declarator {
+            if let Some(params) = current.child_by_field_name("parameters") {
+                return Some(params);
+            }
+            declarator = current.child_by_field_name("declarator");
+        }
+        None
+    }
+
     fn count_params(&self, node: Node<'a>) -> u8 {
-        let Some(params) = node.child_by_field_name("parameters") else {
+        let Some(params) = self.params_node(node) else {
             return 0;
         };
         let mut cursor = params.walk();
@@ -426,6 +441,49 @@ impl<'a> Walk<'a> {
             .filter(|child| child.kind() != "comment")
             .count();
         count.min(u8::MAX as usize) as u8
+    }
+
+    fn param_names(&self, node: Node<'a>) -> Vec<String> {
+        let Some(params) = self.params_node(node) else {
+            return Vec::new();
+        };
+        let mut names = Vec::new();
+        let mut cursor = params.walk();
+        for child in params.named_children(&mut cursor) {
+            match child.kind() {
+                "comment" | "self_parameter" => {}
+                "identifier" => names.extend(node_text(child, self.source)),
+                "parameter" => {
+                    if let Some(pattern) = child.child_by_field_name("pattern") {
+                        names.extend(first_identifier_text(pattern, self.source));
+                    }
+                }
+                "parameter_declaration"
+                | "variadic_parameter_declaration"
+                | "optional_parameter_declaration" => {
+                    let mut name_cursor = child.walk();
+                    let named: Vec<String> = child
+                        .children_by_field_name("name", &mut name_cursor)
+                        .filter_map(|name| node_text(name, self.source))
+                        .collect();
+                    if !named.is_empty() {
+                        names.extend(named);
+                    } else if let Some(declarator) = child.child_by_field_name("declarator") {
+                        names.extend(first_identifier_text(declarator, self.source));
+                    }
+                }
+                _ => {
+                    if self.language == SourceLanguage::Python {
+                        let named = child
+                            .child_by_field_name("name")
+                            .and_then(|name| node_text(name, self.source))
+                            .or_else(|| first_identifier_text(child, self.source));
+                        names.extend(named);
+                    }
+                }
+            }
+        }
+        names
     }
 
     fn visit_type(&mut self, node: Node<'a>, kind: SymbolKind) {
@@ -1121,6 +1179,18 @@ fn node_text(node: Node<'_>, source: &[u8]) -> Option<String> {
     node.utf8_text(source).ok().map(|s| s.to_string())
 }
 
+fn first_identifier_text(node: Node<'_>, source: &[u8]) -> Option<String> {
+    if node.kind() == "identifier" {
+        return node_text(node, source);
+    }
+    let mut cursor = node.walk();
+    let children: Vec<Node<'_>> = node.named_children(&mut cursor).collect();
+    drop(cursor);
+    children
+        .into_iter()
+        .find_map(|child| first_identifier_text(child, source))
+}
+
 fn field_text(node: Node<'_>, field: &str, source: &[u8]) -> Option<String> {
     node.child_by_field_name(field)
         .and_then(|child| node_text(child, source))
@@ -1684,6 +1754,61 @@ mod tests {
         assert!(
             branchy.cognitive >= 5,
             "deep nesting must weigh: {branchy:?}"
+        );
+    }
+
+    #[test]
+    fn python_param_names_cover_plain_typed_default_and_splat_forms() {
+        let facts = extract(
+            SourceLanguage::Python,
+            "def f(self, host, port: int, timeout=5, *args, **kwargs):\n    return host\n",
+        );
+        assert_eq!(
+            complexity_of(&facts, "f").param_names,
+            vec!["self", "host", "port", "timeout", "args", "kwargs"]
+        );
+    }
+
+    #[test]
+    fn rust_param_names_take_the_pattern_and_skip_the_receiver() {
+        let facts = extract(
+            SourceLanguage::Rust,
+            "struct S;\nimpl S {\n    fn m(&self, host: &str, mut port: u16, (a, b): (u8, u8), _: u8) -> u16 { port }\n}\n",
+        );
+        assert_eq!(
+            complexity_of(&facts, "S.m").param_names,
+            vec!["host", "port", "a"],
+            "receiver skipped, mut unwrapped, tuple takes its first binding, wildcard dropped"
+        );
+    }
+
+    #[test]
+    fn go_param_names_expand_grouped_and_variadic_declarations() {
+        let facts = extract(
+            SourceLanguage::Go,
+            "package main\nfunc f(host, port string, opts ...int) string { return host }\n",
+        );
+        assert_eq!(
+            complexity_of(&facts, "f").param_names,
+            vec!["host", "port", "opts"]
+        );
+    }
+
+    #[test]
+    fn cpp_param_names_come_from_declarators_not_defaults() {
+        let facts = extract(
+            SourceLanguage::Cpp,
+            "int f(int host, char *port, int timeout = fallback) { return host; }\n",
+        );
+        let f = complexity_of(&facts, "f");
+        assert_eq!(
+            f.param_names,
+            vec!["host", "port", "timeout"],
+            "the default-value expression must not leak in"
+        );
+        assert_eq!(
+            f.param_count, 3,
+            "C++ parameters hide under the declarator chain"
         );
     }
 

@@ -455,6 +455,14 @@ pub fn metric_definitions() -> BTreeMap<String, MetaMetric> {
                 "lower is better",
             ),
         ),
+        (
+            "code_smells".to_string(),
+            metric(
+                "Structural code-smell findings: feature envy, large classes, data clumps.",
+                "[0, inf)",
+                "lower is better",
+            ),
+        ),
     ])
 }
 
@@ -557,6 +565,29 @@ pub fn rule_definitions() -> BTreeMap<String, MetaRule> {
             "long-parameter-list".to_string(),
             rule(
                 "A function with too many parameters (7 low / 10 medium).",
+                "low/medium",
+            ),
+        ),
+        (
+            "feature-envy".to_string(),
+            rule(
+                "A function whose resolved calls predominantly target one other module \
+                 (>= 5 calls, >= 3x its own-module calls, >= half of all its resolved calls).",
+                "low/medium",
+            ),
+        ),
+        (
+            "large-class".to_string(),
+            rule(
+                "A class/struct/enum with too many methods in one file (20 low / 30 medium).",
+                "low/medium",
+            ),
+        ),
+        (
+            "data-clumps".to_string(),
+            rule(
+                "The same group of >= 3 parameter names recurs across >= 3 functions; \
+                 the group wants to be a parameter object.",
                 "low/medium",
             ),
         ),

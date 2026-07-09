@@ -21,6 +21,16 @@ a module pair — so it can be defended in review.
 - **Layer rules** — the explicit `[[rules.layers]]` entries (e.g. "controllers
   cannot access tables").
 - **Circular dependencies** — module cycles surfaced from the graph.
+- **Dead code** (`deadcode` module) — entry-point reachability over the import
+  graph: unused exports, unreachable files, and re-export chains.
+- **Code smells** (`smells` module) — the classic-catalog detectors computed
+  from resolved facts at index time: *feature envy* (a function whose resolved
+  calls predominantly target one other module), *large class* (a
+  class/struct/enum with too many methods in one file), and *data clumps* (the
+  same group of ≥ 3 parameter names recurring across ≥ 3 functions of one
+  language family). Test files are excluded; feature envy also skips entry
+  points, and idiomatic signatures (`req/res/next`, `event/context/callback`)
+  never count as clumps.
 
 ## Inputs and outputs
 
