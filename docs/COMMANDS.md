@@ -322,6 +322,6 @@ comment, and gates on `fail-on`:
 ```yaml
 - uses: actions/checkout@v4
   with: { fetch-depth: 0 }
-- uses: ovecc-dev/ovecc@main
+- uses: Ovecc-labs/ovecc@main
   with: { fail-on: high }
 ```
