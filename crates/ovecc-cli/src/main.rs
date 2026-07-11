@@ -1,7 +1,9 @@
 mod cli;
+mod commands;
 mod export_graph;
 mod fix;
 mod mcp;
+mod render;
 
 use ovecc_core::error::OveccError;
 use peak_alloc::PeakAlloc;
