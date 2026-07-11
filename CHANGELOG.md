@@ -13,9 +13,11 @@ Initial public release.
 
 ### Added
 
-- Deterministic architecture index (`ovecc index`): tree-sitter + oxc parsing,
-  import/call resolution, DuckDB persistence, incremental re-index (unchanged
-  files are never re-parsed).
+- `ovecc init` to scaffold `.ovecc/config.toml`, and `ovecc index` to build the
+  model: tree-sitter + oxc parsing, import/call resolution, DuckDB persistence,
+  incremental re-index (unchanged files are never re-parsed).
+- `ovecc capabilities`: machine-readable contract listing every command, metric,
+  rule, severity, exit code, and output format.
 - Analysis commands: `summary`, `impact`, `query`, `violations`, `security`,
   `audit` (offline OSV), `hotspots`, `dupes`, `health`, `deadcode`, `fix`,
   `diagnose`, `advise`, `metrics`, `conventions`, `diff`, `drift`, `history`,
