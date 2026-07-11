@@ -46,6 +46,11 @@ fn copy_dir(source: &Path, destination: &Path) {
     fs::create_dir_all(destination).expect("create dir");
     for entry in fs::read_dir(source).expect("read fixture dir") {
         let entry = entry.expect("dir entry");
+        // Never stage a .ovecc left by running ovecc on the fixture in place:
+        // tests that assert on the unindexed state would see a database.
+        if entry.file_name() == ".ovecc" {
+            continue;
+        }
         let target = destination.join(entry.file_name());
         if entry.file_type().expect("file type").is_dir() {
             copy_dir(&entry.path(), &target);
