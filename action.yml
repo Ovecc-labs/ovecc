@@ -19,7 +19,7 @@
 #         - uses: actions/checkout@v4
 #           with:
 #             fetch-depth: 0        # review needs the base commit
-#         - uses: gitvonBS/ovecc@main
+#         - uses: ovecc/ovecc@main
 #           with:
 #             fail-on: high
 #
@@ -47,7 +47,7 @@ inputs:
     default: ""
   binary-repo:
     description: "Repository whose rolling release provides the ovecc binaries."
-    default: "gitvonBS/ovecc"
+    default: "ovecc/ovecc"
   binary-version:
     description: "Release tag to download the binary from."
     default: "latest"

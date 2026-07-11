@@ -1,0 +1,42 @@
+name: Bug report
+description: Something crashed, hung, or produced a wrong result
+labels: [bug]
+body:
+  - type: input
+    id: version
+    attributes:
+      label: ovecc version
+      description: Output of `ovecc --version`
+      placeholder: ovecc 0.1.0
+    validations:
+      required: true
+  - type: input
+    id: platform
+    attributes:
+      label: Platform
+      placeholder: Windows 11 x86_64 / Ubuntu 24.04 / macOS 15
+    validations:
+      required: true
+  - type: input
+    id: command
+    attributes:
+      label: Command
+      description: The exact command that misbehaved
+      placeholder: ovecc deadcode --format json
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: What happened, and how to reproduce it
+      description: >
+        What you expected vs what you got. If the bug depends on repository
+        content, a minimal file or repo that triggers it makes the fix much
+        faster. Paste relevant output as text, not screenshots.
+    validations:
+      required: true
+  - type: textarea
+    id: extra
+    attributes:
+      label: Anything else
+      description: Config (`.ovecc/config.toml`), repo size, language mix…
