@@ -42,16 +42,6 @@ under thirty seconds. C++ is the slowest per file because the grammar's nested
 declarators make extraction heavier; Abseil's 875 headers and sources produce
 the second-largest symbol count.
 
-## AI-assisted ("vibe-coded") repositories
-
-Small projects generated quickly with AI assistance: the workload Ovecc is
-designed to keep honest.
-
-| Repository | Lang | Files | Deps | Symbols | Findings | Risk | Time | Peak heap |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| smol-ai/developer | Python | 21 | 58 | 92 | 0 | Low | 0.36 s | 0.6 MB |
-| nutlope/roomgpt | JS/TS | 19 | 43 | 36 | 0 | Low | 0.50 s | 1.2 MB |
-
 ## Security findings on the large repositories
 
 The findings are deterministic pattern and source-to-sink detections, surfaced
