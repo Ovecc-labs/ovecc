@@ -197,6 +197,10 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          # Replace any existing release for this tag so re-cutting a version
+          # (e.g. fixing the notes before anyone has consumed it) is idempotent.
+          # Keep the tag itself — it is what triggered this run.
+          gh release delete "$GITHUB_REF_NAME" --yes 2>/dev/null || true
           gh release create "$GITHUB_REF_NAME" \
             --title "ovecc ${GITHUB_REF_NAME#v}" \
             --verify-tag \
