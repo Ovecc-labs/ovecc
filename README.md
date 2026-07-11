@@ -13,7 +13,7 @@
 
   <!-- Badges -->
   <p>
-    <a href="https://github.com/ovecc/ovecc/actions/workflows/ci.yml"><img src="https://github.com/ovecc/ovecc/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
+    <a href="https://github.com/ovecc-dev/ovecc/actions/workflows/ci.yml"><img src="https://github.com/ovecc-dev/ovecc/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
     <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache--2.0-blue?style=flat-square" alt="License" /></a>
     <a href="../../releases/latest"><img src="https://img.shields.io/badge/Release-latest-00d2b4?style=flat-square" alt="Latest release" /></a>
     <img src="https://img.shields.io/badge/Built%20with-Rust-dea584?style=flat-square&logo=rust" alt="Rust" />
