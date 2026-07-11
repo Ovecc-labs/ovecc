@@ -2570,6 +2570,9 @@ fn dependency_difference(left: &[DependencyEdge], right: &[DependencyEdge]) -> V
         .collect()
 }
 
+// Intra-module imports read as `billing -> billing` at module granularity;
+// reporting them as added/removed dependencies would make every file move
+// look like an architecture change.
 fn without_self_edges(edges: Vec<DependencyEdge>) -> Vec<DependencyEdge> {
     edges
         .into_iter()

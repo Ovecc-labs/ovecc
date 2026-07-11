@@ -20,6 +20,8 @@ Initial public release.
   `audit` (offline OSV), `hotspots`, `dupes`, `health`, `deadcode`, `fix`,
   `diagnose`, `advise`, `metrics`, `conventions`, `diff`, `drift`, `history`,
   `gate`, `review`, `report`, `explain`, `export context`, `export graph`.
+- Code-smell detectors over the resolved call graph: feature envy, large
+  class, and data clumps; counted by `gate` and named by `review`.
 - `ovecc mcp`: Model Context Protocol server over stdio exposing every command
   as an agent tool.
 - Drop-in GitHub Action (`action.yml`): indexes base and head of a PR, comments

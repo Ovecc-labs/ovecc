@@ -417,6 +417,8 @@ impl<'a> Walk<'a> {
         }
     }
 
+    // Most grammars put the list in a `parameters` field; C/C++ nest it under
+    // a chain of declarators (pointer/reference wrappers), so walk that chain.
     fn params_node(&self, node: Node<'a>) -> Option<Node<'a>> {
         if let Some(params) = node.child_by_field_name("parameters") {
             return Some(params);
@@ -443,6 +445,8 @@ impl<'a> Walk<'a> {
         count.min(u8::MAX as usize) as u8
     }
 
+    // Parameter names per grammar family; nodes without a binding name (bare
+    // types, destructuring) contribute nothing rather than a wrong guess.
     fn param_names(&self, node: Node<'a>) -> Vec<String> {
         let Some(params) = self.params_node(node) else {
             return Vec::new();
@@ -452,12 +456,16 @@ impl<'a> Walk<'a> {
         for child in params.named_children(&mut cursor) {
             match child.kind() {
                 "comment" | "self_parameter" => {}
+                // Python/Go plain params sit directly as identifiers.
                 "identifier" => names.extend(node_text(child, self.source)),
+                // Rust: the name is the pattern side of `pattern: Type`.
                 "parameter" => {
                     if let Some(pattern) = child.child_by_field_name("pattern") {
                         names.extend(first_identifier_text(pattern, self.source));
                     }
                 }
+                // C/C++: named field when present, otherwise buried in the
+                // declarator (pointers, references, arrays).
                 "parameter_declaration"
                 | "variadic_parameter_declaration"
                 | "optional_parameter_declaration" => {
@@ -472,6 +480,8 @@ impl<'a> Walk<'a> {
                         names.extend(first_identifier_text(declarator, self.source));
                     }
                 }
+                // Python's typed/default/splat parameter kinds all carry a
+                // `name` field (or lead with the identifier).
                 _ => {
                     if self.language == SourceLanguage::Python {
                         let named = child
@@ -1179,6 +1189,7 @@ fn node_text(node: Node<'_>, source: &[u8]) -> Option<String> {
     node.utf8_text(source).ok().map(|s| s.to_string())
 }
 
+/// Depth-first: the first `identifier` at or below `node`.
 fn first_identifier_text(node: Node<'_>, source: &[u8]) -> Option<String> {
     if node.kind() == "identifier" {
         return node_text(node, source);

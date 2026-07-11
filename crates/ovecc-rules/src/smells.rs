@@ -1,3 +1,13 @@
+//! Code-smell detectors over the resolved symbol/call model: feature envy,
+//! large class, and data clumps (Fowler's catalog, the subset a dependency
+//! graph can witness without type information).
+//!
+//! Same contract as every other analyzer: deterministic output (sorted, id-safe
+//! across runs), only resolved calls count as evidence, and test files are
+//! exempt — test helpers legitimately reach across modules and take wide
+//! parameter lists. Thresholds are deliberately conservative: a smell that
+//! fires on idiomatic code trains people to ignore the rule.
+
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use chrono::Utc;
@@ -9,6 +19,8 @@ use ovecc_core::id::{FindingId, RepositoryId, SnapshotId};
 use ovecc_core::lang::SourceLanguage;
 use ovecc_core::util::is_test_path;
 
+// Envy fires when a function makes >= MIN foreign calls into one module, at
+// least OWN_RATIO x its own-module calls, and that module gets half its total.
 const ENVY_MIN_FOREIGN_CALLS: usize = 5;
 const ENVY_OWN_RATIO: usize = 3;
 const ENVY_MEDIUM_FOREIGN_CALLS: usize = 10;
@@ -20,11 +32,15 @@ const CLUMP_MIN_NAMES: usize = 3;
 const CLUMP_MIN_FUNCTIONS: usize = 3;
 const CLUMP_MEDIUM_NAMES: usize = 4;
 const CLUMP_MEDIUM_FUNCTIONS: usize = 4;
+// Triple enumeration is C(n,3); cap n so a mega-signature can't blow it up.
 const CLUMP_MAX_NAMES_PER_FUNCTION: usize = 12;
 const MAX_EVIDENCE: usize = 20;
 
+// Receiver conventions carry no data; they never count toward a clump.
 const RECEIVER_NAMES: [&str; 3] = ["self", "cls", "this"];
 
+// Framework signatures every codebase repeats (Express middleware, Node
+// callbacks, AWS handlers). Recurring by design, not a clump.
 const IDIOMATIC_GROUPS: [&[&str]; 4] = [
     &["err", "next", "req", "res"],
     &["error", "next", "req", "res"],
@@ -32,6 +48,8 @@ const IDIOMATIC_GROUPS: [&[&str]; 4] = [
     &["callback", "context", "event"],
 ];
 
+/// One function signature as the data-clumps detector sees it: just the
+/// parameter names, with enough location to point the finding somewhere.
 pub struct ClumpFunction {
     pub path: String,
     pub language: SourceLanguage,
@@ -51,6 +69,8 @@ pub struct SmellsInput<'a> {
     pub functions: &'a [ClumpFunction],
 }
 
+/// Runs every smell detector and returns the findings sorted by id, so the
+/// output (and therefore the persisted snapshot) is byte-stable across runs.
 pub fn analyze(input: &SmellsInput<'_>) -> Vec<FindingRecord> {
     let mut findings = feature_envy(input);
     findings.extend(large_class(input));
@@ -87,6 +107,10 @@ fn finding(
     }
 }
 
+/// A function that talks to one foreign module far more than to its own is
+/// probably in the wrong place. Entry points are exempt (dispatching outward
+/// is their job), and only resolved calls count — unresolved names would turn
+/// every dynamic-dispatch-heavy file into a false positive.
 fn feature_envy(input: &SmellsInput<'_>) -> Vec<FindingRecord> {
     let symbol_by_id: HashMap<&str, &SymbolRecord> = input
         .symbols
@@ -134,6 +158,8 @@ fn feature_envy(input: &SmellsInput<'_>) -> Vec<FindingRecord> {
 
         let total: usize = counts.values().sum();
         let own = counts.get(own_module.0.as_str()).copied().unwrap_or(0);
+        // Deterministic winner on a count tie: highest count, then the
+        // alphabetically first module name (hence the Reverse under max).
         let top_foreign = counts
             .iter()
             .filter(|(module, _)| **module != own_module.0.as_str())
@@ -202,6 +228,9 @@ fn feature_envy(input: &SmellsInput<'_>) -> Vec<FindingRecord> {
     findings
 }
 
+/// A type with too many methods concentrates too many reasons to change.
+/// Methods are attributed by `(file, owner)` from the qualified name, so
+/// same-named types in different files stay separate.
 fn large_class(input: &SmellsInput<'_>) -> Vec<FindingRecord> {
     let mut methods: HashMap<(&str, &str), (usize, u64)> = HashMap::new();
     for symbol in input.symbols {
@@ -287,6 +316,8 @@ fn large_class(input: &SmellsInput<'_>) -> Vec<FindingRecord> {
     findings
 }
 
+// JS and TS share naming conventions, so their clumps live in one namespace;
+// other languages never clump across a language boundary.
 fn language_family(language: SourceLanguage) -> &'static str {
     if language.is_js_family() {
         "js"
@@ -302,6 +333,12 @@ struct ClumpSite<'a> {
     names: Vec<&'a str>,
 }
 
+/// The same parameter names traveling together through several signatures are
+/// an object waiting to be extracted. Detection: normalize each function's
+/// parameter names, enumerate every 3-name combination, and report a group
+/// when at least CLUMP_MIN_FUNCTIONS functions share it. Name-based on
+/// purpose — no type information exists at this layer, and names are the
+/// convention a team actually repeats.
 fn data_clumps(input: &SmellsInput<'_>) -> Vec<FindingRecord> {
     let mut sites: Vec<(&'static str, ClumpSite<'_>)> = Vec::new();
     for function in input.functions {
@@ -334,9 +371,12 @@ fn data_clumps(input: &SmellsInput<'_>) -> Vec<FindingRecord> {
         (a.1.path, a.1.line, a.1.qualified_name).cmp(&(b.1.path, b.1.line, b.1.qualified_name))
     });
 
+    // Overloads and re-exported declarations show up as several sites with the
+    // same name and signature; counting them again would inflate the clump.
     let mut seen: HashSet<(&str, &str, Vec<&str>)> = HashSet::new();
     sites.retain(|(family, site)| seen.insert((family, site.qualified_name, site.names.clone())));
 
+    // triple -> the functions whose signature contains it.
     let mut triples: BTreeMap<(&str, [&str; 3]), BTreeSet<usize>> = BTreeMap::new();
     for (index, (family, site)) in sites.iter().enumerate() {
         let names = &site.names;
@@ -352,6 +392,9 @@ fn data_clumps(input: &SmellsInput<'_>) -> Vec<FindingRecord> {
         }
     }
 
+    // Triples shared by the same set of functions are one clump: merging them
+    // rebuilds the widest recurring group (a 4-name clump would otherwise be
+    // reported as four separate triples).
     let mut clumps: BTreeMap<(&str, Vec<usize>), BTreeSet<&str>> = BTreeMap::new();
     for ((family, names), members) in &triples {
         if members.len() < CLUMP_MIN_FUNCTIONS {
