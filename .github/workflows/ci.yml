@@ -8,8 +8,13 @@
 #   Swatinem/rust-cache, so only the first run per OS pays the full ~15-20 min;
 #   later runs are minutes.
 # - `release` runs only on push to `main` (or manual dispatch from main). It
-#   recreates a rolling "latest" GitHub Release with both binaries attached, so
-#   the newest Linux and Windows builds are always downloadable.
+#   recreates a rolling "latest" pre-release with both binaries attached, so
+#   the newest Linux and Windows dev builds are always downloadable.
+# - `release-version` runs on `v*` tags. It checks the tag against the
+#   workspace version, takes that version's CHANGELOG section as the notes,
+#   and publishes the versioned release — the one `/releases/latest` serves.
+#   Cutting a release is: bump the version in Cargo.toml, move the Unreleased
+#   changelog entries under the new heading, tag `vX.Y.Z`, push the tag.
 #
 # Windows uses the GNU (MinGW-w64) toolchain — the supported path per
 # docs/dev/SETUP.md. We install the gnu host toolchain and MSYS2's gcc so
@@ -21,6 +26,7 @@ name: CI
 on:
   push:
     branches: [mvp, main]
+    tags: ["v*"]
   pull_request:
   workflow_dispatch:
 
@@ -143,11 +149,57 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           # Drop the previous rolling release and its tag (ignore if absent),
-          # then recreate it at this commit with the new assets.
+          # then recreate it at this commit with the new assets. Marked
+          # pre-release so /releases/latest keeps serving the tagged versions.
           gh release delete latest --yes --cleanup-tag 2>/dev/null || true
           gh release create latest \
-            --title "Latest build (${GITHUB_SHA::7})" \
-            --notes "Rolling build from \`${GITHUB_SHA}\` — Linux + Windows x86_64 binaries." \
+            --title "Rolling build (${GITHUB_SHA::7})" \
+            --notes "Dev build from \`${GITHUB_SHA}\` — Linux + Windows x86_64 binaries. For the supported build, use the newest versioned release." \
             --target "${GITHUB_SHA}" \
+            --prerelease \
+            dist/*
+
+  release-version:
+    name: Publish tagged release
+    needs: [lint, build-test]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check the tag against the workspace version
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          grep -q "^version = \"${version}\"$" Cargo.toml || {
+            echo "${GITHUB_REF_NAME} does not match the workspace version in Cargo.toml" >&2
+            exit 1
+          }
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Take this version's CHANGELOG section as the notes
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          awk -v ver="$version" '
+            $0 ~ "^## \\[" ver "\\]" { in_section = 1; next }
+            /^## \[/ { in_section = 0 }
+            in_section' CHANGELOG.md > notes.md
+          test -s notes.md || echo "See CHANGELOG.md." > notes.md
+
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --title "ovecc ${GITHUB_REF_NAME#v}" \
+            --verify-tag \
+            --notes-file notes.md \
             --latest \
             dist/*

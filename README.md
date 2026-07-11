@@ -52,11 +52,12 @@ real repositories is in [docs/benchmark/BENCHMARKS.md](docs/benchmark/BENCHMARKS
 
 ## Install
 
-Grab a prebuilt binary from the rolling
-[**latest** release](../../releases/latest): CI publishes fresh Linux and
-Windows x86_64 builds on every push to `main`. Drop it on your `PATH` and run
-`ovecc index .`; there is nothing else to install (DuckDB is bundled, no
-runtime, fully offline).
+Grab a prebuilt binary from the
+[**latest** release](../../releases/latest) (Linux and Windows x86_64). Drop it
+on your `PATH` and run `ovecc index .`; there is nothing else to install
+(DuckDB is bundled, no runtime, fully offline). A rolling
+[dev build](../../releases/tag/latest) is also published on every push to
+`main`.
 
 ### Build from source
 
