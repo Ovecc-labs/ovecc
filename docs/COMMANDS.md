@@ -173,7 +173,7 @@ Key flags: `--severity`, `--fail-on`, `--write-baseline` / `--baseline`
 The security slice: hardcoded secrets (provider patterns + entropy), dynamic
 eval, command execution, weak crypto, permissive CORS (both the middleware
 `origin: "*"` form and raw `setHeader("Access-Control-Allow-Origin", "*")`),
-and tainted source→sink flows (HTTP route → SQL/eval/exec — named *and*
+and tainted source→sink flows (HTTP route → SQL/eval/exec, for named *and*
 inline arrow handlers, with `file:line` evidence for the sink and the route).
 Deterministic, offline, no LLM. Findings in test code (test dirs *and* Rust
 inline `#[cfg(test)]`) are down-ranked to Low, not hidden.
@@ -214,7 +214,7 @@ Likely-dead code from exports + entry-point reachability: unused exports
 (type-only exports tagged `unused-type`), unreachable files, unused manifest
 dependencies (opt-in: `[index] detect_unused_deps = true`), and phantom
 (unlisted) dependencies. When nothing is flagged the report states its
-coverage — entry points found and JS/TS files analyzed — so a clean result is
+coverage (entry points found, JS/TS files analyzed), so a clean result is
 distinguishable from an analysis that never ran (no entry points, or no JS/TS
 sources for the unused-export pass; file reachability itself is
 language-agnostic).

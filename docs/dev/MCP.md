@@ -35,7 +35,7 @@ thin wrapper that re-invokes the same `ovecc` binary for each tool call
 
 - A built `target/release/ovecc.exe`; see [SETUP.md](./SETUP.md).
 - An MCP client (Claude Code, Claude Desktop, Cursor, or any MCP-capable agent).
-- The target repository you want analyzed (TS/JS is the MVP focus).
+- The target repository you want analyzed.
 
 ---
 
@@ -181,7 +181,7 @@ All 27 tools (every one takes an optional `repo`; `*` marks required arguments):
    `ovecc_health`: specific findings.
 5. `ovecc_impact` / `ovecc_query`: reason about blast radius and dependencies.
 
-**Detect what a change introduced (the MVP regression loop):**
+**Detect what a change introduced (the regression loop):**
 
 1. `ovecc_index` on the base ref → produces a snapshot.
 2. Make the change, `ovecc_index` again → second snapshot.

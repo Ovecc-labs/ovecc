@@ -28,7 +28,7 @@ deliberately small. Reports are especially welcome for:
 - flaws in `ovecc audit`'s advisory matching that hide known vulnerabilities.
 
 Findings *about your own code* that ovecc reports (or misses) are product
-feedback, not vulnerabilities — please open a regular issue for those.
+feedback, not vulnerabilities; please open a regular issue for those.
 
 ## Supported versions
 

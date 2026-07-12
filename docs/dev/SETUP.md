@@ -102,7 +102,7 @@ The binary is `ovecc` (from `crates/ovecc-cli`).
 - **`ring` build script fails ("Compiler family detection failed") from a Git-Bash/MSYS
   shell?** The `ring` crate (pulled in by the HTTPS client behind `audit --fetch`) probes
   the C compiler in a way that breaks under some MSYS/Git-Bash environments even when
-  `gcc` itself works there. Build from **PowerShell or cmd** instead — the same
+  `gcc` itself works there. Build from **PowerShell or cmd** instead: the same
   `cargo build --release` succeeds. Also note that piping cargo output (e.g.
   `cargo build 2>&1 | tail`) can mask the real exit code in some shells; check
   `$LASTEXITCODE` (PowerShell) explicitly.

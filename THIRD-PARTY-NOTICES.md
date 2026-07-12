@@ -20,7 +20,7 @@ Adapted or ported (verbatim or lightly-modified) into Ovecc:
 | `crates/ovecc-core/src/capabilities.rs` | The self-describing capability-manifest pattern (single source of truth for the `capabilities` command and per-command `meta`), modeled on `crates/types/src/mcp_manifest.rs` and the `Meta` shapes. |
 | `crates/ovecc-graph/src/dupes.rs` | Clone-family detection: normalized k-gram fingerprint grouping + region merging, adapted from fallow's `core/src/duplicates/` engine (SA-IS/LCP detector, the rolling-fingerprint alternative, and the family/instance/stat shapes). |
 | `crates/ovecc-parser/src/tokenize.rs` | The duplication tokenizer/normalizer (identifier and literal bucketing), re-implemented on tree-sitter from fallow's `core/src/duplicates/tokenize` + `normalize`. |
-| `crates/ovecc-indexer/src/lib.rs` (oxc_resolver helpers) | The oxc_resolver-backed JS/TS module resolution — resolver options (extensions, `extension_alias`, condition names, tsconfig auto-discovery), the tsconfig-error retry, and the resolve→repo-relative mapping — adapted from fallow's `crates/graph/src/resolve/specifier.rs`. |
+| `crates/ovecc-indexer/src/imports.rs` | The oxc_resolver-backed JS/TS module resolution (resolver options: extensions, `extension_alias`, condition names, tsconfig auto-discovery; the tsconfig-error retry; the resolve→repo-relative mapping), adapted from fallow's `crates/graph/src/resolve/specifier.rs`. |
 | `crates/ovecc-parser/src/oxc_extractor.rs` | The oxc-based TS/JS semantic extractor: file exports (with re-export provenance) and per-function McCabe cyclomatic + SonarSource cognitive complexity, ported from fallow's `crates/extract/src/{parse.rs, complexity.rs, visitor/visit_impl.rs, visitor/declarations.rs}` and `crates/types/src/extract.rs`. |
 | `crates/ovecc-rules/src/deadcode.rs` | Dead-code analysis (unused exports/files): entry-point reachability BFS, per-export reference sets, and the unused-export/unused-file predicates, ported from fallow's `crates/graph/src/graph/{reachability.rs, re_exports}` and `crates/core/src/analyze/{unused_exports.rs, unused_files.rs}`. |
 
@@ -61,12 +61,12 @@ SOFTWARE.
 Ovecc links a number of Rust crates (see `Cargo.toml` and `Cargo.lock`), each
 under its own license (predominantly MIT or Apache-2.0). Notable ones:
 
-- **DuckDB** (`duckdb`, bundled) — MIT License.
+- **DuckDB** (`duckdb`, bundled): MIT License.
 - **oxc** (`oxc_resolver`, and the `oxc_parser`/`oxc_ast`/`oxc_semantic`/`oxc_span`
-  stack where used for the TS/JS extractor) — MIT License. Pure-Rust, offline.
-- **tree-sitter** and the grammar crates — MIT License.
+  stack where used for the TS/JS extractor): MIT License. Pure-Rust, offline.
+- **tree-sitter** and the grammar crates: MIT License.
 - **petgraph**, **serde**, **clap**, **chrono**, **rayon**, **gix**, **ignore**,
-  **globset**, **toml**, **anyhow**, **thiserror**, **sha2**, **semver** —
+  **globset**, **toml**, **anyhow**, **thiserror**, **sha2**, **semver**:
   MIT or Apache-2.0.
 
 For the authoritative, complete list of dependency licenses, run:
