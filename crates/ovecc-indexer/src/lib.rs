@@ -18,10 +18,10 @@ use discover::{discover_source_files, infer_module_name, infer_module_prefix, la
 use entrypoints::{detect_entry_points, is_standalone_entry, is_test_file};
 use hygiene::{detect_unlisted_dependencies, detect_unused_dependencies, external_package_root};
 use imports::resolve_dependencies;
-use ovecc_core::config::{ArchitectureConfig, OveccConfig, ProjectPaths};
+use ovecc_core::config::{ArchitectureConfig, OveccConfig, ProjectPaths, RulesConfig};
 use ovecc_core::facts::{
     ChangeKind, CommitRecord, ComplexityRecord, ExportRecord, FileChangeRecord, FileFacts,
-    FindingKind, ImportFactKind, ParseFailure, SourceFile,
+    FindingKind, FindingRecord, ImportFactKind, ParseFailure, SecurityPatternFact, SourceFile,
 };
 use ovecc_core::id::{CommitId, ComplexityId, ExportId, FileChangeId, FileId, RepositoryId};
 use ovecc_core::legacy::{
@@ -34,7 +34,7 @@ use ovecc_db::{ArchitectureStore, ResolvedCode};
 use ovecc_parser::{GenericAdapter, TypeScriptAdapter};
 use rayon::prelude::*;
 use resolve::{ImportBinding, ResolveUnit};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 // Bump when the extracted fact shape changes, so older cache entries miss and
@@ -99,71 +99,191 @@ pub fn index_repository(
         .collect();
     phase(&mut timings.parse_ms);
 
-    let mut files = Vec::new();
-    let mut modules = BTreeMap::<String, ModuleRecord>::new();
-    let mut parsed_imports = HashMap::<String, Vec<ImportFact>>::new();
-    let mut file_facts = HashMap::<String, FileFacts>::new();
-    let mut parse_failures = Vec::new();
-    let mut files_parsed = 0_usize;
-    let mut files_from_cache = 0_usize;
+    let parsed = collect_processed(
+        processed,
+        &previous_dependencies,
+        &repository_id,
+        &config.architecture,
+    );
+    let dependencies = resolve_dependencies(
+        paths,
+        &repository_id,
+        &parsed.files,
+        &parsed.by_path,
+        &parsed.parsed_imports,
+    );
+    let resolved = resolve_code_facts(&repository_id, &parsed, &dependencies);
+    phase(&mut timings.resolve_ms);
 
+    let snapshot_id = new_snapshot_id(&repository_id);
+    let module_records: Vec<ModuleRecord> = parsed.modules.values().cloned().collect();
+    let mut metrics = compute_snapshot_metrics(&module_records, &parsed, &resolved, &dependencies);
+    let (commit_sha, commits_ingested) = git_metrics(
+        &mut store,
+        &repository_id,
+        &paths.root,
+        skip_git,
+        &mut metrics,
+    )?;
+
+    let entry_points = detect_entry_points(&paths.root, &parsed.files);
+    let input = AnalysisInput {
+        repository_id: &repository_id,
+        snapshot_id: &snapshot_id,
+        parsed: &parsed,
+        dependencies: &dependencies,
+        resolved: &resolved,
+        entry_points: &entry_points,
+    };
+    let (mut findings, security_patterns) = evaluate_rules(&input, &config.rules);
+    findings.extend(taint_findings(&input));
+    findings.extend(audit_findings(&mut store, paths, &input)?);
+    findings.extend(complexity_findings(&input, &mut metrics));
+    findings.extend(deadcode_findings(&input, &mut metrics));
+    findings.extend(hygiene_findings(
+        &paths.root,
+        &input,
+        config.index.detect_unused_deps,
+        &mut metrics,
+    ));
+    findings.extend(smell_findings(&input, &mut metrics));
+    downrank_test_security(&mut findings, &security_patterns);
+    apply_suppressions(&mut findings, &input, &mut metrics);
+    finalize_findings(&mut findings, &mut metrics);
+
+    let external_dependencies = dependencies
+        .iter()
+        .filter(|dependency| dependency.is_external)
+        .count();
+    let (schema_edges, complexity_records, export_records) = build_code_records(&input);
+    let code = ResolvedCode {
+        symbols: &resolved.symbols,
+        calls: &resolved.calls,
+        apis: &resolved.apis,
+        schema_objects: &resolved.schema_objects,
+        schema_edges: &schema_edges,
+        complexity: &complexity_records,
+        exports: &export_records,
+    };
+    phase(&mut timings.analyze_ms);
+    store.sync_current_index(
+        &repository_id,
+        &paths.root_display(),
+        &module_records,
+        &parsed.files,
+        &dependencies,
+        &snapshot_id,
+        commit_sha.as_deref(),
+        &metrics,
+        &code,
+    )?;
+    store.replace_findings(&repository_id, &findings)?;
+    phase(&mut timings.persist_ms);
+    timings.total_ms = run_start.elapsed().as_millis() as u64;
+
+    Ok(IndexReport {
+        repository_root: paths.root_display(),
+        database_path: ovecc_core::util::normalize_path(&paths.db_path),
+        snapshot_id,
+        files_scanned: source_files.len(),
+        files_indexed: parsed.files.len(),
+        files_parsed: parsed.files_parsed,
+        files_from_cache: parsed.files_from_cache,
+        modules: parsed.modules.len(),
+        dependencies: dependencies.len(),
+        external_dependencies,
+        symbols: resolved.symbols.len(),
+        calls: resolved.calls.len(),
+        apis: resolved.apis.len(),
+        tables: resolved.schema_objects.len(),
+        commits_ingested,
+        parse_failures: parsed.parse_failures,
+        timings,
+    })
+}
+
+/// The per-file parse outcomes folded into the index's working set: file and
+/// module records, retained imports, and grammar-level facts.
+struct ParsedFiles {
+    files: Vec<FileRecord>,
+    by_path: HashMap<String, FileRecord>,
+    modules: BTreeMap<String, ModuleRecord>,
+    parsed_imports: HashMap<String, Vec<ImportFact>>,
+    file_facts: HashMap<String, FileFacts>,
+    parse_failures: Vec<IndexFailure>,
+    files_parsed: usize,
+    files_from_cache: usize,
+}
+
+fn collect_processed(
+    processed: Vec<ProcessedFile>,
+    previous_dependencies: &[DependencyRecord],
+    repository_id: &str,
+    architecture: &ArchitectureConfig,
+) -> ParsedFiles {
+    let mut parsed = ParsedFiles {
+        files: Vec::new(),
+        by_path: HashMap::new(),
+        modules: BTreeMap::new(),
+        parsed_imports: HashMap::new(),
+        file_facts: HashMap::new(),
+        parse_failures: Vec::new(),
+        files_parsed: 0,
+        files_from_cache: 0,
+    };
     for outcome in processed {
         let parse_failed = outcome.failure.is_some() && outcome.file.is_some();
         if let Some(failure) = outcome.failure {
-            parse_failures.push(failure);
+            parsed.parse_failures.push(failure);
         }
         let Some(file) = outcome.file else {
             // Unreadable file: reported above, treated as absent.
             continue;
         };
         if outcome.parsed {
-            files_parsed += 1;
+            parsed.files_parsed += 1;
         }
         if outcome.from_cache {
-            files_from_cache += 1;
+            parsed.files_from_cache += 1;
         }
 
-        modules
+        parsed
+            .modules
             .entry(file.module_name.clone())
             .or_insert_with(|| ModuleRecord {
                 id: file.module_id.clone(),
-                repository_id: repository_id.clone(),
+                repository_id: repository_id.to_string(),
                 name: file.module_name.clone(),
-                path_prefix: infer_module_prefix(&file.path, &config.architecture),
+                path_prefix: infer_module_prefix(&file.path, architecture),
             });
 
         let imports = if parse_failed {
             // Do not pretend the file suddenly has zero dependencies.
-            retained_imports(&previous_dependencies, &file.path)
+            retained_imports(previous_dependencies, &file.path)
         } else {
             outcome.imports
         };
-        parsed_imports.insert(file.path.clone(), imports);
+        parsed.parsed_imports.insert(file.path.clone(), imports);
         // On parse failure `facts` is empty; code-level retention across a
         // failed re-parse is a later refinement (the module graph is retained
         // via `parsed_imports` above).
-        file_facts.insert(file.path.clone(), outcome.facts);
-        files.push(file);
+        parsed.file_facts.insert(file.path.clone(), outcome.facts);
+        parsed.by_path.insert(file.path.clone(), file.clone());
+        parsed.files.push(file);
     }
+    parsed
+}
 
-    let file_by_path: HashMap<String, FileRecord> = files
-        .iter()
-        .map(|file| (file.path.clone(), file.clone()))
-        .collect();
-
-    let dependencies = resolve_dependencies(
-        paths,
-        &repository_id,
-        &files,
-        &file_by_path,
-        &parsed_imports,
-    );
-
-    // Code-fact resolution: build per-file import bindings, then resolve
-    // grammar-level facts into typed records with a linked call graph.
-    // Bindings reuse the already-resolved dependency edges (oxc_resolver), so
-    // calls through aliased (`@/x`) and monorepo (`@scope/pkg`) imports link,
-    // not just relative ones.
+/// Code-fact resolution: build per-file import bindings, then resolve
+/// grammar-level facts into typed records with a linked call graph. Bindings
+/// reuse the already-resolved dependency edges (oxc_resolver), so calls
+/// through aliased (`@/x`) and monorepo (`@scope/pkg`) imports link, not just
+/// relative ones.
+fn resolve_code_facts(
+    repository_id: &str,
+    parsed: &ParsedFiles,
+    dependencies: &[DependencyRecord],
+) -> resolve::ResolvedFacts {
     let resolved_targets: HashMap<(String, String), String> = dependencies
         .iter()
         .filter(|dependency| !dependency.is_external)
@@ -178,27 +298,30 @@ pub fn index_repository(
             ))
         })
         .collect();
-    let bindings_by_path: HashMap<String, Vec<ImportBinding>> = files
+    let bindings_by_path: HashMap<String, Vec<ImportBinding>> = parsed
+        .files
         .iter()
         .map(|file| {
-            let bindings = file_facts
+            let bindings = parsed
+                .file_facts
                 .get(&file.path)
                 .map(|facts| build_import_bindings(file, facts, &resolved_targets))
                 .unwrap_or_default();
             (file.path.clone(), bindings)
         })
         .collect();
-    let units: Vec<ResolveUnit<'_>> = files
+    let units: Vec<ResolveUnit<'_>> = parsed
+        .files
         .iter()
         .filter_map(|file| {
-            let facts = file_facts.get(&file.path)?;
+            let facts = parsed.file_facts.get(&file.path)?;
             let bindings = bindings_by_path
                 .get(&file.path)
                 .map(|b| b.as_slice())
                 .unwrap_or(&[]);
             Some(ResolveUnit {
                 file_id: file.id.as_str(),
-                repository_id: repository_id.as_str(),
+                repository_id,
                 path: file.path.as_str(),
                 module_id: file.module_id.as_str(),
                 language: core_language(file.language),
@@ -207,33 +330,35 @@ pub fn index_repository(
             })
         })
         .collect();
-    let resolved = resolve::resolve_facts(&units);
-    phase(&mut timings.resolve_ms);
-    let snapshot_id = stable_id(
+    resolve::resolve_facts(&units)
+}
+
+fn new_snapshot_id(repository_id: &str) -> String {
+    stable_id(
         "snapshot",
         &[
-            &repository_id,
+            repository_id,
             &Utc::now()
                 .timestamp_nanos_opt()
                 .unwrap_or_default()
                 .to_string(),
         ],
-    );
+    )
+}
 
-    let module_records: Vec<ModuleRecord> = modules.values().cloned().collect();
-    let mut metrics = compute_snapshot_metrics(&module_records, &files, &dependencies);
-    // Surface parser failures and code-fact counts in the metrics.
-    metrics.push(("parse_failures".to_string(), parse_failures.len() as f64));
-    metrics.push(("symbols".to_string(), resolved.symbols.len() as f64));
-    metrics.push(("calls".to_string(), resolved.calls.len() as f64));
-    metrics.push(("apis".to_string(), resolved.apis.len() as f64));
-    metrics.push(("tables".to_string(), resolved.schema_objects.len() as f64));
-    // Native Git ingestion (replaces the `git rev-parse` shell-out): pull
-    // recent commits + changed files, persist them, and derive ownership.
+/// Native Git ingestion: pull recent commits + changed files, persist them,
+/// and derive the ownership metrics.
+fn git_metrics(
+    store: &mut ArchitectureStore,
+    repository_id: &str,
+    root: &Path,
+    skip_git: bool,
+    metrics: &mut Vec<(String, f64)>,
+) -> Result<(Option<String>, usize)> {
     let (commit_sha, commits_ingested) = if skip_git {
         (None, 0)
     } else {
-        let (head_sha, ingested, ownership) = ingest_git(&mut store, &repository_id, &paths.root)?;
+        let (head_sha, ingested, ownership) = ingest_git(store, repository_id, root)?;
         // A file at risk has low majority ownership and several
         // minor contributors. Surface the count plus the worst churn.
         let fragmented = ownership
@@ -246,15 +371,31 @@ pub fn index_repository(
         (head_sha, ingested)
     };
     metrics.push(("commits_ingested".to_string(), commits_ingested as f64));
+    Ok((commit_sha, commits_ingested))
+}
 
-    // Rule evaluation: turn the architecture into findings (boundary
-    // violations, cycles), persisted for `summary`/`violations` to read.
-    let module_names: Vec<String> = module_records
-        .iter()
-        .map(|module| module.name.clone())
-        .collect();
-    // Flatten the per-file security patterns the parser detected.
-    let security_patterns: Vec<(String, ovecc_core::facts::SecurityPatternFact)> = file_facts
+/// Read-only inputs every finding phase shares: the snapshot identity plus
+/// the parsed, resolved, and entry-point views of the repository.
+struct AnalysisInput<'a> {
+    repository_id: &'a str,
+    snapshot_id: &'a str,
+    parsed: &'a ParsedFiles,
+    dependencies: &'a [DependencyRecord],
+    resolved: &'a resolve::ResolvedFacts,
+    entry_points: &'a HashSet<String>,
+}
+
+/// Rule evaluation: turn the architecture into findings (boundary violations,
+/// cycles), persisted for `summary`/`violations` to read. Also returns the
+/// flattened per-file security patterns for the test-code down-ranking pass.
+fn evaluate_rules(
+    input: &AnalysisInput<'_>,
+    config: &RulesConfig,
+) -> (Vec<FindingRecord>, Vec<(String, SecurityPatternFact)>) {
+    let module_names: Vec<String> = input.parsed.modules.keys().cloned().collect();
+    let security_patterns: Vec<(String, SecurityPatternFact)> = input
+        .parsed
+        .file_facts
         .iter()
         .flat_map(|(path, facts)| {
             facts
@@ -263,22 +404,27 @@ pub fn index_repository(
                 .map(move |pattern| (path.clone(), pattern.clone()))
         })
         .collect();
-    let mut findings = ovecc_rules::evaluate(&ovecc_rules::RuleInput {
-        repository_id: &repository_id,
-        snapshot_id: Some(&snapshot_id),
+    let findings = ovecc_rules::evaluate(&ovecc_rules::RuleInput {
+        repository_id: input.repository_id,
+        snapshot_id: Some(input.snapshot_id),
         modules: &module_names,
-        dependencies: &dependencies,
-        config: &config.rules,
+        dependencies: input.dependencies,
+        config,
         security_patterns: &security_patterns,
     });
-    // Source→sink taint reachability over the code graph (SQL + eval/exec).
-    let (flow_nodes, flow_edges) = build_flow_graph(&resolved);
+    (findings, security_patterns)
+}
+
+/// Source→sink taint reachability over the code graph (SQL + eval/exec),
+/// with endpoint locations so findings cite real file:line evidence.
+fn taint_findings(input: &AnalysisInput<'_>) -> Vec<FindingRecord> {
+    let resolved = input.resolved;
+    let (flow_nodes, flow_edges) = build_flow_graph(resolved);
     let dangerous_sinks: Vec<(String, String)> = resolved
         .dangerous_sinks
         .iter()
         .map(|sink| (sink.symbol_id.clone(), sink.label.clone()))
         .collect();
-    // Endpoint locations so taint findings cite real file:line evidence.
     let mut flow_locations = ovecc_dataflow::FlowLocations::default();
     for api in &resolved.apis {
         if let Some(evidence) = &api.evidence {
@@ -299,18 +445,24 @@ pub fn index_repository(
             .entry(sink.symbol_id.clone())
             .or_insert_with(|| sink.evidence.clone());
     }
-    findings.extend(ovecc_dataflow::analyze(
-        &repository_id,
-        Some(&snapshot_id),
+    ovecc_dataflow::analyze(
+        input.repository_id,
+        Some(input.snapshot_id),
         &flow_nodes,
         &flow_edges,
         &dangerous_sinks,
         &flow_locations,
         ovecc_dataflow::DEFAULT_FLOW_DEPTH,
-    ));
+    )
+}
 
-    // Offline OSV dependency audit: inventory packages from lockfiles,
-    // persist them, and match against the local OSV database (.ovecc/osv/).
+/// Offline OSV dependency audit: inventory packages from lockfiles, persist
+/// them, and match against the local OSV database (`.ovecc/osv/`).
+fn audit_findings(
+    store: &mut ArchitectureStore,
+    paths: &ProjectPaths,
+    input: &AnalysisInput<'_>,
+) -> Result<Vec<FindingRecord>> {
     let packages = ovecc_audit::discover_packages(&paths.root);
     let package_rows: Vec<ovecc_db::PackageRow> = packages
         .iter()
@@ -322,125 +474,38 @@ pub fn index_repository(
             is_direct: package.is_direct,
         })
         .collect();
-    store.replace_packages(&repository_id, &package_rows)?;
+    store.replace_packages(input.repository_id, &package_rows)?;
     let osv = ovecc_audit::load_osv_dir(&paths.ovecc_dir.join("osv"));
-    findings.extend(ovecc_audit::audit(
-        &repository_id,
-        Some(&snapshot_id),
+    Ok(ovecc_audit::audit(
+        input.repository_id,
+        Some(input.snapshot_id),
         &packages,
         &osv,
-    ));
+    ))
+}
 
-    // Complexity (oxc cyclomatic + cognitive) → repo metrics + HighComplexity
-    // findings for functions over the maintainability thresholds.
+/// Complexity (oxc cyclomatic + cognitive) findings for functions over the
+/// maintainability thresholds, plus the aggregate complexity metrics.
+fn complexity_findings(
+    input: &AnalysisInput<'_>,
+    metrics: &mut Vec<(String, f64)>,
+) -> Vec<FindingRecord> {
+    let mut findings = Vec::new();
     let (mut max_cyclomatic, mut max_cognitive, mut function_count) = (0u16, 0u16, 0usize);
     let mut total_cognitive: u64 = 0;
     let mut high_complexity_functions: usize = 0;
-    for (path, facts) in &file_facts {
+    for (path, facts) in &input.parsed.file_facts {
         for complexity in &facts.complexity {
             function_count += 1;
             max_cyclomatic = max_cyclomatic.max(complexity.cyclomatic);
             max_cognitive = max_cognitive.max(complexity.cognitive);
             total_cognitive += complexity.cognitive as u64;
-            // Unit size (Long Method) — independent of the branching thresholds:
-            // a linear-but-endless function is a maintainability risk too. Low
-            // below 150 lines so it informs without tripping medium/high gates.
-            if complexity.line_count >= 75 {
-                let severity = if complexity.line_count >= 150 {
-                    ovecc_core::facts::Severity::Medium
-                } else {
-                    ovecc_core::facts::Severity::Low
-                };
-                findings.push(function_metric_finding(
-                    &repository_id,
-                    &snapshot_id,
-                    path,
-                    complexity,
-                    ovecc_core::facts::FindingKind::LongFunction,
-                    "long-function",
-                    severity,
-                    format!(
-                        "Long function: {} ({} lines)",
-                        complexity.qualified_name, complexity.line_count
-                    ),
-                    format!(
-                        "{} at {}:{} spans {} source lines; extract cohesive sections into named helpers.",
-                        complexity.qualified_name, path, complexity.line, complexity.line_count
-                    ),
-                    format!("{} lines", complexity.line_count),
-                ));
+            findings.extend(long_function_finding(input, path, complexity));
+            findings.extend(long_parameter_list_finding(input, path, complexity));
+            if let Some(finding) = high_complexity_finding(input, path, complexity) {
+                high_complexity_functions += 1;
+                findings.push(finding);
             }
-            // Long Parameter List — same shape: 7+ informs, 10+ is a real smell.
-            if complexity.param_count >= 7 {
-                let severity = if complexity.param_count >= 10 {
-                    ovecc_core::facts::Severity::Medium
-                } else {
-                    ovecc_core::facts::Severity::Low
-                };
-                findings.push(function_metric_finding(
-                    &repository_id,
-                    &snapshot_id,
-                    path,
-                    complexity,
-                    ovecc_core::facts::FindingKind::LongParameterList,
-                    "long-parameter-list",
-                    severity,
-                    format!(
-                        "Long parameter list: {} ({} parameters)",
-                        complexity.qualified_name, complexity.param_count
-                    ),
-                    format!(
-                        "{} at {}:{} takes {} parameters; group related ones into a typed options object.",
-                        complexity.qualified_name, path, complexity.line, complexity.param_count
-                    ),
-                    format!("{} parameters", complexity.param_count),
-                ));
-            }
-            let severity = if complexity.cognitive >= 25 || complexity.cyclomatic >= 20 {
-                ovecc_core::facts::Severity::High
-            } else if complexity.cognitive >= 15 || complexity.cyclomatic >= 10 {
-                ovecc_core::facts::Severity::Medium
-            } else {
-                continue;
-            };
-            high_complexity_functions += 1;
-            findings.push(ovecc_core::facts::FindingRecord {
-                id: ovecc_core::id::FindingId::from_parts(&[
-                    &repository_id,
-                    "complexity",
-                    path,
-                    &complexity.line.to_string(),
-                    &complexity.qualified_name,
-                ]),
-                repository_id: RepositoryId::from_raw(&repository_id),
-                snapshot_id: Some(ovecc_core::id::SnapshotId::from_raw(&snapshot_id)),
-                kind: FindingKind::HighComplexity,
-                severity,
-                rule_name: Some("complexity".to_string()),
-                target: None,
-                title: format!(
-                    "High complexity: {} (cyclomatic {}, cognitive {})",
-                    complexity.qualified_name, complexity.cyclomatic, complexity.cognitive
-                ),
-                description: format!(
-                    "{} at {}:{} has cyclomatic {} and cognitive {} complexity; consider refactoring.",
-                    complexity.qualified_name,
-                    path,
-                    complexity.line,
-                    complexity.cyclomatic,
-                    complexity.cognitive
-                ),
-                evidence: vec![ovecc_core::facts::Evidence {
-                    file_path: path.clone(),
-                    line: Some(complexity.line),
-                    symbol: Some(complexity.qualified_name.clone()),
-                    detail: Some(format!(
-                        "cyclomatic {}, cognitive {}",
-                        complexity.cyclomatic, complexity.cognitive
-                    )),
-                }],
-                created_at: chrono::Utc::now(),
-            });
         }
     }
     metrics.push(("functions".to_string(), function_count as f64));
@@ -451,13 +516,148 @@ pub fn index_repository(
         "high_complexity_functions".to_string(),
         high_complexity_functions as f64,
     ));
+    findings
+}
 
-    // Dead-code analysis (unused exports/files) over the in-memory facts: oxc
-    // exports + resolved internal import edges (carrying the imported names) +
-    // detected entry points. Runs at index time and persists only findings.
-    let all_files: Vec<String> = files.iter().map(|file| file.path.clone()).collect();
-    let entry_points = detect_entry_points(&paths.root, &files);
-    let export_facts: Vec<(String, ovecc_core::facts::ExportFact)> = file_facts
+/// Unit size (Long Method) — independent of the branching thresholds: a
+/// linear-but-endless function is a maintainability risk too. Low below 150
+/// lines so it informs without tripping medium/high gates.
+fn long_function_finding(
+    input: &AnalysisInput<'_>,
+    path: &str,
+    complexity: &ovecc_core::facts::ComplexityFact,
+) -> Option<FindingRecord> {
+    if complexity.line_count < 75 {
+        return None;
+    }
+    let severity = if complexity.line_count >= 150 {
+        ovecc_core::facts::Severity::Medium
+    } else {
+        ovecc_core::facts::Severity::Low
+    };
+    Some(function_metric_finding(
+        input.repository_id,
+        input.snapshot_id,
+        path,
+        complexity,
+        ovecc_core::facts::FindingKind::LongFunction,
+        "long-function",
+        severity,
+        format!(
+            "Long function: {} ({} lines)",
+            complexity.qualified_name, complexity.line_count
+        ),
+        format!(
+            "{} at {}:{} spans {} source lines; extract cohesive sections into named helpers.",
+            complexity.qualified_name, path, complexity.line, complexity.line_count
+        ),
+        format!("{} lines", complexity.line_count),
+    ))
+}
+
+/// Long Parameter List — same shape: 7+ informs, 10+ is a real smell.
+fn long_parameter_list_finding(
+    input: &AnalysisInput<'_>,
+    path: &str,
+    complexity: &ovecc_core::facts::ComplexityFact,
+) -> Option<FindingRecord> {
+    if complexity.param_count < 7 {
+        return None;
+    }
+    let severity = if complexity.param_count >= 10 {
+        ovecc_core::facts::Severity::Medium
+    } else {
+        ovecc_core::facts::Severity::Low
+    };
+    Some(function_metric_finding(
+        input.repository_id,
+        input.snapshot_id,
+        path,
+        complexity,
+        ovecc_core::facts::FindingKind::LongParameterList,
+        "long-parameter-list",
+        severity,
+        format!(
+            "Long parameter list: {} ({} parameters)",
+            complexity.qualified_name, complexity.param_count
+        ),
+        format!(
+            "{} at {}:{} takes {} parameters; group related ones into a typed options object.",
+            complexity.qualified_name, path, complexity.line, complexity.param_count
+        ),
+        format!("{} parameters", complexity.param_count),
+    ))
+}
+
+fn high_complexity_finding(
+    input: &AnalysisInput<'_>,
+    path: &str,
+    complexity: &ovecc_core::facts::ComplexityFact,
+) -> Option<FindingRecord> {
+    let severity = if complexity.cognitive >= 25 || complexity.cyclomatic >= 20 {
+        ovecc_core::facts::Severity::High
+    } else if complexity.cognitive >= 15 || complexity.cyclomatic >= 10 {
+        ovecc_core::facts::Severity::Medium
+    } else {
+        return None;
+    };
+    Some(FindingRecord {
+        id: ovecc_core::id::FindingId::from_parts(&[
+            input.repository_id,
+            "complexity",
+            path,
+            &complexity.line.to_string(),
+            &complexity.qualified_name,
+        ]),
+        repository_id: RepositoryId::from_raw(input.repository_id),
+        snapshot_id: Some(ovecc_core::id::SnapshotId::from_raw(input.snapshot_id)),
+        kind: FindingKind::HighComplexity,
+        severity,
+        rule_name: Some("complexity".to_string()),
+        target: None,
+        title: format!(
+            "High complexity: {} (cyclomatic {}, cognitive {})",
+            complexity.qualified_name, complexity.cyclomatic, complexity.cognitive
+        ),
+        description: format!(
+            "{} at {}:{} has cyclomatic {} and cognitive {} complexity; consider refactoring.",
+            complexity.qualified_name,
+            path,
+            complexity.line,
+            complexity.cyclomatic,
+            complexity.cognitive
+        ),
+        evidence: vec![ovecc_core::facts::Evidence {
+            file_path: path.to_string(),
+            line: Some(complexity.line),
+            symbol: Some(complexity.qualified_name.clone()),
+            detail: Some(format!(
+                "cyclomatic {}, cognitive {}",
+                complexity.cyclomatic, complexity.cognitive
+            )),
+        }],
+        created_at: chrono::Utc::now(),
+    })
+}
+
+/// Dead-code analysis (unused exports/files) over the in-memory facts: oxc
+/// exports + resolved internal import edges (carrying the imported names) +
+/// detected entry points. Runs at index time and persists only findings, plus
+/// aggregate counts on the snapshot so `diff`/`drift` can trend them ("dead
+/// code grew this quarter").
+fn deadcode_findings(
+    input: &AnalysisInput<'_>,
+    metrics: &mut Vec<(String, f64)>,
+) -> Vec<FindingRecord> {
+    let all_files: Vec<String> = input
+        .parsed
+        .files
+        .iter()
+        .map(|file| file.path.clone())
+        .collect();
+    let export_facts: Vec<(String, ovecc_core::facts::ExportFact)> = input
+        .parsed
+        .file_facts
         .iter()
         .flat_map(|(path, facts)| {
             facts
@@ -466,14 +666,17 @@ pub fn index_repository(
                 .map(move |export| (path.clone(), export.clone()))
         })
         .collect();
-    let import_edges: Vec<ovecc_rules::deadcode::ImportEdge> = dependencies
+    let import_edges: Vec<ovecc_rules::deadcode::ImportEdge> = input
+        .dependencies
         .iter()
         .filter_map(|dependency| {
             let target = dependency.target_file_path.clone()?;
             if dependency.is_external {
                 return None;
             }
-            let names: Vec<String> = file_facts
+            let names: Vec<String> = input
+                .parsed
+                .file_facts
                 .get(&dependency.source_file_path)
                 .map(|facts| {
                     facts
@@ -492,21 +695,19 @@ pub fn index_repository(
             })
         })
         .collect();
-    let deadcode_findings = ovecc_rules::deadcode::analyze(&ovecc_rules::deadcode::DeadCodeInput {
-        repository_id: &repository_id,
-        snapshot_id: Some(&snapshot_id),
+    let findings = ovecc_rules::deadcode::analyze(&ovecc_rules::deadcode::DeadCodeInput {
+        repository_id: input.repository_id,
+        snapshot_id: Some(input.snapshot_id),
         files: &all_files,
-        entry_points: &entry_points,
+        entry_points: input.entry_points,
         exports: &export_facts,
         imports: &import_edges,
     });
-    // Persist aggregate counts on the snapshot so `diff`/`drift` can trend them
-    // ("dead code grew this quarter").
-    let unused_exports = deadcode_findings
+    let unused_exports = findings
         .iter()
         .filter(|finding| finding.kind == FindingKind::UnusedExport)
         .count();
-    let unused_files = deadcode_findings
+    let unused_files = findings
         .iter()
         .filter(|finding| finding.kind == FindingKind::UnusedFile)
         .count();
@@ -514,57 +715,81 @@ pub fn index_repository(
     metrics.push(("unused_files".to_string(), unused_files as f64));
     metrics.push((
         "deadcode_entry_points".to_string(),
-        entry_points.len() as f64,
+        input.entry_points.len() as f64,
     ));
-    findings.extend(deadcode_findings);
+    findings
+}
 
-    // Unused dependencies: packages declared in a `package.json` `dependencies`
-    // map but never imported by an indexed file. Opt-in (`detect_unused_deps`):
-    // real-repo measurement showed a high false-positive rate — config files,
-    // `scripts` entries, side-effect imports, and test fixtures use a package
-    // without an import the graph can see — so it is off by default.
-    if config.index.detect_unused_deps {
+/// Dependency-hygiene findings. Unused dependencies are opt-in
+/// (`detect_unused_deps`): real-repo measurement showed a high false-positive
+/// rate — config files, `scripts` entries, side-effect imports, and test
+/// fixtures use a package without an import the graph can see. Unlisted
+/// (phantom) dependencies are precise by construction, so always on (silent
+/// on repos with no package.json).
+fn hygiene_findings(
+    root: &Path,
+    input: &AnalysisInput<'_>,
+    detect_unused: bool,
+    metrics: &mut Vec<(String, f64)>,
+) -> Vec<FindingRecord> {
+    let mut findings = Vec::new();
+    if detect_unused {
         // Any bare-specifier import counts as using the package — including
         // workspace packages (`@scope/pkg`) that resolve to an internal file
         // (`is_external == false`), so monorepo packages are not falsely
         // flagged. `external_package_root` drops relative imports and built-ins.
-        let imported_roots: HashSet<String> = dependencies
+        let imported_roots: HashSet<String> = input
+            .dependencies
             .iter()
             .filter_map(|dependency| external_package_root(&dependency.specifier))
             .collect();
-        let unused_dep_findings =
-            detect_unused_dependencies(&paths.root, &repository_id, &snapshot_id, &imported_roots);
-        metrics.push((
-            "unused_dependencies".to_string(),
-            unused_dep_findings.len() as f64,
-        ));
-        findings.extend(unused_dep_findings);
+        let unused = detect_unused_dependencies(
+            root,
+            input.repository_id,
+            input.snapshot_id,
+            &imported_roots,
+        );
+        metrics.push(("unused_dependencies".to_string(), unused.len() as f64));
+        findings.extend(unused);
     }
+    let unlisted = detect_unlisted_dependencies(
+        root,
+        input.repository_id,
+        input.snapshot_id,
+        input.dependencies,
+    );
+    metrics.push(("unlisted_dependencies".to_string(), unlisted.len() as f64));
+    findings.extend(unlisted);
+    findings
+}
 
-    // Unlisted (phantom) dependencies: imported but declared in no manifest.
-    // Precise by construction, so always on (silent on repos with no
-    // package.json).
-    let unlisted_findings =
-        detect_unlisted_dependencies(&paths.root, &repository_id, &snapshot_id, &dependencies);
-    metrics.push((
-        "unlisted_dependencies".to_string(),
-        unlisted_findings.len() as f64,
-    ));
-    findings.extend(unlisted_findings);
-
-    let module_name_by_id: HashMap<String, String> = module_records
-        .iter()
+/// Code smells (feature envy, data clumps) over the resolved call graph and
+/// the per-function parameter names.
+fn smell_findings(
+    input: &AnalysisInput<'_>,
+    metrics: &mut Vec<(String, f64)>,
+) -> Vec<FindingRecord> {
+    let module_name_by_id: HashMap<String, String> = input
+        .parsed
+        .modules
+        .values()
         .map(|module| (module.id.clone(), module.name.clone()))
         .collect();
-    let path_by_file_id: HashMap<String, String> = files
+    let path_by_file_id: HashMap<String, String> = input
+        .parsed
+        .files
         .iter()
         .map(|file| (file.id.clone(), file.path.clone()))
         .collect();
-    let clump_functions: Vec<ovecc_rules::smells::ClumpFunction> = files
+    let clump_functions: Vec<ovecc_rules::smells::ClumpFunction> = input
+        .parsed
+        .files
         .iter()
         .flat_map(|file| {
             let language = core_language(file.language);
-            file_facts
+            input
+                .parsed
+                .file_facts
                 .get(&file.path)
                 .into_iter()
                 .flat_map(move |facts| {
@@ -580,34 +805,39 @@ pub fn index_repository(
                 })
         })
         .collect();
-    let smell_findings = ovecc_rules::smells::analyze(&ovecc_rules::smells::SmellsInput {
-        repository_id: &repository_id,
-        snapshot_id: Some(&snapshot_id),
-        symbols: &resolved.symbols,
-        calls: &resolved.calls,
+    let findings = ovecc_rules::smells::analyze(&ovecc_rules::smells::SmellsInput {
+        repository_id: input.repository_id,
+        snapshot_id: Some(input.snapshot_id),
+        symbols: &input.resolved.symbols,
+        calls: &input.resolved.calls,
         module_names: &module_name_by_id,
         file_paths: &path_by_file_id,
-        entry_points: &entry_points,
+        entry_points: input.entry_points,
         functions: &clump_functions,
     });
-    metrics.push(("code_smells".to_string(), smell_findings.len() as f64));
-    findings.extend(smell_findings);
+    metrics.push(("code_smells".to_string(), findings.len() as f64));
+    findings
+}
 
-    // Security findings in test, fixture, and example files are usually test
-    // data or deliberate test scaffolding (fake secrets, an `eval` under test,
-    // a weak hash in a vector), not production risk — the canonical
-    // secret/SAST false positive. Down-rank them to Low so they stay visible in
-    // `security` but do not trip a high-severity gate. Down-ranked, not dropped:
-    // a real issue committed to a test file is still reported.
-    // Rust's inline `#[cfg(test)]` scopes are test code the path heuristics
-    // can't see; the parser stamped their patterns, collect the (file, line)
-    // sites so they down-rank exactly like test files.
-    let test_scoped_patterns: std::collections::HashSet<(&str, u32)> = security_patterns
+/// Security findings in test, fixture, and example files are usually test
+/// data or deliberate test scaffolding (fake secrets, an `eval` under test, a
+/// weak hash in a vector), not production risk — the canonical secret/SAST
+/// false positive. Down-rank them to Low so they stay visible in `security`
+/// but do not trip a high-severity gate. Down-ranked, not dropped: a real
+/// issue committed to a test file is still reported. Rust's inline
+/// `#[cfg(test)]` scopes are test code the path heuristics can't see; the
+/// parser stamped their patterns, so those (file, line) sites down-rank
+/// exactly like test files.
+fn downrank_test_security(
+    findings: &mut [FindingRecord],
+    security_patterns: &[(String, SecurityPatternFact)],
+) {
+    let test_scoped_patterns: HashSet<(&str, u32)> = security_patterns
         .iter()
         .filter(|(_, pattern)| pattern.in_test_code)
         .map(|(path, pattern)| (path.as_str(), pattern.line))
         .collect();
-    for finding in &mut findings {
+    for finding in findings.iter_mut() {
         let is_security = matches!(
             finding.kind,
             FindingKind::HardcodedSecret | FindingKind::InsecurePattern | FindingKind::WeakCrypto
@@ -625,83 +855,99 @@ pub fn index_repository(
             finding.severity = ovecc_core::facts::Severity::Low;
         }
     }
+}
 
-    // Drop findings explicitly suppressed by an inline `// ovecc-ignore`.
+/// Drops findings explicitly suppressed by an inline `// ovecc-ignore`
+/// (`# ovecc-ignore` in Python) and surfaces the stale suppressions.
+fn apply_suppressions(
+    findings: &mut Vec<FindingRecord>,
+    input: &AnalysisInput<'_>,
+    metrics: &mut Vec<(String, f64)>,
+) {
     // BTreeMap so the stale-suppression sweep below iterates deterministically.
-    let suppressions: std::collections::BTreeMap<String, std::collections::BTreeSet<u32>> =
-        file_facts
-            .iter()
-            .filter(|(_, facts)| !facts.suppressed_lines.is_empty())
-            .map(|(path, facts)| {
-                (
-                    path.clone(),
-                    facts.suppressed_lines.iter().copied().collect(),
-                )
-            })
-            .collect();
-    if !suppressions.is_empty() {
-        let mut used: HashSet<(String, u32)> = HashSet::new();
-        findings.retain(|finding| {
-            let mut suppressed = false;
-            for evidence in &finding.evidence {
-                if let Some(line) = evidence.line
-                    && suppressions
-                        .get(&evidence.file_path)
-                        .is_some_and(|lines| lines.contains(&line))
-                {
-                    used.insert((evidence.file_path.clone(), line));
-                    suppressed = true;
-                }
-            }
-            !suppressed
-        });
-        // A suppression that silenced nothing is stale: it documents a finding
-        // that no longer exists and will silently swallow the next real one on
-        // its line. Surface it (Low) so it gets cleaned up.
-        let mut stale = 0usize;
-        for (path, lines) in &suppressions {
-            for line in lines {
-                if used.contains(&(path.clone(), *line)) {
-                    continue;
-                }
-                stale += 1;
-                findings.push(ovecc_core::facts::FindingRecord {
-                    id: ovecc_core::id::FindingId::from_parts(&[
-                        &repository_id,
-                        "stale-suppression",
-                        path,
-                        &line.to_string(),
-                    ]),
-                    repository_id: RepositoryId::from_raw(&repository_id),
-                    snapshot_id: Some(ovecc_core::id::SnapshotId::from_raw(&snapshot_id)),
-                    kind: FindingKind::StaleSuppression,
-                    severity: ovecc_core::facts::Severity::Low,
-                    rule_name: Some("stale-suppression".to_string()),
-                    target: None,
-                    title: format!("Stale suppression: {path}:{line}"),
-                    description: format!(
-                        "The ovecc-ignore targeting {path}:{line} suppresses no finding. \
-                         Delete it — a stale suppression silently swallows the next real \
-                         finding on that line."
-                    ),
-                    evidence: vec![ovecc_core::facts::Evidence {
-                        file_path: path.clone(),
-                        line: Some(*line),
-                        symbol: None,
-                        detail: Some("ovecc-ignore with no matching finding".to_string()),
-                    }],
-                    created_at: chrono::Utc::now(),
-                });
+    let suppressions: BTreeMap<String, BTreeSet<u32>> = input
+        .parsed
+        .file_facts
+        .iter()
+        .filter(|(_, facts)| !facts.suppressed_lines.is_empty())
+        .map(|(path, facts)| {
+            (
+                path.clone(),
+                facts.suppressed_lines.iter().copied().collect(),
+            )
+        })
+        .collect();
+    if suppressions.is_empty() {
+        return;
+    }
+    let mut used: HashSet<(String, u32)> = HashSet::new();
+    findings.retain(|finding| {
+        let mut suppressed = false;
+        for evidence in &finding.evidence {
+            if let Some(line) = evidence.line
+                && suppressions
+                    .get(&evidence.file_path)
+                    .is_some_and(|lines| lines.contains(&line))
+            {
+                used.insert((evidence.file_path.clone(), line));
+                suppressed = true;
             }
         }
-        metrics.push(("stale_suppressions".to_string(), stale as f64));
+        !suppressed
+    });
+    // A suppression that silenced nothing is stale: it documents a finding
+    // that no longer exists and will silently swallow the next real one on
+    // its line. Surface it (Low) so it gets cleaned up.
+    let mut stale = 0usize;
+    for (path, lines) in &suppressions {
+        for line in lines {
+            if used.contains(&(path.clone(), *line)) {
+                continue;
+            }
+            stale += 1;
+            findings.push(stale_suppression_finding(input, path, *line));
+        }
     }
+    metrics.push(("stale_suppressions".to_string(), stale as f64));
+}
 
+fn stale_suppression_finding(input: &AnalysisInput<'_>, path: &str, line: u32) -> FindingRecord {
+    FindingRecord {
+        id: ovecc_core::id::FindingId::from_parts(&[
+            input.repository_id,
+            "stale-suppression",
+            path,
+            &line.to_string(),
+        ]),
+        repository_id: RepositoryId::from_raw(input.repository_id),
+        snapshot_id: Some(ovecc_core::id::SnapshotId::from_raw(input.snapshot_id)),
+        kind: FindingKind::StaleSuppression,
+        severity: ovecc_core::facts::Severity::Low,
+        rule_name: Some("stale-suppression".to_string()),
+        target: None,
+        title: format!("Stale suppression: {path}:{line}"),
+        description: format!(
+            "The ovecc-ignore targeting {path}:{line} suppresses no finding. \
+             Delete it — a stale suppression silently swallows the next real \
+             finding on that line."
+        ),
+        evidence: vec![ovecc_core::facts::Evidence {
+            file_path: path.to_string(),
+            line: Some(line),
+            symbol: None,
+            detail: Some("ovecc-ignore with no matching finding".to_string()),
+        }],
+        created_at: chrono::Utc::now(),
+    }
+}
+
+/// A stable finding ID encodes the finding's identity (rule + target +
+/// location), so two findings with the same ID are the same finding — e.g.
+/// two same-kind security patterns on one line. Collapse them so the unique
+/// `findings.id` primary key never collides on write, then derive the
+/// trendable finding counts.
+fn finalize_findings(findings: &mut Vec<FindingRecord>, metrics: &mut Vec<(String, f64)>) {
     findings.sort_by(|a, b| a.id.0.cmp(&b.id.0));
-    // A stable finding ID encodes the finding's identity (rule + target +
-    // location), so two findings with the same ID are the same finding — e.g.
-    // two same-kind security patterns on one line. Collapse them so the unique
-    // `findings.id` primary key never collides on write.
     findings.dedup_by(|a, b| a.id.0 == b.id.0);
     let boundary_violations = findings
         .iter()
@@ -744,13 +990,20 @@ pub fn index_repository(
         "dependency_advisories".to_string(),
         dependency_advisories as f64,
     ));
+}
 
-    let external_dependencies = dependencies
-        .iter()
-        .filter(|dependency| dependency.is_external)
-        .count();
-
-    let schema_edges: Vec<ovecc_db::SchemaEdge> = resolved
+/// First-class persistence records derived from the resolved code facts:
+/// symbol→table access edges plus the per-function complexity and per-file
+/// export rows (oxc), keyed by file id.
+fn build_code_records(
+    input: &AnalysisInput<'_>,
+) -> (
+    Vec<ovecc_db::SchemaEdge>,
+    Vec<ComplexityRecord>,
+    Vec<ExportRecord>,
+) {
+    let schema_edges: Vec<ovecc_db::SchemaEdge> = input
+        .resolved
         .schema_accesses
         .iter()
         .map(|access| ovecc_db::SchemaEdge {
@@ -764,24 +1017,22 @@ pub fn index_repository(
             ),
         })
         .collect();
-    // First-class code-health facts (oxc): normalize per-function complexity and
-    // per-file exports into persistable records keyed by file id.
     let mut complexity_records: Vec<ComplexityRecord> = Vec::new();
     let mut export_records: Vec<ExportRecord> = Vec::new();
-    for (path, facts) in &file_facts {
-        let Some(file) = file_by_path.get(path) else {
+    for (path, facts) in &input.parsed.file_facts {
+        let Some(file) = input.parsed.by_path.get(path) else {
             continue;
         };
         let file_id = &file.id;
         for complexity in &facts.complexity {
             complexity_records.push(ComplexityRecord {
                 id: ComplexityId::from_parts(&[
-                    &repository_id,
+                    input.repository_id,
                     file_id,
                     &complexity.qualified_name,
                     &complexity.line.to_string(),
                 ]),
-                repository_id: RepositoryId::from_raw(&repository_id),
+                repository_id: RepositoryId::from_raw(input.repository_id),
                 file_id: FileId::from_raw(file_id.clone()),
                 qualified_name: complexity.qualified_name.clone(),
                 line: complexity.line,
@@ -794,12 +1045,12 @@ pub fn index_repository(
         for export in &facts.exports {
             export_records.push(ExportRecord {
                 id: ExportId::from_parts(&[
-                    &repository_id,
+                    input.repository_id,
                     file_id,
                     &export.name,
                     &export.line.to_string(),
                 ]),
-                repository_id: RepositoryId::from_raw(&repository_id),
+                repository_id: RepositoryId::from_raw(input.repository_id),
                 file_id: FileId::from_raw(file_id.clone()),
                 name: export.name.clone(),
                 line: export.line,
@@ -812,50 +1063,7 @@ pub fn index_repository(
             });
         }
     }
-    let code = ResolvedCode {
-        symbols: &resolved.symbols,
-        calls: &resolved.calls,
-        apis: &resolved.apis,
-        schema_objects: &resolved.schema_objects,
-        schema_edges: &schema_edges,
-        complexity: &complexity_records,
-        exports: &export_records,
-    };
-    phase(&mut timings.analyze_ms);
-    store.sync_current_index(
-        &repository_id,
-        &paths.root_display(),
-        &module_records,
-        &files,
-        &dependencies,
-        &snapshot_id,
-        commit_sha.as_deref(),
-        &metrics,
-        &code,
-    )?;
-    store.replace_findings(&repository_id, &findings)?;
-    phase(&mut timings.persist_ms);
-    timings.total_ms = run_start.elapsed().as_millis() as u64;
-
-    Ok(IndexReport {
-        repository_root: paths.root_display(),
-        database_path: ovecc_core::util::normalize_path(&paths.db_path),
-        snapshot_id,
-        files_scanned: source_files.len(),
-        files_indexed: files.len(),
-        files_parsed,
-        files_from_cache,
-        modules: modules.len(),
-        dependencies: dependencies.len(),
-        external_dependencies,
-        symbols: resolved.symbols.len(),
-        calls: resolved.calls.len(),
-        apis: resolved.apis.len(),
-        tables: resolved.schema_objects.len(),
-        commits_ingested,
-        parse_failures,
-        timings,
-    })
+    (schema_edges, complexity_records, export_records)
 }
 
 /// Recent-history window and cap for Git ingestion: current ownership
@@ -1245,11 +1453,12 @@ impl ParseCache {
     }
 }
 
-/// Snapshot metrics persisted with each index run. Computed here (with
-/// `ovecc-graph`) and handed to the store as plain values.
+/// Snapshot metrics persisted with each index run: the structural counts
+/// (computed with `ovecc-graph`) plus the parser and code-fact counts.
 fn compute_snapshot_metrics(
     modules: &[ModuleRecord],
-    files: &[FileRecord],
+    parsed: &ParsedFiles,
+    resolved: &resolve::ResolvedFacts,
     dependencies: &[DependencyRecord],
 ) -> Vec<(String, f64)> {
     let module_names: Vec<String> = modules.iter().map(|module| module.name.clone()).collect();
@@ -1270,7 +1479,7 @@ fn compute_snapshot_metrics(
 
     vec![
         ("modules".to_string(), module_names.len() as f64),
-        ("files".to_string(), files.len() as f64),
+        ("files".to_string(), parsed.files.len() as f64),
         ("dependencies".to_string(), dependencies.len() as f64),
         (
             "external_dependencies".to_string(),
@@ -1281,6 +1490,14 @@ fn compute_snapshot_metrics(
             circular_dependencies as f64,
         ),
         ("coupling_density".to_string(), coupling_density),
+        (
+            "parse_failures".to_string(),
+            parsed.parse_failures.len() as f64,
+        ),
+        ("symbols".to_string(), resolved.symbols.len() as f64),
+        ("calls".to_string(), resolved.calls.len() as f64),
+        ("apis".to_string(), resolved.apis.len() as f64),
+        ("tables".to_string(), resolved.schema_objects.len() as f64),
     ]
 }
 
