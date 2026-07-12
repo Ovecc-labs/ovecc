@@ -24,6 +24,3 @@ ovecc-graph.html
 
 *.pdf
 docs/local/
-
-# Claude Code local memory / agent scratch — never published
-.claude/
