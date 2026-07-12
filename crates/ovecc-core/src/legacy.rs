@@ -1,9 +1,6 @@
-//! Transitional types carried over from the monolithic MVP.
-//!
-//! These keep the migrated crates iso-functional during the workspace split.
-//! Each of them is scheduled for replacement by the richer `facts`/`report`
-//! models as the roadmap steps land (DB schema step, parser step, graph
-//! step). Do not add new features on top of these types.
+//! Transitional record types from the engine's first iteration, each
+//! scheduled for replacement by the richer `facts`/`report` models. Do not
+//! add new features on top of these types.
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;

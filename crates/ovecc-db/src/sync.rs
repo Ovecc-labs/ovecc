@@ -1005,9 +1005,8 @@ fn append_api_edges(
 impl ArchitectureStore {
     /// Synchronizes the persisted index with the freshly extracted state.
     ///
-    /// Replaces the MVP "delete everything, reinsert everything" strategy
-    /// (groundwork for incremental indexing): rows are diffed by their
-    /// stable IDs, only added/changed/removed facts touch the
+    /// Differential, as groundwork for incremental indexing: rows are diffed
+    /// by their stable IDs, only added/changed/removed facts touch the
     /// database, and everything runs in one transaction with reused prepared
     /// statements. Append-only snapshot rows go through the DuckDB appender.
     ///

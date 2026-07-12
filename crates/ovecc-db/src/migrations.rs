@@ -14,9 +14,9 @@ struct SchemaMigration {
     sql: &'static str,
 }
 
-/// Baseline schema carried over from the MVP (kept `IF NOT EXISTS` so that
-/// databases created before the migration framework are stamped cleanly).
-const MIGRATION_V1_MVP_BASELINE: &str = r#"
+/// Baseline schema, kept `IF NOT EXISTS` so that databases created before
+/// the migration framework are stamped cleanly.
+const MIGRATION_V1_BASELINE: &str = r#"
             CREATE TABLE IF NOT EXISTS repositories (
                 id TEXT PRIMARY KEY,
                 root_path TEXT NOT NULL,
@@ -321,8 +321,8 @@ const MIGRATION_V5_SNAPSHOT_RETENTION: &str = r#"
 const SCHEMA_MIGRATIONS: &[SchemaMigration] = &[
     SchemaMigration {
         version: 1,
-        name: "mvp_baseline",
-        sql: MIGRATION_V1_MVP_BASELINE,
+        name: "baseline",
+        sql: MIGRATION_V1_BASELINE,
     },
     SchemaMigration {
         version: 2,
@@ -470,10 +470,10 @@ mod tests {
 
     #[test]
     fn pre_framework_database_is_stamped_cleanly() {
-        // Simulates a database created by the step-2 code: v1 tables exist
-        // but ovecc_schema does not.
+        // Simulates a database from before the migration framework: v1 tables
+        // exist but ovecc_schema does not.
         let (_dir, mut store) = temp_store();
-        store.conn.execute_batch(MIGRATION_V1_MVP_BASELINE).unwrap();
+        store.conn.execute_batch(MIGRATION_V1_BASELINE).unwrap();
         assert_eq!(store.schema_version().unwrap(), None);
 
         let version = store.migrate_to_latest().unwrap();
