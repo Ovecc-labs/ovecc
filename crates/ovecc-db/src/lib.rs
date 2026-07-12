@@ -6,19 +6,22 @@
 //! Metric values and the commit SHA are computed upstream (indexer) and
 //! passed in, so `ovecc-db` only depends on `ovecc-core`.
 
+mod code_facts;
 mod migrations;
 mod queries;
+mod replace;
 mod snapshots;
 mod sync;
 
 use anyhow::{Context, Result};
 use chrono::Utc;
-use duckdb::Connection;
+use duckdb::{Connection, Transaction, params};
 use ovecc_core::facts::{
     ApiRecord, CallRecord, ComplexityRecord, Evidence, ExportRecord, FindingKind, FindingRecord,
     SchemaObjectRecord, Severity, SymbolRecord,
 };
 use ovecc_core::id::{FindingId, RepositoryId, SnapshotId};
+use std::collections::HashSet;
 use std::path::Path;
 
 /// Resolved code-level facts persisted alongside the module-level index.
@@ -171,6 +174,17 @@ impl ArchitectureStore {
                 .with_context(|| format!("failed to open DuckDB database {}", path.display()))?,
         })
     }
+}
+
+/// IDs of every row of `table` already persisted for the repository.
+pub(crate) fn existing_ids(
+    tx: &Transaction<'_>,
+    table: &str,
+    repository_id: &str,
+) -> Result<HashSet<String>> {
+    let mut statement = tx.prepare(&format!("SELECT id FROM {table} WHERE repository_id = ?"))?;
+    let rows = statement.query_map(params![repository_id], |row| row.get::<_, String>(0))?;
+    Ok(collect_rows::<String>(rows)?.into_iter().collect())
 }
 
 pub(crate) fn collect_rows<T>(rows: impl Iterator<Item = duckdb::Result<T>>) -> Result<Vec<T>> {
