@@ -51,7 +51,9 @@ use std::path::{Path, PathBuf};
 // cached v15 facts would keep those routes disconnected from the taint graph.
 // v17: complexity facts gain `param_names` (data-clumps detection); cached
 // v16 facts would deserialize with empty names and silently skip clumps.
-const PARSE_CACHE_VERSION: &str = "v17";
+// v18: Rust `?` no longer counts toward cyclomatic; cached v17 facts would
+// keep the inflated counts and their stale HighComplexity findings.
+const PARSE_CACHE_VERSION: &str = "v18";
 
 pub fn index_repository(
     paths: &ProjectPaths,

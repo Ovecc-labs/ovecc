@@ -1487,6 +1487,10 @@ fn decision_node(language: SourceLanguage, kind: &str) -> bool {
                 | "type_case"
                 | "communication_case"
         ),
+        // `?` (try_expression) is deliberately not a decision point: it is
+        // error propagation, not logic to reason about, and counting it made
+        // every fallible DB-style function (one `?` per statement) read as
+        // high-complexity at cognitive 0 (found dogfooding the sync split).
         SourceLanguage::Rust => matches!(
             kind,
             "if_expression"
@@ -1494,7 +1498,6 @@ fn decision_node(language: SourceLanguage, kind: &str) -> bool {
                 | "for_expression"
                 | "loop_expression"
                 | "match_arm"
-                | "try_expression"
         ),
         SourceLanguage::Cpp => matches!(
             kind,
@@ -1835,6 +1838,18 @@ mod tests {
         let branchy = complexity_of(&facts, "branchy");
         assert!(branchy.cyclomatic >= 4, "{branchy:?}");
         assert!(branchy.cognitive >= 4, "{branchy:?}");
+    }
+
+    #[test]
+    fn rust_try_operator_is_not_a_decision_point() {
+        let facts = extract(
+            SourceLanguage::Rust,
+            "fn load(x: i32) -> Result<i32, ()> {\n    let a = one(x)?;\n    let b = two(a)?;\n    \
+             let c = three(b)?;\n    Ok(a + b + c)\n}\n",
+        );
+        let load = complexity_of(&facts, "load");
+        assert_eq!(load.cyclomatic, 1, "{load:?}");
+        assert_eq!(load.cognitive, 0, "{load:?}");
     }
 
     #[test]
