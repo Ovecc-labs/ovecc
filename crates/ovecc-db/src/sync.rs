@@ -109,6 +109,899 @@ fn repository_name(repository_root: &str) -> String {
         .to_string()
 }
 
+/// The differential between the persisted index and the freshly extracted
+/// state, keyed by stable IDs. Removed entries carry the persisted values the
+/// delete path needs to recompute derived edge IDs.
+struct IndexDelta<'a> {
+    files_to_add: Vec<&'a FileRecord>,
+    /// (file, previously persisted module id).
+    files_to_update: Vec<(&'a FileRecord, String)>,
+    /// (file id, module id).
+    files_to_remove: Vec<(String, String)>,
+    modules_to_add: Vec<&'a ModuleRecord>,
+    modules_to_reprefix: Vec<&'a ModuleRecord>,
+    modules_to_remove: Vec<String>,
+    dependencies_to_add: Vec<&'a DependencyRecord>,
+    /// (dependency id, source module id, target module id).
+    dependencies_to_remove: Vec<(String, String, String)>,
+}
+
+fn compute_index_delta<'a>(
+    tx: &Transaction<'_>,
+    repository_id: &str,
+    modules: &'a [ModuleRecord],
+    files: &'a [FileRecord],
+    dependencies: &'a [DependencyRecord],
+) -> Result<IndexDelta<'a>> {
+    let (existing_files, existing_modules, existing_dependencies) =
+        load_persisted_index(tx, repository_id)?;
+    let (files_to_add, files_to_update, files_to_remove) = diff_files(files, &existing_files);
+    let (modules_to_add, modules_to_reprefix, modules_to_remove) =
+        diff_modules(modules, &existing_modules);
+    let (dependencies_to_add, dependencies_to_remove) =
+        diff_dependencies(dependencies, &existing_dependencies);
+    Ok(IndexDelta {
+        files_to_add,
+        files_to_update,
+        files_to_remove,
+        modules_to_add,
+        modules_to_reprefix,
+        modules_to_remove,
+        dependencies_to_add,
+        dependencies_to_remove,
+    })
+}
+
+type PersistedFiles = HashMap<String, (String, String)>;
+type PersistedModules = HashMap<String, String>;
+type PersistedDependencies = HashMap<String, (String, String)>;
+
+/// Persisted state keyed by stable IDs: files as `id → (content_hash,
+/// module_id)`, modules as `id → path_prefix`, dependencies as
+/// `id → (source_module_id, target_module_id)`.
+fn load_persisted_index(
+    tx: &Transaction<'_>,
+    repository_id: &str,
+) -> Result<(PersistedFiles, PersistedModules, PersistedDependencies)> {
+    let files: PersistedFiles = {
+        let mut statement =
+            tx.prepare("SELECT id, content_hash, module_id FROM files WHERE repository_id = ?")?;
+        let rows = statement.query_map(params![repository_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                (row.get::<_, String>(1)?, row.get::<_, String>(2)?),
+            ))
+        })?;
+        collect_rows(rows)?.into_iter().collect()
+    };
+    let modules: PersistedModules = {
+        let mut statement =
+            tx.prepare("SELECT id, path_prefix FROM modules WHERE repository_id = ?")?;
+        let rows = statement.query_map(params![repository_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        collect_rows(rows)?.into_iter().collect()
+    };
+    let dependencies: PersistedDependencies = {
+        let mut statement = tx.prepare(
+            "SELECT id, source_module_id, target_module_id FROM dependencies WHERE repository_id = ?",
+        )?;
+        let rows = statement.query_map(params![repository_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                (row.get::<_, String>(1)?, row.get::<_, String>(2)?),
+            ))
+        })?;
+        collect_rows(rows)?.into_iter().collect()
+    };
+    Ok((files, modules, dependencies))
+}
+
+#[allow(clippy::type_complexity)] // the three delta buckets, named in IndexDelta
+fn diff_files<'a>(
+    files: &'a [FileRecord],
+    existing: &PersistedFiles,
+) -> (
+    Vec<&'a FileRecord>,
+    Vec<(&'a FileRecord, String)>,
+    Vec<(String, String)>,
+) {
+    let new_ids: HashSet<&str> = files.iter().map(|file| file.id.as_str()).collect();
+    let to_remove: Vec<(String, String)> = existing
+        .iter()
+        .filter(|(id, _)| !new_ids.contains(id.as_str()))
+        .map(|(id, (_, module_id))| (id.clone(), module_id.clone()))
+        .collect();
+    let mut to_add = Vec::new();
+    let mut to_update = Vec::new();
+    for file in files {
+        match existing.get(&file.id) {
+            None => to_add.push(file),
+            Some((hash, module_id))
+                if *hash != file.content_hash || *module_id != file.module_id =>
+            {
+                to_update.push((file, module_id.clone()));
+            }
+            Some(_) => {}
+        }
+    }
+    (to_add, to_update, to_remove)
+}
+
+fn diff_modules<'a>(
+    modules: &'a [ModuleRecord],
+    existing: &PersistedModules,
+) -> (Vec<&'a ModuleRecord>, Vec<&'a ModuleRecord>, Vec<String>) {
+    let new_ids: HashSet<&str> = modules.iter().map(|module| module.id.as_str()).collect();
+    let to_remove: Vec<String> = existing
+        .keys()
+        .filter(|id| !new_ids.contains(id.as_str()))
+        .cloned()
+        .collect();
+    let mut to_add = Vec::new();
+    let mut to_reprefix = Vec::new();
+    for module in modules {
+        match existing.get(&module.id) {
+            None => to_add.push(module),
+            Some(prefix) if *prefix != module.path_prefix => to_reprefix.push(module),
+            Some(_) => {}
+        }
+    }
+    (to_add, to_reprefix, to_remove)
+}
+
+fn diff_dependencies<'a>(
+    dependencies: &'a [DependencyRecord],
+    existing: &PersistedDependencies,
+) -> (Vec<&'a DependencyRecord>, Vec<(String, String, String)>) {
+    let mut new_ids = HashSet::new();
+    let mut to_add = Vec::new();
+    for dependency in dependencies {
+        // In-batch dedup: stable IDs must stay unique per run.
+        if !new_ids.insert(dependency.id.as_str()) {
+            continue;
+        }
+        if !existing.contains_key(&dependency.id) {
+            to_add.push(dependency);
+        }
+    }
+    let to_remove: Vec<(String, String, String)> = existing
+        .iter()
+        .filter(|(id, _)| !new_ids.contains(id.as_str()))
+        .map(|(id, (source, target))| (id.clone(), source.clone(), target.clone()))
+        .collect();
+    (to_add, to_remove)
+}
+
+/// Repository upsert: created_at survives re-indexing.
+fn upsert_repository(
+    tx: &Transaction<'_>,
+    repository_id: &str,
+    repository_root: &str,
+    now: &str,
+) -> Result<()> {
+    let updated = tx.execute(
+        "UPDATE repositories SET root_path = ?, name = ?, updated_at = ? WHERE id = ?",
+        params![
+            repository_root,
+            repository_name(repository_root),
+            now,
+            repository_id
+        ],
+    )?;
+    if updated == 0 {
+        tx.execute(
+            "INSERT INTO repositories (id, root_path, name, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+            params![repository_id, repository_root, repository_name(repository_root), now, now],
+        )?;
+    }
+    Ok(())
+}
+
+/// Targeted deletes for everything the delta removed or is about to rewrite,
+/// including the graph nodes/edges derived from each row.
+fn apply_index_deletes(
+    tx: &Transaction<'_>,
+    repository_id: &str,
+    delta: &IndexDelta<'_>,
+    stats: &mut SyncStats,
+) -> Result<()> {
+    let mut delete_file = tx.prepare("DELETE FROM files WHERE id = ?")?;
+    let mut delete_module = tx.prepare("DELETE FROM modules WHERE id = ?")?;
+    let mut delete_dependency = tx.prepare("DELETE FROM dependencies WHERE id = ?")?;
+    let mut delete_node = tx.prepare("DELETE FROM graph_nodes WHERE id = ?")?;
+    let mut delete_edge = tx.prepare("DELETE FROM graph_edges WHERE id = ?")?;
+
+    for (file_id, module_id) in &delta.files_to_remove {
+        delete_file.execute(params![file_id])?;
+        delete_node.execute(params![file_id])?;
+        delete_edge.execute(params![contains_edge_id(repository_id, module_id, file_id)])?;
+        stats.files_removed += 1;
+    }
+    for (file, old_module_id) in &delta.files_to_update {
+        delete_file.execute(params![file.id])?;
+        if *old_module_id != file.module_id {
+            delete_edge.execute(params![contains_edge_id(
+                repository_id,
+                old_module_id,
+                &file.id
+            )])?;
+        }
+        stats.files_updated += 1;
+    }
+    for (dependency_id, source_module_id, target_module_id) in &delta.dependencies_to_remove {
+        delete_dependency.execute(params![dependency_id])?;
+        delete_edge.execute(params![depends_on_edge_id(
+            repository_id,
+            source_module_id,
+            target_module_id,
+            dependency_id
+        )])?;
+        // Mirror of the file→file edge added on insert (no-op if absent).
+        delete_edge.execute(params![depends_on_file_edge_id(
+            repository_id,
+            dependency_id
+        )])?;
+        stats.dependencies_removed += 1;
+    }
+    for module_id in &delta.modules_to_remove {
+        delete_module.execute(params![module_id])?;
+        delete_node.execute(params![module_id])?;
+        stats.modules_removed += 1;
+    }
+    for module in &delta.modules_to_reprefix {
+        tx.execute(
+            "UPDATE modules SET path_prefix = ? WHERE id = ?",
+            params![module.path_prefix, module.id],
+        )?;
+    }
+    Ok(())
+}
+
+/// New module/file/dependency rows, via the columnar appender rather than
+/// per-row prepared statements: on large repos the `dependencies`/`files`
+/// inserts (tens to hundreds of thousands of rows, each a round-trip) were
+/// the dominant persist cost. Each table gets its own scoped appender; ids
+/// are deduplicated first because the appender fails silently on a duplicate
+/// primary key.
+fn append_index_rows(
+    tx: &Transaction<'_>,
+    delta: &IndexDelta<'_>,
+    now: &str,
+    stats: &mut SyncStats,
+) -> Result<()> {
+    {
+        let mut modules = tx.appender("modules")?;
+        for module in &delta.modules_to_add {
+            modules.append_row(params![
+                module.id,
+                module.repository_id,
+                module.name,
+                module.path_prefix,
+                "inferred",
+                Option::<String>::None,
+                Option::<String>::None
+            ])?;
+            stats.modules_added += 1;
+        }
+    }
+    {
+        let mut files = tx.appender("files")?;
+        for file in &delta.files_to_add {
+            files.append_row(params![
+                file.id,
+                file.repository_id,
+                file.path,
+                file.language.as_str(),
+                file.content_hash,
+                file.size_bytes as i64,
+                file.module_id,
+                file.module_name,
+                now
+            ])?;
+            stats.files_added += 1;
+        }
+    }
+    {
+        let mut deps = tx.appender("dependencies")?;
+        let mut seen = HashSet::new();
+        for dependency in &delta.dependencies_to_add {
+            if !seen.insert(dependency.id.as_str()) {
+                continue;
+            }
+            deps.append_row(params![
+                dependency.id,
+                dependency.repository_id,
+                dependency.source_file_id,
+                dependency.target_file_id,
+                dependency.source_file_path,
+                dependency.target_file_path,
+                dependency.source_module_id,
+                dependency.target_module_id,
+                dependency.source_module,
+                dependency.target_module,
+                dependency.specifier,
+                dependency.dependency_kind,
+                dependency.is_external,
+                dependency.evidence_line as i32,
+                now
+            ])?;
+            stats.dependencies_added += 1;
+        }
+    }
+    Ok(())
+}
+
+fn append_index_graph_nodes(
+    tx: &Transaction<'_>,
+    repository_id: &str,
+    delta: &IndexDelta<'_>,
+) -> Result<()> {
+    let mut nodes = tx.appender("graph_nodes")?;
+    for module in &delta.modules_to_add {
+        nodes.append_row(params![
+            module.id,
+            repository_id,
+            "module",
+            module.name,
+            "{}"
+        ])?;
+    }
+    for file in &delta.files_to_add {
+        nodes.append_row(params![file.id, repository_id, "file", file.path, "{}"])?;
+    }
+    Ok(())
+}
+
+fn append_index_graph_edges(
+    tx: &Transaction<'_>,
+    repository_id: &str,
+    delta: &IndexDelta<'_>,
+) -> Result<()> {
+    let mut edges = tx.appender("graph_edges")?;
+    let mut seen = HashSet::new();
+    for file in &delta.files_to_add {
+        let edge_id = contains_edge_id(repository_id, &file.module_id, &file.id);
+        if !seen.insert(edge_id.clone()) {
+            continue;
+        }
+        edges.append_row(params![
+            edge_id,
+            repository_id,
+            file.module_id,
+            file.id,
+            "contains",
+            1.0_f64,
+            "{}"
+        ])?;
+    }
+    for dependency in &delta.dependencies_to_add {
+        // File→file edge first: lets blast/impact reach a file's direct
+        // dependents (the module→module edge alone hides intra-module
+        // coupling). Only internal deps carry a target file node; skip
+        // self-loops.
+        if let Some(target_file_id) = dependency.target_file_id.as_deref()
+            && !dependency.is_external
+            && !target_file_id.is_empty()
+            && dependency.source_file_id != target_file_id
+        {
+            let file_edge_id = depends_on_file_edge_id(repository_id, &dependency.id);
+            if seen.insert(file_edge_id.clone()) {
+                edges.append_row(params![
+                    file_edge_id,
+                    repository_id,
+                    dependency.source_file_id,
+                    target_file_id,
+                    "depends_on",
+                    1.0_f64,
+                    format!(
+                        r#"{{"file":"{}","line":{},"specifier":"{}"}}"#,
+                        dependency.source_file_path, dependency.evidence_line, dependency.specifier
+                    )
+                ])?;
+            }
+        }
+        let edge_id = depends_on_edge_id(
+            repository_id,
+            &dependency.source_module_id,
+            &dependency.target_module_id,
+            &dependency.id,
+        );
+        if !seen.insert(edge_id.clone()) {
+            continue;
+        }
+        edges.append_row(params![
+            edge_id,
+            repository_id,
+            dependency.source_module_id,
+            dependency.target_module_id,
+            "depends_on",
+            1.0_f64,
+            format!(
+                r#"{{"file":"{}","line":{},"specifier":"{}"}}"#,
+                dependency.source_file_path, dependency.evidence_line, dependency.specifier
+            )
+        ])?;
+    }
+    Ok(())
+}
+
+/// Updated files: re-insert the row and re-link the module edge when the
+/// module changed. Prepared statements, scoped after the appenders so the
+/// connection is free.
+fn reinsert_updated_files(
+    tx: &Transaction<'_>,
+    repository_id: &str,
+    delta: &IndexDelta<'_>,
+    now: &str,
+) -> Result<()> {
+    let mut insert_file = tx.prepare(
+        "INSERT INTO files (id, repository_id, path, language, content_hash, size_bytes, module_id, module_name, last_indexed_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )?;
+    let mut insert_edge = tx.prepare(
+        "INSERT INTO graph_edges (id, repository_id, source_id, target_id, edge_kind, weight, evidence_json)
+         VALUES (?, ?, ?, ?, ?, ?, ?)",
+    )?;
+    for (file, old_module_id) in &delta.files_to_update {
+        insert_file.execute(params![
+            file.id,
+            file.repository_id,
+            file.path,
+            file.language.as_str(),
+            file.content_hash,
+            file.size_bytes as i64,
+            file.module_id,
+            file.module_name,
+            now
+        ])?;
+        if *old_module_id != file.module_id {
+            insert_edge.execute(params![
+                contains_edge_id(repository_id, &file.module_id, &file.id),
+                repository_id,
+                file.module_id,
+                file.id,
+                "contains",
+                1.0_f64,
+                "{}"
+            ])?;
+        }
+    }
+    Ok(())
+}
+
+/// Everything one appended snapshot records: its identity plus the state and
+/// metrics it captures.
+struct SnapshotRows<'a> {
+    snapshot_id: &'a str,
+    commit_sha: Option<&'a str>,
+    modules: &'a [ModuleRecord],
+    files: &'a [FileRecord],
+    dependencies: &'a [DependencyRecord],
+    metrics: &'a [(String, f64)],
+}
+
+/// Append-only snapshot rows, bulk via the DuckDB appender.
+fn append_snapshot_rows(
+    tx: &Transaction<'_>,
+    repository_id: &str,
+    snapshot: &SnapshotRows<'_>,
+    now: &str,
+) -> Result<()> {
+    let circular_dependencies = snapshot
+        .metrics
+        .iter()
+        .find(|(name, _)| name == "circular_dependencies")
+        .map(|(_, value)| *value as i64)
+        .unwrap_or(0);
+    let summary_hash = stable_id(
+        "summary",
+        &[
+            repository_id,
+            &snapshot.modules.len().to_string(),
+            &snapshot.dependencies.len().to_string(),
+            &circular_dependencies.to_string(),
+        ],
+    );
+
+    tx.execute(
+        "INSERT INTO snapshots (id, repository_id, commit_sha, created_at, summary_hash) VALUES (?, ?, ?, ?, ?)",
+        params![snapshot.snapshot_id, repository_id, snapshot.commit_sha, now, summary_hash],
+    )?;
+
+    {
+        let mut appender = tx.appender("snapshot_modules")?;
+        for module in snapshot.modules {
+            appender.append_row(params![snapshot.snapshot_id, module.name])?;
+        }
+    }
+    {
+        let mut appender = tx.appender("snapshot_dependencies")?;
+        for dependency in snapshot.dependencies {
+            appender.append_row(params![
+                snapshot.snapshot_id,
+                dependency.source_module,
+                dependency.target_module,
+                dependency.specifier,
+                dependency.is_external
+            ])?;
+        }
+    }
+    {
+        let mut appender = tx.appender("snapshot_metrics")?;
+        for (name, value) in snapshot.metrics {
+            appender.append_row(params![snapshot.snapshot_id, name, value])?;
+        }
+    }
+    {
+        // Retain per-file content hashes so a later review can tell exactly
+        // which files a change added/modified (and scope clone detection to
+        // them). Append-only, like the other snapshot_* tables.
+        let mut appender = tx.appender("snapshot_files")?;
+        for file in snapshot.files {
+            appender.append_row(params![snapshot.snapshot_id, file.path, file.content_hash])?;
+        }
+    }
+    Ok(())
+}
+
+/// Persisted code-fact IDs per table, loaded before the diff.
+struct PriorCodeIds {
+    symbols: HashSet<String>,
+    calls: HashSet<String>,
+    apis: HashSet<String>,
+    schema_objects: HashSet<String>,
+}
+
+fn load_prior_code_ids(tx: &Transaction<'_>, repository_id: &str) -> Result<PriorCodeIds> {
+    Ok(PriorCodeIds {
+        symbols: existing_ids(tx, "symbols", repository_id)?,
+        calls: existing_ids(tx, "calls", repository_id)?,
+        apis: existing_ids(tx, "apis", repository_id)?,
+        schema_objects: existing_ids(tx, "schema_objects", repository_id)?,
+    })
+}
+
+/// Deletes the rows whose stable ID vanished from the fresh extraction, with
+/// the graph nodes/edges derived from them. Table-driven: each code-fact
+/// table declares the edge kinds and node rows it owns.
+fn delete_stale_code_facts(
+    tx: &Transaction<'_>,
+    repository_id: &str,
+    prior: &PriorCodeIds,
+    code: &ResolvedCode<'_>,
+    stats: &mut SyncStats,
+) -> Result<()> {
+    let new_symbols: HashSet<&str> = code.symbols.iter().map(|s| s.id.as_str()).collect();
+    let new_calls: HashSet<&str> = code.calls.iter().map(|c| c.id.as_str()).collect();
+    let new_apis: HashSet<&str> = code.apis.iter().map(|a| a.id.as_str()).collect();
+    let new_schema: HashSet<&str> = code.schema_objects.iter().map(|s| s.id.as_str()).collect();
+
+    let mut delete_edge = tx.prepare("DELETE FROM graph_edges WHERE id = ?")?;
+    let mut delete_node = tx.prepare("DELETE FROM graph_nodes WHERE id = ?")?;
+    let tables = [
+        (
+            "symbols",
+            &prior.symbols,
+            &new_symbols,
+            &["declares"][..],
+            true,
+            &mut stats.symbols_removed,
+        ),
+        (
+            "calls",
+            &prior.calls,
+            &new_calls,
+            &["calls"][..],
+            false,
+            &mut stats.calls_removed,
+        ),
+        (
+            "apis",
+            &prior.apis,
+            &new_apis,
+            &["exposes", "handles"][..],
+            true,
+            &mut stats.apis_removed,
+        ),
+        (
+            "schema_objects",
+            &prior.schema_objects,
+            &new_schema,
+            &[][..],
+            true,
+            &mut stats.schema_objects_removed,
+        ),
+    ];
+    for (table, prior_ids, current, edge_kinds, has_node, removed) in tables {
+        let mut delete = tx.prepare(&format!("DELETE FROM {table} WHERE id = ?"))?;
+        for id in prior_ids.iter().filter(|id| !current.contains(id.as_str())) {
+            delete.execute(params![id])?;
+            for kind in edge_kinds {
+                delete_edge.execute(params![code_edge_id(repository_id, id, kind)])?;
+            }
+            if has_node {
+                delete_node.execute(params![id])?;
+            }
+            *removed += 1;
+        }
+    }
+    Ok(())
+}
+
+fn append_symbol_rows(
+    tx: &Transaction<'_>,
+    code: &ResolvedCode<'_>,
+    prior: &PriorCodeIds,
+    stats: &mut SyncStats,
+) -> Result<()> {
+    let mut seen = HashSet::new();
+    let mut symbols = tx.appender("symbols")?;
+    for symbol in code.symbols {
+        if prior.symbols.contains(symbol.id.as_str()) || !seen.insert(symbol.id.as_str()) {
+            continue;
+        }
+        let (start_line, end_line) = match symbol.span {
+            Some(span) => (Some(span.start_line as i32), Some(span.end_line as i32)),
+            None => (None, None),
+        };
+        symbols.append_row(params![
+            symbol.id.as_str(),
+            symbol.repository_id.as_str(),
+            symbol.file_id.as_str(),
+            symbol.module_id.as_ref().map(|m| m.as_str()),
+            symbol.language.as_str(),
+            enum_str(&symbol.kind),
+            symbol.name,
+            symbol.qualified_name,
+            start_line,
+            end_line,
+            symbol.visibility.as_ref().map(enum_str),
+            symbol.type_signature,
+        ])?;
+        stats.symbols_added += 1;
+    }
+    Ok(())
+}
+
+fn append_call_rows(
+    tx: &Transaction<'_>,
+    code: &ResolvedCode<'_>,
+    prior: &PriorCodeIds,
+    stats: &mut SyncStats,
+) -> Result<()> {
+    let mut seen = HashSet::new();
+    let mut calls = tx.appender("calls")?;
+    for call in code.calls {
+        if prior.calls.contains(call.id.as_str()) || !seen.insert(call.id.as_str()) {
+            continue;
+        }
+        calls.append_row(params![
+            call.id.as_str(),
+            call.repository_id.as_str(),
+            call.caller_symbol_id.as_str(),
+            call.callee_symbol_id.as_ref().map(|s| s.as_str()),
+            call.callee_name,
+            enum_str(&call.kind),
+            Option::<&str>::None,
+            call.evidence
+                .as_ref()
+                .and_then(|e| e.line)
+                .map(|l| l as i32),
+        ])?;
+        stats.calls_added += 1;
+    }
+    Ok(())
+}
+
+fn append_api_rows(
+    tx: &Transaction<'_>,
+    code: &ResolvedCode<'_>,
+    prior: &PriorCodeIds,
+    stats: &mut SyncStats,
+) -> Result<()> {
+    let mut seen = HashSet::new();
+    let mut apis = tx.appender("apis")?;
+    for api in code.apis {
+        if prior.apis.contains(api.id.as_str()) || !seen.insert(api.id.as_str()) {
+            continue;
+        }
+        apis.append_row(params![
+            api.id.as_str(),
+            api.repository_id.as_str(),
+            api.module_id.as_ref().map(|m| m.as_str()),
+            enum_str(&api.kind),
+            api.method,
+            api.path,
+            api.name,
+            api.handler_symbol_id.as_ref().map(|s| s.as_str()),
+            api.request_type,
+            api.response_type,
+            Option::<&str>::None,
+            api.evidence.as_ref().and_then(|e| e.line).map(|l| l as i32),
+        ])?;
+        stats.apis_added += 1;
+    }
+    Ok(())
+}
+
+fn append_schema_object_rows(
+    tx: &Transaction<'_>,
+    code: &ResolvedCode<'_>,
+    prior: &PriorCodeIds,
+    stats: &mut SyncStats,
+) -> Result<()> {
+    let mut seen = HashSet::new();
+    let mut schema = tx.appender("schema_objects")?;
+    for object in code.schema_objects {
+        if prior.schema_objects.contains(object.id.as_str()) || !seen.insert(object.id.as_str()) {
+            continue;
+        }
+        schema.append_row(params![
+            object.id.as_str(),
+            object.repository_id.as_str(),
+            enum_str(&object.kind),
+            object.name,
+            object.parent_id.as_ref().map(|p| p.as_str()),
+            Option::<&str>::None,
+            object
+                .evidence
+                .as_ref()
+                .and_then(|e| e.line)
+                .map(|l| l as i32),
+        ])?;
+        stats.schema_objects_added += 1;
+    }
+    Ok(())
+}
+
+/// Graph nodes mirroring the code facts (symbols, APIs, tables) so blast
+/// analysis can classify and label traversed ids.
+fn append_code_graph_nodes(
+    tx: &Transaction<'_>,
+    repository_id: &str,
+    code: &ResolvedCode<'_>,
+    prior: &PriorCodeIds,
+) -> Result<()> {
+    let mut nodes = tx.appender("graph_nodes")?;
+    let mut seen = HashSet::new();
+    for symbol in code.symbols {
+        if prior.symbols.contains(symbol.id.as_str()) || !seen.insert(symbol.id.as_str()) {
+            continue;
+        }
+        nodes.append_row(params![
+            symbol.id.as_str(),
+            repository_id,
+            "symbol",
+            symbol.qualified_name,
+            "{}"
+        ])?;
+    }
+    for api in code.apis {
+        if prior.apis.contains(api.id.as_str()) || !seen.insert(api.id.as_str()) {
+            continue;
+        }
+        nodes.append_row(params![
+            api.id.as_str(),
+            repository_id,
+            "api",
+            api_label(api),
+            "{}"
+        ])?;
+    }
+    for object in code.schema_objects {
+        if prior.schema_objects.contains(object.id.as_str()) || !seen.insert(object.id.as_str()) {
+            continue;
+        }
+        nodes.append_row(params![
+            object.id.as_str(),
+            repository_id,
+            enum_str(&object.kind),
+            object.name,
+            "{}"
+        ])?;
+    }
+    Ok(())
+}
+
+/// `declares` and `calls` edges derived from the code facts: a file declares
+/// each of its symbols, a caller calls each resolved callee.
+fn append_declaration_edges(
+    tx: &Transaction<'_>,
+    repository_id: &str,
+    code: &ResolvedCode<'_>,
+    prior: &PriorCodeIds,
+) -> Result<()> {
+    let mut edges = tx.appender("graph_edges")?;
+    let mut seen = HashSet::new();
+    for symbol in code.symbols {
+        if prior.symbols.contains(symbol.id.as_str()) {
+            continue;
+        }
+        let edge_id = code_edge_id(repository_id, symbol.id.as_str(), "declares");
+        if !seen.insert(edge_id.clone()) {
+            continue;
+        }
+        edges.append_row(params![
+            edge_id,
+            repository_id,
+            symbol.file_id.as_str(),
+            symbol.id.as_str(),
+            "declares",
+            1.0_f64,
+            "{}"
+        ])?;
+    }
+    for call in code.calls {
+        if prior.calls.contains(call.id.as_str()) {
+            continue;
+        }
+        // Only resolved calls carry an edge.
+        if let Some(callee) = &call.callee_symbol_id {
+            let edge_id = code_edge_id(repository_id, call.id.as_str(), "calls");
+            if !seen.insert(edge_id.clone()) {
+                continue;
+            }
+            edges.append_row(params![
+                edge_id,
+                repository_id,
+                call.caller_symbol_id.as_str(),
+                callee.as_str(),
+                "calls",
+                1.0_f64,
+                "{}"
+            ])?;
+        }
+    }
+    Ok(())
+}
+
+/// `exposes` and `handles` edges: a module exposes each API, an API is
+/// handled by its resolved handler symbol.
+fn append_api_edges(
+    tx: &Transaction<'_>,
+    repository_id: &str,
+    code: &ResolvedCode<'_>,
+    prior: &PriorCodeIds,
+) -> Result<()> {
+    let mut edges = tx.appender("graph_edges")?;
+    let mut seen = HashSet::new();
+    for api in code.apis {
+        if prior.apis.contains(api.id.as_str()) {
+            continue;
+        }
+        if let Some(module) = &api.module_id {
+            let edge_id = code_edge_id(repository_id, api.id.as_str(), "exposes");
+            if seen.insert(edge_id.clone()) {
+                edges.append_row(params![
+                    edge_id,
+                    repository_id,
+                    module.as_str(),
+                    api.id.as_str(),
+                    "exposes",
+                    1.0_f64,
+                    "{}"
+                ])?;
+            }
+        }
+        if let Some(handler) = &api.handler_symbol_id {
+            let edge_id = code_edge_id(repository_id, api.id.as_str(), "handles");
+            if seen.insert(edge_id.clone()) {
+                edges.append_row(params![
+                    edge_id,
+                    repository_id,
+                    api.id.as_str(),
+                    handler.as_str(),
+                    "handles",
+                    1.0_f64,
+                    "{}"
+                ])?;
+            }
+        }
+    }
+    Ok(())
+}
+
 impl ArchitectureStore {
     /// Synchronizes the persisted index with the freshly extracted state.
     ///
@@ -149,425 +1042,35 @@ impl ArchitectureStore {
             }
         };
 
-        // Repository upsert: created_at survives re-indexing.
-        let updated = tx.execute(
-            "UPDATE repositories SET root_path = ?, name = ?, updated_at = ? WHERE id = ?",
-            params![
-                repository_root,
-                repository_name(repository_root),
-                now,
-                repository_id
-            ],
-        )?;
-        if updated == 0 {
-            tx.execute(
-                "INSERT INTO repositories (id, root_path, name, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
-                params![repository_id, repository_root, repository_name(repository_root), now, now],
-            )?;
-        }
-
-        // ---- persisted state, keyed by stable IDs ----
-        let existing_files: HashMap<String, (String, String)> = {
-            let mut statement = tx
-                .prepare("SELECT id, content_hash, module_id FROM files WHERE repository_id = ?")?;
-            let rows = statement.query_map(params![repository_id], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    (row.get::<_, String>(1)?, row.get::<_, String>(2)?),
-                ))
-            })?;
-            collect_rows(rows)?.into_iter().collect()
-        };
-        let existing_modules: HashMap<String, String> = {
-            let mut statement =
-                tx.prepare("SELECT id, path_prefix FROM modules WHERE repository_id = ?")?;
-            let rows = statement.query_map(params![repository_id], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })?;
-            collect_rows(rows)?.into_iter().collect()
-        };
-        let existing_dependencies: HashMap<String, (String, String)> = {
-            let mut statement = tx.prepare(
-                "SELECT id, source_module_id, target_module_id FROM dependencies WHERE repository_id = ?",
-            )?;
-            let rows = statement.query_map(params![repository_id], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    (row.get::<_, String>(1)?, row.get::<_, String>(2)?),
-                ))
-            })?;
-            collect_rows(rows)?.into_iter().collect()
-        };
-
-        // ---- diff by stable IDs ----
-        let new_file_ids: HashSet<&str> = files.iter().map(|file| file.id.as_str()).collect();
-        let new_module_ids: HashSet<&str> =
-            modules.iter().map(|module| module.id.as_str()).collect();
-
-        let mut new_dependency_ids = HashSet::new();
-        let mut dependencies_to_add = Vec::new();
-        for dependency in dependencies {
-            // In-batch dedup: stable IDs must stay unique per run.
-            if !new_dependency_ids.insert(dependency.id.as_str()) {
-                continue;
-            }
-            if !existing_dependencies.contains_key(&dependency.id) {
-                dependencies_to_add.push(dependency);
-            }
-        }
-
-        let files_to_remove: Vec<(String, String)> = existing_files
-            .iter()
-            .filter(|(id, _)| !new_file_ids.contains(id.as_str()))
-            .map(|(id, (_, module_id))| (id.clone(), module_id.clone()))
-            .collect();
-        let mut files_to_add = Vec::new();
-        let mut files_to_update = Vec::new();
-        for file in files {
-            match existing_files.get(&file.id) {
-                None => files_to_add.push(file),
-                Some((hash, module_id))
-                    if *hash != file.content_hash || *module_id != file.module_id =>
-                {
-                    files_to_update.push((file, module_id.clone()));
-                }
-                Some(_) => {}
-            }
-        }
-
-        let modules_to_remove: Vec<String> = existing_modules
-            .keys()
-            .filter(|id| !new_module_ids.contains(id.as_str()))
-            .cloned()
-            .collect();
-        let mut modules_to_add = Vec::new();
-        let mut modules_to_reprefix = Vec::new();
-        for module in modules {
-            match existing_modules.get(&module.id) {
-                None => modules_to_add.push(module),
-                Some(prefix) if *prefix != module.path_prefix => modules_to_reprefix.push(module),
-                Some(_) => {}
-            }
-        }
-
-        let dependencies_to_remove: Vec<(String, String, String)> = existing_dependencies
-            .iter()
-            .filter(|(id, _)| !new_dependency_ids.contains(id.as_str()))
-            .map(|(id, (source, target))| (id.clone(), source.clone(), target.clone()))
-            .collect();
-
-        // ---- targeted deletes ----
-        {
-            let mut delete_file = tx.prepare("DELETE FROM files WHERE id = ?")?;
-            let mut delete_module = tx.prepare("DELETE FROM modules WHERE id = ?")?;
-            let mut delete_dependency = tx.prepare("DELETE FROM dependencies WHERE id = ?")?;
-            let mut delete_node = tx.prepare("DELETE FROM graph_nodes WHERE id = ?")?;
-            let mut delete_edge = tx.prepare("DELETE FROM graph_edges WHERE id = ?")?;
-
-            for (file_id, module_id) in &files_to_remove {
-                delete_file.execute(params![file_id])?;
-                delete_node.execute(params![file_id])?;
-                delete_edge.execute(params![contains_edge_id(
-                    repository_id,
-                    module_id,
-                    file_id
-                )])?;
-                stats.files_removed += 1;
-            }
-            for (file, old_module_id) in &files_to_update {
-                delete_file.execute(params![file.id])?;
-                if *old_module_id != file.module_id {
-                    delete_edge.execute(params![contains_edge_id(
-                        repository_id,
-                        old_module_id,
-                        &file.id
-                    )])?;
-                }
-                stats.files_updated += 1;
-            }
-            for (dependency_id, source_module_id, target_module_id) in &dependencies_to_remove {
-                delete_dependency.execute(params![dependency_id])?;
-                delete_edge.execute(params![depends_on_edge_id(
-                    repository_id,
-                    source_module_id,
-                    target_module_id,
-                    dependency_id
-                )])?;
-                // Mirror of the file→file edge added on insert (no-op if absent).
-                delete_edge.execute(params![depends_on_file_edge_id(
-                    repository_id,
-                    dependency_id
-                )])?;
-                stats.dependencies_removed += 1;
-            }
-            for module_id in &modules_to_remove {
-                delete_module.execute(params![module_id])?;
-                delete_node.execute(params![module_id])?;
-                stats.modules_removed += 1;
-            }
-            for module in &modules_to_reprefix {
-                tx.execute(
-                    "UPDATE modules SET path_prefix = ? WHERE id = ?",
-                    params![module.path_prefix, module.id],
-                )?;
-            }
-        }
-
-        // ---- inserts ----
-        // New rows go through the columnar appender rather than per-row prepared
-        // statements: on large repos the `dependencies`/`files` inserts (tens to
-        // hundreds of thousands of rows, each a round-trip) were the dominant
-        // persist cost. Each table gets its own scoped appender; ids are
-        // deduplicated first because the appender fails silently on a duplicate
-        // primary key. Updated files keep the prepared-statement path — a small
-        // set, and a re-insert rather than an append.
-        {
-            let mut modules = tx.appender("modules")?;
-            for module in &modules_to_add {
-                modules.append_row(params![
-                    module.id,
-                    module.repository_id,
-                    module.name,
-                    module.path_prefix,
-                    "inferred",
-                    Option::<String>::None,
-                    Option::<String>::None
-                ])?;
-                stats.modules_added += 1;
-            }
-        }
-        {
-            let mut files = tx.appender("files")?;
-            for file in &files_to_add {
-                files.append_row(params![
-                    file.id,
-                    file.repository_id,
-                    file.path,
-                    file.language.as_str(),
-                    file.content_hash,
-                    file.size_bytes as i64,
-                    file.module_id,
-                    file.module_name,
-                    now
-                ])?;
-                stats.files_added += 1;
-            }
-        }
-        {
-            let mut deps = tx.appender("dependencies")?;
-            let mut seen = HashSet::new();
-            for dependency in &dependencies_to_add {
-                if !seen.insert(dependency.id.as_str()) {
-                    continue;
-                }
-                deps.append_row(params![
-                    dependency.id,
-                    dependency.repository_id,
-                    dependency.source_file_id,
-                    dependency.target_file_id,
-                    dependency.source_file_path,
-                    dependency.target_file_path,
-                    dependency.source_module_id,
-                    dependency.target_module_id,
-                    dependency.source_module,
-                    dependency.target_module,
-                    dependency.specifier,
-                    dependency.dependency_kind,
-                    dependency.is_external,
-                    dependency.evidence_line as i32,
-                    now
-                ])?;
-                stats.dependencies_added += 1;
-            }
-        }
-        {
-            let mut nodes = tx.appender("graph_nodes")?;
-            for module in &modules_to_add {
-                nodes.append_row(params![
-                    module.id,
-                    repository_id,
-                    "module",
-                    module.name,
-                    "{}"
-                ])?;
-            }
-            for file in &files_to_add {
-                nodes.append_row(params![file.id, repository_id, "file", file.path, "{}"])?;
-            }
-        }
-        {
-            let mut edges = tx.appender("graph_edges")?;
-            let mut seen = HashSet::new();
-            for file in &files_to_add {
-                let edge_id = contains_edge_id(repository_id, &file.module_id, &file.id);
-                if !seen.insert(edge_id.clone()) {
-                    continue;
-                }
-                edges.append_row(params![
-                    edge_id,
-                    repository_id,
-                    file.module_id,
-                    file.id,
-                    "contains",
-                    1.0_f64,
-                    "{}"
-                ])?;
-            }
-            for dependency in &dependencies_to_add {
-                // File→file edge first: lets blast/impact reach a file's direct
-                // dependents (the module→module edge alone hides intra-module
-                // coupling). Only internal deps carry a target file node; skip
-                // self-loops.
-                if let Some(target_file_id) = dependency.target_file_id.as_deref()
-                    && !dependency.is_external
-                    && !target_file_id.is_empty()
-                    && dependency.source_file_id != target_file_id
-                {
-                    let file_edge_id = depends_on_file_edge_id(repository_id, &dependency.id);
-                    if seen.insert(file_edge_id.clone()) {
-                        edges.append_row(params![
-                            file_edge_id,
-                            repository_id,
-                            dependency.source_file_id,
-                            target_file_id,
-                            "depends_on",
-                            1.0_f64,
-                            format!(
-                                r#"{{"file":"{}","line":{},"specifier":"{}"}}"#,
-                                dependency.source_file_path,
-                                dependency.evidence_line,
-                                dependency.specifier
-                            )
-                        ])?;
-                    }
-                }
-                let edge_id = depends_on_edge_id(
-                    repository_id,
-                    &dependency.source_module_id,
-                    &dependency.target_module_id,
-                    &dependency.id,
-                );
-                if !seen.insert(edge_id.clone()) {
-                    continue;
-                }
-                edges.append_row(params![
-                    edge_id,
-                    repository_id,
-                    dependency.source_module_id,
-                    dependency.target_module_id,
-                    "depends_on",
-                    1.0_f64,
-                    format!(
-                        r#"{{"file":"{}","line":{},"specifier":"{}"}}"#,
-                        dependency.source_file_path, dependency.evidence_line, dependency.specifier
-                    )
-                ])?;
-            }
-        }
-        // Updated files: re-insert the row and re-link the module edge when the
-        // module changed. Prepared statements, scoped after the appenders so the
-        // connection is free.
-        {
-            let mut insert_file = tx.prepare(
-                "INSERT INTO files (id, repository_id, path, language, content_hash, size_bytes, module_id, module_name, last_indexed_at)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            )?;
-            let mut insert_edge = tx.prepare(
-                "INSERT INTO graph_edges (id, repository_id, source_id, target_id, edge_kind, weight, evidence_json)
-                 VALUES (?, ?, ?, ?, ?, ?, ?)",
-            )?;
-            for (file, old_module_id) in &files_to_update {
-                insert_file.execute(params![
-                    file.id,
-                    file.repository_id,
-                    file.path,
-                    file.language.as_str(),
-                    file.content_hash,
-                    file.size_bytes as i64,
-                    file.module_id,
-                    file.module_name,
-                    now
-                ])?;
-                if *old_module_id != file.module_id {
-                    insert_edge.execute(params![
-                        contains_edge_id(repository_id, &file.module_id, &file.id),
-                        repository_id,
-                        file.module_id,
-                        file.id,
-                        "contains",
-                        1.0_f64,
-                        "{}"
-                    ])?;
-                }
-            }
-        }
+        upsert_repository(&tx, repository_id, repository_root, &now)?;
+        let delta = compute_index_delta(&tx, repository_id, modules, files, dependencies)?;
+        apply_index_deletes(&tx, repository_id, &delta, &mut stats)?;
+        append_index_rows(&tx, &delta, &now, &mut stats)?;
+        append_index_graph_nodes(&tx, repository_id, &delta)?;
+        append_index_graph_edges(&tx, repository_id, &delta)?;
+        reinsert_updated_files(&tx, repository_id, &delta, &now)?;
 
         mark("graph+rows");
-        // ---- code-level facts: symbols, calls, APIs, schema objects ----
         Self::sync_code_facts(&tx, repository_id, code, &mut stats)?;
-
-        // ---- reads/writes access edges, diffed by their own ID ----
         Self::sync_schema_access_edges(&tx, repository_id, code)?;
 
         mark("code-facts");
-        // ---- code-health facts: complexity + exports (full replace) ----
         Self::replace_health_facts(&tx, repository_id, code)?;
 
         mark("v4-health");
-        // ---- snapshot rows (append-only; bulk via the DuckDB appender) ----
-        let circular_dependencies = metrics
-            .iter()
-            .find(|(name, _)| name == "circular_dependencies")
-            .map(|(_, value)| *value as i64)
-            .unwrap_or(0);
-        let summary_hash = stable_id(
-            "summary",
-            &[
-                repository_id,
-                &modules.len().to_string(),
-                &dependencies.len().to_string(),
-                &circular_dependencies.to_string(),
-            ],
-        );
-
-        tx.execute(
-            "INSERT INTO snapshots (id, repository_id, commit_sha, created_at, summary_hash) VALUES (?, ?, ?, ?, ?)",
-            params![snapshot_id, repository_id, commit_sha, now, summary_hash],
+        append_snapshot_rows(
+            &tx,
+            repository_id,
+            &SnapshotRows {
+                snapshot_id,
+                commit_sha,
+                modules,
+                files,
+                dependencies,
+                metrics,
+            },
+            &now,
         )?;
-
-        {
-            let mut appender = tx.appender("snapshot_modules")?;
-            for module in modules {
-                appender.append_row(params![snapshot_id, module.name])?;
-            }
-        }
-        {
-            let mut appender = tx.appender("snapshot_dependencies")?;
-            for dependency in dependencies {
-                appender.append_row(params![
-                    snapshot_id,
-                    dependency.source_module,
-                    dependency.target_module,
-                    dependency.specifier,
-                    dependency.is_external
-                ])?;
-            }
-        }
-        {
-            let mut appender = tx.appender("snapshot_metrics")?;
-            for (name, value) in metrics {
-                appender.append_row(params![snapshot_id, name, value])?;
-            }
-        }
-        {
-            // Retain per-file content hashes so a later review can tell exactly
-            // which files a change added/modified (and scope clone detection to
-            // them). Append-only, like the other snapshot_* tables.
-            let mut appender = tx.appender("snapshot_files")?;
-            for file in files {
-                appender.append_row(params![snapshot_id, file.path, file.content_hash])?;
-            }
-        }
 
         mark("snapshot");
         tx.commit()?;
@@ -586,312 +1089,21 @@ impl ArchitectureStore {
         code: &ResolvedCode<'_>,
         stats: &mut SyncStats,
     ) -> Result<()> {
-        let prior_symbols = existing_ids(tx, "symbols", repository_id)?;
-        let prior_calls = existing_ids(tx, "calls", repository_id)?;
-        let prior_apis = existing_ids(tx, "apis", repository_id)?;
-        let prior_schema = existing_ids(tx, "schema_objects", repository_id)?;
-
-        let new_symbols: HashSet<&str> = code.symbols.iter().map(|s| s.id.as_str()).collect();
-        let new_calls: HashSet<&str> = code.calls.iter().map(|c| c.id.as_str()).collect();
-        let new_apis: HashSet<&str> = code.apis.iter().map(|a| a.id.as_str()).collect();
-        let new_schema: HashSet<&str> = code.schema_objects.iter().map(|s| s.id.as_str()).collect();
-
-        // edges.
-        // Scoped so these prepared statements drop before the bulk appenders
-        // below claim the connection.
-        {
-            let mut delete_edge = tx.prepare("DELETE FROM graph_edges WHERE id = ?")?;
-            let mut delete_node = tx.prepare("DELETE FROM graph_nodes WHERE id = ?")?;
-            for (table, prior, current) in [
-                ("symbols", &prior_symbols, &new_symbols),
-                ("calls", &prior_calls, &new_calls),
-                ("apis", &prior_apis, &new_apis),
-                ("schema_objects", &prior_schema, &new_schema),
-            ] {
-                let mut delete = tx.prepare(&format!("DELETE FROM {table} WHERE id = ?"))?;
-                let removed = prior
-                    .iter()
-                    .filter(|id| !current.contains(id.as_str()))
-                    .count();
-                for id in prior.iter().filter(|id| !current.contains(id.as_str())) {
-                    delete.execute(params![id])?;
-                    match table {
-                        "symbols" => {
-                            delete_edge.execute(params![code_edge_id(
-                                repository_id,
-                                id,
-                                "declares"
-                            )])?;
-                            delete_node.execute(params![id])?;
-                        }
-                        "calls" => {
-                            delete_edge.execute(params![code_edge_id(
-                                repository_id,
-                                id,
-                                "calls"
-                            )])?;
-                        }
-                        "apis" => {
-                            delete_edge.execute(params![code_edge_id(
-                                repository_id,
-                                id,
-                                "exposes"
-                            )])?;
-                            delete_edge.execute(params![code_edge_id(
-                                repository_id,
-                                id,
-                                "handles"
-                            )])?;
-                            delete_node.execute(params![id])?;
-                        }
-                        "schema_objects" => {
-                            delete_node.execute(params![id])?;
-                        }
-                        _ => {}
-                    }
-                }
-                match table {
-                    "symbols" => stats.symbols_removed = removed,
-                    "calls" => stats.calls_removed = removed,
-                    "apis" => stats.apis_removed = removed,
-                    _ => stats.schema_objects_removed = removed,
-                }
-            }
-        }
-
-        // Bulk inserts via DuckDB appenders: one columnar append per
-        // table is far cheaper than per-row INSERTs for the high-volume code
-        // facts (symbols, calls, and their graph nodes/edges). Each appender
-        // is scoped so it flushes (on drop) before the next one opens — only
-        // one may borrow the connection at a time. `start_line`/`end_line`/
-        // `evidence_line` are INTEGER, so they are appended as `i32`.
-        let mut seen_symbols = HashSet::new();
-        let mut seen_calls = HashSet::new();
-        let mut seen_apis = HashSet::new();
-        let mut seen_schema = HashSet::new();
-        {
-            let mut symbols = tx.appender("symbols")?;
-            for symbol in code.symbols {
-                if prior_symbols.contains(symbol.id.as_str())
-                    || !seen_symbols.insert(symbol.id.as_str())
-                {
-                    continue;
-                }
-                let (start_line, end_line) = match symbol.span {
-                    Some(span) => (Some(span.start_line as i32), Some(span.end_line as i32)),
-                    None => (None, None),
-                };
-                symbols.append_row(params![
-                    symbol.id.as_str(),
-                    symbol.repository_id.as_str(),
-                    symbol.file_id.as_str(),
-                    symbol.module_id.as_ref().map(|m| m.as_str()),
-                    symbol.language.as_str(),
-                    enum_str(&symbol.kind),
-                    symbol.name,
-                    symbol.qualified_name,
-                    start_line,
-                    end_line,
-                    symbol.visibility.as_ref().map(enum_str),
-                    symbol.type_signature,
-                ])?;
-                stats.symbols_added += 1;
-            }
-        }
-        {
-            let mut calls = tx.appender("calls")?;
-            for call in code.calls {
-                if prior_calls.contains(call.id.as_str()) || !seen_calls.insert(call.id.as_str()) {
-                    continue;
-                }
-                calls.append_row(params![
-                    call.id.as_str(),
-                    call.repository_id.as_str(),
-                    call.caller_symbol_id.as_str(),
-                    call.callee_symbol_id.as_ref().map(|s| s.as_str()),
-                    call.callee_name,
-                    enum_str(&call.kind),
-                    Option::<&str>::None,
-                    call.evidence
-                        .as_ref()
-                        .and_then(|e| e.line)
-                        .map(|l| l as i32),
-                ])?;
-                stats.calls_added += 1;
-            }
-        }
-        {
-            let mut apis = tx.appender("apis")?;
-            for api in code.apis {
-                if prior_apis.contains(api.id.as_str()) || !seen_apis.insert(api.id.as_str()) {
-                    continue;
-                }
-                apis.append_row(params![
-                    api.id.as_str(),
-                    api.repository_id.as_str(),
-                    api.module_id.as_ref().map(|m| m.as_str()),
-                    enum_str(&api.kind),
-                    api.method,
-                    api.path,
-                    api.name,
-                    api.handler_symbol_id.as_ref().map(|s| s.as_str()),
-                    api.request_type,
-                    api.response_type,
-                    Option::<&str>::None,
-                    api.evidence.as_ref().and_then(|e| e.line).map(|l| l as i32),
-                ])?;
-                stats.apis_added += 1;
-            }
-        }
-        {
-            let mut schema = tx.appender("schema_objects")?;
-            for object in code.schema_objects {
-                if prior_schema.contains(object.id.as_str())
-                    || !seen_schema.insert(object.id.as_str())
-                {
-                    continue;
-                }
-                schema.append_row(params![
-                    object.id.as_str(),
-                    object.repository_id.as_str(),
-                    enum_str(&object.kind),
-                    object.name,
-                    object.parent_id.as_ref().map(|p| p.as_str()),
-                    Option::<&str>::None,
-                    object
-                        .evidence
-                        .as_ref()
-                        .and_then(|e| e.line)
-                        .map(|l| l as i32),
-                ])?;
-                stats.schema_objects_added += 1;
-            }
-        }
-        // Graph nodes mirror the code facts (symbols, APIs, tables) so
-        // blast analysis can classify and label traversed ids.
-        {
-            let mut nodes = tx.appender("graph_nodes")?;
-            let mut seen_nodes = HashSet::new();
-            for symbol in code.symbols {
-                if prior_symbols.contains(symbol.id.as_str())
-                    || !seen_nodes.insert(symbol.id.as_str())
-                {
-                    continue;
-                }
-                nodes.append_row(params![
-                    symbol.id.as_str(),
-                    repository_id,
-                    "symbol",
-                    symbol.qualified_name,
-                    "{}"
-                ])?;
-            }
-            for api in code.apis {
-                if prior_apis.contains(api.id.as_str()) || !seen_nodes.insert(api.id.as_str()) {
-                    continue;
-                }
-                nodes.append_row(params![
-                    api.id.as_str(),
-                    repository_id,
-                    "api",
-                    api_label(api),
-                    "{}"
-                ])?;
-            }
-            for object in code.schema_objects {
-                if prior_schema.contains(object.id.as_str())
-                    || !seen_nodes.insert(object.id.as_str())
-                {
-                    continue;
-                }
-                nodes.append_row(params![
-                    object.id.as_str(),
-                    repository_id,
-                    enum_str(&object.kind),
-                    object.name,
-                    "{}"
-                ])?;
-            }
-        }
-        // Graph edges derived from the code facts: a file
-        // `declares` each symbol, a caller `calls` each resolved callee, and
-        // a module `exposes`/`handles` each API.
-        {
-            let mut edges = tx.appender("graph_edges")?;
-            let mut seen_edges = HashSet::new();
-            for symbol in code.symbols {
-                if prior_symbols.contains(symbol.id.as_str()) {
-                    continue;
-                }
-                let edge_id = code_edge_id(repository_id, symbol.id.as_str(), "declares");
-                if !seen_edges.insert(edge_id.clone()) {
-                    continue;
-                }
-                edges.append_row(params![
-                    edge_id,
-                    repository_id,
-                    symbol.file_id.as_str(),
-                    symbol.id.as_str(),
-                    "declares",
-                    1.0_f64,
-                    "{}"
-                ])?;
-            }
-            for call in code.calls {
-                if prior_calls.contains(call.id.as_str()) {
-                    continue;
-                }
-                // Only resolved calls carry an edge.
-                if let Some(callee) = &call.callee_symbol_id {
-                    let edge_id = code_edge_id(repository_id, call.id.as_str(), "calls");
-                    if !seen_edges.insert(edge_id.clone()) {
-                        continue;
-                    }
-                    edges.append_row(params![
-                        edge_id,
-                        repository_id,
-                        call.caller_symbol_id.as_str(),
-                        callee.as_str(),
-                        "calls",
-                        1.0_f64,
-                        "{}"
-                    ])?;
-                }
-            }
-            for api in code.apis {
-                if prior_apis.contains(api.id.as_str()) {
-                    continue;
-                }
-                if let Some(module) = &api.module_id {
-                    let edge_id = code_edge_id(repository_id, api.id.as_str(), "exposes");
-                    if seen_edges.insert(edge_id.clone()) {
-                        edges.append_row(params![
-                            edge_id,
-                            repository_id,
-                            module.as_str(),
-                            api.id.as_str(),
-                            "exposes",
-                            1.0_f64,
-                            "{}"
-                        ])?;
-                    }
-                }
-                if let Some(handler) = &api.handler_symbol_id {
-                    let edge_id = code_edge_id(repository_id, api.id.as_str(), "handles");
-                    if seen_edges.insert(edge_id.clone()) {
-                        edges.append_row(params![
-                            edge_id,
-                            repository_id,
-                            api.id.as_str(),
-                            handler.as_str(),
-                            "handles",
-                            1.0_f64,
-                            "{}"
-                        ])?;
-                    }
-                }
-            }
-        }
+        let prior = load_prior_code_ids(tx, repository_id)?;
+        delete_stale_code_facts(tx, repository_id, &prior, code, stats)?;
+        // Bulk inserts via DuckDB appenders: one columnar append per table is
+        // far cheaper than per-row INSERTs for the high-volume code facts.
+        // Each appender lives in its own helper so it flushes (on drop) before
+        // the next one opens — only one may borrow the connection at a time.
+        // `start_line`/`end_line`/`evidence_line` are INTEGER, so they are
+        // appended as `i32`.
+        append_symbol_rows(tx, code, &prior, stats)?;
+        append_call_rows(tx, code, &prior, stats)?;
+        append_api_rows(tx, code, &prior, stats)?;
+        append_schema_object_rows(tx, code, &prior, stats)?;
+        append_code_graph_nodes(tx, repository_id, code, &prior)?;
+        append_declaration_edges(tx, repository_id, code, &prior)?;
+        append_api_edges(tx, repository_id, code, &prior)?;
         Ok(())
     }
 
