@@ -106,64 +106,69 @@ pub(crate) fn run_query(paths: &ProjectPaths, query: &Query, format: OutputForma
     let (nodes, edges) = load_graph(&store, &paths.repository_id().0)?;
     const DEPTH: usize = blast::DEFAULT_MAX_DEPTH;
 
-    let run = |selector: &TargetSelector, direction: ImpactDirection| {
-        blast::resolve_target(&selector_to_blast(selector), &nodes)
-            .and_then(|node| blast::blast_radius(&nodes, &edges, &node.id, direction, DEPTH))
+    let resolve = |selector: &TargetSelector| {
+        let input = selector_to_blast(selector);
+        blast::resolve_target(&input, &nodes)
+            .ok_or_else(|| unresolved_target(&input, &nodes, &edges))
+    };
+    let run = |selector: &TargetSelector, direction: ImpactDirection| -> Result<BlastResult> {
+        let node = resolve(selector)?;
+        blast::blast_radius(&nodes, &edges, &node.id, direction, DEPTH).ok_or_else(|| {
+            OveccError::Internal {
+                message: format!(
+                    "resolved target '{}' vanished from the graph view",
+                    node.label
+                ),
+            }
+            .into()
+        })
     };
 
     match query {
         Query::Deps(target) => print_query_labels(
             "Dependencies",
-            run(target, ImpactDirection::Upstream),
+            run(target, ImpactDirection::Upstream)?,
             format,
         ),
         Query::ReverseDeps(target) => print_query_labels(
             "Dependents",
-            run(target, ImpactDirection::Downstream),
+            run(target, ImpactDirection::Downstream)?,
             format,
         ),
         Query::Module(name) => {
             let selector = TargetSelector::Free(name.clone());
             print_query_labels(
                 "Dependencies",
-                run(&selector, ImpactDirection::Upstream),
+                run(&selector, ImpactDirection::Upstream)?,
                 format,
             )
         }
         Query::Paths(target) => {
-            let result = run(target, ImpactDirection::Both);
-            print_query_paths(
-                "Paths",
-                &result.map(|r| r.paths).unwrap_or_default(),
-                format,
-            )
+            print_query_paths("Paths", &run(target, ImpactDirection::Both)?, format)
         }
         Query::Relation { source, target } => {
-            let result = run(source, ImpactDirection::Upstream);
-            let needle = target.needle().to_ascii_lowercase();
+            let result = run(source, ImpactDirection::Upstream)?;
+            // Resolving the right-hand side too keeps `a -> b` honest: an
+            // unknown `b` errors with suggestions instead of a false "no".
+            let target_node = resolve(target)?;
             let reached = result
-                .as_ref()
-                .map(|r| {
-                    r.impacted_labels
-                        .iter()
-                        .any(|label| label.to_ascii_lowercase().contains(&needle))
-                })
-                .unwrap_or(false);
+                .impacted_labels
+                .iter()
+                .any(|label| label.eq_ignore_ascii_case(&target_node.label));
             let path = result
-                .as_ref()
-                .and_then(|r| {
-                    r.paths.iter().find(|p| {
-                        p.last()
-                            .is_some_and(|l| l.to_ascii_lowercase().contains(&needle))
-                    })
+                .paths
+                .iter()
+                .find(|p| {
+                    p.last()
+                        .is_some_and(|l| l.eq_ignore_ascii_case(&target_node.label))
                 })
                 .cloned();
             match format {
                 OutputFormat::Json | OutputFormat::Ndjson => {
                     let data = serde_json::json!({
                         "query": "relation",
-                        "source": source.needle(),
-                        "target": target.needle(),
+                        "source": result.target_label,
+                        "target": target_node.label,
                         "depends_on": reached,
                         "path": path,
                     });
@@ -172,8 +177,8 @@ pub(crate) fn run_query(paths: &ProjectPaths, query: &Query, format: OutputForma
                 _ => {
                     println!(
                         "{} depends on {}: {}",
-                        source.needle(),
-                        target.needle(),
+                        result.target_label,
+                        target_node.label,
                         if reached { "yes" } else { "no" }
                     );
                     if let Some(path) = path {
@@ -188,22 +193,51 @@ pub(crate) fn run_query(paths: &ProjectPaths, query: &Query, format: OutputForma
     }
 }
 
-fn print_query_labels(
-    label: &str,
-    result: Option<BlastResult>,
-    format: OutputFormat,
-) -> Result<u8> {
-    let labels = result.map(|r| r.impacted_labels).unwrap_or_default();
+/// Usage error for a target no graph node matches. Naming the closest indexed
+/// elements lets the caller — human or agent — retry with a real target
+/// instead of falling back to a broad text search; the stale index is the
+/// other common cause, so the message always ends on it.
+fn unresolved_target(input: &str, nodes: &[BlastNode], edges: &[BlastEdge]) -> anyhow::Error {
+    let candidates = blast::closest_targets(input, nodes, edges, 5);
+    let message = if candidates.is_empty() {
+        format!(
+            "no architecture element matches '{input}' — try an indexed module name or file \
+             path, or re-run `ovecc index` if the code changed since the last index"
+        )
+    } else {
+        let mut message =
+            format!("no architecture element matches '{input}' — closest indexed elements:");
+        for node in candidates {
+            message.push_str(&format!(
+                "\n  {} ({})",
+                blast::target_syntax(node),
+                node.kind
+            ));
+        }
+        message.push_str(
+            "\nretry with one of these, or re-run `ovecc index` if the code changed since the last index",
+        );
+        message
+    };
+    OveccError::Usage { message }.into()
+}
+
+// Echoing the resolved label matters because targets resolve by substring:
+// `deps sinc` lands on `filter_changed_since`, and a count without the
+// resolved name reads as an answer about the literal input.
+fn print_query_labels(label: &str, result: BlastResult, format: OutputFormat) -> Result<u8> {
+    let labels = result.impacted_labels;
     match format {
         OutputFormat::Json | OutputFormat::Ndjson => {
             let data = serde_json::json!({
                 "query": label.to_ascii_lowercase(),
+                "target": result.target_label,
                 "items": labels,
             });
             emit_json("query", &data, meta_for("query"))?;
         }
         _ => {
-            println!("{label}: {}", labels.len());
+            println!("{label} of {}: {}", result.target_label, labels.len());
             for item in &labels {
                 println!("  {item}");
             }
@@ -212,18 +246,23 @@ fn print_query_labels(
     Ok(0)
 }
 
-fn print_query_paths(label: &str, paths: &[Vec<String>], format: OutputFormat) -> Result<u8> {
+fn print_query_paths(label: &str, result: &BlastResult, format: OutputFormat) -> Result<u8> {
     match format {
         OutputFormat::Json | OutputFormat::Ndjson => {
             let data = serde_json::json!({
                 "query": label.to_ascii_lowercase(),
-                "paths": paths,
+                "target": result.target_label,
+                "paths": result.paths,
             });
             emit_json("query", &data, meta_for("query"))?;
         }
         _ => {
-            println!("{label}: {}", paths.len());
-            for path in paths {
+            println!(
+                "{label} for {}: {}",
+                result.target_label,
+                result.paths.len()
+            );
+            for path in &result.paths {
                 println!("  {}", path.join(" -> "));
             }
         }
@@ -241,28 +280,15 @@ pub(crate) fn build_context_slice(
 ) -> Result<ContextSlice> {
     let repository_id = paths.repository_id().0;
     let (nodes, edges) = load_graph(store, &repository_id)?;
-    let resolved = blast::resolve_target(target, &nodes);
     // An unknown target would otherwise narrate an empty slice as if the
     // element existed and were isolated — actively misleading for an agent.
-    if resolved.is_none() {
-        return Err(OveccError::Usage {
-            message: format!(
-                "no architecture element matches '{target}' — try a module name, a file path, \
-                 or `ovecc query \"module {target}\"` to search"
-            ),
-        }
-        .into());
-    }
-    let (label, target_id) = match &resolved {
-        Some(node) => (node.label.clone(), Some(node.id.clone())),
-        None => (target.to_string(), None),
+    let Some(node) = blast::resolve_target(target, &nodes) else {
+        return Err(unresolved_target(target, &nodes, &edges));
     };
+    let (label, target_id) = (node.label.clone(), node.id.clone());
 
-    let radius = |direction, depth| {
-        target_id
-            .as_ref()
-            .and_then(|id| blast::blast_radius(&nodes, &edges, id, direction, depth))
-    };
+    let radius =
+        |direction, depth| blast::blast_radius(&nodes, &edges, &target_id, direction, depth);
     // Depth 1: "dependencies"/"dependents" must mean the direct edges, not the
     // transitive closure — a file two imports away is not a dependency of the
     // target, and narrating it as one is actively misleading.
@@ -284,9 +310,10 @@ pub(crate) fn build_context_slice(
         .findings(&repository_id, None)?
         .into_iter()
         .filter(|finding| {
-            finding.target.as_ref().is_some_and(|t| {
-                Some(&t.id) == target_id.as_ref() || t.id.to_ascii_lowercase().contains(&needle)
-            })
+            finding
+                .target
+                .as_ref()
+                .is_some_and(|t| t.id == target_id || t.id.to_ascii_lowercase().contains(&needle))
         })
         .collect();
 
@@ -332,13 +359,7 @@ pub(crate) fn load_impact(
     let store = open_store(paths)?;
     let (nodes, edges) = load_graph(&store, &paths.repository_id().0)?;
     let Some(node) = blast::resolve_target(target, &nodes) else {
-        return Err(OveccError::Usage {
-            message: format!(
-                "no architecture element matches '{target}' — try a module name, a file path, \
-                 or `ovecc query \"module {target}\"` to search"
-            ),
-        }
-        .into());
+        return Err(unresolved_target(target, &nodes, &edges));
     };
     // A file target carries no architectural edges of its own — dependency edges
     // are module-level — so a raw file node yields an empty (and falsely
@@ -419,4 +440,41 @@ pub(crate) fn render_blast(result: &BlastResult, format: OutputFormat) -> Result
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn message(input: &str, nodes: &[BlastNode]) -> String {
+        format!("{:#}", unresolved_target(input, nodes, &[]))
+    }
+
+    #[test]
+    fn unresolved_target_names_the_closest_elements() {
+        let nodes: Vec<BlastNode> = [
+            ("m:billing", "module", "billing"),
+            ("t:customers", "table", "customers"),
+        ]
+        .map(|(id, kind, label)| BlastNode {
+            id: id.to_string(),
+            kind: kind.to_string(),
+            label: label.to_string(),
+        })
+        .into();
+        let text = message("biling", &nodes);
+        assert!(text.contains("no architecture element matches 'biling'"));
+        assert!(text.contains("billing (module)"), "{text}");
+        assert!(text.contains("`ovecc index`"));
+        // The table prefix comes back so the suggested retry resolves as typed.
+        assert!(message("custommers", &nodes).contains("table:customers (table)"));
+    }
+
+    #[test]
+    fn unresolved_target_without_candidates_still_points_at_the_index() {
+        let text = message("zzzz", &[]);
+        assert!(text.contains("no architecture element matches 'zzzz'"));
+        assert!(text.contains("`ovecc index`"));
+        assert!(!text.contains("closest"));
+    }
 }

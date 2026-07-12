@@ -151,6 +151,100 @@ fn api_needles(rest: &str) -> Vec<String> {
     needles
 }
 
+/// The "did you mean" pool for a target `resolve_target` returned `None` for:
+/// nodes whose label sits within a small edit distance of the input, closest
+/// first. Ties go to the node with the most incoming impact edges (the most
+/// referenced element is the likeliest intent), then to label order, so the
+/// list is identical run to run.
+pub fn closest_targets<'a>(
+    input: &str,
+    nodes: &'a [BlastNode],
+    edges: &[BlastEdge],
+    limit: usize,
+) -> Vec<&'a BlastNode> {
+    let needle = input
+        .strip_prefix("table:")
+        .or_else(|| input.strip_prefix("api:"))
+        .unwrap_or(input)
+        .to_ascii_lowercase();
+    // One tolerated edit per four characters: a 7-char target forgives two
+    // typos, a 3-char one only a single edit. Looser and the pool fills with
+    // noise; resolve_target already handled every substring match.
+    let budget = 1 + needle.chars().count() / 4;
+
+    let impact_kinds: HashSet<&str> = IMPACT_EDGE_KINDS.iter().copied().collect();
+    let mut incoming: HashMap<&str, usize> = HashMap::new();
+    for edge in edges {
+        if impact_kinds.contains(edge.kind.as_str()) {
+            *incoming.entry(edge.target.as_str()).or_default() += 1;
+        }
+    }
+
+    let mut scored: Vec<(usize, std::cmp::Reverse<usize>, &str, &BlastNode)> = nodes
+        .iter()
+        .filter_map(|node| {
+            let distance = label_distance(&needle, &node.label);
+            (distance <= budget).then(|| {
+                let references = incoming.get(node.id.as_str()).copied().unwrap_or(0);
+                (
+                    distance,
+                    std::cmp::Reverse(references),
+                    node.label.as_str(),
+                    node,
+                )
+            })
+        })
+        .collect();
+    scored.sort_by(|a, b| (a.0, a.1, a.2).cmp(&(b.0, b.1, b.2)));
+    scored.truncate(limit);
+    scored.into_iter().map(|(.., node)| node).collect()
+}
+
+// A file label is a path and a nested module label may be `a::b::c`; the user
+// usually types the leaf (`sync.rs`, `c`), so the leaf competes on equal
+// footing with the full label.
+fn label_distance(needle: &str, label: &str) -> usize {
+    let label = label.to_ascii_lowercase();
+    let mut best = levenshtein(needle, &label);
+    for separator in ["/", "::"] {
+        if let Some((_, leaf)) = label.rsplit_once(separator) {
+            best = best.min(levenshtein(needle, leaf));
+        }
+    }
+    best
+}
+
+// Two-row Levenshtein over chars; label and needle are short, no need for a
+// dependency or early exit.
+fn levenshtein(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    if a.is_empty() || b.is_empty() {
+        return a.len().max(b.len());
+    }
+    let mut previous: Vec<usize> = (0..=b.len()).collect();
+    let mut current = vec![0usize; b.len() + 1];
+    for (i, ca) in a.iter().enumerate() {
+        current[0] = i + 1;
+        for (j, cb) in b.iter().enumerate() {
+            let substitution = previous[j] + usize::from(ca != cb);
+            current[j + 1] = substitution.min(previous[j + 1] + 1).min(current[j] + 1);
+        }
+        std::mem::swap(&mut previous, &mut current);
+    }
+    previous[b.len()]
+}
+
+/// The CLI-typable form of a node: the prefix `resolve_target` parses back,
+/// plus the label. Modules, files, and symbols resolve by bare label.
+pub fn target_syntax(node: &BlastNode) -> String {
+    match categorize(&node.kind) {
+        Category::Table => format!("table:{}", node.label),
+        Category::Api => format!("api:{}", node.label),
+        _ => node.label.clone(),
+    }
+}
+
 /// Computes the blast radius of `target_id` over the impact edge kinds.
 ///
 /// Impact follows reverse dependency direction by default: if `A`
@@ -426,6 +520,52 @@ mod tests {
             "a:list"
         );
         assert!(resolve_target("api:DELETE:/users", &nodes).is_none());
+    }
+
+    #[test]
+    fn typo_suggestions_rank_distance_then_references() {
+        let nodes = vec![
+            node("m:usery", "module", "usery"),
+            node("m:users", "module", "users"),
+            node("m:billing", "module", "billing"),
+        ];
+        // `users` and `usery` are both one edit from `user`; two modules
+        // depending on `users` must rank it first.
+        let edges = vec![
+            edge("m:billing", "m:users", "depends_on"),
+            edge("m:usery", "m:users", "depends_on"),
+        ];
+        let labels: Vec<&str> = closest_targets("user", &nodes, &edges, 5)
+            .iter()
+            .map(|n| n.label.as_str())
+            .collect();
+        assert_eq!(labels, vec!["users", "usery"]);
+        assert!(closest_targets("zzzzz", &nodes, &edges, 5).is_empty());
+    }
+
+    #[test]
+    fn suggestions_match_file_basenames_and_module_leaves() {
+        let nodes = vec![
+            node("f:sync", "file", "crates/ovecc-db/src/sync.rs"),
+            node("m:leaf", "module", "billing::invoice"),
+        ];
+        // One substitution from the `/` basename, one from the `::` leaf.
+        for (input, expected) in [("sinc.rs", "f:sync"), ("invoyce", "m:leaf")] {
+            let suggested = closest_targets(input, &nodes, &[], 5);
+            assert_eq!(suggested.len(), 1, "{input}");
+            assert_eq!(suggested[0].id, expected, "{input}");
+        }
+    }
+
+    #[test]
+    fn target_syntax_restores_resolver_prefixes() {
+        for (kind, label, expected) in [
+            ("table", "customers", "table:customers"),
+            ("api", "GET /users", "api:GET /users"),
+            ("module", "billing", "billing"),
+        ] {
+            assert_eq!(target_syntax(&node("n", kind, label)), expected);
+        }
     }
 
     #[test]
