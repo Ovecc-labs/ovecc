@@ -359,10 +359,7 @@ impl ArchitectureStore {
     /// single definition site: symbols (their file + start line), apis and
     /// schema objects (their evidence file + line). Modules and files are
     /// absent. A read-time join, so anchors need no reindex to appear.
-    pub fn node_source_locations(
-        &self,
-        repository_id: &str,
-    ) -> Result<Vec<(String, String, i64)>> {
+    pub fn node_source_locations(&self, repository_id: &str) -> Result<Vec<(String, String, i64)>> {
         let mut statement = self.conn.prepare(
             "SELECT s.id, f.path, s.start_line \
                FROM symbols s JOIN files f ON f.id = s.file_id \

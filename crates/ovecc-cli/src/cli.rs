@@ -437,7 +437,9 @@ fn unresolved_target_envelope(input: &str, candidates: &[(String, String)]) -> S
         Some((target, _)) => format!(
             "retry with a candidate target, e.g. '{target}', or run `ovecc index` if the code changed"
         ),
-        None => "run `ovecc index`, then retry with an indexed module name or file path".to_string(),
+        None => {
+            "run `ovecc index`, then retry with an indexed module name or file path".to_string()
+        }
     };
     serde_json::json!({
         "schema_version": 1,
@@ -832,7 +834,10 @@ mod tests {
             serde_json::from_str(&unresolved_target_envelope("custommers", &candidates)).unwrap();
         assert_eq!(envelope["error"]["kind"], "unresolved_target");
         assert_eq!(envelope["error"]["input"], "custommers");
-        assert_eq!(envelope["error"]["candidates"][0]["target"], "table:customers");
+        assert_eq!(
+            envelope["error"]["candidates"][0]["target"],
+            "table:customers"
+        );
         assert_eq!(envelope["error"]["candidates"][0]["kind"], "table");
         // The next call points at the top candidate, not a bare prose hint.
         assert!(
