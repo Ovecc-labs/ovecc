@@ -26,4 +26,6 @@ the same gate CI enforces in the `self-review` job.
 Gates that need an external cargo tool (`cargo-audit`, `cargo-llvm-cov`)
 detect its absence and skip with an install hint rather than failing, except
 under `ci`, where the audit is strict. Coverage starts at `--min 0` — a
-floor to ratchet upward, not a day-one wall.
+floor to ratchet upward, not a day-one wall. On windows-gnu hosts the
+coverage command skips outright: that toolchain ships no profiler runtime,
+so instrumentation is only possible on Linux, macOS, or windows-msvc.

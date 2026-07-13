@@ -238,6 +238,12 @@ fn run_audit(strict: bool) -> Vec<StepResult> {
 }
 
 fn run_coverage(min: &str) -> Vec<StepResult> {
+    if cfg!(all(target_os = "windows", target_env = "gnu")) {
+        return vec![skipped(
+            "coverage",
+            "the windows-gnu toolchain ships no profiler runtime; run coverage on linux, macos, or windows-msvc",
+        )];
+    }
     if !cargo_subcommand_available("llvm-cov") {
         return vec![skipped(
             "coverage",
