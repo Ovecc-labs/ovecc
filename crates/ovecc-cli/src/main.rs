@@ -49,8 +49,8 @@ fn main() -> ExitCode {
     match outcome {
         Ok(Ok(code)) => ExitCode::from(code),
         Ok(Err(error)) => {
-            eprintln!("ovecc: {error:#}");
-            // Stable exit codes; unknown errors fall back to 7.
+            // `cli::run` has already rendered the error (format-aware); here we
+            // only map it to its stable exit code. Unknown errors fall back to 7.
             let code = error
                 .downcast_ref::<OveccError>()
                 .map(|inner| inner.exit_code().code())

@@ -198,7 +198,13 @@ pub(crate) fn run_query(paths: &ProjectPaths, query: &Query, format: OutputForma
 /// instead of falling back to a broad text search; the stale index is the
 /// other common cause, so the message always ends on it.
 fn unresolved_target(input: &str, nodes: &[BlastNode], edges: &[BlastEdge]) -> anyhow::Error {
-    let candidates = blast::closest_targets(input, nodes, edges, 5);
+    // Own the candidate labels up front: they drive both the human prose and the
+    // JSON envelope the CLI emits under `--format json`, and the borrowed nodes
+    // cannot outlive this call.
+    let candidates: Vec<(String, String)> = blast::closest_targets(input, nodes, edges, 5)
+        .into_iter()
+        .map(|node| (blast::target_syntax(node), node.kind.clone()))
+        .collect();
     let message = if candidates.is_empty() {
         format!(
             "no architecture element matches '{input}' — try an indexed module name or file \
@@ -207,19 +213,20 @@ fn unresolved_target(input: &str, nodes: &[BlastNode], edges: &[BlastEdge]) -> a
     } else {
         let mut message =
             format!("no architecture element matches '{input}' — closest indexed elements:");
-        for node in candidates {
-            message.push_str(&format!(
-                "\n  {} ({})",
-                blast::target_syntax(node),
-                node.kind
-            ));
+        for (target, kind) in &candidates {
+            message.push_str(&format!("\n  {target} ({kind})"));
         }
         message.push_str(
             "\nretry with one of these, or re-run `ovecc index` if the code changed since the last index",
         );
         message
     };
-    OveccError::Usage { message }.into()
+    OveccError::UnresolvedTarget {
+        message,
+        input: input.to_string(),
+        candidates,
+    }
+    .into()
 }
 
 // Echoing the resolved label matters because targets resolve by substring:
@@ -476,5 +483,33 @@ mod tests {
         assert!(text.contains("no architecture element matches 'zzzz'"));
         assert!(text.contains("`ovecc index`"));
         assert!(!text.contains("closest"));
+    }
+
+    #[test]
+    fn unresolved_target_carries_structured_candidates() {
+        let nodes: Vec<BlastNode> = [("t:customers", "table", "customers")]
+            .map(|(id, kind, label)| BlastNode {
+                id: id.to_string(),
+                kind: kind.to_string(),
+                label: label.to_string(),
+            })
+            .into();
+        let err = unresolved_target("custommers", &nodes, &[]);
+        let inner = err
+            .downcast_ref::<OveccError>()
+            .expect("unresolved target is an OveccError");
+        match inner {
+            OveccError::UnresolvedTarget {
+                input, candidates, ..
+            } => {
+                assert_eq!(input, "custommers");
+                // The retry target keeps its resolver prefix and its kind.
+                assert_eq!(
+                    candidates.first(),
+                    Some(&("table:customers".to_string(), "table".to_string()))
+                );
+            }
+            other => panic!("expected UnresolvedTarget, got {other:?}"),
+        }
     }
 }

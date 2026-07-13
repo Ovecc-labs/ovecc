@@ -400,6 +400,62 @@ pub enum GroupByArg {
 pub fn run() -> Result<u8> {
     let cli = Cli::parse();
     let format_override = cli.format;
+    match run_command(cli) {
+        Ok(code) => Ok(code),
+        Err(err) => {
+            print_cli_error(&err, format_override);
+            Err(err)
+        }
+    }
+}
+
+/// Renders a command failure to stderr. Under `--format json`/`ndjson` an
+/// unresolved target becomes a machine-readable envelope (structured recovery
+/// data beats prose for agents, arXiv 2606.05037); every other error stays the
+/// one-line human message `main` used to print.
+fn print_cli_error(err: &anyhow::Error, format: Option<FormatArg>) {
+    let structured = matches!(format, Some(FormatArg::Json) | Some(FormatArg::Ndjson));
+    if structured
+        && let Some(OveccError::UnresolvedTarget {
+            input, candidates, ..
+        }) = err.downcast_ref::<OveccError>()
+    {
+        eprintln!("{}", unresolved_target_envelope(input, candidates));
+        return;
+    }
+    eprintln!("ovecc: {err:#}");
+}
+
+/// The JSON error envelope for an unresolved target: the named candidates plus a
+/// concrete next call, so the agent retries a real target instead of grepping.
+fn unresolved_target_envelope(input: &str, candidates: &[(String, String)]) -> String {
+    let listed: Vec<serde_json::Value> = candidates
+        .iter()
+        .map(|(target, kind)| serde_json::json!({"target": target, "kind": kind}))
+        .collect();
+    let next_call = match candidates.first() {
+        Some((target, _)) => format!(
+            "retry with a candidate target, e.g. '{target}', or run `ovecc index` if the code changed"
+        ),
+        None => "run `ovecc index`, then retry with an indexed module name or file path".to_string(),
+    };
+    serde_json::json!({
+        "schema_version": 1,
+        "error": {
+            "kind": "unresolved_target",
+            "message": format!("no architecture element matches '{input}'"),
+            "input": input,
+            "candidates": listed,
+            "next_call": next_call,
+        }
+    })
+    .to_string()
+}
+
+/// Executes the parsed command. Split from [`run`] so the single error boundary
+/// there can render failures format-aware before they reach `main`.
+fn run_command(cli: Cli) -> Result<u8> {
+    let format_override = cli.format;
     let stats = cli.stats;
     if cli.no_meta {
         SUPPRESS_META.store(true, Ordering::Relaxed);
@@ -760,4 +816,43 @@ pub fn run() -> Result<u8> {
         report_run_stats(started.elapsed());
     }
     outcome
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn envelope_names_candidates_and_a_concrete_next_call() {
+        let candidates = vec![
+            ("table:customers".to_string(), "table".to_string()),
+            ("billing".to_string(), "module".to_string()),
+        ];
+        let envelope: serde_json::Value =
+            serde_json::from_str(&unresolved_target_envelope("custommers", &candidates)).unwrap();
+        assert_eq!(envelope["error"]["kind"], "unresolved_target");
+        assert_eq!(envelope["error"]["input"], "custommers");
+        assert_eq!(envelope["error"]["candidates"][0]["target"], "table:customers");
+        assert_eq!(envelope["error"]["candidates"][0]["kind"], "table");
+        // The next call points at the top candidate, not a bare prose hint.
+        assert!(
+            envelope["error"]["next_call"]
+                .as_str()
+                .unwrap()
+                .contains("table:customers")
+        );
+    }
+
+    #[test]
+    fn envelope_without_candidates_falls_back_to_indexing() {
+        let envelope: serde_json::Value =
+            serde_json::from_str(&unresolved_target_envelope("zzzz", &[])).unwrap();
+        assert_eq!(envelope["error"]["candidates"].as_array().unwrap().len(), 0);
+        assert!(
+            envelope["error"]["next_call"]
+                .as_str()
+                .unwrap()
+                .contains("ovecc index")
+        );
+    }
 }

@@ -119,8 +119,9 @@ printf '%s\n' \
 ```
 
 You should get an `initialize` result (serverInfo `ovecc`) followed by a `tools/list`
-result enumerating **27 tools**. To exercise a real analysis tool against an indexed
-repo:
+result enumerating the **agent profile** (8 tools by default — see
+[Tool profiles](#tool-profiles)). Set `OVECC_MCP_PROFILE=full` in the server's
+environment to list all 27. To exercise a real analysis tool against an indexed repo:
 
 ```sh
 printf '%s\n' \
@@ -134,9 +135,30 @@ automatically; you only send it by hand in this manual test.
 
 ---
 
+## Tool profiles
+
+`tools/list` advertises a **profile**; `tools/call` dispatches every tool regardless,
+so a scripted caller naming `ovecc_gate` keeps working under either profile — the
+profile only controls what the agent *discovers*.
+
+- **`agent`** (default): a small, ordered set tuned for an interactive coding agent —
+  `ovecc_query`, `ovecc_impact`, `ovecc_context`, `ovecc_advise`, `ovecc_review`,
+  `ovecc_summary`, `ovecc_capabilities`, `ovecc_index`. Fewer tools and a deliberate
+  order both help adoption: a bloated list is a known failure mode, and the first
+  listed tool tends to win when a request maps to several. Navigation leads because
+  that is where an ambiguous "search the code" impulse gets decided.
+- **`full`**: the complete surface below. Set `OVECC_MCP_PROFILE=full` in the server's
+  environment (e.g. the `env` block of the MCP client config).
+- **LSP aliases** (opt-in): set `OVECC_MCP_LSP_ALIASES=on` to also expose
+  `find_references`, `get_call_hierarchy`, and `workspace_symbol` — LSP-vocabulary
+  names over the existing commands, prepended to the agent profile. An A/B lever for
+  measuring whether a familiar name attracts the call; off by default.
+
 ## Tool catalog
 
-All 27 tools (every one takes an optional `repo`; `*` marks required arguments):
+The full surface — 27 tools (every one takes an optional `repo`; `*` marks required
+arguments). The eight in the agent profile are listed under
+[Tool profiles](#tool-profiles) above.
 
 | Tool | Maps to | Key arguments |
 | --- | --- | --- |

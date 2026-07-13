@@ -38,6 +38,18 @@ pub enum OveccError {
     #[error("usage error: {message}")]
     Usage { message: String },
 
+    /// A query/impact/context target that resolved to nothing. Carries the
+    /// closest indexed candidates so a caller can retry with a real target
+    /// instead of falling back to a broad text search. `message` is the human
+    /// prose; the CLI turns `input`/`candidates` into a machine-readable JSON
+    /// envelope under `--format json`. Shares the usage exit code.
+    #[error("{message}")]
+    UnresolvedTarget {
+        message: String,
+        input: String,
+        candidates: Vec<(String, String)>,
+    },
+
     #[error("repository or configuration error: {message}")]
     Repository { message: String },
 
@@ -67,6 +79,7 @@ impl OveccError {
     pub fn exit_code(&self) -> ExitCode {
         match self {
             Self::Usage { .. } => ExitCode::Usage,
+            Self::UnresolvedTarget { .. } => ExitCode::Usage,
             Self::Repository { .. } => ExitCode::Repository,
             Self::Index { .. } => ExitCode::Index,
             Self::Parser { .. } => ExitCode::Parser,
@@ -97,6 +110,15 @@ mod tests {
         assert_eq!(
             OveccError::Usage {
                 message: "x".into()
+            }
+            .exit_code(),
+            ExitCode::Usage
+        );
+        assert_eq!(
+            OveccError::UnresolvedTarget {
+                message: "x".into(),
+                input: "x".into(),
+                candidates: vec![]
             }
             .exit_code(),
             ExitCode::Usage

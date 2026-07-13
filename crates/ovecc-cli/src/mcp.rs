@@ -20,6 +20,57 @@ use std::path::Path;
 /// when present (forward-compatible), falling back to this.
 const DEFAULT_PROTOCOL_VERSION: &str = "2025-06-18";
 
+/// Which slice of the tool registry `tools/list` advertises. `tools/call` still
+/// dispatches every tool regardless — the profile only controls discovery, so a
+/// scripted CI caller naming `ovecc_gate` keeps working under either.
+///
+/// `Agent` is the default: a small, ordered set for interactive coding agents.
+/// A bloated list and weak positional ordering both suppress adoption (a full
+/// ~25-tool surface is the "too many tools" failure mode, and list order biases
+/// the pick when descriptions are close — arXiv 2505.18135). `Full` exposes
+/// everything for humans and CI automation.
+#[derive(Clone, Copy)]
+enum Profile {
+    Agent,
+    Full,
+}
+
+fn active_profile() -> Profile {
+    match std::env::var("OVECC_MCP_PROFILE").ok().as_deref() {
+        Some("full") => Profile::Full,
+        _ => Profile::Agent,
+    }
+}
+
+/// The agent profile, ordered by how readily a coding agent should reach for
+/// each tool. The navigation tools lead because that is where an ambiguous
+/// "search the code" impulse gets resolved, and the first listed tool wins ties
+/// under positional bias; setup (`capabilities`, `index`) trails since the
+/// SessionStart digest and the `initialize` instructions already point at it.
+const AGENT_PROFILE: &[&str] = &[
+    "ovecc_query",
+    "ovecc_impact",
+    "ovecc_context",
+    "ovecc_advise",
+    "ovecc_review",
+    "ovecc_summary",
+    "ovecc_capabilities",
+    "ovecc_index",
+];
+
+/// Opt-in LSP-vocabulary aliases (`find_references`, `get_call_hierarchy`,
+/// `workspace_symbol`) over the existing commands. The hypothesis (arXiv
+/// 2505.18135: renaming a tool shifts its use >10x) is that a name the model
+/// already knows from language servers attracts the call a proprietary name
+/// misses. Additive and off by default so the baseline agent profile stays
+/// clean; the Phase 4 A/B flips this on to measure which name gets called.
+fn lsp_aliases_enabled() -> bool {
+    matches!(
+        std::env::var("OVECC_MCP_LSP_ALIASES").ok().as_deref(),
+        Some("on" | "1" | "true")
+    )
+}
+
 /// Runs the stdio server loop until stdin closes. Always exits 0: a transport
 /// read error ends the session cleanly rather than failing the process.
 pub fn serve() -> Result<u8> {
@@ -75,12 +126,18 @@ fn handle(method: &str, params: Option<&Value>, exe: &Path) -> Result<Value, (i6
                 "capabilities": {"tools": {}},
                 "serverInfo": {"name": "ovecc", "version": env!("CARGO_PKG_VERSION")},
                 "instructions": "Deterministic, offline architecture intelligence. \
-                    Call ovecc_capabilities first for the full contract (commands, \
-                    metrics, rules, exit codes). Run ovecc_index once before querying \
-                    a repository. Every tool accepts an optional `repo` path."
+                    Reach for these tools before Grep or Read to trace code \
+                    relationships and understand an element from the index instead of \
+                    scanning files. Call ovecc_capabilities once for the full contract \
+                    and run ovecc_index before querying a repository, then use \
+                    ovecc_query, ovecc_impact, and ovecc_context. Every tool accepts an \
+                    optional `repo` path. This is the agent profile; set \
+                    OVECC_MCP_PROFILE=full for the complete command surface."
             }))
         }
-        "tools/list" => Ok(json!({"tools": tool_specs()})),
+        "tools/list" => Ok(json!({
+            "tools": listed_tools(active_profile(), lsp_aliases_enabled())
+        })),
         "tools/call" => {
             let params = params.ok_or((-32602, "missing params".to_string()))?;
             let name = params
@@ -172,7 +229,15 @@ fn run_tool(name: &str, arguments: &Value, exe: &Path) -> Value {
             // 2+ are real failures (usage, repo/config, db, parser, internal).
             if code >= 2 {
                 let stderr = String::from_utf8_lossy(&output.stderr);
-                error_result(format!("ovecc exited with code {code}: {}", stderr.trim()))
+                let trimmed = stderr.trim();
+                // A structured error envelope (emitted under `--format json`) is
+                // already the machine-readable payload the agent should parse;
+                // forward it verbatim instead of prefixing prose over it.
+                if trimmed.starts_with('{') && serde_json::from_str::<Value>(trimmed).is_ok() {
+                    error_result(trimmed.to_string())
+                } else {
+                    error_result(format!("ovecc exited with code {code}: {trimmed}"))
+                }
             } else {
                 let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
                 json!({"content": [{"type": "text", "text": stdout}], "isError": false})
@@ -366,6 +431,24 @@ fn build_argv(name: &str, args: &Value) -> Option<Vec<String>> {
                 argv.push(target.into());
             }
         }
+        // LSP-vocabulary aliases (opt-in, see `lsp_aliases_enabled`). Each is a
+        // thin renaming of an existing verb, not new analysis.
+        "find_references" => {
+            argv.push("query".into());
+            argv.push(format!("rdeps {}", s("symbol")?));
+        }
+        "get_call_hierarchy" => {
+            argv.push("impact".into());
+            argv.push(s("symbol")?.into());
+            if let Some(direction) = s("direction") {
+                argv.push("--direction".into());
+                argv.push(direction.into());
+            }
+        }
+        "workspace_symbol" => {
+            argv.push("explain".into());
+            argv.push(s("query")?.into());
+        }
         _ => return None,
     }
     Some(argv)
@@ -396,12 +479,12 @@ fn tool_specs() -> Value {
     let obj = |props: Value, required: Value| json!({"type": "object", "properties": props, "required": required});
 
     json!([
-        {"name": "ovecc_capabilities", "description": "The machine-readable contract: every command, metric, rule, severity, exit code, and output format. Call this first.", "inputSchema": obj(json!({"repo": repo}), json!([]))},
-        {"name": "ovecc_index", "description": "Build or update the local architecture database for a repository. Run once before querying.", "inputSchema": obj(json!({"repo": repo, "path": {"type": "string", "description": "Repository path to index (alternative to repo)."}}), json!([]))},
-        {"name": "ovecc_summary", "description": "Repository-level architecture health: coupling, density, cycles, risk score.", "inputSchema": obj(json!({"repo": repo}), json!([]))},
+        {"name": "ovecc_capabilities", "description": "The machine-readable contract: every command, metric, rule, severity, exit code, and output format. Call this once up front for the full vocabulary. Example: {}.", "inputSchema": obj(json!({"repo": repo}), json!([]))},
+        {"name": "ovecc_index", "description": "Build or refresh the local architecture database. Run once before the other tools and again after edits. Example: {}.", "inputSchema": obj(json!({"repo": repo, "path": {"type": "string", "description": "Repository path to index (alternative to repo)."}}), json!([]))},
+        {"name": "ovecc_summary", "description": "Orient in a repo before ls/Read sweeps: architecture health at a glance (coupling, density, cycles, risk score). Example: {}.", "inputSchema": obj(json!({"repo": repo}), json!([]))},
         {"name": "ovecc_report", "description": "One-shot architecture report: summary + cycles + violations + security + hotspots.", "inputSchema": obj(json!({"repo": repo}), json!([]))},
-        {"name": "ovecc_impact", "description": "Blast radius of changing a target (module, table:NAME, api:METHOD:/path): the impacted nodes and the paths that reach them.", "inputSchema": obj(json!({"repo": repo, "target": {"type": "string", "description": "Element to analyze, e.g. Billing, table:customers, api:GET:/x."}, "direction": {"type": "string", "enum": ["downstream", "upstream", "both"], "description": "Traversal direction (default downstream)."}, "max_depth": {"type": "integer", "description": "Maximum traversal depth (default 6)."}}), json!(["target"]))},
-        {"name": "ovecc_query", "description": "Structured architecture query. Verbs: deps X, rdeps X, paths X, module X, 'a -> b', hotspots, violations, cycles.", "inputSchema": obj(json!({"repo": repo, "query": {"type": "string", "description": "Query expression, e.g. 'cycles' or 'deps Billing'."}}), json!(["query"]))},
+        {"name": "ovecc_impact", "description": "Blast radius of changing a target: every element the change reaches and the paths that carry it. Use before editing instead of grepping for usages. Targets: module, table:NAME, api:METHOD:/path. Example: {\"target\": \"Billing\", \"direction\": \"downstream\"}.", "inputSchema": obj(json!({"repo": repo, "target": {"type": "string", "description": "Element to analyze, e.g. Billing, table:customers, api:GET:/x."}, "direction": {"type": "string", "enum": ["downstream", "upstream", "both"], "description": "Traversal direction (default downstream)."}, "max_depth": {"type": "integer", "description": "Maximum traversal depth (default 6)."}}), json!(["target"]))},
+        {"name": "ovecc_query", "description": "Trace code relationships from the index instead of grepping: callers, callees, import paths, cycles. Use before Grep or Bash grep when the question is 'who calls X', 'what does X import', or 'is there a cycle'. Verbs: rdeps X (callers), deps X (callees), paths X, 'a -> b', cycles, hotspots, violations. Example: {\"query\": \"rdeps Billing\"}.", "inputSchema": obj(json!({"repo": repo, "query": {"type": "string", "description": "Query expression, e.g. 'cycles' or 'rdeps Billing'."}}), json!(["query"]))},
         {"name": "ovecc_violations", "description": "Architecture and rule findings (boundaries, banned imports, cycles), with optional severity filter and baseline.", "inputSchema": obj(json!({"repo": repo, "severity": severity, "baseline": {"type": "boolean", "description": "Hide findings recorded in the baseline (show only new ones)."}, "changed_since": {"type": "string", "description": "Only findings touching files changed since this Git ref (progressive adoption)."}}), json!([]))},
         {"name": "ovecc_security", "description": "Security findings: hardcoded secrets, insecure patterns, weak crypto, tainted source->sink flows.", "inputSchema": obj(json!({"repo": repo, "severity": severity}), json!([]))},
         {"name": "ovecc_audit", "description": "OSV audit of declared dependencies against the local vulnerability database (offline). Set fetch=true to first download the advisories for the discovered packages — the only ovecc operation that touches the network.", "inputSchema": obj(json!({"repo": repo, "fetch": {"type": "boolean", "description": "Download OSV advisories into .ovecc/osv/ before auditing (network, opt-in)."}}), json!([]))},
@@ -414,16 +497,56 @@ fn tool_specs() -> Value {
         {"name": "ovecc_drift", "description": "Architecture drift over time versus a previous snapshot or Git ref.", "inputSchema": obj(json!({"repo": repo, "since": {"type": "string", "description": "Git ref or snapshot to compare against, e.g. main or v1.0.0."}}), json!([]))},
         {"name": "ovecc_history", "description": "Trend one snapshot metric across every index run (values, deltas, sparkline). Without a metric, lists everything trendable.", "inputSchema": obj(json!({"repo": repo, "metric": {"type": "string", "description": "Metric to trend, e.g. coupling_density, high_complexity_functions."}, "limit": {"type": "integer", "description": "Most recent N snapshots to keep (default 20)."}}), json!([]))},
         {"name": "ovecc_init", "description": "Set up ovecc in a repository: write a commented .ovecc/config.toml, git-ignore the local state, and return the suggested first commands.", "inputSchema": obj(json!({"repo": repo, "force": {"type": "boolean", "description": "Overwrite an existing config."}}), json!([]))},
-        {"name": "ovecc_review", "description": "Change review (lead with this for PR review): the NAMED new defects a change introduced between base and head — new findings (security/dead-code/complexity) with file:line, new dependency cycles WITH their concrete import witness edges, and the duplications the change added (scoped to touched files). One deterministic call; the actionable companion to ovecc_gate, which reports only counts.", "inputSchema": obj(json!({"repo": repo, "base": base, "head": head, "fail_on": fail_on}), json!([]))},
+        {"name": "ovecc_review", "description": "Lead with this to review a change instead of reading the diff by hand: the named new defects between base and head. Reports new security/dead-code/complexity findings with file:line, new dependency cycles with their concrete import witness edges, and the duplications the change added (scoped to touched files). The actionable companion to ovecc_gate, which reports only counts. Example: {\"base\": \"main\", \"head\": \"HEAD\"}.", "inputSchema": obj(json!({"repo": repo, "base": base, "head": head, "fail_on": fail_on}), json!([]))},
         {"name": "ovecc_gate", "description": "CI gate: fail when a change introduces new cycles, violations, or quality regressions (security/dead-code/complexity) versus a base snapshot or Git ref. Returns a pass/fail verdict and the signals behind it. For the named defects behind the verdict, use ovecc_review.", "inputSchema": obj(json!({"repo": repo, "base": base, "head": head, "fail_on": fail_on}), json!([]))},
         {"name": "ovecc_diff", "description": "Compare two stored architecture snapshots (or Git refs): added/removed modules and dependency edges, plus the overall diff risk score.", "inputSchema": obj(json!({"repo": repo, "base": base, "head": head, "fail_on": fail_on}), json!([]))},
         {"name": "ovecc_explain", "description": "Offline, deterministic architectural explanation of a target from its context slice.", "inputSchema": obj(json!({"repo": repo, "target": {"type": "string", "description": "Element to explain, e.g. Billing."}}), json!(["target"]))},
-        {"name": "ovecc_context", "description": "Deterministic ContextSlice for a target as JSON, for feeding other tools or agents.", "inputSchema": obj(json!({"repo": repo, "target": {"type": "string", "description": "Element to slice, e.g. Billing."}}), json!(["target"]))},
+        {"name": "ovecc_context", "description": "Deterministic ContextSlice for a target as JSON: its neighbors, findings, and file:line anchors. Use instead of reading whole files to understand an element. Example: {\"target\": \"Billing\"}.", "inputSchema": obj(json!({"repo": repo, "target": {"type": "string", "description": "Element to slice, e.g. Billing."}}), json!(["target"]))},
         {"name": "ovecc_export_graph", "description": "The dependency graph as data: module- and file-level nodes and edges, sorted and deterministic. Pass html to instead write a self-contained offline HTML viewer for the human in the loop.", "inputSchema": obj(json!({"repo": repo, "html": {"type": "string", "description": "Optional path: write the interactive HTML viewer there instead of returning JSON."}}), json!([]))},
         {"name": "ovecc_diagnose", "description": "Deterministic architectural diagnosis: cycles, hub-like (crossing), unstable and god components, dense structure, and hotspots — each with evidence, the design principle it breaks, and an established remediation. Components are directories; no design patterns are invented.", "inputSchema": obj(json!({"repo": repo, "target": {"type": "string", "description": "Scope to findings touching this file or component (substring)."}, "severity": severity}), json!([]))},
-        {"name": "ovecc_advise", "description": "Advise on one file, module, or component: the findings touching it and the established fix for each. Call before editing that area.", "inputSchema": obj(json!({"repo": repo, "target": {"type": "string", "description": "File, module, or component to advise on."}}), json!(["target"]))},
+        {"name": "ovecc_advise", "description": "Findings touching one file, module, or component and the established fix for each. Call before editing that area so a change doesn't reintroduce a known problem. Example: {\"target\": \"src/billing\"}.", "inputSchema": obj(json!({"repo": repo, "target": {"type": "string", "description": "File, module, or component to advise on."}}), json!(["target"]))},
         {"name": "ovecc_metrics", "description": "Per-component architecture metrics: fan-in/out, coupling, Martin instability, aggregate complexity, churn, and repository coupling density.", "inputSchema": obj(json!({"repo": repo, "target": {"type": "string", "description": "Scope to a single component (substring)."}}), json!([]))}
     ])
+}
+
+/// The tools `tools/list` advertises for a profile, in order. `Full` returns
+/// the whole registry; `Agent` returns the ordered [`AGENT_PROFILE`] subset,
+/// prefixed with the LSP aliases when they are enabled so the familiar names
+/// sit first (positional bias). Kept pure (profile passed in) so tests need no
+/// environment coupling.
+fn listed_tools(profile: Profile, lsp_aliases: bool) -> Vec<Value> {
+    let specs = tool_specs();
+    let all = specs.as_array().expect("tool_specs is a JSON array");
+    match profile {
+        Profile::Full => all.clone(),
+        Profile::Agent => {
+            let mut out = Vec::with_capacity(AGENT_PROFILE.len() + 3);
+            if lsp_aliases {
+                out.extend(lsp_alias_specs());
+            }
+            for name in AGENT_PROFILE {
+                let spec = all
+                    .iter()
+                    .find(|t| t["name"] == *name)
+                    .unwrap_or_else(|| panic!("agent profile names a missing tool: {name}"));
+                out.push(spec.clone());
+            }
+            out
+        }
+    }
+}
+
+/// Tool specs for the opt-in LSP aliases. Their schemas mirror the LSP requests
+/// an agent knows, and `build_argv` routes each onto an existing command.
+fn lsp_alias_specs() -> Vec<Value> {
+    let repo = json!({"type": "string", "description": "Repository root path (defaults to the server's working directory)."});
+    let direction = json!({"type": "string", "enum": ["downstream", "upstream", "both"], "description": "Traversal direction (default downstream)."});
+    let obj = |props: Value, required: Value| json!({"type": "object", "properties": props, "required": required});
+    vec![
+        json!({"name": "find_references", "description": "Find all references to a symbol across the repository (its callers and dependents), served from the architecture index rather than a text scan. Example: {\"symbol\": \"Billing\"}.", "inputSchema": obj(json!({"repo": repo, "symbol": {"type": "string", "description": "Symbol or element to find references to."}}), json!(["symbol"]))}),
+        json!({"name": "get_call_hierarchy", "description": "Incoming/outgoing call and dependency hierarchy for a symbol: everything reachable from it and the paths that get there. Example: {\"symbol\": \"Billing\", \"direction\": \"downstream\"}.", "inputSchema": obj(json!({"repo": repo, "symbol": {"type": "string", "description": "Symbol or element to walk the hierarchy from."}, "direction": direction}), json!(["symbol"]))}),
+        json!({"name": "workspace_symbol", "description": "Look up an architecture element by name and return what it is and where it sits, with file:line anchors. Example: {\"query\": \"Billing\"}.", "inputSchema": obj(json!({"repo": repo, "query": {"type": "string", "description": "Symbol or element name to resolve."}}), json!(["query"]))}),
+    ]
 }
 
 #[cfg(test)]
@@ -503,6 +626,67 @@ mod tests {
     }
 
     #[test]
+    fn lsp_aliases_route_onto_existing_commands() {
+        assert_eq!(
+            build_argv("find_references", &json!({"symbol": "Billing"})).unwrap(),
+            vec!["query", "rdeps Billing"]
+        );
+        assert_eq!(
+            build_argv(
+                "get_call_hierarchy",
+                &json!({"symbol": "Billing", "direction": "upstream"})
+            )
+            .unwrap(),
+            vec!["impact", "Billing", "--direction", "upstream"]
+        );
+        assert_eq!(
+            build_argv("workspace_symbol", &json!({"query": "Billing"})).unwrap(),
+            vec!["explain", "Billing"]
+        );
+        // The aliases are off by default, so they must not shadow a required arg.
+        assert!(build_argv("find_references", &json!({})).is_none());
+    }
+
+    #[test]
+    fn agent_profile_is_lean_ordered_and_hides_ci_tools() {
+        let tools = listed_tools(Profile::Agent, false);
+        let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
+        assert_eq!(names, AGENT_PROFILE);
+        // Navigation leads (positional bias); CI-only tools are not advertised
+        // here even though `build_argv` still dispatches them.
+        assert_eq!(names.first(), Some(&"ovecc_query"));
+        assert!(!names.contains(&"ovecc_gate"));
+        assert!(!names.contains(&"ovecc_diff"));
+    }
+
+    #[test]
+    fn full_profile_lists_the_whole_registry() {
+        let full = listed_tools(Profile::Full, false);
+        let registry = tool_specs();
+        assert_eq!(full.len(), registry.as_array().unwrap().len());
+        assert!(full.iter().any(|t| t["name"] == "ovecc_gate"));
+        assert!(full.iter().any(|t| t["name"] == "ovecc_diff"));
+    }
+
+    #[test]
+    fn lsp_aliases_prepend_only_when_enabled() {
+        let off = listed_tools(Profile::Agent, false);
+        assert_eq!(off.len(), AGENT_PROFILE.len());
+
+        let on = listed_tools(Profile::Agent, true);
+        assert_eq!(on.len(), AGENT_PROFILE.len() + 3);
+        let lead: Vec<&str> = on
+            .iter()
+            .take(3)
+            .map(|t| t["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            lead,
+            ["find_references", "get_call_hierarchy", "workspace_symbol"]
+        );
+    }
+
+    #[test]
     fn initialize_echoes_protocol_version_and_lists_tools() {
         let exe = std::path::PathBuf::from("ovecc");
         let init = handle(
@@ -514,14 +698,11 @@ mod tests {
         assert_eq!(init["protocolVersion"], "2025-03-26");
         assert_eq!(init["serverInfo"]["name"], "ovecc");
 
+        // The default (no OVECC_MCP_PROFILE) is the agent profile.
         let listed = handle("tools/list", None, &exe).unwrap();
         let tools = listed["tools"].as_array().unwrap();
-        let has = |name: &str| tools.iter().any(|t| t["name"] == name);
-        assert!(has("ovecc_capabilities"));
-        assert!(has("ovecc_gate"));
-        assert!(has("ovecc_diff"));
-        assert!(has("ovecc_review"));
-        assert!(tools.len() >= 18);
+        assert!(tools.iter().any(|t| t["name"] == "ovecc_query"));
+        assert!(!tools.is_empty());
     }
 
     #[test]
