@@ -476,13 +476,41 @@ pub struct FindingDiff {
 
 // ---- ovecc export context / explain ----
 
+/// A referenced element with its source anchor, when it has a single site.
+/// Mirrors `ImpactedNode` in ovecc-graph; core cannot depend on graph, so the
+/// CLI maps between the two.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AnchoredRef {
+    pub label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line: Option<u32>,
+}
+
+impl From<String> for AnchoredRef {
+    fn from(label: String) -> Self {
+        Self {
+            label,
+            file: None,
+            line: None,
+        }
+    }
+}
+
+impl From<&str> for AnchoredRef {
+    fn from(label: &str) -> Self {
+        Self::from(label.to_string())
+    }
+}
+
 /// Compact deterministic architecture slice for external tools and optional
 /// AI consumers. This is the ONLY input an LLM ever receives.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ContextSlice {
     pub target: String,
-    pub dependencies: Vec<String>,
-    pub reverse_dependencies: Vec<String>,
+    pub dependencies: Vec<AnchoredRef>,
+    pub reverse_dependencies: Vec<AnchoredRef>,
     pub call_paths: Vec<Vec<String>>,
     pub apis: Vec<ApiRecord>,
     pub schemas: Vec<SchemaObjectRecord>,

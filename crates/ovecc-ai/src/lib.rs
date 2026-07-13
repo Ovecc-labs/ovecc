@@ -16,7 +16,7 @@
 
 use ovecc_core::error::Result;
 use ovecc_core::facts::{FindingRecord, Severity};
-use ovecc_core::report::ContextSlice;
+use ovecc_core::report::{AnchoredRef, ContextSlice};
 use ovecc_core::traits::ExplanationProvider;
 use std::fmt::Write as _;
 
@@ -206,13 +206,23 @@ fn findings_section(out: &mut String, target: &str, findings: &[FindingRecord]) 
 
 /// Writes a `## Heading` followed by a bullet list, or a fallback line when the
 /// list is empty.
-fn section_list(out: &mut String, heading: &str, items: &[String], empty: &str) {
+fn section_list(out: &mut String, heading: &str, items: &[AnchoredRef], empty: &str) {
     let _ = writeln!(out, "## {heading}");
     if items.is_empty() {
         let _ = writeln!(out, "{empty}");
     } else {
         for item in items {
-            let _ = writeln!(out, "- {item}");
+            match (&item.file, item.line) {
+                (Some(file), Some(line)) => {
+                    let _ = writeln!(out, "- {}  {file}:{line}", item.label);
+                }
+                (Some(file), None) => {
+                    let _ = writeln!(out, "- {}  {file}", item.label);
+                }
+                _ => {
+                    let _ = writeln!(out, "- {}", item.label);
+                }
+            }
         }
     }
     let _ = writeln!(out);
@@ -279,8 +289,8 @@ mod tests {
     fn explains_an_intermediary_with_findings() {
         let slice = ContextSlice {
             target: "Billing".to_string(),
-            dependencies: vec!["User".to_string(), "Db".to_string()],
-            reverse_dependencies: vec!["Api".to_string()],
+            dependencies: vec!["User".into(), "Db".into()],
+            reverse_dependencies: vec!["Api".into()],
             call_paths: vec![vec![
                 "Api".to_string(),
                 "Billing".to_string(),
@@ -323,7 +333,7 @@ mod tests {
     fn explanation_is_deterministic() {
         let slice = ContextSlice {
             target: "Billing".to_string(),
-            dependencies: vec!["User".to_string()],
+            dependencies: vec!["User".into()],
             ..ContextSlice::default()
         };
         let a = DeterministicExplainer.explain(&slice).unwrap();
@@ -336,7 +346,7 @@ mod tests {
         // Depends on others but nothing depends on it → entry point.
         let slice = ContextSlice {
             target: "Cli".to_string(),
-            dependencies: vec!["Parser".to_string()],
+            dependencies: vec!["Parser".into()],
             ..ContextSlice::default()
         };
         let text = DeterministicExplainer.explain(&slice).unwrap();
@@ -349,7 +359,7 @@ mod tests {
         // Others depend on it but it has no dependencies → foundational.
         let slice = ContextSlice {
             target: "Core".to_string(),
-            reverse_dependencies: vec!["A".to_string(), "B".to_string()],
+            reverse_dependencies: vec!["A".into(), "B".into()],
             ..ContextSlice::default()
         };
         let text = DeterministicExplainer.explain(&slice).unwrap();
@@ -361,7 +371,7 @@ mod tests {
     fn change_impact_omits_external_call_paths() {
         let slice = ContextSlice {
             target: "Svc".to_string(),
-            reverse_dependencies: vec!["X".to_string()],
+            reverse_dependencies: vec!["X".into()],
             call_paths: vec![
                 vec!["X".to_string(), "Svc".to_string()],
                 vec!["external:lodash".to_string(), "Svc".to_string()],

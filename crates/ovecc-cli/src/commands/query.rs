@@ -10,7 +10,7 @@ use ovecc_core::config::{OutputFormat, ProjectPaths};
 use ovecc_core::error::OveccError;
 use ovecc_core::legacy::ImpactDirection;
 use ovecc_core::query::{Query, TargetSelector};
-use ovecc_core::report::ContextSlice;
+use ovecc_core::report::{AnchoredRef, ContextSlice};
 use ovecc_db::ArchitectureStore;
 use ovecc_graph::blast::{self, BlastEdge, BlastNode, BlastResult, ImpactedNode};
 use std::collections::HashMap;
@@ -310,13 +310,21 @@ pub(crate) fn build_context_slice(
     // Depth 1: "dependencies"/"dependents" must mean the direct edges, not the
     // transitive closure — a file two imports away is not a dependency of the
     // target, and narrating it as one is actively misleading.
-    // The context slice stays label-only for now; anchors land here in the
-    // follow-up that enriches ContextSlice's dependency lists.
-    let dependencies: Vec<String> = radius(ImpactDirection::Upstream, 1)
-        .map(|r| r.impacted.into_iter().map(|n| n.label).collect())
+    let to_refs = |r: BlastResult| -> Vec<AnchoredRef> {
+        r.impacted
+            .into_iter()
+            .map(|n| AnchoredRef {
+                label: n.label,
+                file: n.file,
+                line: n.line,
+            })
+            .collect()
+    };
+    let dependencies = radius(ImpactDirection::Upstream, 1)
+        .map(to_refs)
         .unwrap_or_default();
-    let reverse_dependencies: Vec<String> = radius(ImpactDirection::Downstream, 1)
-        .map(|r| r.impacted.into_iter().map(|n| n.label).collect())
+    let reverse_dependencies = radius(ImpactDirection::Downstream, 1)
+        .map(to_refs)
         .unwrap_or_default();
     // Impact paths follow the reverse-dependency direction only. A `Both`
     // walk stitches forward and backward hops into a single path, producing
