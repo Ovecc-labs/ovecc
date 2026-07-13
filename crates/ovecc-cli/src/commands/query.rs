@@ -357,6 +357,19 @@ pub(crate) fn build_context_slice(
     })
 }
 
+/// A module node labels itself `path/to/file.ext::<module>`. It has no row in
+/// the symbol/api/schema anchor tables, so recover its file (the actionable part)
+/// from the label. Returns `None` for any other nodeless label (external deps,
+/// packages) so only real source modules gain a file.
+fn module_file_from_label(label: &str) -> Option<String> {
+    const SOURCE_EXTS: [&str; 7] = [".py", ".ts", ".tsx", ".js", ".jsx", ".go", ".rs"];
+    let (head, _) = label.split_once("::")?;
+    SOURCE_EXTS
+        .iter()
+        .any(|ext| head.ends_with(ext))
+        .then(|| head.to_string())
+}
+
 fn load_graph(
     store: &ArchitectureStore,
     repository_id: &str,
@@ -373,7 +386,11 @@ fn load_graph(
         .map(|(id, kind, label)| {
             let (file, line) = match locations.get(&id) {
                 Some((path, at)) => (Some(path.clone()), Some(*at)),
-                None => (None, None),
+                // A synthesized module node (`path/to/file.py::<module>`) has no
+                // anchor row; recover its file from the label so a value-reference
+                // dependent still points at an actionable file (line is unknown
+                // for a whole module).
+                None => (module_file_from_label(&label), None),
             };
             BlastNode {
                 id,

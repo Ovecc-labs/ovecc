@@ -217,6 +217,11 @@ pub enum CallKind {
     Route,
     Rpc,
     Event,
+    /// A callable named in value position (passed as an argument, stored in a
+    /// registry dict, used as a decorator or default) rather than invoked. Not
+    /// a call, but a real dependency: changing the callee's signature breaks the
+    /// reference site, so `rdeps`/`impact` must see it.
+    Reference,
 }
 
 /// An exposed route, endpoint, RPC method, event, or CLI command.

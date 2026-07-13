@@ -318,6 +318,16 @@ impl<'a> Walk<'a> {
             self.record_rust_mod_declaration(node);
         }
 
+        // A Python callable named in value position (`purry(fn)`, a registry
+        // `{Key: handler}`, `@decorator`, `sort(key=func)`) is a real dependency
+        // the call graph would otherwise miss — the function-as-value blind spot
+        // that leaves `rdeps`/`impact` empty for registry-heavy code. Record it
+        // as a Reference; the resolver's local/import/unique-name gate keeps it
+        // precise, so bare variable reads that name nothing cost nothing.
+        if self.language == SourceLanguage::Python && node.kind() == "identifier" {
+            self.record_python_value_reference(node);
+        }
+
         // C++ declarations are overloaded (a method prototype, a free-function
         // prototype, or a typed variable), so they get a dedicated handler.
         if self.language == SourceLanguage::Cpp
@@ -626,6 +636,63 @@ impl<'a> Walk<'a> {
     }
 
     // -- calls -------------------------------------------------------------
+
+    /// Records a Python callable used in value position (not invoked) as a
+    /// `CallKind::Reference` dependency. Excludes call callees (already Calls),
+    /// member access (name collides across classes, like member calls), and
+    /// declaration/param/import/keyword/binding names. Everything else is left
+    /// to the resolver, which drops names that do not resolve to a repo callable.
+    fn record_python_value_reference(&mut self, node: Node<'a>) {
+        let Some(parent) = node.parent() else {
+            return;
+        };
+        let pk = parent.kind();
+        // The callee of a call is a Call, not a value reference.
+        if pk == "call" && parent.child_by_field_name("function") == Some(node) {
+            return;
+        }
+        // Member access (`obj.attr`): the attribute name collides across classes
+        // and the object is a receiver, not a callable — skip, matching the
+        // "member calls kept unresolved" precision choice in the resolver.
+        if pk == "attribute" {
+            return;
+        }
+        match pk {
+            "function_definition" | "class_definition" => return,
+            "keyword_argument"
+            | "typed_parameter"
+            | "default_parameter"
+            | "typed_default_parameter"
+                if parent.child_by_field_name("name") == Some(node) =>
+            {
+                return;
+            }
+            "parameters"
+            | "lambda_parameters"
+            | "list_splat_pattern"
+            | "dictionary_splat_pattern" => return,
+            "import_statement" | "import_from_statement" | "aliased_import" | "dotted_name" => {
+                return;
+            }
+            "assignment" | "augmented_assignment" | "for_statement"
+                if parent.child_by_field_name("left") == Some(node) =>
+            {
+                return;
+            }
+            "as_pattern" | "for_in_clause" | "except_clause" => return,
+            _ => {}
+        }
+        let Some(name) = node_text(node, self.source) else {
+            return;
+        };
+        self.calls.push(CallFact {
+            caller_qualified_name: self.callables.last().cloned(),
+            callee_name: name,
+            kind: CallKind::Reference,
+            line: span_of(node).start_line,
+            receiver: None,
+        });
+    }
 
     fn record_call(&mut self, node: Node<'a>) {
         let Some((callee, receiver, kind)) = self.call_target(node) else {
@@ -1922,6 +1989,58 @@ def main():
         let specs: Vec<_> = facts.imports.iter().map(|i| i.specifier.as_str()).collect();
         assert!(specs.contains(&"os"), "{specs:?}");
         assert!(specs.contains(&"billing.invoice"), "{specs:?}");
+    }
+
+    #[test]
+    fn python_records_function_as_value_reference() {
+        let facts = extract(
+            SourceLanguage::Python,
+            r#"
+def helper(x):
+    return x
+
+def use_it(data):
+    return transform(data, helper)
+
+REGISTRY = {"k": helper}
+
+@helper
+def decorated():
+    pass
+"#,
+        );
+        // `helper` used as a call argument, a dict value, and a decorator: three
+        // value references the call graph would otherwise miss.
+        let helper_refs = facts
+            .calls
+            .iter()
+            .filter(|c| c.kind == CallKind::Reference && c.callee_name == "helper")
+            .count();
+        assert!(helper_refs >= 3, "{:?}", callee_names(&facts));
+        // The invoked `transform(...)` stays a Direct call, not a Reference.
+        let transform = facts
+            .calls
+            .iter()
+            .find(|c| c.callee_name == "transform")
+            .expect("transform call");
+        assert_eq!(transform.kind, CallKind::Direct);
+    }
+
+    #[test]
+    fn python_value_reference_skips_member_access() {
+        let facts = extract(
+            SourceLanguage::Python,
+            "def run(obj):\n    obj.method\n    return obj\n",
+        );
+        // A member name collides across classes; it must not become a reference.
+        assert!(
+            !facts
+                .calls
+                .iter()
+                .any(|c| c.kind == CallKind::Reference && c.callee_name == "method"),
+            "{:?}",
+            callee_names(&facts)
+        );
     }
 
     #[test]
