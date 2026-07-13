@@ -1,0 +1,10 @@
+command = "violations"
+
+[[require]]
+rule = "feature-envy"
+path = "src/orders/checkout.ts"
+title = "finalizeOrder -> inventory"
+
+[[deny]]
+rule = "feature-envy"
+title = "tidyOrder"

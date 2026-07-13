@@ -93,6 +93,20 @@ cargo test --workspace
 
 The binary is `ovecc` (from `crates/ovecc-cli`).
 
+## 5. Development gates
+
+`cargo xtask` (the std-only runner in `crates/xtask`) drives every quality
+gate, and CI runs the identical commands:
+
+```sh
+cargo xtask hooks     # one-time: install the pre-commit and pre-push git hooks
+cargo xtask check     # after edits: fix, format, lint, test, suppression report
+cargo xtask ci        # the full CI pipeline locally
+```
+
+See the workflow section in [CONTRIBUTING.md](../../CONTRIBUTING.md) for the
+full command list, including `dogfood`, `coverage`, and the accuracy corpus.
+
 > **Next:** to expose Ovecc to a coding agent over MCP, see [MCP.md](./MCP.md).
 
 ---

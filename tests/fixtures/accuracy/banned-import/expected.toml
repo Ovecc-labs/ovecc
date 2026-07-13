@@ -1,0 +1,16 @@
+command = "violations"
+
+config = """
+[[rules.banned_imports]]
+name = "no-legacy-imports"
+pattern = "../legacy/*"
+severity = "medium"
+"""
+
+[[require]]
+rule = "banned-import/no-legacy-imports"
+path = "src/app/service.ts"
+
+[[deny]]
+rule = "banned-import/no-legacy-imports"
+path = "src/app/clean.ts"

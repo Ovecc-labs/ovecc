@@ -1,7 +1,7 @@
 # Lint, build, test, and publish downloadable ovecc binaries.
 #
-# - `lint` runs fmt + clippy on Linux. Both block: rustfmt and clippy
-#   (`-D warnings`) failures fail the job and gate downstream builds/releases.
+# - `lint` runs `cargo xtask lint` (fmt + clippy `-D warnings`), the strict
+#   dependency audit, and the suppression report; failures gate everything.
 # - `build-test` runs on every push to `mvp` or `main` and every PR, on Linux +
 #   Windows, compiling and testing in release mode. The heavy dependencies
 #   (DuckDB's bundled C++ build, oxc, tree-sitter) are cached by
@@ -41,7 +41,7 @@ concurrency:
 
 jobs:
   lint:
-    name: Lint (fmt + clippy)
+    name: Lint, audit, suppressions (cargo xtask)
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -52,16 +52,24 @@ jobs:
         with:
           components: rustfmt, clippy
 
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+
       - name: Cache cargo registry + target
         uses: Swatinem/rust-cache@v2
         with:
           key: lint
 
-      - name: rustfmt
-        run: cargo fmt --all --check
+      - name: Lint
+        run: cargo xtask lint
 
-      - name: clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Dependency audit
+        run: cargo xtask audit --strict
+
+      - name: Suppression report
+        run: cargo xtask suppressions
 
   build-test:
     name: Build & test (${{ matrix.os }})
@@ -110,7 +118,7 @@ jobs:
         run: cargo build --release --bin ovecc
 
       - name: Test (release)
-        run: cargo test --release
+        run: cargo xtask test --release
 
       - name: Package binary
         shell: bash
@@ -125,9 +133,63 @@ jobs:
           path: dist/${{ matrix.asset }}
           if-no-files-found: error
 
+  self-review:
+    name: Self review (ovecc on ovecc)
+    needs: build-test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download the Linux binary
+        uses: actions/download-artifact@v4
+        with:
+          name: ovecc-linux-x86_64
+          path: dist
+
+      - name: Index the base and head commits
+        id: snapshots
+        run: |
+          chmod +x dist/ovecc-linux-x86_64
+          BIN="$PWD/dist/ovecc-linux-x86_64"
+          BASE="${{ github.event.pull_request.base.sha }}"
+          if [ -z "$BASE" ]; then
+            BASE="$(git rev-parse --verify --quiet HEAD~1 || true)"
+          fi
+          HEAD_SHA="$(git rev-parse HEAD)"
+          if [ -n "$BASE" ]; then
+            git checkout --quiet "$BASE"
+            "$BIN" index .
+            git checkout --quiet "$HEAD_SHA"
+          fi
+          "$BIN" index .
+          echo "base=$BASE" >> "$GITHUB_OUTPUT"
+
+      - name: Summary
+        run: |
+          BIN="$PWD/dist/ovecc-linux-x86_64"
+          "$BIN" summary --format markdown | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Review the change (fail on new high findings)
+        run: |
+          BIN="$PWD/dist/ovecc-linux-x86_64"
+          if [ -z "${{ steps.snapshots.outputs.base }}" ]; then
+            echo "no base commit to review against; skipping" | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          set +e
+          "$BIN" review --fail-on high --format markdown > review.md
+          code=$?
+          set -e
+          cat review.md
+          cat review.md >> "$GITHUB_STEP_SUMMARY"
+          exit "$code"
+
   release:
     name: Publish rolling "latest" release
-    needs: [lint, build-test]
+    needs: [lint, build-test, self-review]
     if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -161,7 +223,7 @@ jobs:
 
   release-version:
     name: Publish tagged release
-    needs: [lint, build-test]
+    needs: [lint, build-test, self-review]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     timeout-minutes: 15

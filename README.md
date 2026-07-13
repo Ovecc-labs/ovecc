@@ -197,7 +197,8 @@ boundary, not a core change.
 
 ## Workspace layout
 
-Ten library crates and one binary, each documented in its own `README.md`:
+Ten library crates and one binary, each documented in its own `README.md`
+(plus `xtask`, the std-only development task runner behind `cargo xtask`):
 
 | Crate | Responsibility |
 | --- | --- |

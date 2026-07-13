@@ -15,18 +15,44 @@ cargo build --release
 cargo test --workspace
 ```
 
-## Before opening a PR
+## Development workflow
 
-CI blocks on all three, so run them locally first:
+The `cargo xtask` runner (crates/xtask, std-only) is the single entry point
+for every quality gate; CI runs the same commands, so green locally means
+green in CI. One-time setup:
 
 ```sh
-cargo fmt --all --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
+cargo xtask hooks     # install the git pre-commit (lint) and pre-push (lint+test) hooks
 ```
 
-We also dogfood: run `ovecc index . && ovecc review` on your branch and make
-sure your change doesn't introduce new findings on ovecc itself.
+Day to day:
+
+```sh
+cargo xtask check     # after edits: clippy --fix, rustfmt, lint, tests, suppression report
+cargo xtask lint      # what the pre-commit hook runs: fmt --check + clippy -D warnings
+cargo xtask ci        # the full CI gate: lint, cargo-audit (strict), tests, suppressions
+cargo xtask dogfood   # build ovecc, index this repo, review the latest change
+cargo xtask coverage --min 0   # cargo-llvm-cov line coverage (ratchet the floor up over time)
+```
+
+`cargo xtask --help` lists the rest. The accuracy corpus under
+`tests/fixtures/accuracy/` gates detector precision and recall: every case
+stages a small repository, and the suite fails if a required finding goes
+missing or a `deny` probe fires. When you add or tune a detector, add a case
+(`repo/` files plus `expected.toml` with `require`/`deny` entries) in the
+same change.
+
+## Before opening a PR
+
+CI blocks on these, so run them locally first:
+
+```sh
+cargo xtask ci
+```
+
+We also dogfood: run `cargo xtask dogfood` (or `ovecc index . && ovecc review`)
+on your branch and make sure your change doesn't introduce new findings on
+ovecc itself — CI enforces this with the `self-review` job.
 
 ## What makes a good change
 

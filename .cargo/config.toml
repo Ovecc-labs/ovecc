@@ -8,6 +8,9 @@
 # Keep these in sync: changing C(XX)FLAGS invalidates the libduckdb-sys build
 # cache and triggers a ~10 minute C++ rebuild.
 
+[alias]
+xtask = "run --quiet --package xtask --"
+
 [env]
 CFLAGS_x86_64_pc_windows_gnu = "-Wa,-mbig-obj -g0 -O1"
 CXXFLAGS_x86_64_pc_windows_gnu = "-Wa,-mbig-obj -g0 -O1"

@@ -1,0 +1,10 @@
+command = "violations"
+
+[[require]]
+rule = "large-class"
+path = "src/net/gateway.ts"
+title = "Gateway (21 methods)"
+
+[[deny]]
+rule = "large-class"
+title = "Cache"

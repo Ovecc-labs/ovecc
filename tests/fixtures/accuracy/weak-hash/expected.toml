@@ -1,0 +1,10 @@
+command = "violations"
+
+[[require]]
+rule = "security/weak-hash"
+path = "src/token.py"
+title = "MD5"
+
+[[deny]]
+rule = "security/weak-hash"
+path = "src/safe_token.py"

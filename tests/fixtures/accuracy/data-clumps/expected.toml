@@ -1,0 +1,10 @@
+command = "violations"
+
+[[require]]
+rule = "data-clumps"
+path = "src/net/api.ts"
+title = "(host, port, timeout)"
+
+[[deny]]
+rule = "data-clumps"
+title = "(host, port)"
