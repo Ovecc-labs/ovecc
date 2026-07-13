@@ -34,6 +34,12 @@ pub struct BlastNode {
     /// `graph_nodes.node_kind` (e.g. `module`, `symbol`, `api`, `table`).
     pub kind: String,
     pub label: String,
+    /// Definition file (repo-relative), when the node has a single source site.
+    /// `None` for modules and files. Filled in at load time from the store; the
+    /// persisted graph itself does not carry it.
+    pub file: Option<String>,
+    /// 1-based definition line paired with `file`.
+    pub line: Option<u32>,
 }
 
 /// A persisted directed graph edge.
@@ -42,6 +48,18 @@ pub struct BlastEdge {
     pub source: String,
     pub target: String,
     pub kind: String,
+}
+
+/// An impacted node with its source anchor, so the next step is a scoped read
+/// rather than a text search (where most of the token saving comes from).
+/// `file`/`line` are omitted for nodes without a single site (modules, files).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ImpactedNode {
+    pub label: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub line: Option<u32>,
 }
 
 /// (impacted entities by category and representative paths).
@@ -56,8 +74,8 @@ pub struct BlastResult {
     /// Dependent source files reached over file→file dependency edges. This is
     /// the file-granularity blast radius the module counts can't express.
     pub impacted_files: usize,
-    /// Labels of every impacted node, sorted for determinism.
-    pub impacted_labels: Vec<String>,
+    /// Every impacted node with its source anchor, sorted for determinism.
+    pub impacted: Vec<ImpactedNode>,
     /// Up to a few representative label paths from the target outward.
     pub paths: Vec<Vec<String>>,
     pub risk_value: u32,
@@ -332,11 +350,24 @@ pub fn blast_radius(
     // Impacted files weigh like symbols (1 each) in the risk score, so a file
     // with many dependents doesn't score Low just because no module is crossed.
     let (risk_value, risk) = risk_score(modules, apis, tables, symbols + files, false);
-    let mut impacted_labels: Vec<String> = visited
+    let mut impacted: Vec<ImpactedNode> = visited
         .iter()
-        .filter_map(|id| node_by_id.get(id).map(|node| node.label.clone()))
+        .filter_map(|id| {
+            node_by_id.get(id).map(|node| ImpactedNode {
+                label: node.label.clone(),
+                file: node.file.clone(),
+                line: node.line,
+            })
+        })
         .collect();
-    impacted_labels.sort();
+    // Label-first so the list reads like the old one; file/line break ties
+    // deterministically when two nodes share a label.
+    impacted.sort_by(|a, b| {
+        a.label
+            .cmp(&b.label)
+            .then_with(|| a.file.cmp(&b.file))
+            .then_with(|| a.line.cmp(&b.line))
+    });
     paths.sort();
     paths.truncate(20);
 
@@ -348,7 +379,7 @@ pub fn blast_radius(
         impacted_tables: tables,
         impacted_symbols: symbols,
         impacted_files: files,
-        impacted_labels,
+        impacted,
         paths,
         risk_value,
         risk,
@@ -397,6 +428,8 @@ mod tests {
             id: id.to_string(),
             kind: kind.to_string(),
             label: label.to_string(),
+            file: None,
+            line: None,
         }
     }
     fn edge(source: &str, target: &str, kind: &str) -> BlastEdge {
@@ -441,7 +474,7 @@ mod tests {
             result.impacted_tables, 0,
             "tables are downstream of billing, not user"
         );
-        assert!(result.impacted_labels.contains(&"checkout".to_string()));
+        assert!(result.impacted.iter().any(|n| n.label == "checkout"));
 
         // Depth bound of 1 stops at direct dependents only.
         let shallow =

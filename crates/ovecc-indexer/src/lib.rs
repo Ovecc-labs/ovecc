@@ -1130,6 +1130,8 @@ fn build_flow_graph(
             id: symbol.id.0.clone(),
             kind: "symbol".to_string(),
             label: symbol.qualified_name.clone(),
+            file: None,
+            line: None,
         });
     }
     for api in &resolved.apis {
@@ -1147,6 +1149,8 @@ fn build_flow_graph(
             id: api.id.0.clone(),
             kind: "api".to_string(),
             label,
+            file: None,
+            line: None,
         });
         if let Some(handler) = &api.handler_symbol_id {
             edges.push(BlastEdge {
@@ -1161,6 +1165,8 @@ fn build_flow_graph(
             id: object.id.0.clone(),
             kind: "table".to_string(),
             label: object.name.clone(),
+            file: None,
+            line: None,
         });
     }
     for call in &resolved.calls {

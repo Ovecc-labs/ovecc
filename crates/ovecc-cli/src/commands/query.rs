@@ -12,7 +12,8 @@ use ovecc_core::legacy::ImpactDirection;
 use ovecc_core::query::{Query, TargetSelector};
 use ovecc_core::report::ContextSlice;
 use ovecc_db::ArchitectureStore;
-use ovecc_graph::blast::{self, BlastEdge, BlastNode, BlastResult};
+use ovecc_graph::blast::{self, BlastEdge, BlastNode, BlastResult, ImpactedNode};
+use std::collections::HashMap;
 
 pub(crate) fn render_explanation(
     slice: &ContextSlice,
@@ -152,9 +153,9 @@ pub(crate) fn run_query(paths: &ProjectPaths, query: &Query, format: OutputForma
             // unknown `b` errors with suggestions instead of a false "no".
             let target_node = resolve(target)?;
             let reached = result
-                .impacted_labels
+                .impacted
                 .iter()
-                .any(|label| label.eq_ignore_ascii_case(&target_node.label));
+                .any(|node| node.label.eq_ignore_ascii_case(&target_node.label));
             let path = result
                 .paths
                 .iter()
@@ -233,24 +234,34 @@ fn unresolved_target(input: &str, nodes: &[BlastNode], edges: &[BlastEdge]) -> a
 // `deps sinc` lands on `filter_changed_since`, and a count without the
 // resolved name reads as an answer about the literal input.
 fn print_query_labels(label: &str, result: BlastResult, format: OutputFormat) -> Result<u8> {
-    let labels = result.impacted_labels;
+    let items = result.impacted;
     match format {
         OutputFormat::Json | OutputFormat::Ndjson => {
             let data = serde_json::json!({
                 "query": label.to_ascii_lowercase(),
                 "target": result.target_label,
-                "items": labels,
+                "items": items,
             });
             emit_json("query", &data, meta_for("query"))?;
         }
         _ => {
-            println!("{label} of {}: {}", result.target_label, labels.len());
-            for item in &labels {
-                println!("  {item}");
+            println!("{label} of {}: {}", result.target_label, items.len());
+            for item in &items {
+                println!("  {}", format_anchor(item));
             }
         }
     }
     Ok(0)
+}
+
+/// `label  file:line`, or just the label when the node has no single source
+/// site (modules, files). The gap keeps the anchor easy to lift into a read.
+fn format_anchor(node: &ImpactedNode) -> String {
+    match (&node.file, node.line) {
+        (Some(file), Some(line)) => format!("{}  {file}:{line}", node.label),
+        (Some(file), None) => format!("{}  {file}", node.label),
+        _ => node.label.clone(),
+    }
 }
 
 fn print_query_paths(label: &str, result: &BlastResult, format: OutputFormat) -> Result<u8> {
@@ -299,11 +310,13 @@ pub(crate) fn build_context_slice(
     // Depth 1: "dependencies"/"dependents" must mean the direct edges, not the
     // transitive closure — a file two imports away is not a dependency of the
     // target, and narrating it as one is actively misleading.
-    let dependencies = radius(ImpactDirection::Upstream, 1)
-        .map(|r| r.impacted_labels)
+    // The context slice stays label-only for now; anchors land here in the
+    // follow-up that enriches ContextSlice's dependency lists.
+    let dependencies: Vec<String> = radius(ImpactDirection::Upstream, 1)
+        .map(|r| r.impacted.into_iter().map(|n| n.label).collect())
         .unwrap_or_default();
-    let reverse_dependencies = radius(ImpactDirection::Downstream, 1)
-        .map(|r| r.impacted_labels)
+    let reverse_dependencies: Vec<String> = radius(ImpactDirection::Downstream, 1)
+        .map(|r| r.impacted.into_iter().map(|n| n.label).collect())
         .unwrap_or_default();
     // Impact paths follow the reverse-dependency direction only. A `Both`
     // walk stitches forward and backward hops into a single path, producing
@@ -340,10 +353,28 @@ fn load_graph(
     store: &ArchitectureStore,
     repository_id: &str,
 ) -> Result<(Vec<BlastNode>, Vec<BlastEdge>)> {
+    // Source anchors, joined in at load time so query/impact outputs carry
+    // file:line and the agent's next step is a scoped read, not a text search.
+    let mut locations: HashMap<String, (String, u32)> = HashMap::new();
+    for (id, file, line) in store.node_source_locations(repository_id)? {
+        locations.insert(id, (file, line.max(0) as u32));
+    }
     let nodes = store
         .graph_nodes(repository_id)?
         .into_iter()
-        .map(|(id, kind, label)| BlastNode { id, kind, label })
+        .map(|(id, kind, label)| {
+            let (file, line) = match locations.get(&id) {
+                Some((path, at)) => (Some(path.clone()), Some(*at)),
+                None => (None, None),
+            };
+            BlastNode {
+                id,
+                kind,
+                label,
+                file,
+                line,
+            }
+        })
         .collect();
     let edges = store
         .graph_edges(repository_id)?
@@ -398,7 +429,7 @@ pub(crate) fn render_blast(result: &BlastResult, format: OutputFormat) -> Result
             emit_ndjson_meta("impact", &meta_for("impact"))?;
             println!(
                 "{}",
-                ndjson_header("impact", result, &["impacted_labels", "paths"])?
+                ndjson_header("impact", result, &["impacted", "paths"])?
             );
             for path in &result.paths {
                 println!(
@@ -467,6 +498,8 @@ mod tests {
             id: id.to_string(),
             kind: kind.to_string(),
             label: label.to_string(),
+            file: None,
+            line: None,
         })
         .into();
         let text = message("biling", &nodes);
@@ -492,6 +525,8 @@ mod tests {
                 id: id.to_string(),
                 kind: kind.to_string(),
                 label: label.to_string(),
+                file: None,
+                line: None,
             })
             .into();
         let err = unresolved_target("custommers", &nodes, &[]);

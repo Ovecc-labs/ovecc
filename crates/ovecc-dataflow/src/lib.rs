@@ -288,6 +288,8 @@ mod tests {
             id: id.to_string(),
             kind: kind.to_string(),
             label: label.to_string(),
+            file: None,
+            line: None,
         }
     }
     fn edge(source: &str, target: &str, kind: &str) -> BlastEdge {

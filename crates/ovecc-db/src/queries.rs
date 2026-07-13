@@ -355,6 +355,40 @@ impl ArchitectureStore {
         collect_rows(rows)
     }
 
+    /// Source anchors `(node_id, file_path, line)` for graph nodes that have a
+    /// single definition site: symbols (their file + start line), apis and
+    /// schema objects (their evidence file + line). Modules and files are
+    /// absent. A read-time join, so anchors need no reindex to appear.
+    pub fn node_source_locations(
+        &self,
+        repository_id: &str,
+    ) -> Result<Vec<(String, String, i64)>> {
+        let mut statement = self.conn.prepare(
+            "SELECT s.id, f.path, s.start_line \
+               FROM symbols s JOIN files f ON f.id = s.file_id \
+              WHERE s.repository_id = ? AND s.start_line IS NOT NULL \
+             UNION ALL \
+             SELECT a.id, f.path, a.evidence_line \
+               FROM apis a JOIN files f ON f.id = a.evidence_file_id \
+              WHERE a.repository_id = ? AND a.evidence_line IS NOT NULL \
+             UNION ALL \
+             SELECT o.id, f.path, o.evidence_line \
+               FROM schema_objects o JOIN files f ON f.id = o.evidence_file_id \
+              WHERE o.repository_id = ? AND o.evidence_line IS NOT NULL",
+        )?;
+        let rows = statement.query_map(
+            params![repository_id, repository_id, repository_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            },
+        )?;
+        collect_rows(rows)
+    }
+
     /// Loads every graph edge as `(source_id, target_id, edge_kind)`.
     pub fn graph_edges(&self, repository_id: &str) -> Result<Vec<(String, String, String)>> {
         let mut statement = self.conn.prepare(
