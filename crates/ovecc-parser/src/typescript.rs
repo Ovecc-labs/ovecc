@@ -286,6 +286,11 @@ impl<'a> Extractor<'a> {
                 self.extract_schema_ref(node);
                 self.extract_secret(node);
             }
+            // A callable named in value position (`pipe(fn)`, `{ key: handler }`,
+            // a decorator, a returned function) is a real dependency the call
+            // graph would otherwise miss. Member/type/property names are distinct
+            // node kinds, so filtering to bare identifiers already excludes them.
+            "identifier" => self.record_value_reference(node),
             _ => {}
         }
 
@@ -496,6 +501,69 @@ impl<'a> Extractor<'a> {
                 self.visit_children(child);
             }
         }
+    }
+
+    /// Records an identifier read in value position. The name a binding
+    /// introduces is not a reference to anything, so every parent below that
+    /// makes this node a binding site bails out; what survives is a read, and
+    /// the resolver's local/import/unique-name gate decides whether it names a
+    /// callable. Reads that name nothing never reach the graph.
+    fn record_value_reference(&mut self, node: Node<'_>) {
+        let Some(parent) = node.parent() else {
+            return;
+        };
+        let pk = parent.kind();
+
+        // These two already produce a richer fact of their own, and a Reference
+        // beside them would double-count the same edge.
+        if pk == "call_expression" && parent.child_by_field_name("function") == Some(node) {
+            return;
+        }
+        if pk == "new_expression" && parent.child_by_field_name("constructor") == Some(node) {
+            return;
+        }
+
+        match pk {
+            "function_declaration"
+            | "generator_function_declaration"
+            | "class_declaration"
+            | "abstract_class_declaration"
+            | "method_definition"
+            | "public_field_definition"
+            | "interface_declaration"
+            | "type_alias_declaration"
+            | "enum_declaration"
+            | "enum_member"
+            | "method_signature"
+            | "property_signature" => return,
+            "import_clause" | "import_specifier" | "namespace_import" | "export_specifier"
+            | "export_clause" => return,
+            "formal_parameters" | "required_parameter" | "optional_parameter" => return,
+            // `x => x + 1` keeps its parameter directly under the arrow, so it
+            // reaches none of the parameter kinds above.
+            "arrow_function" if parent.child_by_field_name("parameter") == Some(node) => return,
+            "catch_clause" if parent.child_by_field_name("parameter") == Some(node) => return,
+            "variable_declarator" | "for_in_statement" | "assignment_expression"
+                if parent.child_by_field_name("name") == Some(node)
+                    || parent.child_by_field_name("left") == Some(node) =>
+            {
+                return;
+            }
+            _ => {}
+        }
+
+        let name = self.text(node).to_string();
+        if name.is_empty() {
+            return;
+        }
+
+        self.calls.push(CallFact {
+            caller_qualified_name: self.current_caller(),
+            callee_name: name,
+            kind: CallKind::Reference,
+            line: self.line(node),
+            receiver: None,
+        });
     }
 
     fn extract_call(&mut self, node: Node<'_>) {
@@ -1096,6 +1164,87 @@ mod tests {
             contents: source.to_string(),
         };
         TypeScriptAdapter.extract(&file).expect("extraction")
+    }
+
+    #[test]
+    fn records_function_as_value_reference() {
+        let facts = extract(
+            r#"
+import { purry } from "./purry";
+
+function helper(x: number): number {
+    return x;
+}
+
+export function run(items: number[]) {
+    const alias = helper;
+    const registry = { key: helper };
+    return purry(alias, [items, registry]);
+}
+"#,
+            SourceLanguage::TypeScript,
+        );
+        // `helper` aliased into a const and stored in a registry object: value
+        // references the call graph would otherwise miss.
+        let helper_refs = facts
+            .calls
+            .iter()
+            .filter(|c| c.kind == CallKind::Reference && c.callee_name == "helper")
+            .count();
+        assert!(helper_refs >= 2, "{:?}", facts.calls);
+        // The invoked `purry(...)` stays a Direct call, not a Reference.
+        let purry = facts
+            .calls
+            .iter()
+            .find(|c| c.callee_name == "purry")
+            .expect("purry call");
+        assert_eq!(purry.kind, CallKind::Direct);
+    }
+
+    #[test]
+    fn value_reference_skips_bindings_and_member_names() {
+        let facts = extract(
+            r#"
+export function run(source: number[]) {
+    const mapped = source.map((entry) => entry);
+    let total = 0;
+    total = mapped;
+    for (const key in mapped) {
+        drain(key);
+    }
+    try {
+        risky();
+    } catch (failure) {
+        drain(failure);
+    }
+    return holder.mapped;
+}
+"#,
+            SourceLanguage::TypeScript,
+        );
+        let refs = |name: &str| {
+            facts
+                .calls
+                .iter()
+                .filter(|c| c.kind == CallKind::Reference && c.callee_name == name)
+                .count()
+        };
+        // A name a binding introduces is not a reference: each of these is read
+        // exactly once besides the binding site, so a second hit means the
+        // binding leaked in.
+        assert_eq!(refs("entry"), 1, "arrow parameter bound, {:?}", facts.calls);
+        assert_eq!(refs("key"), 1, "for-in binding, {:?}", facts.calls);
+        assert_eq!(refs("failure"), 1, "catch parameter, {:?}", facts.calls);
+        // `total = mapped` writes `total` and reads `mapped`.
+        assert_eq!(refs("total"), 0, "assignment target, {:?}", facts.calls);
+        // `holder.mapped` names a property, not the local `mapped`; the grammar
+        // gives it a distinct kind, so the count stays at the two real reads.
+        assert_eq!(
+            refs("mapped"),
+            2,
+            "member property leaked, {:?}",
+            facts.calls
+        );
     }
 
     #[test]
