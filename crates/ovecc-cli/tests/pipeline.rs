@@ -91,6 +91,57 @@ fn plant_banned_import_rule(root: &Path) {
 }
 
 #[test]
+fn rdeps_returns_direct_callers_and_depth_opts_into_reach() {
+    let staged = staged_fixture("small-service");
+    let repo = staged.path().to_string_lossy().to_string();
+    index_repo(&repo);
+
+    // checkout -> handleCreateInvoice -> createInvoice.
+    let labels = |args: &[&str]| -> Vec<String> {
+        let out = ovecc(&repo, args);
+        assert!(
+            out.status.success(),
+            "query failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let json: serde_json::Value =
+            serde_json::from_slice(&out.stdout).expect("query emits json");
+        json["data"]["items"]
+            .as_array()
+            .expect("items array")
+            .iter()
+            .filter_map(|item| item["label"].as_str().map(str::to_string))
+            .collect()
+    };
+
+    // `rdeps` answers "who calls X", so only the immediate caller belongs here.
+    // It used to run at the blast-radius depth and drag the whole reverse
+    // reachable set in with it.
+    let direct = labels(&["query", "rdeps createInvoice", "--format", "json"]);
+    assert!(
+        direct.iter().any(|l| l == "handleCreateInvoice"),
+        "direct caller missing: {direct:?}"
+    );
+    assert!(
+        !direct.iter().any(|l| l == "checkout"),
+        "transitive caller leaked into rdeps: {direct:?}"
+    );
+
+    let reached = labels(&[
+        "query",
+        "rdeps createInvoice",
+        "--depth",
+        "3",
+        "--format",
+        "json",
+    ]);
+    assert!(
+        reached.iter().any(|l| l == "checkout"),
+        "--depth must opt back into transitive reach: {reached:?}"
+    );
+}
+
+#[test]
 fn typescript_service_indexes_and_resolves_internally() {
     let staged = staged_fixture("small-service");
     let paths = ProjectPaths::resolve(staged.path()).unwrap();

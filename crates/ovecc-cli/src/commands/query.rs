@@ -51,7 +51,12 @@ fn selector_to_blast(selector: &TargetSelector) -> String {
     }
 }
 
-pub(crate) fn run_query(paths: &ProjectPaths, query: &Query, format: OutputFormat) -> Result<u8> {
+pub(crate) fn run_query(
+    paths: &ProjectPaths,
+    query: &Query,
+    format: OutputFormat,
+    depth: Option<usize>,
+) -> Result<u8> {
     match query {
         Query::Hotspots => {
             let report = load_hotspots(paths, 10)?;
@@ -105,16 +110,25 @@ pub(crate) fn run_query(paths: &ProjectPaths, query: &Query, format: OutputForma
 
     let store = open_store(paths)?;
     let (nodes, edges) = load_graph(&store, &paths.repository_id().0)?;
-    const DEPTH: usize = blast::DEFAULT_MAX_DEPTH;
+    // `deps`/`rdeps` answer "who calls X", one hop: what the MCP contract
+    // advertises and what `find_references` aliases to. Sharing the blast-radius
+    // depth returned 175 nodes for a function with one caller, everything that
+    // reached that caller. Reachability (`paths`, `a -> b`) stays transitive.
+    const DIRECT: usize = 1;
+    let reach_depth = depth.unwrap_or(blast::DEFAULT_MAX_DEPTH);
+    let direct_depth = depth.unwrap_or(DIRECT);
 
     let resolve = |selector: &TargetSelector| {
         let input = selector_to_blast(selector);
         blast::resolve_target(&input, &nodes)
             .ok_or_else(|| unresolved_target(&input, &nodes, &edges))
     };
-    let run = |selector: &TargetSelector, direction: ImpactDirection| -> Result<BlastResult> {
+    let run = |selector: &TargetSelector,
+               direction: ImpactDirection,
+               max_depth: usize|
+     -> Result<BlastResult> {
         let node = resolve(selector)?;
-        blast::blast_radius(&nodes, &edges, &node.id, direction, DEPTH).ok_or_else(|| {
+        blast::blast_radius(&nodes, &edges, &node.id, direction, max_depth).ok_or_else(|| {
             OveccError::Internal {
                 message: format!(
                     "resolved target '{}' vanished from the graph view",
@@ -128,27 +142,29 @@ pub(crate) fn run_query(paths: &ProjectPaths, query: &Query, format: OutputForma
     match query {
         Query::Deps(target) => print_query_labels(
             "Dependencies",
-            run(target, ImpactDirection::Upstream)?,
+            run(target, ImpactDirection::Upstream, direct_depth)?,
             format,
         ),
         Query::ReverseDeps(target) => print_query_labels(
             "Dependents",
-            run(target, ImpactDirection::Downstream)?,
+            run(target, ImpactDirection::Downstream, direct_depth)?,
             format,
         ),
         Query::Module(name) => {
             let selector = TargetSelector::Free(name.clone());
             print_query_labels(
                 "Dependencies",
-                run(&selector, ImpactDirection::Upstream)?,
+                run(&selector, ImpactDirection::Upstream, direct_depth)?,
                 format,
             )
         }
-        Query::Paths(target) => {
-            print_query_paths("Paths", &run(target, ImpactDirection::Both)?, format)
-        }
+        Query::Paths(target) => print_query_paths(
+            "Paths",
+            &run(target, ImpactDirection::Both, reach_depth)?,
+            format,
+        ),
         Query::Relation { source, target } => {
-            let result = run(source, ImpactDirection::Upstream)?;
+            let result = run(source, ImpactDirection::Upstream, reach_depth)?;
             // Resolving the right-hand side too keeps `a -> b` honest: an
             // unknown `b` errors with suggestions instead of a false "no".
             let target_node = resolve(target)?;

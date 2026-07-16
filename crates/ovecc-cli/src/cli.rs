@@ -203,6 +203,11 @@ pub enum Command {
         /// e.g. `"deps Billing"`, `"rdeps table:customers"`, `"billing -> user"`,
         /// `"paths X"`, `"hotspots"`, `"cycles"`.
         query: String,
+        /// Hops to traverse. `deps`/`rdeps` are direct (1) by default; `paths`
+        /// and `a -> b` follow the graph to depth 3. Use `impact` for a full
+        /// blast radius.
+        #[arg(long)]
+        depth: Option<usize>,
     },
     /// Export deterministic architecture slices.
     Export {
@@ -619,11 +624,11 @@ fn run_command(cli: Cli) -> Result<u8> {
             render_conventions(&report, config.output.default_format)?;
             Ok(0)
         }
-        Command::Query { query } => {
+        Command::Query { query, depth } => {
             let paths = ProjectPaths::resolve(cli.repo.unwrap_or_else(|| PathBuf::from(".")))?;
             let config = load_config(&paths, format_override)?;
             let parsed = Query::parse(&query)?;
-            run_query(&paths, &parsed, config.output.default_format)
+            run_query(&paths, &parsed, config.output.default_format, depth)
         }
         Command::Export {
             what: ExportCommand::Context { target },
