@@ -47,8 +47,9 @@ Repository -> deterministic analysis -> architecture database -> insights -> opt
 </picture>
 <p align="center"><i>ovecc's own dependency graph, rendered by <code>ovecc export graph --html</code> into one self-contained offline file.</i></p>
 
-The full design is in [ARCHITECTURE.md](ARCHITECTURE.md). Measured performance on
-real repositories is in [docs/benchmark/BENCHMARKS.md](docs/benchmark/BENCHMARKS.md).
+The full design is in [ARCHITECTURE.md](ARCHITECTURE.md). Measured performance and
+answer accuracy on real repositories are in
+[docs/benchmark/BENCHMARKS.md](docs/benchmark/BENCHMARKS.md).
 
 ## Install
 
