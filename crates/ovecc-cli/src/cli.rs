@@ -11,9 +11,9 @@ use crate::commands::{
     },
     dupes::{load_dupes_report, render_dupes},
     findings::{
-        build_security_report, filter_changed_since, findings_exit, load_audit_report,
-        load_baseline, load_deadcode_report, load_health_report, render_audit, render_deadcode,
-        render_fix, render_health, render_security, render_violations,
+        DEFAULT_FINDING_LIMIT, build_security_report, filter_changed_since, findings_exit,
+        load_audit_report, load_baseline, load_deadcode_report, load_health_report, render_audit,
+        render_deadcode, render_fix, render_health, render_security, render_violations,
     },
     history::{render_history, render_history_index},
     index::{render_index_report, render_index_timings, run_init},
@@ -190,6 +190,13 @@ pub enum Command {
         /// (progressive adoption: gate the diff, not the backlog).
         #[arg(long, value_name = "REF")]
         changed_since: Option<String>,
+        /// Findings to print. 0 prints all of them. Counts, `--fail-on`, and
+        /// the SARIF/Code Climate exports always cover the whole set.
+        #[arg(long, default_value_t = DEFAULT_FINDING_LIMIT)]
+        limit: usize,
+        /// Skip this many findings before printing (pages `--limit`).
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
     },
     /// Rank technical-debt hotspots.
     Hotspots {
@@ -555,6 +562,8 @@ fn run_command(cli: Cli) -> Result<u8> {
             baseline,
             write_baseline,
             changed_since,
+            limit,
+            offset,
         } => {
             let paths = ProjectPaths::resolve(cli.repo.unwrap_or_else(|| PathBuf::from(".")))?;
             let config = load_config(&paths, format_override)?;
@@ -581,7 +590,7 @@ fn run_command(cli: Cli) -> Result<u8> {
                 filter_changed_since(&mut findings, &paths.root, reference)?;
             }
 
-            render_violations(&findings, config.output.default_format)?;
+            render_violations(&findings, config.output.default_format, limit, offset)?;
             Ok(findings_exit(&findings, fail_on))
         }
         Command::History { metric, limit } => {

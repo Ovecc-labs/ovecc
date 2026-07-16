@@ -46,6 +46,80 @@ pub(crate) fn filter_changed_since(
     Ok(())
 }
 
+/// Findings a list command prints before it cuts. Twenty keeps a full page
+/// inside the 25k-token ceiling agents put on a tool result; the whole backlog
+/// does not fit at any severity (Django's 1 825 findings serialize to ~470k
+/// tokens, past the hard ceiling, so the call fails outright rather than
+/// wasting context). `--limit 0` prints everything.
+pub(crate) const DEFAULT_FINDING_LIMIT: usize = 20;
+
+/// The `--offset`/`--limit` slice. A limit of 0 means no cut.
+pub(crate) fn window(findings: &[FindingRecord], limit: usize, offset: usize) -> &[FindingRecord] {
+    let rest = &findings[offset.min(findings.len())..];
+    match limit {
+        0 => rest,
+        n => &rest[..n.min(rest.len())],
+    }
+}
+
+/// Severity counts over the whole filtered set, so a cut list still reports
+/// what it is a slice of.
+fn severity_tally(findings: &[FindingRecord]) -> Vec<(&'static str, usize)> {
+    [
+        ("critical", Severity::Critical),
+        ("high", Severity::High),
+        ("medium", Severity::Medium),
+        ("low", Severity::Low),
+    ]
+    .into_iter()
+    .filter_map(|(label, severity)| {
+        match findings.iter().filter(|f| f.severity == severity).count() {
+            0 => None,
+            n => Some((label, n)),
+        }
+    })
+    .collect()
+}
+
+/// The rules carrying the backlog, most findings first. Which rule dominates is
+/// the first thing a reader acts on and it is invisible from a truncated list.
+fn rule_tally(findings: &[FindingRecord], top: usize) -> Vec<(String, usize)> {
+    let mut counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for finding in findings {
+        let rule = finding.rule_name.as_deref().unwrap_or("(no rule)");
+        *counts.entry(rule).or_default() += 1;
+    }
+    let mut ranked: Vec<(String, usize)> = counts
+        .into_iter()
+        .map(|(rule, n)| (rule.to_string(), n))
+        .collect();
+    // Count first, then name, so equal counts do not reorder between runs.
+    ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    ranked.truncate(top);
+    ranked
+}
+
+fn tally_line(tally: &[(&'static str, usize)]) -> String {
+    tally
+        .iter()
+        .map(|(label, n)| format!("{n} {label}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Tells the reader the list is a slice and how to move it. A silent cut would
+/// read as "that is all there is".
+fn truncation_note(total: usize, shown: usize, offset: usize) -> Option<String> {
+    (shown < total).then(|| {
+        format!(
+            "Showing {}-{} of {total}. Narrow with --severity, page with --offset, \
+             or pass --limit 0 for the full list.",
+            offset + 1,
+            offset + shown,
+        )
+    })
+}
+
 pub(crate) fn findings_exit(findings: &[FindingRecord], fail_on: Option<FailOn>) -> u8 {
     let Some(fail_on) = fail_on else {
         return 0;
@@ -58,18 +132,50 @@ pub(crate) fn findings_exit(findings: &[FindingRecord], fail_on: Option<FailOn>)
     u8::from(triggered)
 }
 
-pub(crate) fn render_violations(findings: &[FindingRecord], format: OutputFormat) -> Result<()> {
+/// `limit`/`offset` cut the list the reader sees, never the set the counts and
+/// the exit code are computed over. SARIF and Code Climate ignore them: those
+/// feed CI ingestion, where a partial file is a wrong file.
+pub(crate) fn render_violations(
+    findings: &[FindingRecord],
+    format: OutputFormat,
+    limit: usize,
+    offset: usize,
+) -> Result<()> {
+    let shown = window(findings, limit, offset);
+    let total = findings.len();
+    let severities = severity_tally(findings);
+    let note = truncation_note(total, shown.len(), offset);
+
     match format {
-        OutputFormat::Json => emit_json_with_fix("violations", findings)?,
+        OutputFormat::Json => emit_json_with_fix(
+            "violations",
+            serde_json::json!({
+                "total": total,
+                "shown": shown.len(),
+                "offset": offset,
+                "by_severity": severities.iter()
+                    .map(|(label, n)| (label.to_string(), serde_json::json!(n)))
+                    .collect::<serde_json::Map<String, serde_json::Value>>(),
+                "by_rule": rule_tally(findings, 10).into_iter()
+                    .map(|(rule, n)| serde_json::json!({"rule": rule, "count": n}))
+                    .collect::<Vec<_>>(),
+                "findings": shown,
+                "note": note,
+            }),
+        )?,
         OutputFormat::Ndjson => {
             emit_ndjson_meta("violations", &meta_for("violations"))?;
-            for finding in findings {
+            for finding in shown {
                 println!("{}", ndjson_line("violation", finding)?);
             }
         }
         OutputFormat::Markdown => {
-            println!("# Violations ({})", findings.len());
-            for finding in findings {
+            println!("# Violations ({total})");
+            if !severities.is_empty() {
+                println!();
+                println!("{}", tally_line(&severities));
+            }
+            for finding in shown {
                 println!();
                 println!("## [{:?}] {}", finding.severity, finding.title);
                 if let Some(rule) = &finding.rule_name {
@@ -81,10 +187,30 @@ pub(crate) fn render_violations(findings: &[FindingRecord], format: OutputFormat
                     println!("- Evidence: `{}`", format_evidence(evidence));
                 }
             }
+            if let Some(note) = note {
+                println!();
+                println!("{note}");
+            }
         }
         OutputFormat::Text => {
-            println!("Violations: {}", findings.len());
-            for finding in findings {
+            print!("Violations: {total}");
+            if severities.is_empty() {
+                println!();
+            } else {
+                println!(" ({})", tally_line(&severities));
+            }
+            let rules = rule_tally(findings, 3);
+            if !rules.is_empty() && total > shown.len() {
+                println!(
+                    "Top rules: {}",
+                    rules
+                        .iter()
+                        .map(|(rule, n)| format!("{rule} {n}"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+            }
+            for finding in shown {
                 println!();
                 println!("[{:?}] {}", finding.severity, finding.title);
                 if let Some(rule) = &finding.rule_name {
@@ -94,6 +220,10 @@ pub(crate) fn render_violations(findings: &[FindingRecord], format: OutputFormat
                 for evidence in &finding.evidence {
                     println!("  Evidence: {}", format_evidence(evidence));
                 }
+            }
+            if let Some(note) = note {
+                println!();
+                println!("{note}");
             }
         }
         OutputFormat::Sarif => emit_sarif(findings)?,
@@ -588,5 +718,65 @@ mod tests {
         assert!(covered.contains("2 entry point(s)"), "{covered}");
         assert!(covered.contains("14 JS/TS file(s)"), "{covered}");
         assert!(deadcode_coverage_note(&report(None, 5)).contains("re-index"));
+    }
+
+    fn finding(severity: Severity, rule: &str) -> FindingRecord {
+        FindingRecord {
+            id: ovecc_core::id::FindingId::from_raw("finding:1"),
+            repository_id: ovecc_core::id::RepositoryId::from_raw("repo:1"),
+            snapshot_id: None,
+            kind: FindingKind::CircularDependency,
+            severity,
+            rule_name: Some(rule.to_string()),
+            target: None,
+            title: "t".to_string(),
+            description: "d".to_string(),
+            evidence: Vec::new(),
+            created_at: Default::default(),
+        }
+    }
+
+    #[test]
+    fn window_pages_and_zero_limit_means_everything() {
+        let findings: Vec<FindingRecord> = (0..5)
+            .map(|_| finding(Severity::Low, "complexity"))
+            .collect();
+
+        assert_eq!(window(&findings, 2, 0).len(), 2);
+        assert_eq!(window(&findings, 2, 4).len(), 1, "last page is short");
+        assert_eq!(window(&findings, 0, 0).len(), 5, "limit 0 is the full set");
+        // An offset past the end is empty, not a panic.
+        assert!(window(&findings, 2, 99).is_empty());
+        assert_eq!(window(&findings, 99, 0).len(), 5);
+    }
+
+    #[test]
+    fn tallies_and_note_describe_the_whole_set_not_the_page() {
+        let mut findings = vec![finding(Severity::High, "security/eval")];
+        findings.extend((0..3).map(|_| finding(Severity::Low, "complexity")));
+
+        assert_eq!(
+            severity_tally(&findings),
+            vec![("high", 1), ("low", 3)],
+            "absent severities are dropped, order is worst-first"
+        );
+        assert_eq!(
+            rule_tally(&findings, 3),
+            vec![
+                ("complexity".to_string(), 3),
+                ("security/eval".to_string(), 1)
+            ]
+        );
+
+        let note = truncation_note(4, 2, 0).expect("a cut list is announced");
+        assert!(note.contains("Showing 1-2 of 4"), "{note}");
+        assert!(
+            note.contains("--limit 0"),
+            "the way out is in the note: {note}"
+        );
+        assert!(
+            truncation_note(4, 4, 0).is_none(),
+            "a complete list says nothing"
+        );
     }
 }

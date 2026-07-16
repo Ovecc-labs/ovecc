@@ -90,6 +90,65 @@ fn plant_banned_import_rule(root: &Path) {
     .expect("write config");
 }
 
+/// The list a reader sees is cut; the gate is not. If `--limit` reached
+/// `--fail-on`, a CI check would go green on a truncated page.
+#[test]
+fn limiting_the_printed_findings_does_not_soften_the_gate() {
+    let staged = staged_fixture("smelly");
+    let repo = staged.path().to_str().expect("utf8 path").to_string();
+    index_repo(&repo);
+
+    let full = ovecc(&repo, &["violations", "--format", "json", "--limit", "0"]);
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&full.stdout).expect("violations json");
+    let total = envelope["data"]["total"].as_u64().expect("total") as usize;
+    assert!(
+        total > 1,
+        "fixture needs several findings to page, got {total}"
+    );
+    assert_eq!(
+        envelope["data"]["findings"]
+            .as_array()
+            .expect("findings")
+            .len(),
+        total,
+        "--limit 0 prints the whole set"
+    );
+
+    let one = ovecc(&repo, &["violations", "--format", "json", "--limit", "1"]);
+    let envelope: serde_json::Value = serde_json::from_slice(&one.stdout).expect("violations json");
+    assert_eq!(envelope["data"]["shown"], 1);
+    assert_eq!(
+        envelope["data"]["total"].as_u64().expect("total") as usize,
+        total,
+        "the count still describes the whole set"
+    );
+    assert!(
+        envelope["data"]["note"].is_string(),
+        "a cut list must say how to see the rest"
+    );
+
+    let gated = ovecc(&repo, &["violations", "--limit", "1", "--fail-on", "any"]);
+    assert_eq!(
+        gated.status.code(),
+        Some(1),
+        "a one-row page must still fail the gate, stderr: {}",
+        String::from_utf8_lossy(&gated.stderr)
+    );
+
+    // SARIF feeds CI ingestion, where a partial file is a wrong file.
+    let sarif = ovecc(&repo, &["violations", "--format", "sarif", "--limit", "1"]);
+    let sarif: serde_json::Value = serde_json::from_slice(&sarif.stdout).expect("sarif json");
+    assert_eq!(
+        sarif["runs"][0]["results"]
+            .as_array()
+            .expect("results")
+            .len(),
+        total,
+        "sarif ignores --limit"
+    );
+}
+
 #[test]
 fn rdeps_returns_direct_callers_and_depth_opts_into_reach() {
     let staged = staged_fixture("small-service");
@@ -726,7 +785,9 @@ fn code_smell_rules_flag_envy_large_class_and_clumps() {
         String::from_utf8_lossy(&out.stderr)
     );
     let envelope: serde_json::Value = serde_json::from_slice(&out.stdout).expect("violations json");
-    let findings = envelope["data"].as_array().expect("findings array");
+    let findings = envelope["data"]["findings"]
+        .as_array()
+        .expect("findings array");
     let by_rule = |rule: &str| -> Vec<&serde_json::Value> {
         findings.iter().filter(|f| f["rule_name"] == rule).collect()
     };

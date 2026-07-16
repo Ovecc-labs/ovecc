@@ -1,7 +1,7 @@
 //! Reads over the persisted graph: `query`, `impact`, `explain`, and the
 //! `export context` slice.
 
-use super::findings::render_violations;
+use super::findings::{DEFAULT_FINDING_LIMIT, render_violations};
 use super::open_store;
 use super::summary::{load_hotspots, render_hotspots};
 use crate::render::{emit_json, emit_ndjson_meta, meta_for, ndjson_header};
@@ -66,7 +66,7 @@ pub(crate) fn run_query(
         Query::Violations => {
             let store = open_store(paths)?;
             let findings = store.findings(&paths.repository_id().0, None)?;
-            render_violations(&findings, format)?;
+            render_violations(&findings, format, DEFAULT_FINDING_LIMIT, 0)?;
             return Ok(0);
         }
         Query::Cycles => {
