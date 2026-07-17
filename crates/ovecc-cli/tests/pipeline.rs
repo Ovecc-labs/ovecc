@@ -889,3 +889,247 @@ fn advise_reports_without_opening_the_database_twice() {
         "advise should render its report, got: {stdout}"
     );
 }
+
+/// A finding's identity is keyed on its file path, so moving a file renames
+/// every finding in it and the snapshot diff reports pre-existing defects as
+/// new — the gate then fails a refactor that introduced nothing. With both
+/// snapshots on commits, review consults the rename-aware git diff and only
+/// charges a lexical finding to the change if its lines were actually touched.
+#[test]
+fn review_does_not_charge_findings_a_file_move_renamed() {
+    fn git(root: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .output()
+            .expect("run git");
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let temp = tempfile::tempdir().expect("temp dir");
+    let root = temp.path();
+    git(root, &["init", "-q"]);
+    git(root, &["config", "user.email", "dev@example.com"]);
+    git(root, &["config", "user.name", "Dev"]);
+    fs::create_dir_all(root.join("src")).expect("mkdir");
+    // A committed provider token is a Critical finding, enough to trip
+    // --fail-on high if review were to charge it to the wrong change.
+    fs::write(
+        root.join("src").join("config.ts"),
+        "export const region = \"eu-west-3\";\n\
+         export const awsKey = \"AKIAAAAABBBBCCCCDDDD\";\n\
+         export function endpoint(name: string): string {\n  return name + region;\n}\n",
+    )
+    .expect("write config.ts");
+    git(root, &["add", "."]);
+    git(root, &["commit", "-q", "-m", "base"]);
+    let repo = root.to_str().expect("utf8 path").to_string();
+    index_repo(&repo);
+
+    let baseline = ovecc(&repo, &["violations", "--format", "json"]);
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&baseline.stdout).expect("violations json");
+    assert_eq!(
+        envelope["data"]["by_severity"]["critical"], 1,
+        "the fixture must start with exactly the planted secret: {}",
+        envelope["data"]
+    );
+
+    // A pure move: the secret's finding identity changes with the path, but
+    // no line of the change touched it.
+    git(root, &["mv", "src/config.ts", "src/settings.ts"]);
+    git(root, &["commit", "-q", "-m", "move"]);
+    index_repo(&repo);
+
+    let review = ovecc(&repo, &["review", "--fail-on", "high", "--format", "json"]);
+    let envelope: serde_json::Value = serde_json::from_slice(&review.stdout).expect("review json");
+    let summary = &envelope["data"]["summary"];
+    assert!(
+        review.status.success(),
+        "a pure file move must pass the gate: {summary}"
+    );
+    assert_eq!(
+        summary["new_security"], 0,
+        "the moved secret predates the change: {summary}"
+    );
+    assert!(
+        summary["shifted_findings"].as_u64().unwrap_or(0) >= 1,
+        "the uncharged finding should be counted, not silently dropped: {summary}"
+    );
+
+    // A genuinely new secret in that same file must still fail the gate.
+    let mut source = fs::read_to_string(root.join("src").join("settings.ts")).expect("read");
+    source.push_str("export const backupKey = \"AKIAEEEEFFFFGGGGHHHH\";\n");
+    fs::write(root.join("src").join("settings.ts"), source).expect("grow settings.ts");
+    git(root, &["add", "."]);
+    git(root, &["commit", "-q", "-m", "add another"]);
+    index_repo(&repo);
+
+    let review = ovecc(&repo, &["review", "--fail-on", "high", "--format", "json"]);
+    let envelope: serde_json::Value = serde_json::from_slice(&review.stdout).expect("review json");
+    assert!(
+        !review.status.success(),
+        "a new hardcoded secret must still fail: {}",
+        envelope["data"]["summary"]
+    );
+    let new_findings = envelope["data"]["new_findings"]
+        .as_array()
+        .expect("new findings");
+    assert!(
+        new_findings
+            .iter()
+            .any(|finding| finding["kind"] == "hardcoded_secret"),
+        "the added secret must be the named finding: {new_findings:#?}"
+    );
+
+    // Severity is part of a finding's identity, so a function pushed across a
+    // band is a new fact: growing `endpoint` from medium to high complexity
+    // must fail the gate even though the finding's kind, file, and symbol all
+    // already existed.
+    let complex_fn = |name: &str, branches: usize| -> String {
+        let body: String = (1..=branches)
+            .map(|i| format!("  if (n > {i}) {{ x += {i}; }}\n"))
+            .collect();
+        format!(
+            "export function {name}(n: number): number {{\n  let x = 0;\n{body}  return x;\n}}\n"
+        )
+    };
+    let secrets = "export const awsKey = \"AKIAAAAABBBBCCCCDDDD\";\n\
+                   export const backupKey = \"AKIAEEEEFFFFGGGGHHHH\";\n";
+    fs::write(
+        root.join("src").join("settings.ts"),
+        format!("{secrets}{}", complex_fn("endpoint", 12)),
+    )
+    .expect("medium endpoint");
+    git(root, &["add", "."]);
+    git(root, &["commit", "-q", "-m", "medium"]);
+    index_repo(&repo);
+
+    fs::write(
+        root.join("src").join("settings.ts"),
+        format!("{secrets}{}", complex_fn("endpoint", 30)),
+    )
+    .expect("high endpoint");
+    git(root, &["add", "."]);
+    git(root, &["commit", "-q", "-m", "escalate"]);
+    index_repo(&repo);
+
+    let review = ovecc(&repo, &["review", "--fail-on", "high", "--format", "json"]);
+    let envelope: serde_json::Value = serde_json::from_slice(&review.stdout).expect("review json");
+    let summary = &envelope["data"]["summary"];
+    assert!(
+        !review.status.success(),
+        "an escalation to high must fail the gate: {summary}"
+    );
+    assert!(
+        summary["resolved_findings"].as_u64().unwrap_or(0) >= 1,
+        "the medium band it left behind reads as resolved: {summary}"
+    );
+}
+
+#[test]
+fn review_scopes_new_duplications_to_touched_lines() {
+    fn git(root: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .output()
+            .expect("run git");
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    // ~160 normalized tokens over 16 lines: identical copies form a clone
+    // family above the 100-token / 10-line defaults (names normalize away).
+    fn clone_copy(name: &str) -> String {
+        let body = r#"  let total = 0;
+  const items = [a, b, a + b, a - b];
+  const flags = { low: a < b, high: a > b, same: a === b };
+  for (const item of items) {
+    if (item > a) { total += item * 2; } else { total -= item; }
+    while (total > b) { total = total - b; }
+  }
+  if (flags.low && !flags.same) { total += 5; }
+  switch (total % 3) {
+    case 0: total += a; break;
+    case 1: total -= b; break;
+    default: total *= 2; break;
+  }
+  return total < 0 ? -total : total;
+}
+"#;
+        format!("function {name}(a: number, b: number): number {{\n{body}")
+    }
+
+    let temp = tempfile::tempdir().expect("temp dir");
+    let root = temp.path();
+    git(root, &["init", "-q"]);
+    git(root, &["config", "user.email", "dev@example.com"]);
+    git(root, &["config", "user.name", "Dev"]);
+    fs::create_dir_all(root.join("src")).expect("mkdir");
+    let copies = format!("{}{}", clone_copy("alpha"), clone_copy("beta"));
+    fs::write(root.join("src").join("util.ts"), &copies).expect("write util.ts");
+    git(root, &["add", "."]);
+    git(root, &["commit", "-q", "-m", "base"]);
+    let repo = root.to_str().expect("utf8 path").to_string();
+    index_repo(&repo);
+    let review = |repo: &str| -> (bool, serde_json::Value) {
+        let output = ovecc(repo, &["review", "--fail-on", "any", "--format", "json"]);
+        let envelope: serde_json::Value =
+            serde_json::from_slice(&output.stdout).expect("review json");
+        (output.status.success(), envelope["data"]["summary"].clone())
+    };
+
+    let dupes = ovecc(&repo, &["dupes", "--format", "json"]);
+    let envelope: serde_json::Value = serde_json::from_slice(&dupes.stdout).expect("dupes json");
+    assert!(
+        envelope["data"]["clone_families"].as_u64().unwrap_or(0) >= 1,
+        "the planted pair must be a family at the defaults: {}",
+        envelope["data"]
+    );
+
+    // An edit below both instances touches the file but no clone line: the
+    // pre-existing family is not this change's doing. (A `function` here would
+    // share a declaration prefix with the clone tail and stretch the second
+    // instance's token run onto the appended line.)
+    let mut source = copies.clone();
+    source.push_str("const pad = 9;\n");
+    fs::write(root.join("src").join("util.ts"), &source).expect("append pad");
+    git(root, &["add", "."]);
+    git(root, &["commit", "-q", "-m", "pad"]);
+    index_repo(&repo);
+
+    let (passed, summary) = review(&repo);
+    assert_eq!(
+        summary["new_duplications"], 0,
+        "a family the change never touched is not new: {summary}"
+    );
+    assert!(
+        passed,
+        "an unrelated edit must pass --fail-on any: {summary}"
+    );
+
+    // Pasting a third copy is what introducing duplication looks like.
+    source.push_str(&clone_copy("gamma"));
+    fs::write(root.join("src").join("util.ts"), &source).expect("append gamma");
+    git(root, &["add", "."]);
+    git(root, &["commit", "-q", "-m", "copy again"]);
+    index_repo(&repo);
+
+    let (passed, summary) = review(&repo);
+    assert!(
+        summary["new_duplications"].as_u64().unwrap_or(0) >= 1,
+        "the pasted copy must be charged to the change: {summary}"
+    );
+    assert!(
+        !passed,
+        "new duplication must fail --fail-on any: {summary}"
+    );
+}

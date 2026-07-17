@@ -155,6 +155,115 @@ pub fn changed_files_since(
     )
 }
 
+/// Head-side line ranges (1-based, inclusive) that differ from `reference`,
+/// keyed by repo-relative path. An added file maps to a single range spanning
+/// the whole file. Renames are tracked at git's default 50% similarity, so a
+/// pure `git mv` touches no line at the destination and a moved-and-edited
+/// file carries only its edited lines. Diffs the reference tree against the
+/// committed HEAD, so uncommitted working-tree edits are not reflected.
+/// Returns `None` outside a Git repository or when the reference does not
+/// resolve to a commit.
+pub fn changed_line_ranges(
+    root: &std::path::Path,
+    reference: &str,
+) -> Option<std::collections::BTreeMap<String, Vec<(u32, u32)>>> {
+    let repo = gix::discover(root).ok()?;
+    let base_id = repo.rev_parse_single(reference).ok()?;
+    let base_tree = repo.find_commit(base_id.detach()).ok()?.tree().ok()?;
+    let head_tree = repo.head_commit().ok()?.tree().ok()?;
+    let mut options = gix::diff::Options::default();
+    options.track_rewrites(Some(gix::diff::Rewrites::default()));
+    let changes = repo
+        .diff_tree_to_tree(Some(&base_tree), Some(&head_tree), options)
+        .ok()?;
+
+    let mut ranges: std::collections::BTreeMap<String, Vec<(u32, u32)>> =
+        std::collections::BTreeMap::new();
+    for change in changes {
+        if let Some((path, hunks)) = change_head_ranges(&repo, change) {
+            ranges.insert(path, hunks);
+        }
+    }
+    Some(ranges)
+}
+
+fn blob(repo: &gix::Repository, id: gix::ObjectId) -> Option<Vec<u8>> {
+    Some(repo.find_object(id).ok()?.data.clone())
+}
+
+/// Lines in a blob. A trailing newline closes the last line, it does not open
+/// an empty one.
+fn line_count(data: &[u8]) -> u32 {
+    let newlines = data.iter().filter(|byte| **byte == b'\n').count() as u32;
+    if data.last() == Some(&b'\n') {
+        newlines.max(1)
+    } else {
+        newlines + 1
+    }
+}
+
+/// Head-side 1-based line spans that differ between two blobs. `after` is a
+/// 0-based half-open range of head lines; a pure deletion has an empty `after`
+/// and touches no head line.
+fn hunk_ranges(before: &[u8], after: &[u8]) -> Vec<(u32, u32)> {
+    use gix::diff::blob::{Algorithm, Diff, InternedInput, sources::byte_lines};
+    let input = InternedInput::new(byte_lines(before), byte_lines(after));
+    Diff::compute(Algorithm::Histogram, &input)
+        .hunks()
+        .filter(|hunk| hunk.after.end > hunk.after.start)
+        .map(|hunk| (hunk.after.start + 1, hunk.after.end))
+        .collect()
+}
+
+/// The head path and its changed line spans for one tree change, or `None` when
+/// the change touches no head line (a deletion, a pure rename) or is not a blob.
+fn change_head_ranges(
+    repo: &gix::Repository,
+    change: gix::diff::tree_with_rewrites::Change,
+) -> Option<(String, Vec<(u32, u32)>)> {
+    use gix::diff::tree_with_rewrites::Change;
+    let whole_file = |id| blob(repo, id).map(|data| vec![(1, line_count(&data).max(1))]);
+    let edited = |before_id, after_id| -> Option<Vec<(u32, u32)>> {
+        let hunks = hunk_ranges(&blob(repo, before_id)?, &blob(repo, after_id)?);
+        (!hunks.is_empty()).then_some(hunks)
+    };
+    match change {
+        Change::Addition {
+            location,
+            id,
+            entry_mode,
+            ..
+        } if entry_mode.is_blob() => Some((location.to_string(), whole_file(id)?)),
+        Change::Modification {
+            location,
+            previous_id,
+            id,
+            entry_mode,
+            ..
+        } if entry_mode.is_blob() => Some((location.to_string(), edited(previous_id, id)?)),
+        // A copy's destination is all new content; a rewrite that changed the
+        // blob carries its edited lines; a pure rename touches no head line.
+        Change::Rewrite {
+            source_id,
+            id,
+            location,
+            entry_mode,
+            copy,
+            ..
+        } if entry_mode.is_blob() => {
+            let hunks = if copy {
+                whole_file(id)?
+            } else if source_id != id {
+                edited(source_id, id)?
+            } else {
+                return None;
+            };
+            Some((location.to_string(), hunks))
+        }
+        _ => None,
+    }
+}
+
 /// Decodes one commit's metadata and the files it changed against its first
 /// parent. Returns `None` if the essential metadata cannot be read.
 fn decode_commit(repo: &gix::Repository, commit: &gix::Commit<'_>) -> Option<GitCommit> {
@@ -336,5 +445,74 @@ mod tests {
         let history = collect_history(dir.path(), 0, 100).unwrap();
         assert!(history.head_sha.is_none());
         assert!(history.commits.is_empty());
+    }
+
+    #[test]
+    fn changed_line_ranges_report_only_the_edited_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        git(root, &["init", "-q"]);
+        git(root, &["config", "user.email", "dev@example.com"]);
+        git(root, &["config", "user.name", "Dev"]);
+        // A five-line file; a second file that will stay untouched.
+        std::fs::write(root.join("a.ts"), "one\ntwo\nthree\nfour\nfive\n").unwrap();
+        std::fs::write(root.join("keep.ts"), "kept\n").unwrap();
+        git(root, &["add", "."]);
+        git(root, &["commit", "-q", "-m", "base"]);
+        let base = resolve_ref(root, "HEAD").unwrap();
+
+        // Edit only line 3 of a.ts, and add a brand-new file.
+        std::fs::write(root.join("a.ts"), "one\ntwo\nTHREE\nfour\nfive\n").unwrap();
+        std::fs::write(root.join("added.ts"), "x\ny\n").unwrap();
+        git(root, &["add", "."]);
+        git(root, &["commit", "-q", "-m", "head"]);
+
+        let ranges = changed_line_ranges(root, &base).unwrap();
+        assert_eq!(
+            ranges.get("a.ts"),
+            Some(&vec![(3, 3)]),
+            "only line 3 changed"
+        );
+        assert_eq!(
+            ranges.get("added.ts"),
+            Some(&vec![(1, 2)]),
+            "whole added file"
+        );
+        assert!(!ranges.contains_key("keep.ts"), "untouched file absent");
+    }
+
+    #[test]
+    fn changed_line_ranges_see_through_renames() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        git(root, &["init", "-q"]);
+        git(root, &["config", "user.email", "dev@example.com"]);
+        git(root, &["config", "user.name", "Dev"]);
+        std::fs::write(root.join("a.ts"), "one\ntwo\nthree\nfour\nfive\n").unwrap();
+        git(root, &["add", "."]);
+        git(root, &["commit", "-q", "-m", "base"]);
+        let base = resolve_ref(root, "HEAD").unwrap();
+
+        // A pure move: same content, new path.
+        git(root, &["mv", "a.ts", "b.ts"]);
+        git(root, &["commit", "-q", "-m", "move"]);
+        let ranges = changed_line_ranges(root, &base).unwrap();
+        assert!(
+            ranges.is_empty(),
+            "a pure rename touches no line: {ranges:?}"
+        );
+
+        // A move that also edits one line carries only that line.
+        std::fs::write(root.join("b.ts"), "one\ntwo\nTHREE\nfour\nfive\n").unwrap();
+        git(root, &["add", "."]);
+        git(root, &["mv", "b.ts", "c.ts"]);
+        git(root, &["commit", "-q", "-m", "move and edit"]);
+        let ranges = changed_line_ranges(root, &base).unwrap();
+        assert_eq!(
+            ranges.get("c.ts"),
+            Some(&vec![(3, 3)]),
+            "only the edited line, under the new path: {ranges:?}"
+        );
+        assert!(!ranges.contains_key("a.ts") && !ranges.contains_key("b.ts"));
     }
 }

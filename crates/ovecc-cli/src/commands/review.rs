@@ -33,8 +33,9 @@ pub(crate) struct ReviewReport {
     /// New dependency cycles, each carrying the file-level witness edges that
     /// form it (so a consumer never has to guess — and mis-guess — the edges).
     new_cycles: Vec<graph::cycles::CycleWitness>,
-    /// Clone families the change introduced (scoped to touched files), so new
-    /// duplication is not buried under pre-existing repo-wide clones.
+    /// Clone families the change introduced (scoped to the touched lines when
+    /// git attests them, else to touched files), so new duplication is not
+    /// buried under pre-existing repo-wide clones.
     new_duplications: Vec<graph::dupes::CloneFamily>,
     changed_files: ChangedFiles,
 }
@@ -52,6 +53,10 @@ struct ReviewSummary {
     new_duplications: usize,
     /// Findings present in base but gone in head — credit for fixes.
     resolved_findings: usize,
+    /// Reported new by the snapshot diff but living entirely on lines this
+    /// change never touched: pre-existing findings whose id moved with a line
+    /// shift. Not charged to the change.
+    shifted_findings: usize,
 }
 
 /// Assembles the change review from the snapshot-diff primitives in `ovecc-db`
@@ -96,6 +101,10 @@ pub(crate) fn build_review_report(
         .filter(|finding| finding.kind != FindingKind::CircularDependency)
         .collect();
 
+    let change_ranges = attested_change_ranges(paths, &base_snapshot, &head_snapshot);
+    let (new_findings, shifted_findings) =
+        scope_to_touched_lines(store, &repository_id, change_ranges.as_ref(), new_findings)?;
+
     let changed_files =
         store.changed_files(&repository_id, &base_snapshot.id, &head_snapshot.id)?;
 
@@ -114,9 +123,11 @@ pub(crate) fn build_review_report(
             .collect();
 
     // Duplication is scanned repo-wide (that is how a new block is matched
-    // against an existing utility) but only families touching a changed file
-    // are reported, so pre-existing clones do not drown out what THIS change
-    // added.
+    // against an existing utility) but only families the change plausibly
+    // introduced are reported: an instance must overlap a touched line when
+    // git attests them, or merely sit in a touched file when it cannot. So
+    // pre-existing clones elsewhere in an edited file do not drown out what
+    // THIS change added.
     let touched: std::collections::HashSet<&str> =
         changed_files.touched().map(String::as_str).collect();
     let new_duplications: Vec<graph::dupes::CloneFamily> = if touched.is_empty() {
@@ -125,14 +136,21 @@ pub(crate) fn build_review_report(
         ovecc_indexer::collect_file_tokens(paths, config)
             // Same-file families count too: a PR that pastes a block twice
             // into one file is still introducing duplication.
-            .map(|files| graph::dupes::detect(&files, 50, 5, false))
+            .map(|files| graph::dupes::detect(&files, 100, 10, false))
             .unwrap_or_default()
             .into_iter()
             .filter(|family| {
                 family
                     .instances
                     .iter()
-                    .any(|instance| touched.contains(instance.path.as_str()))
+                    .any(|instance| match &change_ranges {
+                        Some(ranges) => ranges.get(instance.path.as_str()).is_some_and(|changed| {
+                            changed.iter().any(|(start, end)| {
+                                *start <= instance.end_line && instance.start_line <= *end
+                            })
+                        }),
+                        None => touched.contains(instance.path.as_str()),
+                    })
             })
             .collect()
     };
@@ -203,12 +221,170 @@ pub(crate) fn build_review_report(
             new_cycles: new_cycles.len(),
             new_duplications: new_duplications.len(),
             resolved_findings: finding_diff.resolved.len(),
+            shifted_findings,
         },
         new_findings,
         new_cycles,
         new_duplications,
         changed_files,
     })
+}
+
+/// The head lines this change touched, when git can attest them: both
+/// snapshots carry commit shas, they differ, and head is still what is checked
+/// out — otherwise the git diff would not describe this comparison.
+fn attested_change_ranges(
+    paths: &ProjectPaths,
+    base_snapshot: &ovecc_core::legacy::SnapshotRecord,
+    head_snapshot: &ovecc_core::legacy::SnapshotRecord,
+) -> Option<std::collections::BTreeMap<String, Vec<(u32, u32)>>> {
+    match (
+        base_snapshot.commit_sha.as_deref(),
+        head_snapshot.commit_sha.as_deref(),
+    ) {
+        (Some(base_sha), Some(head_sha))
+            if base_sha != head_sha
+                && ovecc_git::resolve_ref(&paths.root, "HEAD").as_deref() == Some(head_sha) =>
+        {
+            ovecc_git::changed_line_ranges(&paths.root, base_sha)
+        }
+        _ => None,
+    }
+}
+
+/// Drops from `new_findings` the lexical findings that only moved: a finding id
+/// embeds its evidence line, so an edit higher in a file renames every finding
+/// below it and the snapshot diff reports pre-existing defects as new. When git
+/// can say which head lines the change touched, a point/body finding whose lines
+/// (or enclosing body) were never touched is not charged to the change. Cross-
+/// file kinds (dead code, taint, advisories) keep the plain diff: their cause
+/// can sit far from their evidence. Returns the kept findings and the count set
+/// aside. Without attested ranges every finding stands.
+fn scope_to_touched_lines(
+    store: &ArchitectureStore,
+    repository_id: &str,
+    ranges: Option<&std::collections::BTreeMap<String, Vec<(u32, u32)>>>,
+    new_findings: Vec<FindingRecord>,
+) -> Result<(Vec<FindingRecord>, usize)> {
+    let Some(ranges) = ranges else {
+        return Ok((new_findings, 0));
+    };
+
+    let mut spans_by_file: std::collections::HashMap<String, Vec<(u32, u32)>> =
+        std::collections::HashMap::new();
+    for (path, start, end) in store.symbol_spans(repository_id)? {
+        spans_by_file.entry(path).or_default().push((start, end));
+    }
+    // The diff cannot say which instance of a repeated pattern is the new one
+    // (ordinals follow hashed ids, not lines), so point kinds are judged by
+    // every current site sharing the finding's identity group: "one more of
+    // these" is charged when any site is on a touched line.
+    let mut point_groups: std::collections::HashMap<String, Vec<(String, Option<u32>)>> =
+        std::collections::HashMap::new();
+    for finding in store.findings(repository_id, None)? {
+        if let Some(evidence) = finding
+            .evidence
+            .first()
+            .filter(|_| point_scoped(finding.kind))
+        {
+            point_groups
+                .entry(ovecc_db::finding_group_key(&finding))
+                .or_default()
+                .push((evidence.file_path.clone(), evidence.line));
+        }
+    }
+    let (kept, shifted): (Vec<_>, Vec<_>) = new_findings
+        .into_iter()
+        .partition(|finding| charged_to_change(finding, ranges, &spans_by_file, &point_groups));
+    Ok((kept, shifted.len()))
+}
+
+/// Finding kinds whose defect lives on the exact evidence line.
+fn point_scoped(kind: FindingKind) -> bool {
+    matches!(
+        kind,
+        FindingKind::HardcodedSecret
+            | FindingKind::InsecurePattern
+            | FindingKind::WeakCrypto
+            | FindingKind::PermissiveCors
+            | FindingKind::StaleSuppression
+    )
+}
+
+/// Finding kinds that describe a whole body (a function or a type), where an
+/// edit anywhere inside the enclosing span can have introduced the defect
+/// even though the evidence anchors at the declaration line.
+fn body_scoped(kind: FindingKind) -> bool {
+    matches!(
+        kind,
+        FindingKind::HighComplexity
+            | FindingKind::LongFunction
+            | FindingKind::LongParameterList
+            | FindingKind::FeatureEnvy
+            | FindingKind::LargeClass
+            | FindingKind::DataClumps
+    )
+}
+
+/// Whether the change can have introduced this finding. Kinds outside the two
+/// scoped families are always charged, as is evidence git knows nothing about
+/// (no line, or no recorded span to widen a body kind with). A file absent
+/// from `ranges` is untouched, so nothing in it came from this change.
+fn charged_to_change(
+    finding: &FindingRecord,
+    ranges: &std::collections::BTreeMap<String, Vec<(u32, u32)>>,
+    spans_by_file: &std::collections::HashMap<String, Vec<(u32, u32)>>,
+    point_groups: &std::collections::HashMap<String, Vec<(String, Option<u32>)>>,
+) -> bool {
+    let line_touched = |path: &str, line: Option<u32>, span: Option<(u32, u32)>| -> bool {
+        let Some(changed) = ranges.get(path) else {
+            return false;
+        };
+        let Some(line) = line else {
+            return true;
+        };
+        let (start, end) = span.unwrap_or((line, line));
+        changed
+            .iter()
+            .any(|(changed_start, changed_end)| *changed_start <= end && start <= *changed_end)
+    };
+
+    if point_scoped(finding.kind)
+        && let Some(sites) = point_groups.get(&ovecc_db::finding_group_key(finding))
+    {
+        return sites
+            .iter()
+            .any(|(path, line)| line_touched(path, *line, None));
+    }
+    if !point_scoped(finding.kind) && !body_scoped(finding.kind) {
+        return true;
+    }
+    if finding.evidence.is_empty() {
+        return true;
+    }
+    finding.evidence.iter().any(|evidence| {
+        let span = evidence.line.and_then(|line| {
+            body_scoped(finding.kind)
+                .then(|| enclosing_span(spans_by_file, &evidence.file_path, line))
+                .flatten()
+        });
+        line_touched(&evidence.file_path, evidence.line, span)
+    })
+}
+
+/// Smallest recorded symbol span containing `line` in `path` — the method
+/// rather than the class it sits in.
+fn enclosing_span(
+    spans_by_file: &std::collections::HashMap<String, Vec<(u32, u32)>>,
+    path: &str,
+    line: u32,
+) -> Option<(u32, u32)> {
+    spans_by_file
+        .get(path)?
+        .iter()
+        .filter(|(start, end)| *start <= line && line <= *end)
+        .min_by_key(|(start, end)| end - start)
+        .copied()
 }
 
 /// A new cycle always fails (it is an architectural regression); findings
@@ -269,7 +445,9 @@ fn review_rationale(
         rationale.push(format!("{new_security} new security finding(s)"));
     }
     if new_complexity > 0 {
-        rationale.push(format!("{new_complexity} new high-complexity function(s)"));
+        rationale.push(format!(
+            "{new_complexity} new complexity finding(s) (high complexity / long function / long parameter list)"
+        ));
     }
     if new_dead_code > 0 {
         rationale.push(format!("{new_dead_code} new dead-code finding(s)"));
@@ -321,139 +499,180 @@ pub(crate) fn render_review(report: &ReviewReport, format: OutputFormat) -> Resu
                 println!("{}", ndjson_line("new_duplication", family)?);
             }
         }
-        OutputFormat::Markdown => {
-            println!("# Change review: {}", report.verdict.to_uppercase());
-            println!();
-            println!("- Base: `{}`", report.base);
-            println!("- Head: `{}`", report.head);
-            println!("- Risk: **{}**", report.risk);
-            println!(
-                "- Files: +{} added, ~{} modified",
-                report.summary.files_added, report.summary.files_modified
-            );
-            for reason in &report.rationale {
-                println!("- {reason}");
-            }
-
-            println!();
-            println!("## New dependency cycles ({})", report.new_cycles.len());
-            if report.new_cycles.is_empty() {
-                println!("_None._");
-            }
-            for cycle in &report.new_cycles {
-                println!();
-                println!("### {}", format_cycle_path(&cycle.modules, " ↔ ", " → "));
-                for edge in &cycle.edges {
-                    let target = edge.to_file.as_deref().unwrap_or(edge.to_module.as_str());
-                    println!(
-                        "- `{}:{}` imports `{}` → `{}`",
-                        edge.from_file, edge.line, edge.specifier, target
-                    );
-                }
-            }
-
-            println!();
-            println!("## New findings ({})", report.new_findings.len());
-            if report.new_findings.is_empty() {
-                println!("_None._");
-            }
-            for finding in &report.new_findings {
-                let rule = finding.rule_name.as_deref().unwrap_or("-");
-                let fix = finding.kind.fix_spec();
-                let auto = if fix.auto_fixable {
-                    ", auto-fixable"
-                } else {
-                    ""
-                };
-                println!(
-                    "- **[{:?}] {:?}**{} — {} _(rule `{}`)_ · action: `{}`{}",
-                    finding.severity,
-                    finding.kind,
-                    first_evidence(finding),
-                    finding.title,
-                    rule,
-                    fix.kind,
-                    auto
-                );
-            }
-
-            println!();
-            println!("## New duplications ({})", report.new_duplications.len());
-            if report.new_duplications.is_empty() {
-                println!("_None._");
-            }
-            for (rank, family) in report.new_duplications.iter().enumerate() {
-                println!();
-                println!(
-                    "### Clone {} ({} tokens, {} lines, {} copies)",
-                    rank + 1,
-                    family.token_length,
-                    family.line_span,
-                    family.instances.len()
-                );
-                for instance in &family.instances {
-                    println!(
-                        "- `{}:{}-{}`",
-                        instance.path, instance.start_line, instance.end_line
-                    );
-                }
-            }
-        }
-        OutputFormat::Text => {
-            println!(
-                "Review: {} (risk {}) {} -> {}",
-                report.verdict, report.risk, report.base, report.head
-            );
-            for reason in &report.rationale {
-                println!("  - {reason}");
-            }
-            if !report.new_cycles.is_empty() {
-                println!("New cycles:");
-                for cycle in &report.new_cycles {
-                    println!("  {}", format_cycle_path(&cycle.modules, " <-> ", " -> "));
-                    for edge in &cycle.edges {
-                        println!(
-                            "    {}:{} imports {} -> {}",
-                            edge.from_file,
-                            edge.line,
-                            edge.specifier,
-                            edge.to_file.as_deref().unwrap_or(edge.to_module.as_str())
-                        );
-                    }
-                }
-            }
-            if !report.new_findings.is_empty() {
-                println!("New findings:");
-                for finding in &report.new_findings {
-                    println!(
-                        "  [{:?}] {:?}{} {}",
-                        finding.severity,
-                        finding.kind,
-                        first_evidence(finding),
-                        finding.title
-                    );
-                }
-            }
-            if !report.new_duplications.is_empty() {
-                println!("New duplications:");
-                for family in &report.new_duplications {
-                    println!(
-                        "  {} tokens / {} lines / {} copies",
-                        family.token_length,
-                        family.line_span,
-                        family.instances.len()
-                    );
-                    for instance in &family.instances {
-                        println!(
-                            "    {}:{}-{}",
-                            instance.path, instance.start_line, instance.end_line
-                        );
-                    }
-                }
-            }
-        }
+        OutputFormat::Markdown => review_markdown(report),
+        OutputFormat::Text => review_text(report),
     }
     Ok(())
+}
+
+fn review_markdown(report: &ReviewReport) {
+    println!("# Change review: {}", report.verdict.to_uppercase());
+    println!();
+    println!("- Base: `{}`", report.base);
+    println!("- Head: `{}`", report.head);
+    println!("- Risk: **{}**", report.risk);
+    println!(
+        "- Files: +{} added, ~{} modified",
+        report.summary.files_added, report.summary.files_modified
+    );
+    for reason in &report.rationale {
+        println!("- {reason}");
+    }
+    review_markdown_cycles(report);
+    review_markdown_findings(report);
+    review_markdown_duplications(report);
+}
+
+fn review_markdown_cycles(report: &ReviewReport) {
+    println!();
+    println!("## New dependency cycles ({})", report.new_cycles.len());
+    if report.new_cycles.is_empty() {
+        println!("_None._");
+    }
+    for cycle in &report.new_cycles {
+        println!();
+        println!("### {}", format_cycle_path(&cycle.modules, " ↔ ", " → "));
+        for edge in &cycle.edges {
+            let target = edge.to_file.as_deref().unwrap_or(edge.to_module.as_str());
+            println!(
+                "- `{}:{}` imports `{}` → `{}`",
+                edge.from_file, edge.line, edge.specifier, target
+            );
+        }
+    }
+}
+
+fn review_markdown_findings(report: &ReviewReport) {
+    println!();
+    println!("## New findings ({})", report.new_findings.len());
+    if report.new_findings.is_empty() {
+        println!("_None._");
+    }
+    if report.summary.shifted_findings > 0 {
+        println!(
+            "_{} pre-existing finding(s) moved with a line shift and are not \
+             charged to this change._",
+            report.summary.shifted_findings
+        );
+    }
+    for finding in &report.new_findings {
+        let rule = finding.rule_name.as_deref().unwrap_or("-");
+        let fix = finding.kind.fix_spec();
+        let auto = if fix.auto_fixable {
+            ", auto-fixable"
+        } else {
+            ""
+        };
+        println!(
+            "- **[{:?}] {:?}**{} — {} _(rule `{}`)_ · action: `{}`{}",
+            finding.severity,
+            finding.kind,
+            first_evidence(finding),
+            finding.title,
+            rule,
+            fix.kind,
+            auto
+        );
+    }
+}
+
+fn review_markdown_duplications(report: &ReviewReport) {
+    println!();
+    println!("## New duplications ({})", report.new_duplications.len());
+    if report.new_duplications.is_empty() {
+        println!("_None._");
+    }
+    for (rank, family) in report.new_duplications.iter().enumerate() {
+        println!();
+        println!(
+            "### Clone {} ({} tokens, {} lines, {} copies)",
+            rank + 1,
+            family.token_length,
+            family.line_span,
+            family.instances.len()
+        );
+        for instance in &family.instances {
+            println!(
+                "- `{}:{}-{}`",
+                instance.path, instance.start_line, instance.end_line
+            );
+        }
+    }
+}
+
+fn review_text(report: &ReviewReport) {
+    println!(
+        "Review: {} (risk {}) {} -> {}",
+        report.verdict, report.risk, report.base, report.head
+    );
+    for reason in &report.rationale {
+        println!("  - {reason}");
+    }
+    review_text_cycles(report);
+    review_text_findings(report);
+    review_text_duplications(report);
+}
+
+fn review_text_cycles(report: &ReviewReport) {
+    if report.new_cycles.is_empty() {
+        return;
+    }
+    println!("New cycles:");
+    for cycle in &report.new_cycles {
+        println!("  {}", format_cycle_path(&cycle.modules, " <-> ", " -> "));
+        for edge in &cycle.edges {
+            println!(
+                "    {}:{} imports {} -> {}",
+                edge.from_file,
+                edge.line,
+                edge.specifier,
+                edge.to_file.as_deref().unwrap_or(edge.to_module.as_str())
+            );
+        }
+    }
+}
+
+fn review_text_findings(report: &ReviewReport) {
+    if !report.new_findings.is_empty() {
+        println!("New findings:");
+        for finding in &report.new_findings {
+            println!(
+                "  [{:?}] {:?}{} {}",
+                finding.severity,
+                finding.kind,
+                first_evidence(finding),
+                finding.title
+            );
+        }
+    }
+    if report.summary.shifted_findings > 0 {
+        println!(
+            "({} pre-existing finding(s) moved with a line shift; not charged \
+             to this change)",
+            report.summary.shifted_findings
+        );
+    }
+}
+
+fn review_text_duplications(report: &ReviewReport) {
+    if report.new_duplications.is_empty() {
+        return;
+    }
+    println!("New duplications:");
+    for family in &report.new_duplications {
+        println!(
+            "  {} tokens / {} lines / {} copies",
+            family.token_length,
+            family.line_span,
+            family.instances.len()
+        );
+        for instance in &family.instances {
+            println!(
+                "    {}:{}-{}",
+                instance.path, instance.start_line, instance.end_line
+            );
+        }
+    }
 }
 
 /// One-shot report stitching health, cycles, findings, security, and hotspots.
@@ -712,7 +931,7 @@ mod tests {
         assert!(
             rationale
                 .iter()
-                .any(|r| r.contains("1 new high-complexity"))
+                .any(|r| r.contains("1 new complexity finding"))
         );
         assert!(rationale.iter().any(|r| r.contains("3 new dead-code")));
         assert!(rationale.iter().any(|r| r.contains("4 new code smell")));

@@ -8,18 +8,31 @@ use ovecc_core::facts::{CommitRecord, FileChangeRecord, FindingRecord};
 use ovecc_core::util::stable_id;
 use std::collections::{HashMap, HashSet};
 
+/// The ordinal-0 identity: the key every instance of the same pattern in the
+/// same file shares. Ordinals are assigned in the findings' persisted order,
+/// which follows their hashed ids — not their lines — so the diff cannot say
+/// *which* instance of a repeated pattern is the new one. Review therefore
+/// charges the group as a unit, via this key.
+pub fn finding_group_key(finding: &FindingRecord) -> String {
+    finding_identity(finding, 0)
+}
+
 /// Stable, snapshot-independent content identity of a finding, so the *same*
 /// defect in two snapshots collapses to one key and a set-difference yields the
-/// genuinely new ones. Keyed by kind + first-evidence location (path, then the
-/// enclosing symbol when known, else the pattern detail, else the line) + rule
-/// — stable across unrelated edits elsewhere in the repo, where the volatile
-/// per-run `FindingId` is not. Line numbers are the locator of last resort:
-/// identifying by line blames a finding that merely *moved* (an edit above it)
-/// on the change under review. `ordinal` disambiguates several otherwise
-/// identical findings (e.g. two `eval` calls in one file), so only the extra
-/// occurrence reads as new.
+/// genuinely new ones. Keyed by kind + severity + first-evidence location
+/// (path, then the enclosing symbol when known, else the pattern detail, else
+/// the line) + rule — stable across unrelated edits elsewhere in the repo,
+/// where the volatile per-run `FindingId` is not. Line numbers are the locator
+/// of last resort: identifying by line blames a finding that merely *moved*
+/// (an edit above it) on the change under review. Severity is part of the
+/// identity so a defect that crosses a band — a function pushed from medium to
+/// high complexity — reads as a new fact (and the old band as resolved), not
+/// as nothing. `ordinal` disambiguates several otherwise identical findings
+/// (e.g. two `eval` calls in one file), so only the extra occurrence reads as
+/// new.
 fn finding_identity(finding: &FindingRecord, ordinal: usize) -> String {
     let kind = enum_str(&finding.kind);
+    let severity = enum_str(&finding.severity);
     let rule = finding.rule_name.clone().unwrap_or_default();
     let (path, locator) = match finding.evidence.first() {
         Some(evidence) => {
@@ -43,7 +56,14 @@ fn finding_identity(finding: &FindingRecord, ordinal: usize) -> String {
     };
     stable_id(
         "finding-identity",
-        &[&kind, &path, &locator, &rule, &ordinal.to_string()],
+        &[
+            &kind,
+            &severity,
+            &path,
+            &locator,
+            &rule,
+            &ordinal.to_string(),
+        ],
     )
 }
 

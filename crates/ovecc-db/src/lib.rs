@@ -13,6 +13,8 @@ mod replace;
 mod snapshots;
 mod sync;
 
+pub use replace::finding_group_key;
+
 use anyhow::{Context, Result};
 use chrono::Utc;
 use duckdb::{Connection, Transaction, params};

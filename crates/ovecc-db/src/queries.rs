@@ -216,6 +216,26 @@ impl ArchitectureStore {
         collect_rows(rows)
     }
 
+    /// `(path, start, end)` for every symbol with a recorded span, so review
+    /// can tell whether a change touched a finding's enclosing body.
+    pub fn symbol_spans(&self, repository_id: &str) -> Result<Vec<(String, u32, u32)>> {
+        let mut statement = self.conn.prepare(
+            "SELECT f.path, s.start_line, s.end_line
+             FROM symbols s
+             JOIN files f ON f.id = s.file_id AND f.repository_id = s.repository_id
+             WHERE s.repository_id = ?
+               AND s.start_line IS NOT NULL AND s.end_line IS NOT NULL",
+        )?;
+        let rows = statement.query_map(params![repository_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)? as u32,
+                row.get::<_, i64>(2)? as u32,
+            ))
+        })?;
+        collect_rows(rows)
+    }
+
     /// Everything `export graph` needs per file: path, language, size, module.
     pub fn current_files(&self, repository_id: &str) -> Result<Vec<FileGraphRow>> {
         let mut statement = self.conn.prepare(
