@@ -44,9 +44,9 @@ symbols and call edges.
 
 | Repository | Lang | Files | Modules | Deps | Symbols | Call edges | APIs / Tables | Findings (high / med / low) | Risk | Time | Peak heap |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| django/django | Python | 2 868 | 6 | 11 113 | 42 980 | 303 442 | 170 / 0 | 1 825 (149 / 698 / 978) | High | 20.3 s | 317.3 MB |
-| gohugoio/hugo | Go | 913 | 38 | 6 384 | 11 758 | 57 927 | 2 / 0 | 1 510 (225 / 517 / 768) | High | 7.2 s | 58.6 MB |
-| tokio-rs/tokio | Rust | 790 | 10 | 8 147 | 9 110 | 41 216 | 0 / 0 | 395 (30 / 60 / 305) | High | 4.5 s | 51.5 MB |
+| django/django | Python | 2 868 | 6 | 11 113 | 42 980 | 303 442 | 170 / 0 | 1 825 (143 / 704 / 978) | High | 20.3 s | 317.3 MB |
+| gohugoio/hugo | Go | 913 | 38 | 6 384 | 11 758 | 57 927 | 2 / 0 | 1 510 (215 / 527 / 768) | High | 7.2 s | 58.6 MB |
+| tokio-rs/tokio | Rust | 790 | 10 | 8 147 | 9 110 | 41 216 | 0 / 0 | 395 (29 / 61 / 305) | High | 4.5 s | 51.5 MB |
 | vuejs/core | JS/TS | 526 | 16 | 2 120 | 12 944 | 113 817 | 0 / 7 | 1 160 (142 / 419 / 599) | High | 6.0 s | 85.5 MB |
 | abseil/abseil-cpp | C++ | 878 | 4 | 8 003 | 20 557 | 97 435 | 0 / 0 | 1 673 (80 / 417 / 1 176) | Low | 8.9 s | 94.5 MB |
 

@@ -137,11 +137,18 @@ fn security_rules(input: &RuleInput<'_>) -> Vec<FindingRecord> {
                     Severity::High,
                     "Dynamic code execution",
                 ),
-                SecurityPatternKind::CommandExec => (
-                    FindingKind::InsecurePattern,
-                    Severity::High,
-                    "OS command execution",
-                ),
+                SecurityPatternKind::CommandExec => {
+                    // A shell-invoking exec (`child_process.exec`/`execSync`)
+                    // runs its command through `/bin/sh -c`, so a tainted
+                    // argument is shell injection. The rest of the family
+                    // (`spawn`, `execFile`) and Rust's `Command::new` exec the
+                    // program directly with no shell, so a literal or even a
+                    // tainted argument is not shell injection; the sink is worth
+                    // a look but not high severity on its own.
+                    let shell = matches!(pattern.detail.as_deref(), Some("exec") | Some("execSync"));
+                    let severity = if shell { Severity::High } else { Severity::Medium };
+                    (FindingKind::InsecurePattern, severity, "OS command execution")
+                }
                 SecurityPatternKind::WeakHash => (
                     FindingKind::WeakCrypto,
                     Severity::Medium,
@@ -451,6 +458,42 @@ mod tests {
             .find(|f| f.kind == FindingKind::WeakCrypto)
             .unwrap();
         assert_eq!(weak.severity, Severity::Medium);
+    }
+
+    #[test]
+    fn command_exec_severity_follows_shell_invocation() {
+        let exec_fact = |detail: &str| SecurityPatternFact {
+            kind: SecurityPatternKind::CommandExec,
+            line: 1,
+            detail: Some(detail.to_string()),
+            caller_qualified_name: None,
+            in_test_code: false,
+        };
+        let patterns = vec![
+            ("a.ts".to_string(), exec_fact("exec")),
+            ("b.ts".to_string(), exec_fact("spawn")),
+            ("c.rs".to_string(), exec_fact("Command::new")),
+        ];
+        let config = RulesConfig::default();
+        let input = RuleInput {
+            repository_id: "repo:test",
+            snapshot_id: None,
+            modules: &[],
+            dependencies: &[],
+            config: &config,
+            security_patterns: &patterns,
+        };
+        let by_path = |path: &str| {
+            evaluate(&input)
+                .into_iter()
+                .find(|f| f.evidence[0].file_path == path)
+                .unwrap()
+                .severity
+        };
+        // `exec` goes through a shell; `spawn` and Rust's `Command::new` do not.
+        assert_eq!(by_path("a.ts"), Severity::High);
+        assert_eq!(by_path("b.ts"), Severity::Medium);
+        assert_eq!(by_path("c.rs"), Severity::Medium);
     }
 
     #[test]
