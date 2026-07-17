@@ -36,8 +36,8 @@ pub(crate) fn load_dupes_report(
 
 /// `limit` cuts the families printed, never the counts. Detection sorts them
 /// longest-run first, so the page is the duplication worth acting on; Django's
-/// 8 771 families serialize to ~1.6M tokens whole, and the first twenty to
-/// ~1.4k. `--limit 0` prints all of them.
+/// 1 597 families serialize to ~313k tokens whole, and the first twenty to
+/// ~2.6k. `--limit 0` prints all of them.
 pub(crate) fn render_dupes(report: &DupesReport, format: OutputFormat, limit: usize) -> Result<()> {
     let plural = |n: usize| if n == 1 { "y" } else { "ies" };
     let shown: &[ovecc_graph::dupes::CloneFamily] = match limit {

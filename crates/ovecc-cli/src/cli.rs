@@ -269,11 +269,12 @@ pub enum Command {
     },
     /// Detect duplicated code (clone families) over a normalized token stream.
     Dupes {
-        /// Minimum shared run, in tokens, to report as a clone.
-        #[arg(long, default_value_t = 50)]
+        /// Minimum shared run, in tokens, to report as a clone. The default
+        /// matches PMD CPD's 100; pass 50 for an aggressive scan.
+        #[arg(long, default_value_t = 100)]
         min_tokens: usize,
         /// Minimum line span for a clone region.
-        #[arg(long, default_value_t = 5)]
+        #[arg(long, default_value_t = 10)]
         min_lines: usize,
         /// Only report clones spanning at least two files. By default,
         /// same-file duplication is reported too — copy-paste within one
