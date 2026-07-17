@@ -44,11 +44,11 @@ symbols and call edges.
 
 | Repository | Lang | Files | Modules | Deps | Symbols | Call edges | APIs / Tables | Findings (high / med / low) | Risk | Time | Peak heap |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| django/django | Python | 2 868 | 6 | 11 113 | 42 980 | 303 442 | 170 / 0 | 1 825 (143 / 704 / 978) | High | 20.3 s | 317.3 MB |
-| gohugoio/hugo | Go | 913 | 38 | 6 384 | 11 758 | 57 927 | 2 / 0 | 1 510 (215 / 527 / 768) | High | 7.2 s | 58.6 MB |
-| tokio-rs/tokio | Rust | 790 | 10 | 8 147 | 9 110 | 41 216 | 0 / 0 | 395 (29 / 61 / 305) | High | 4.5 s | 51.5 MB |
-| vuejs/core | JS/TS | 526 | 16 | 2 120 | 12 944 | 113 817 | 0 / 7 | 1 160 (142 / 419 / 599) | High | 6.0 s | 85.5 MB |
-| abseil/abseil-cpp | C++ | 878 | 4 | 8 003 | 20 557 | 97 435 | 0 / 0 | 1 673 (80 / 417 / 1 176) | Low | 8.9 s | 94.5 MB |
+| django/django | Python | 2 868 | 6 | 11 113 | 42 980 | 303 442 | 170 / 0 | 1 825 (133 / 714 / 978) | High | 20.3 s | 317.3 MB |
+| gohugoio/hugo | Go | 913 | 38 | 6 384 | 11 758 | 57 927 | 2 / 0 | 1 510 (206 / 536 / 768) | High | 7.2 s | 58.6 MB |
+| tokio-rs/tokio | Rust | 790 | 10 | 8 147 | 9 110 | 41 216 | 0 / 0 | 395 (24 / 66 / 305) | High | 4.5 s | 51.5 MB |
+| vuejs/core | JS/TS | 526 | 16 | 2 120 | 12 944 | 113 817 | 0 / 7 | 1 160 (132 / 429 / 599) | High | 6.0 s | 85.5 MB |
+| abseil/abseil-cpp | C++ | 878 | 4 | 8 003 | 20 557 | 97 435 | 0 / 0 | 1 673 (71 / 426 / 1 176) | Low | 8.9 s | 94.5 MB |
 
 The largest case, Django, builds a graph of ~43k symbols and ~303k call edges
 in about twenty seconds. Most findings by volume are code-quality rules
@@ -105,17 +105,17 @@ Method:
 | Repository | Lang | n | ovecc P | ovecc R | ovecc exact-set | grep P | grep R | grep exact-set | ovecc empty |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | remeda | TS | 80 | 0.84 | 0.94 | **80%** | 0.62 | 1.00 | 46% | 6% |
-| sqlglot | Python | 73 | 0.75 | 0.79 | **64%** | 0.73 | 1.00 | 40% | 14% |
+| sqlglot | Python | 73 | 0.75 | 0.79 | **64%** | 0.73 | 1.00 | 41% | 14% |
 | dask | Python | 32 | 0.75 | 0.75 | **62%** | 0.73 | 1.00 | 53% | 19% |
-| django | Python | 74 | 0.66 | 0.71 | **61%** | 0.70 | 0.82 | 46% | 22% |
-| yt-dlp | Python | 78 | 0.64 | 0.70 | **50%** | 0.66 | 0.85 | 47% | 12% |
+| django | Python | 74 | 0.66 | 0.71 | **61%** | 0.68 | 0.95 | 46% | 22% |
+| yt-dlp | Python | 78 | 0.64 | 0.70 | **50%** | 0.66 | 0.85 | 46% | 12% |
 
 How to read this: the truth set is by construction a subset of the files that
 contain the identifier as a word, so grep's recall is close to 1.0 no matter
 what and inflates any recall-weighted score. The honest comparison is
 exact-set match, the share of symbols where a method returns exactly the
 reference set with nothing to sift. Ovecc leads it on all five repositories,
-from 50% against 47% on yt-dlp's dynamic dispatch up to 80% against 46% on
+from 50% against 46% on yt-dlp's dynamic dispatch up to 80% against 46% on
 TypeScript, where value-position references (callbacks, registries, pipe
 combinators) are invisible to a call-only graph and are now recorded.
 
