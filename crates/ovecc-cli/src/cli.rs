@@ -250,7 +250,12 @@ pub enum Command {
     },
     /// Produce a one-shot architecture report (summary + cycles + violations +
     /// security + hotspots). Markdown by default; `--format json` for agents.
-    Report,
+    Report {
+        /// Findings to list, highest severity first. 0 lists all of them; the
+        /// counts always cover the whole set.
+        #[arg(long, default_value_t = DEFAULT_FINDING_LIMIT)]
+        limit: usize,
+    },
     /// CI gate: fail when a change introduces new cycles or violations versus a
     /// base snapshot. Models a PR check over Ovecc's `diff`.
     Gate {
@@ -275,6 +280,10 @@ pub enum Command {
         /// file is still duplication.
         #[arg(long)]
         cross_file_only: bool,
+        /// Clone families to print, longest run first. 0 prints all of them;
+        /// the counts always cover the whole set.
+        #[arg(long, default_value_t = DEFAULT_FINDING_LIMIT)]
+        limit: usize,
     },
     /// Report code-health hotspots: functions over the complexity thresholds
     /// (cyclomatic / cognitive), computed by the oxc TS/JS extractor.
@@ -708,10 +717,10 @@ fn run_command(cli: Cli) -> Result<u8> {
             render_audit(&report, config.output.default_format)?;
             Ok(findings_exit(&report.findings, fail_on))
         }
-        Command::Report => {
+        Command::Report { limit } => {
             let paths = ProjectPaths::resolve(cli.repo.unwrap_or_else(|| PathBuf::from(".")))?;
             let config = load_config(&paths, format_override)?;
-            render_full_report(&paths, config.output.default_format)?;
+            render_full_report(&paths, config.output.default_format, limit)?;
             Ok(0)
         }
         Command::Gate {
@@ -734,12 +743,13 @@ fn run_command(cli: Cli) -> Result<u8> {
             min_tokens,
             min_lines,
             cross_file_only,
+            limit,
         } => {
             let paths = ProjectPaths::resolve(cli.repo.unwrap_or_else(|| PathBuf::from(".")))?;
             let config = load_config(&paths, format_override)?;
             let report =
                 load_dupes_report(&paths, &config, min_tokens, min_lines, cross_file_only)?;
-            render_dupes(&report, config.output.default_format)?;
+            render_dupes(&report, config.output.default_format, limit)?;
             Ok(0)
         }
         Command::Health => {

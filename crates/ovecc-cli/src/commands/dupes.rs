@@ -34,15 +34,43 @@ pub(crate) fn load_dupes_report(
     })
 }
 
-pub(crate) fn render_dupes(report: &DupesReport, format: OutputFormat) -> Result<()> {
+/// `limit` cuts the families printed, never the counts. Detection sorts them
+/// longest-run first, so the page is the duplication worth acting on; Django's
+/// 8 771 families serialize to ~1.6M tokens whole, and the first twenty to
+/// ~1.4k. `--limit 0` prints all of them.
+pub(crate) fn render_dupes(report: &DupesReport, format: OutputFormat, limit: usize) -> Result<()> {
     let plural = |n: usize| if n == 1 { "y" } else { "ies" };
+    let shown: &[ovecc_graph::dupes::CloneFamily] = match limit {
+        0 => &report.families,
+        n => &report.families[..n.min(report.families.len())],
+    };
+    let note = (shown.len() < report.families.len()).then(|| {
+        format!(
+            "Showing the {} longest of {} clone families. Raise --min-tokens to cut \
+             the tail, or pass --limit 0 for all of them.",
+            shown.len(),
+            report.clone_families
+        )
+    });
+
     match format {
-        OutputFormat::Json | OutputFormat::Sarif | OutputFormat::Codeclimate => {
-            emit_json("dupes", report, meta_for("dupes"))?
-        }
+        OutputFormat::Json | OutputFormat::Sarif | OutputFormat::Codeclimate => emit_json(
+            "dupes",
+            &serde_json::json!({
+                "files_scanned": report.files_scanned,
+                "min_tokens": report.min_tokens,
+                "min_lines": report.min_lines,
+                "clone_families": report.clone_families,
+                "duplicated_lines": report.duplicated_lines,
+                "shown": shown.len(),
+                "families": shown,
+                "note": note,
+            }),
+            meta_for("dupes"),
+        )?,
         OutputFormat::Ndjson => {
             emit_ndjson_meta("dupes", &meta_for("dupes"))?;
-            for family in &report.families {
+            for family in shown {
                 println!("{}", ndjson_line("clone_family", family)?);
             }
         }
@@ -58,7 +86,7 @@ pub(crate) fn render_dupes(report: &DupesReport, format: OutputFormat) -> Result
                 "- Thresholds: >= {} tokens, >= {} lines",
                 report.min_tokens, report.min_lines
             );
-            for (rank, family) in report.families.iter().enumerate() {
+            for (rank, family) in shown.iter().enumerate() {
                 println!();
                 println!(
                     "## Clone {} ({} tokens, {} lines, {} copies)",
@@ -74,6 +102,10 @@ pub(crate) fn render_dupes(report: &DupesReport, format: OutputFormat) -> Result
                     );
                 }
             }
+            if let Some(note) = &note {
+                println!();
+                println!("{note}");
+            }
         }
         OutputFormat::Text => {
             println!(
@@ -84,7 +116,7 @@ pub(crate) fn render_dupes(report: &DupesReport, format: OutputFormat) -> Result
                 report.min_tokens,
                 report.min_lines
             );
-            for (rank, family) in report.families.iter().enumerate() {
+            for (rank, family) in shown.iter().enumerate() {
                 println!();
                 println!(
                     "{}. {} tokens / {} lines, {} copies:",
@@ -102,6 +134,10 @@ pub(crate) fn render_dupes(report: &DupesReport, format: OutputFormat) -> Result
             }
             if report.families.is_empty() {
                 println!("  (no duplication above the threshold)");
+            }
+            if let Some(note) = &note {
+                println!();
+                println!("{note}");
             }
         }
     }

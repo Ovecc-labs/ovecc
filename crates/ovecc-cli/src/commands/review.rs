@@ -1,7 +1,7 @@
 //! `ovecc review` (the named defects a change introduced) and the one-shot
 //! `ovecc report`.
 
-use super::findings::build_security_report;
+use super::findings::{build_security_report, window};
 use super::open_store;
 use super::summary::{load_hotspots, load_summary};
 use crate::cli::FailOn;
@@ -458,7 +458,15 @@ pub(crate) fn render_review(report: &ReviewReport, format: OutputFormat) -> Resu
 
 /// One-shot report stitching health, cycles, findings, security, and hotspots.
 /// Markdown for humans; structured JSON for agents.
-pub(crate) fn render_full_report(paths: &ProjectPaths, format: OutputFormat) -> Result<()> {
+/// `limit` cuts the findings list; every count, the cycles, and the security
+/// tallies stay whole. This is the surface agents call first, so the default
+/// page has to leave room for the rest of their context: Django's report
+/// serialized to ~404k tokens with the findings uncut.
+pub(crate) fn render_full_report(
+    paths: &ProjectPaths,
+    format: OutputFormat,
+    limit: usize,
+) -> Result<()> {
     let repository_id = paths.repository_id().0;
     // `load_summary` and `load_hotspots` each open and release their own store,
     // so gather them before opening one here: DuckDB permits only one
@@ -487,15 +495,37 @@ pub(crate) fn render_full_report(paths: &ProjectPaths, format: OutputFormat) -> 
             .then_with(|| a.title.cmp(&b.title))
     });
     let security = build_security_report(&findings, None);
+    let shown = window(&findings, limit, 0);
+    let note = (shown.len() < findings.len()).then(|| {
+        format!(
+            "Showing the {} highest-severity of {} findings. `ovecc violations \
+             --severity high --limit 0` lists them.",
+            shown.len(),
+            findings.len()
+        )
+    });
 
     match format {
         OutputFormat::Json | OutputFormat::Ndjson => {
+            // Security findings are a subset of `findings`, so the list is left
+            // out here rather than shipped twice; the tallies are the point, and
+            // `ovecc security` has the records.
             let data = serde_json::json!({
                 "summary": summary,
                 "cycles": cycles,
-                "findings": findings,
-                "security": security,
+                "total_findings": findings.len(),
+                "shown_findings": shown.len(),
+                "findings": shown,
+                "security": {
+                    "secrets": security.secrets,
+                    "insecure_patterns": security.insecure_patterns,
+                    "weak_crypto": security.weak_crypto,
+                    "permissive_cors": security.permissive_cors,
+                    "tainted_flows": security.tainted_flows,
+                    "total": security.total,
+                },
                 "hotspots": hotspots,
+                "note": note,
             });
             emit_json("report", &data, meta_for("report"))?;
         }
@@ -529,13 +559,17 @@ pub(crate) fn render_full_report(paths: &ProjectPaths, format: OutputFormat) -> 
             if findings.is_empty() {
                 println!("_None._");
             }
-            for finding in &findings {
+            for finding in shown {
                 println!(
                     "- [{:?}] {}{}",
                     finding.severity,
                     finding.title,
                     first_evidence(finding)
                 );
+            }
+            if let Some(note) = &note {
+                println!();
+                println!("{note}");
             }
             println!();
             println!("## Security");
