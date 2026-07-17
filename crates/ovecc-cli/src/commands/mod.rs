@@ -8,6 +8,7 @@ use ovecc_core::config::{ConfigOverrides, OveccConfig, ProjectPaths};
 use ovecc_core::error::OveccError;
 use ovecc_db::ArchitectureStore;
 
+pub(crate) mod agent;
 pub(crate) mod capabilities;
 pub(crate) mod conventions;
 pub(crate) mod diagnose;

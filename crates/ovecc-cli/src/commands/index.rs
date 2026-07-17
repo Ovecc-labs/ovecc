@@ -86,6 +86,7 @@ pub(crate) fn run_init(paths: &ProjectPaths, force: bool) -> Result<u8> {
     println!("  ovecc summary        one-screen health");
     println!("  ovecc diagnose       named architecture smells, each with a fix");
     println!("  ovecc mcp            expose every command to your coding agent");
+    println!("  ovecc init --agent   make the agent query the graph before grepping");
     Ok(0)
 }
 

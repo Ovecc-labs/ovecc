@@ -25,6 +25,12 @@ Sets up a repository: writes a fully commented `.ovecc/config.toml` (every
 value shown is the default), adds `.ovecc/` to `.gitignore`, and prints the
 first commands to run. Idempotent; `--force` overwrites the config.
 
+`--agent` also wires the repository's coding agent (Claude Code hooks in
+`.claude/settings.json`) to query the graph before a broad text search: the
+block fails open the moment ovecc cannot answer, so the agent is never
+trapped. `OVECC_AGENT_HOOKS=off` disables it for a session; `--agent --remove`
+undoes the wiring.
+
 ### `ovecc index [path]`
 
 Parses, resolves, and persists the architecture model (symbols, imports, calls,

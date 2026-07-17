@@ -117,6 +117,18 @@ pub enum FailOn {
     Any,
 }
 
+/// Which agent hook to run. Wired into `.claude/settings.json` by
+/// `ovecc init --agent`; not meant to be called by hand.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum AgentHookKind {
+    /// PreToolUse: block a broad text search while the graph can answer it.
+    Enforce,
+    /// PostToolUse: record that an ovecc call just ran (unlocks the grace).
+    Mark,
+    /// SessionStart: point the agent at the graph.
+    Session,
+}
+
 #[derive(Debug, Subcommand)]
 pub enum Command {
     /// Set up ovecc in a repository: write a commented .ovecc/config.toml,
@@ -125,6 +137,20 @@ pub enum Command {
         /// Overwrite an existing .ovecc/config.toml.
         #[arg(long)]
         force: bool,
+        /// Also wire this repo's coding agent (Claude Code hooks) to query the
+        /// graph before text search. Writes .claude/settings.json; reversible.
+        #[arg(long)]
+        agent: bool,
+        /// With --agent, remove the wiring instead of adding it.
+        #[arg(long, requires = "agent")]
+        remove: bool,
+    },
+    /// Runs one agent hook from a stdin event. Wired by `init --agent`; not
+    /// meant to be called by hand.
+    #[command(hide = true)]
+    AgentHook {
+        #[arg(value_enum)]
+        kind: AgentHookKind,
     },
     /// Build or update the local architecture database.
     Index {
@@ -487,10 +513,19 @@ fn run_command(cli: Cli) -> Result<u8> {
     let started = std::time::Instant::now();
 
     let outcome = match cli.command {
-        Command::Init { force } => {
+        Command::Init {
+            force,
+            agent,
+            remove,
+        } => {
             let paths = ProjectPaths::resolve(cli.repo.unwrap_or_else(|| PathBuf::from(".")))?;
-            run_init(&paths, force)
+            if agent {
+                crate::commands::agent::wire(&paths, remove)
+            } else {
+                run_init(&paths, force)
+            }
         }
+        Command::AgentHook { kind } => crate::commands::agent::run_hook(kind),
         Command::Index {
             path,
             no_git,
