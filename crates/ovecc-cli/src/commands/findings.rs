@@ -149,19 +149,7 @@ pub(crate) fn render_violations(
     match format {
         OutputFormat::Json => emit_json_with_fix(
             "violations",
-            serde_json::json!({
-                "total": total,
-                "shown": shown.len(),
-                "offset": offset,
-                "by_severity": severities.iter()
-                    .map(|(label, n)| (label.to_string(), serde_json::json!(n)))
-                    .collect::<serde_json::Map<String, serde_json::Value>>(),
-                "by_rule": rule_tally(findings, 10).into_iter()
-                    .map(|(rule, n)| serde_json::json!({"rule": rule, "count": n}))
-                    .collect::<Vec<_>>(),
-                "findings": shown,
-                "note": note,
-            }),
+            violations_json(findings, shown, offset, &note),
         )?,
         OutputFormat::Ndjson => {
             emit_ndjson_meta("violations", &meta_for("violations"))?;
@@ -169,67 +157,105 @@ pub(crate) fn render_violations(
                 println!("{}", ndjson_line("violation", finding)?);
             }
         }
-        OutputFormat::Markdown => {
-            println!("# Violations ({total})");
-            if !severities.is_empty() {
-                println!();
-                println!("{}", tally_line(&severities));
-            }
-            for finding in shown {
-                println!();
-                println!("## [{:?}] {}", finding.severity, finding.title);
-                if let Some(rule) = &finding.rule_name {
-                    println!("- Rule: `{rule}`");
-                }
-                println!("- Type: {:?}", finding.kind);
-                println!("- {}", finding.description);
-                for evidence in &finding.evidence {
-                    println!("- Evidence: `{}`", format_evidence(evidence));
-                }
-            }
-            if let Some(note) = note {
-                println!();
-                println!("{note}");
-            }
-        }
-        OutputFormat::Text => {
-            print!("Violations: {total}");
-            if severities.is_empty() {
-                println!();
-            } else {
-                println!(" ({})", tally_line(&severities));
-            }
-            let rules = rule_tally(findings, 3);
-            if !rules.is_empty() && total > shown.len() {
-                println!(
-                    "Top rules: {}",
-                    rules
-                        .iter()
-                        .map(|(rule, n)| format!("{rule} {n}"))
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                );
-            }
-            for finding in shown {
-                println!();
-                println!("[{:?}] {}", finding.severity, finding.title);
-                if let Some(rule) = &finding.rule_name {
-                    println!("  Rule: {rule}");
-                }
-                println!("  Type: {:?}", finding.kind);
-                for evidence in &finding.evidence {
-                    println!("  Evidence: {}", format_evidence(evidence));
-                }
-            }
-            if let Some(note) = note {
-                println!();
-                println!("{note}");
-            }
-        }
+        OutputFormat::Markdown => violations_markdown(shown, total, &severities, note.as_deref()),
+        OutputFormat::Text => violations_text(findings, shown, total, &severities, note.as_deref()),
         OutputFormat::Sarif => emit_sarif(findings)?,
         OutputFormat::Codeclimate => emit_codeclimate(findings)?,
     }
     Ok(())
+}
+
+fn violations_json(
+    findings: &[FindingRecord],
+    shown: &[FindingRecord],
+    offset: usize,
+    note: &Option<String>,
+) -> serde_json::Value {
+    let by_severity = severity_tally(findings)
+        .iter()
+        .map(|(label, n)| (label.to_string(), serde_json::json!(n)))
+        .collect::<serde_json::Map<String, serde_json::Value>>();
+    let by_rule = rule_tally(findings, 10)
+        .into_iter()
+        .map(|(rule, n)| serde_json::json!({"rule": rule, "count": n}))
+        .collect::<Vec<_>>();
+    serde_json::json!({
+        "total": findings.len(),
+        "shown": shown.len(),
+        "offset": offset,
+        "by_severity": by_severity,
+        "by_rule": by_rule,
+        "findings": shown,
+        "note": note,
+    })
+}
+
+fn violations_markdown(
+    shown: &[FindingRecord],
+    total: usize,
+    severities: &[(&'static str, usize)],
+    note: Option<&str>,
+) {
+    println!("# Violations ({total})");
+    if !severities.is_empty() {
+        println!();
+        println!("{}", tally_line(severities));
+    }
+    for finding in shown {
+        println!();
+        println!("## [{:?}] {}", finding.severity, finding.title);
+        if let Some(rule) = &finding.rule_name {
+            println!("- Rule: `{rule}`");
+        }
+        println!("- Type: {:?}", finding.kind);
+        println!("- {}", finding.description);
+        for evidence in &finding.evidence {
+            println!("- Evidence: `{}`", format_evidence(evidence));
+        }
+    }
+    if let Some(note) = note {
+        println!();
+        println!("{note}");
+    }
+}
+
+fn violations_text(
+    findings: &[FindingRecord],
+    shown: &[FindingRecord],
+    total: usize,
+    severities: &[(&'static str, usize)],
+    note: Option<&str>,
+) {
+    print!("Violations: {total}");
+    if severities.is_empty() {
+        println!();
+    } else {
+        println!(" ({})", tally_line(severities));
+    }
+    let rules = rule_tally(findings, 3);
+    if !rules.is_empty() && total > shown.len() {
+        let joined = rules
+            .iter()
+            .map(|(rule, n)| format!("{rule} {n}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!("Top rules: {joined}");
+    }
+    for finding in shown {
+        println!();
+        println!("[{:?}] {}", finding.severity, finding.title);
+        if let Some(rule) = &finding.rule_name {
+            println!("  Rule: {rule}");
+        }
+        println!("  Type: {:?}", finding.kind);
+        for evidence in &finding.evidence {
+            println!("  Evidence: {}", format_evidence(evidence));
+        }
+    }
+    if let Some(note) = note {
+        println!();
+        println!("{note}");
+    }
 }
 
 fn is_security_kind(kind: FindingKind) -> bool {

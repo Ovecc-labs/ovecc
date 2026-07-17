@@ -101,12 +101,71 @@ struct SymbolIndex {
     by_qualified_global: HashMap<(SourceLanguage, String), Vec<String>>,
 }
 
+/// The mutable accumulators threaded through the link pass, so each per-unit
+/// step stays a small method instead of one long loop body. `module_init` and
+/// `synthesized` are shared across units: a module-init symbol is synthesized
+/// once and reused by every fact in that file with no enclosing symbol.
+#[derive(Default)]
+struct LinkState {
+    calls: Vec<CallRecord>,
+    apis: Vec<ApiRecord>,
+    schema_objects: Vec<SchemaObjectRecord>,
+    schema_accesses: Vec<SchemaAccessEdge>,
+    dangerous_sinks: Vec<DangerousSink>,
+    seen_schema: HashMap<(String, String), ()>,
+    seen_access: HashMap<(String, String, &'static str), ()>,
+    module_init: HashMap<String, String>,
+    synthesized: Vec<SymbolRecord>,
+}
+
 /// Resolves every unit into a single [`ResolvedFacts`] batch.
 pub fn resolve_facts(units: &[ResolveUnit<'_>]) -> ResolvedFacts {
+    // Symbol pass first (all files), so cross-file linking sees every symbol.
+    let (mut symbols, index) = index_symbols(units);
+
+    let mut state = LinkState::default();
+    for unit in units {
+        state.resolve_calls(unit, &index);
+        state.resolve_apis(unit, &index);
+        state.resolve_schema(unit, &index);
+        state.resolve_sinks(unit, &index);
+    }
+
+    symbols.extend(state.synthesized);
+    symbols.sort_by(|a, b| a.id.0.cmp(&b.id.0));
+    state.calls.sort_by(|a, b| a.id.0.cmp(&b.id.0));
+    state.apis.sort_by(|a, b| a.id.0.cmp(&b.id.0));
+    state.schema_objects.sort_by(|a, b| a.id.0.cmp(&b.id.0));
+    state.schema_accesses.sort_by(|a, b| {
+        a.accessor_symbol_id
+            .cmp(&b.accessor_symbol_id)
+            .then_with(|| a.table_id.cmp(&b.table_id))
+            .then_with(|| a.kind.cmp(b.kind))
+    });
+    state.dangerous_sinks.sort_by(|a, b| {
+        a.symbol_id
+            .cmp(&b.symbol_id)
+            .then_with(|| a.label.cmp(&b.label))
+    });
+    state
+        .dangerous_sinks
+        .dedup_by(|a, b| a.symbol_id == b.symbol_id && a.label == b.label);
+
+    ResolvedFacts {
+        symbols,
+        calls: state.calls,
+        apis: state.apis,
+        schema_objects: state.schema_objects,
+        schema_accesses: state.schema_accesses,
+        dangerous_sinks: state.dangerous_sinks,
+    }
+}
+
+/// Builds every [`SymbolRecord`] and the per-file/global lookup tables the link
+/// pass resolves against.
+fn index_symbols(units: &[ResolveUnit<'_>]) -> (Vec<SymbolRecord>, SymbolIndex) {
     let mut symbols = Vec::new();
     let mut index = SymbolIndex::default();
-
-    // ---- symbol pass (all files first, so cross-file linking sees them) ----
     for unit in units {
         for fact in &unit.facts.symbols {
             let span_key = format!("{}:{}", fact.span.start_line, fact.span.end_line);
@@ -166,19 +225,11 @@ pub fn resolve_facts(units: &[ResolveUnit<'_>]) -> ResolvedFacts {
             });
         }
     }
+    (symbols, index)
+}
 
-    // ---- link pass ----
-    let mut calls = Vec::new();
-    let mut apis = Vec::new();
-    let mut schema_objects = Vec::new();
-    let mut schema_accesses = Vec::new();
-    let mut dangerous_sinks = Vec::new();
-    let mut seen_schema: HashMap<(String, String), ()> = HashMap::new();
-    let mut seen_access: HashMap<(String, String, &str), ()> = HashMap::new();
-    let mut module_init: HashMap<String, String> = HashMap::new();
-    let mut synthesized = Vec::new();
-
-    for unit in units {
+impl LinkState {
+    fn resolve_calls(&mut self, unit: &ResolveUnit<'_>, index: &SymbolIndex) {
         let local = index.local_top.get(unit.path);
         let var_types: HashMap<&str, &str> = unit
             .facts
@@ -186,7 +237,6 @@ pub fn resolve_facts(units: &[ResolveUnit<'_>]) -> ResolvedFacts {
             .iter()
             .map(|(name, type_name)| (name.as_str(), type_name.as_str()))
             .collect();
-
         let mut call_counts = HashMap::new();
         for call in &unit.facts.calls {
             let caller_id = match &call.caller_qualified_name {
@@ -196,22 +246,23 @@ pub fn resolve_facts(units: &[ResolveUnit<'_>]) -> ResolvedFacts {
                     .cloned(),
                 None => None,
             }
-            .unwrap_or_else(|| ensure_module_init(unit, &mut module_init, &mut synthesized));
+            .unwrap_or_else(|| {
+                ensure_module_init(unit, &mut self.module_init, &mut self.synthesized)
+            });
 
             // Dispatch resolution. Method calls: `this.m()` resolves
             // precisely within the enclosing class (even when `m` is ambiguous
             // repository-wide), otherwise fall back to a unique repo-wide name.
             // Direct calls: local/import first, then the unique-name rule.
             let callee_id = match call.kind {
-                CallKind::Method => resolve_method_callee(call, unit, &index, &var_types),
+                CallKind::Method => resolve_method_callee(call, unit, index, &var_types),
                 _ => resolve_callee(&call.callee_name, unit, local, &index.exported)
-                    .or_else(|| resolve_unique_name(&call.callee_name, unit.language, &index)),
+                    .or_else(|| resolve_unique_name(&call.callee_name, unit.language, index)),
             };
 
             let count = call_counts
                 .entry((caller_id.clone(), call.callee_name.clone(), call.line))
                 .or_insert(0);
-
             let id = CallId::from_parts(&[
                 unit.repository_id,
                 &caller_id,
@@ -221,7 +272,7 @@ pub fn resolve_facts(units: &[ResolveUnit<'_>]) -> ResolvedFacts {
             ]);
             *count += 1;
 
-            calls.push(CallRecord {
+            self.calls.push(CallRecord {
                 id,
                 repository_id: RepositoryId::from_raw(unit.repository_id),
                 caller_symbol_id: SymbolId::from_raw(caller_id),
@@ -236,7 +287,10 @@ pub fn resolve_facts(units: &[ResolveUnit<'_>]) -> ResolvedFacts {
                 }),
             });
         }
+    }
 
+    fn resolve_apis(&mut self, unit: &ResolveUnit<'_>, index: &SymbolIndex) {
+        let local = index.local_top.get(unit.path);
         for api in &unit.facts.apis {
             let handler_id = api
                 .handler_name
@@ -248,7 +302,7 @@ pub fn resolve_facts(units: &[ResolveUnit<'_>]) -> ResolvedFacts {
                 .or_else(|| api.name.clone())
                 .unwrap_or_default();
             let api_line_str = api.line.to_string();
-            apis.push(ApiRecord {
+            self.apis.push(ApiRecord {
                 id: ApiId::from_parts(&[
                     unit.repository_id,
                     unit.path,
@@ -273,9 +327,11 @@ pub fn resolve_facts(units: &[ResolveUnit<'_>]) -> ResolvedFacts {
                 }),
             });
         }
+    }
 
-        // Schema objects are deduplicated repository-wide by (name, kind);
-        // each access becomes a reads/writes edge from the accessor symbol.
+    /// Schema objects are deduplicated repository-wide by (name, kind); each
+    /// access becomes a reads/writes edge from the accessor symbol.
+    fn resolve_schema(&mut self, unit: &ResolveUnit<'_>, index: &SymbolIndex) {
         for schema in &unit.facts.schema_refs {
             let table_id =
                 SchemaObjectId::from_parts(&[unit.repository_id, "", &schema.object_name]).0;
@@ -283,8 +339,8 @@ pub fn resolve_facts(units: &[ResolveUnit<'_>]) -> ResolvedFacts {
                 schema.object_name.clone(),
                 format!("{:?}", schema.object_kind),
             );
-            if seen_schema.insert(object_key, ()).is_none() {
-                schema_objects.push(SchemaObjectRecord {
+            if self.seen_schema.insert(object_key, ()).is_none() {
+                self.schema_objects.push(SchemaObjectRecord {
                     id: SchemaObjectId::from_raw(table_id.clone()),
                     repository_id: RepositoryId::from_raw(unit.repository_id),
                     kind: schema.object_kind,
@@ -307,16 +363,19 @@ pub fn resolve_facts(units: &[ResolveUnit<'_>]) -> ResolvedFacts {
                     .cloned(),
                 None => None,
             }
-            .unwrap_or_else(|| ensure_module_init(unit, &mut module_init, &mut synthesized));
+            .unwrap_or_else(|| {
+                ensure_module_init(unit, &mut self.module_init, &mut self.synthesized)
+            });
             let kind = match schema.access {
                 SchemaAccess::Read => "reads",
                 SchemaAccess::Write | SchemaAccess::Define => "writes",
             };
-            if seen_access
+            if self
+                .seen_access
                 .insert((accessor_id.clone(), table_id.clone(), kind), ())
                 .is_none()
             {
-                schema_accesses.push(SchemaAccessEdge {
+                self.schema_accesses.push(SchemaAccessEdge {
                     accessor_symbol_id: accessor_id,
                     table_id,
                     kind,
@@ -329,8 +388,10 @@ pub fn resolve_facts(units: &[ResolveUnit<'_>]) -> ResolvedFacts {
                 });
             }
         }
+    }
 
-        // Dangerous-call sinks (eval, command exec) attributed to their symbol.
+    /// Dangerous-call sinks (eval, command exec) attributed to their symbol.
+    fn resolve_sinks(&mut self, unit: &ResolveUnit<'_>, index: &SymbolIndex) {
         for pattern in &unit.facts.security_patterns {
             if !pattern.kind.is_taint_sink() {
                 continue;
@@ -342,12 +403,14 @@ pub fn resolve_facts(units: &[ResolveUnit<'_>]) -> ResolvedFacts {
                     .cloned(),
                 None => None,
             }
-            .unwrap_or_else(|| ensure_module_init(unit, &mut module_init, &mut synthesized));
+            .unwrap_or_else(|| {
+                ensure_module_init(unit, &mut self.module_init, &mut self.synthesized)
+            });
             let label = match pattern.kind {
                 SecurityPatternKind::CommandExec => "command",
                 _ => "eval",
             };
-            dangerous_sinks.push(DangerousSink {
+            self.dangerous_sinks.push(DangerousSink {
                 symbol_id,
                 label: label.to_string(),
                 evidence: Evidence {
@@ -358,33 +421,6 @@ pub fn resolve_facts(units: &[ResolveUnit<'_>]) -> ResolvedFacts {
                 },
             });
         }
-    }
-
-    symbols.extend(synthesized);
-    symbols.sort_by(|a, b| a.id.0.cmp(&b.id.0));
-    calls.sort_by(|a, b| a.id.0.cmp(&b.id.0));
-    apis.sort_by(|a, b| a.id.0.cmp(&b.id.0));
-    schema_objects.sort_by(|a, b| a.id.0.cmp(&b.id.0));
-    schema_accesses.sort_by(|a, b| {
-        a.accessor_symbol_id
-            .cmp(&b.accessor_symbol_id)
-            .then_with(|| a.table_id.cmp(&b.table_id))
-            .then_with(|| a.kind.cmp(b.kind))
-    });
-    dangerous_sinks.sort_by(|a, b| {
-        a.symbol_id
-            .cmp(&b.symbol_id)
-            .then_with(|| a.label.cmp(&b.label))
-    });
-    dangerous_sinks.dedup_by(|a, b| a.symbol_id == b.symbol_id && a.label == b.label);
-
-    ResolvedFacts {
-        symbols,
-        calls,
-        apis,
-        schema_objects,
-        schema_accesses,
-        dangerous_sinks,
     }
 }
 

@@ -56,50 +56,90 @@ pub fn analyze(input: &DeadCodeInput<'_>) -> Vec<FindingRecord> {
         return Vec::new();
     }
 
-    let mut exports_by_file: HashMap<&str, Vec<&ExportFact>> = HashMap::new();
-    for (file, export) in input.exports {
-        exports_by_file
-            .entry(file.as_str())
-            .or_default()
-            .push(export);
-    }
-
-    // Out-edges for reachability (importer -> imported internal files).
-    let mut out_edges: HashMap<&str, Vec<&str>> = HashMap::new();
-    for edge in input.imports {
-        out_edges
-            .entry(edge.source_file.as_str())
-            .or_default()
-            .push(edge.target_file.as_str());
-    }
+    let exports_by_file = index_exports_by_file(input.exports);
+    let out_edges = build_out_edges(input.imports);
     let reachable = bfs_reachable(input.entry_points, &out_edges);
-
-    // A re-exported name is "used" only when something downstream actually
-    // consumes it. Crediting a re-export *forward* as a use outright (the way a
-    // plain consuming import is credited) hides dead code that is mechanically
-    // forwarded through a barrel: `index` imports `a` from a barrel that
-    // `export {a, b}`s from a leaf, and `b` — forwarded the whole way but never
-    // consumed — looks used. So separate forwards from real uses and propagate
-    // usage along the re-export chain to a fixpoint.
-    let mut reexport_names: HashMap<&str, HashSet<&str>> = HashMap::new();
-    for (file, export) in input.exports {
-        if export.re_export.is_some() {
-            reexport_names
-                .entry(file.as_str())
-                .or_default()
-                .insert(export.name.as_str());
-        }
-    }
+    let reexport_names = collect_reexport_names(input.exports);
 
     // `used` holds every (file, export) reached from a real consumer or the
     // public (entry-point) surface; `forwards` carries the re-export hops along
     // which that usage propagates.
     let mut used: HashSet<(&str, &str)> = HashSet::new();
     let mut worklist: Vec<(&str, &str)> = Vec::new();
-    let mut forwards: Vec<Forward<'_>> = Vec::new();
+    seed_public_surface(input, &mut used, &mut worklist);
+    let forwards = seed_from_imports(
+        input,
+        &reachable,
+        &exports_by_file,
+        &reexport_names,
+        &mut used,
+        &mut worklist,
+    );
+    propagate_forwards(&forwards, &mut used, &mut worklist);
 
-    // The public surface: every export of an entry-point file is a usage root, so
-    // a library barrel that re-exports its API never flags that API as dead.
+    let mut findings = Vec::new();
+    flag_unused_exports(input, &reachable, &used, &mut findings);
+    flag_unused_files(input, &reachable, &exports_by_file, &mut findings);
+    // Sort by id, then drop any exact-id duplicates. The id carries the source
+    // location, so genuinely distinct declarations (a name exported twice in one
+    // file via TypeScript declaration merging or overloads) keep distinct ids and
+    // survive; this only removes a finding the analysis emitted twice (e.g. a
+    // duplicated export fact). Sorting first lets `dedup_by` remove ALL
+    // duplicates, not just adjacent ones, and guarantees the returned set is what
+    // gets persisted — so the `unused_exports`/`unused_files` metrics can never
+    // disagree with what `deadcode`/`violations` actually report.
+    findings.sort_by(|a, b| a.id.0.cmp(&b.id.0));
+    findings.dedup_by(|a, b| a.id.0 == b.id.0);
+    findings
+}
+
+fn index_exports_by_file(exports: &[(String, ExportFact)]) -> HashMap<&str, Vec<&ExportFact>> {
+    let mut by_file: HashMap<&str, Vec<&ExportFact>> = HashMap::new();
+    for (file, export) in exports {
+        by_file.entry(file.as_str()).or_default().push(export);
+    }
+    by_file
+}
+
+/// Out-edges for reachability (importer -> imported internal files).
+fn build_out_edges(imports: &[ImportEdge]) -> HashMap<&str, Vec<&str>> {
+    let mut out_edges: HashMap<&str, Vec<&str>> = HashMap::new();
+    for edge in imports {
+        out_edges
+            .entry(edge.source_file.as_str())
+            .or_default()
+            .push(edge.target_file.as_str());
+    }
+    out_edges
+}
+
+/// The names each file re-exports. A re-exported name is "used" only when
+/// something downstream actually consumes it. Crediting a re-export *forward* as
+/// a use outright (the way a plain consuming import is credited) hides dead code
+/// mechanically forwarded through a barrel: `index` imports `a` from a barrel
+/// that `export {a, b}`s from a leaf, and `b` — forwarded the whole way but
+/// never consumed — looks used. So forwards are separated from real uses and
+/// usage propagates along the re-export chain to a fixpoint.
+fn collect_reexport_names(exports: &[(String, ExportFact)]) -> HashMap<&str, HashSet<&str>> {
+    let mut names: HashMap<&str, HashSet<&str>> = HashMap::new();
+    for (file, export) in exports {
+        if export.re_export.is_some() {
+            names
+                .entry(file.as_str())
+                .or_default()
+                .insert(export.name.as_str());
+        }
+    }
+    names
+}
+
+/// Every export of an entry-point file is a usage root, so a library barrel that
+/// re-exports its API never flags that API as dead.
+fn seed_public_surface<'a>(
+    input: &'a DeadCodeInput<'a>,
+    used: &mut HashSet<(&'a str, &'a str)>,
+    worklist: &mut Vec<(&'a str, &'a str)>,
+) {
     for (file, export) in input.exports {
         if input.entry_points.contains(file) {
             let key = (file.as_str(), export.name.as_str());
@@ -108,7 +148,19 @@ pub fn analyze(input: &DeadCodeInput<'_>) -> Vec<FindingRecord> {
             }
         }
     }
+}
 
+/// Credits every consuming import against its target's exports and returns the
+/// re-export forward hops, along which usage still has to propagate.
+fn seed_from_imports<'a>(
+    input: &'a DeadCodeInput<'a>,
+    reachable: &HashSet<&str>,
+    exports_by_file: &HashMap<&'a str, Vec<&'a ExportFact>>,
+    reexport_names: &HashMap<&str, HashSet<&str>>,
+    used: &mut HashSet<(&'a str, &'a str)>,
+    worklist: &mut Vec<(&'a str, &'a str)>,
+) -> Vec<Forward<'a>> {
+    let mut forwards: Vec<Forward<'a>> = Vec::new();
     for edge in input.imports {
         // An import from an unreachable file is itself dead; it cannot keep
         // anything alive (its target is reachable iff its source is).
@@ -116,21 +168,19 @@ pub fn analyze(input: &DeadCodeInput<'_>) -> Vec<FindingRecord> {
             continue;
         }
         let exported = exports_by_file.get(edge.target_file.as_str());
-        let forwarded_here = reexport_names.get(edge.source_file.as_str());
         if edge.is_namespace {
             // `import *` (or an un-named `export *`): credit every export of the
             // target outright. That is the conservative choice — it can only miss
             // dead code, never invent a false positive.
-            if let Some(exports) = exported {
-                for export in exports {
-                    let key = (edge.target_file.as_str(), export.name.as_str());
-                    if used.insert(key) {
-                        worklist.push(key);
-                    }
+            for export in exported.into_iter().flatten() {
+                let key = (edge.target_file.as_str(), export.name.as_str());
+                if used.insert(key) {
+                    worklist.push(key);
                 }
             }
             continue;
         }
+        let forwarded_here = reexport_names.get(edge.source_file.as_str());
         for name in &edge.imported_names {
             let exports_name =
                 exported.is_some_and(|exports| exports.iter().any(|e| &e.name == name));
@@ -153,10 +203,17 @@ pub fn analyze(input: &DeadCodeInput<'_>) -> Vec<FindingRecord> {
             }
         }
     }
+    forwards
+}
 
-    // Propagate usage across re-export hops until it stops spreading.
+/// Propagates usage across re-export hops until it stops spreading.
+fn propagate_forwards<'a>(
+    forwards: &[Forward<'a>],
+    used: &mut HashSet<(&'a str, &'a str)>,
+    worklist: &mut Vec<(&'a str, &'a str)>,
+) {
     let mut forward_index: HashMap<(&str, &str), Vec<(&str, &str)>> = HashMap::new();
-    for (from, to) in forwards {
+    for &(from, to) in forwards {
         forward_index.entry(from).or_default().push(to);
     }
     while let Some(key) = worklist.pop() {
@@ -168,21 +225,6 @@ pub fn analyze(input: &DeadCodeInput<'_>) -> Vec<FindingRecord> {
             }
         }
     }
-
-    let mut findings = Vec::new();
-    flag_unused_exports(input, &reachable, &used, &mut findings);
-    flag_unused_files(input, &reachable, &exports_by_file, &mut findings);
-    // Sort by id, then drop any exact-id duplicates. The id carries the source
-    // location, so genuinely distinct declarations (a name exported twice in one
-    // file via TypeScript declaration merging or overloads) keep distinct ids and
-    // survive; this only removes a finding the analysis emitted twice (e.g. a
-    // duplicated export fact). Sorting first lets `dedup_by` remove ALL
-    // duplicates, not just adjacent ones, and guarantees the returned set is what
-    // gets persisted — so the `unused_exports`/`unused_files` metrics can never
-    // disagree with what `deadcode`/`violations` actually report.
-    findings.sort_by(|a, b| a.id.0.cmp(&b.id.0));
-    findings.dedup_by(|a, b| a.id.0 == b.id.0);
-    findings
 }
 
 fn bfs_reachable<'a>(

@@ -339,8 +339,11 @@ struct ClumpSite<'a> {
 /// when at least CLUMP_MIN_FUNCTIONS functions share it. Name-based on
 /// purpose — no type information exists at this layer, and names are the
 /// convention a team actually repeats.
-fn data_clumps(input: &SmellsInput<'_>) -> Vec<FindingRecord> {
-    let mut sites: Vec<(&'static str, ClumpSite<'_>)> = Vec::new();
+/// The non-test functions whose deduplicated parameter names could form a
+/// clump, sorted for deterministic output. Overloads and re-exports collapse to
+/// one site so a repeated signature does not inflate a clump.
+fn collect_clump_sites<'a>(input: &'a SmellsInput<'a>) -> Vec<(&'static str, ClumpSite<'a>)> {
+    let mut sites: Vec<(&'static str, ClumpSite<'a>)> = Vec::new();
     for function in input.functions {
         if is_test_path(&function.path) {
             continue;
@@ -370,13 +373,16 @@ fn data_clumps(input: &SmellsInput<'_>) -> Vec<FindingRecord> {
     sites.sort_by(|a, b| {
         (a.1.path, a.1.line, a.1.qualified_name).cmp(&(b.1.path, b.1.line, b.1.qualified_name))
     });
-
-    // Overloads and re-exported declarations show up as several sites with the
-    // same name and signature; counting them again would inflate the clump.
     let mut seen: HashSet<(&str, &str, Vec<&str>)> = HashSet::new();
     sites.retain(|(family, site)| seen.insert((family, site.qualified_name, site.names.clone())));
+    sites
+}
 
-    // triple -> the functions whose signature contains it.
+/// Each name triple mapped to the site indices whose signature contains it. A
+/// clump is a triple (or wider group) shared by enough functions.
+fn index_triples<'a>(
+    sites: &[(&'static str, ClumpSite<'a>)],
+) -> BTreeMap<(&'a str, [&'a str; 3]), BTreeSet<usize>> {
     let mut triples: BTreeMap<(&str, [&str; 3]), BTreeSet<usize>> = BTreeMap::new();
     for (index, (family, site)) in sites.iter().enumerate() {
         let names = &site.names;
@@ -391,6 +397,12 @@ fn data_clumps(input: &SmellsInput<'_>) -> Vec<FindingRecord> {
             }
         }
     }
+    triples
+}
+
+fn data_clumps(input: &SmellsInput<'_>) -> Vec<FindingRecord> {
+    let sites = collect_clump_sites(input);
+    let triples = index_triples(&sites);
 
     // Triples shared by the same set of functions are one clump: merging them
     // rebuilds the widest recurring group (a 4-name clump would otherwise be

@@ -145,9 +145,18 @@ fn security_rules(input: &RuleInput<'_>) -> Vec<FindingRecord> {
                     // program directly with no shell, so a literal or even a
                     // tainted argument is not shell injection; the sink is worth
                     // a look but not high severity on its own.
-                    let shell = matches!(pattern.detail.as_deref(), Some("exec") | Some("execSync"));
-                    let severity = if shell { Severity::High } else { Severity::Medium };
-                    (FindingKind::InsecurePattern, severity, "OS command execution")
+                    let shell =
+                        matches!(pattern.detail.as_deref(), Some("exec") | Some("execSync"));
+                    let severity = if shell {
+                        Severity::High
+                    } else {
+                        Severity::Medium
+                    };
+                    (
+                        FindingKind::InsecurePattern,
+                        severity,
+                        "OS command execution",
+                    )
                 }
                 SecurityPatternKind::WeakHash => (
                     FindingKind::WeakCrypto,

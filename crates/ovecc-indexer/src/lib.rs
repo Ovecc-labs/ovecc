@@ -596,7 +596,15 @@ fn high_complexity_finding(
     path: &str,
     complexity: &ovecc_core::facts::ComplexityFact,
 ) -> Option<FindingRecord> {
-    let severity = if complexity.cognitive >= 25 || complexity.cyclomatic >= 20 {
+    // Severity is driven by cognitive complexity: how hard the function is to
+    // hold in your head. A high branch count alone does not make High, because
+    // a flat exhaustive `match` (a dispatch table, an enum classifier) has one
+    // path per arm yet reads top-to-bottom with nothing to track. Cyclomatic
+    // still raises Medium so a very branchy function gets a glance. This is the
+    // distinction SonarSource built cognitive complexity to make; scoring the
+    // branch count as High flagged our own command dispatch and node
+    // classifiers, which are long but not complex.
+    let severity = if complexity.cognitive >= 25 {
         ovecc_core::facts::Severity::High
     } else if complexity.cognitive >= 15 || complexity.cyclomatic >= 10 {
         ovecc_core::facts::Severity::Medium

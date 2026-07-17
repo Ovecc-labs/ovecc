@@ -31,13 +31,42 @@ pub(crate) fn detect_entry_points(root: &Path, files: &[FileRecord]) -> HashSet<
     let mut entries = HashSet::new();
     let file_paths: HashSet<&str> = files.iter().map(|file| file.path.as_str()).collect();
 
+    collect_manifest_entries(root, &file_paths, &mut entries);
+    collect_cargo_entries(root, files, &file_paths, &mut entries);
+    for file in files {
+        if is_default_entry(&file.path)
+            || is_test_file(&file.path)
+            || is_framework_entry(&file.path)
+            || is_standalone_entry(&file.path)
+        {
+            entries.insert(file.path.clone());
+        }
+    }
+    entries
+}
+
+/// Entry files declared by package manifests (`package.json` main/bin/exports).
+fn collect_manifest_entries(
+    root: &Path,
+    file_paths: &HashSet<&str>,
+    entries: &mut HashSet<String>,
+) {
     for (dir, manifest) in find_package_manifests(root) {
         for spec in manifest_entry_specs(&manifest) {
-            if let Some(resolved) = resolve_entry_spec(&dir, &spec, &file_paths) {
+            if let Some(resolved) = resolve_entry_spec(&dir, &spec, file_paths) {
                 entries.insert(resolved);
             }
         }
     }
+}
+
+/// Cargo crate roots: `main.rs`/`lib.rs`, a `build.rs`, and every `src/bin/*.rs`.
+fn collect_cargo_entries(
+    root: &Path,
+    files: &[FileRecord],
+    file_paths: &HashSet<&str>,
+    entries: &mut HashSet<String>,
+) {
     for src in find_cargo_crate_roots(root).values() {
         for root_file in ["main.rs", "lib.rs"] {
             let candidate = format!("{src}/{root_file}");
@@ -59,16 +88,6 @@ pub(crate) fn detect_entry_points(root: &Path, files: &[FileRecord]) -> HashSet<
             }
         }
     }
-    for file in files {
-        if is_default_entry(&file.path)
-            || is_test_file(&file.path)
-            || is_framework_entry(&file.path)
-            || is_standalone_entry(&file.path)
-        {
-            entries.insert(file.path.clone());
-        }
-    }
-    entries
 }
 
 /// True for files under conventional standalone directories — examples,

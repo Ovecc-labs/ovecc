@@ -181,96 +181,108 @@ pub(crate) fn render_advise(
                 println!("{}", ndjson_line("diagnosis", &diagnosis_value(smell))?);
             }
         }
-        OutputFormat::Markdown => {
-            println!("# Advise: `{target}`");
-            println!();
-            println!(
-                "{} finding(s), {} design smell(s)",
-                findings.len(),
-                smells.findings.len()
-            );
-            for finding in findings {
-                let fix = finding.kind.fix_spec();
-                println!();
-                println!("## [{:?}] {}", finding.severity, finding.title);
-                if let Some(rule) = &finding.rule_name {
-                    println!("- Rule: `{rule}`");
-                }
-                println!("- {}", finding.description);
-                for evidence in &finding.evidence {
-                    println!("- Evidence: `{}`", format_evidence(evidence));
-                }
-                println!(
-                    "- Fix: {} (`{}`, auto-fixable: {})",
-                    fix.instruction,
-                    fix.kind,
-                    if fix.auto_fixable { "yes" } else { "no" }
-                );
-            }
-            for smell in &smells.findings {
-                println!();
-                println!(
-                    "## [{:?}] {} — `{}`",
-                    smell.severity, smell.title, smell.target
-                );
-                println!("- Principle: {}", smell.principle);
-                for evidence in &smell.evidence {
-                    println!("- Evidence: `{}`", fmt_diag_evidence(evidence));
-                }
-                println!(
-                    "- Fix: {} ({})",
-                    smell.remediation.summary, smell.remediation.refactoring
-                );
-                if let Some(note) = &smell.remediation.when_not_to_act {
-                    println!("- When not to act: {note}");
-                }
-            }
-            if findings.is_empty() && smells.findings.is_empty() {
-                println!();
-                println!("Nothing touches `{target}` — safe to edit.");
-            }
-        }
-        OutputFormat::Text => {
-            println!(
-                "Advise for {target}: {} finding(s), {} design smell(s)",
-                findings.len(),
-                smells.findings.len()
-            );
-            for finding in findings {
-                let fix = finding.kind.fix_spec();
-                println!();
-                println!("[{:?}] {}", finding.severity, finding.title);
-                if let Some(rule) = &finding.rule_name {
-                    println!("  Rule: {rule}");
-                }
-                for evidence in &finding.evidence {
-                    println!("  Evidence: {}", format_evidence(evidence));
-                }
-                println!(
-                    "  Fix: {} (auto-fixable: {})",
-                    fix.instruction,
-                    if fix.auto_fixable { "yes" } else { "no" }
-                );
-            }
-            for smell in &smells.findings {
-                println!();
-                println!(
-                    "[{:?}] {} — {}  (confidence {:.2})",
-                    smell.severity, smell.title, smell.target, smell.confidence
-                );
-                let evidence: Vec<String> = smell.evidence.iter().map(fmt_diag_evidence).collect();
-                println!("  Evidence: {}", evidence.join(", "));
-                println!(
-                    "  Fix: {} [{}]",
-                    smell.remediation.summary, smell.remediation.refactoring
-                );
-            }
-            if findings.is_empty() && smells.findings.is_empty() {
-                println!("  (nothing touches this target — safe to edit)");
-            }
-        }
+        OutputFormat::Markdown => advise_markdown(target, findings, smells),
+        OutputFormat::Text => advise_text(target, findings, smells),
     }
     Ok(())
+}
+
+fn advise_markdown(
+    target: &str,
+    findings: &[FindingRecord],
+    smells: &ovecc_graph::diagnose::DiagnoseReport,
+) {
+    println!("# Advise: `{target}`");
+    println!();
+    println!(
+        "{} finding(s), {} design smell(s)",
+        findings.len(),
+        smells.findings.len()
+    );
+    for finding in findings {
+        let fix = finding.kind.fix_spec();
+        println!();
+        println!("## [{:?}] {}", finding.severity, finding.title);
+        if let Some(rule) = &finding.rule_name {
+            println!("- Rule: `{rule}`");
+        }
+        println!("- {}", finding.description);
+        for evidence in &finding.evidence {
+            println!("- Evidence: `{}`", format_evidence(evidence));
+        }
+        println!(
+            "- Fix: {} (`{}`, auto-fixable: {})",
+            fix.instruction,
+            fix.kind,
+            if fix.auto_fixable { "yes" } else { "no" }
+        );
+    }
+    for smell in &smells.findings {
+        println!();
+        println!(
+            "## [{:?}] {} — `{}`",
+            smell.severity, smell.title, smell.target
+        );
+        println!("- Principle: {}", smell.principle);
+        for evidence in &smell.evidence {
+            println!("- Evidence: `{}`", fmt_diag_evidence(evidence));
+        }
+        println!(
+            "- Fix: {} ({})",
+            smell.remediation.summary, smell.remediation.refactoring
+        );
+        if let Some(note) = &smell.remediation.when_not_to_act {
+            println!("- When not to act: {note}");
+        }
+    }
+    if findings.is_empty() && smells.findings.is_empty() {
+        println!();
+        println!("Nothing touches `{target}` — safe to edit.");
+    }
+}
+
+fn advise_text(
+    target: &str,
+    findings: &[FindingRecord],
+    smells: &ovecc_graph::diagnose::DiagnoseReport,
+) {
+    println!(
+        "Advise for {target}: {} finding(s), {} design smell(s)",
+        findings.len(),
+        smells.findings.len()
+    );
+    for finding in findings {
+        let fix = finding.kind.fix_spec();
+        println!();
+        println!("[{:?}] {}", finding.severity, finding.title);
+        if let Some(rule) = &finding.rule_name {
+            println!("  Rule: {rule}");
+        }
+        for evidence in &finding.evidence {
+            println!("  Evidence: {}", format_evidence(evidence));
+        }
+        println!(
+            "  Fix: {} (auto-fixable: {})",
+            fix.instruction,
+            if fix.auto_fixable { "yes" } else { "no" }
+        );
+    }
+    for smell in &smells.findings {
+        println!();
+        println!(
+            "[{:?}] {} — {}  (confidence {:.2})",
+            smell.severity, smell.title, smell.target, smell.confidence
+        );
+        let evidence: Vec<String> = smell.evidence.iter().map(fmt_diag_evidence).collect();
+        println!("  Evidence: {}", evidence.join(", "));
+        println!(
+            "  Fix: {} [{}]",
+            smell.remediation.summary, smell.remediation.refactoring
+        );
+    }
+    if findings.is_empty() && smells.findings.is_empty() {
+        println!("  (nothing touches this target — safe to edit)");
+    }
 }
 
 pub(crate) fn diagnose_exit(
@@ -380,90 +392,97 @@ pub(crate) fn render_diagnose(
                 println!("{}", ndjson_line("diagnosis", &diagnosis_value(finding))?);
             }
         }
-        OutputFormat::Markdown => {
-            println!("# Diagnosis ({} finding(s))", report.total);
-            println!();
-            println!(
-                "Critical: {} · High: {} · Medium: {} · Low: {}",
-                report.critical, report.high, report.medium, report.low
-            );
-            for (label, bucket) in group_diagnoses(&report.findings, group_by) {
-                if !label.is_empty() {
-                    println!();
-                    println!("# {} ({})", label, bucket.len());
-                }
-                for finding in bucket {
-                    println!();
-                    println!(
-                        "## [{:?}] {} — `{}`",
-                        finding.severity, finding.title, finding.target
-                    );
-                    println!("- Principle: {}", finding.principle);
-                    println!("- Confidence: {:.2}", finding.confidence);
-                    for evidence in &finding.evidence {
-                        println!("- Evidence: `{}`", fmt_diag_evidence(evidence));
-                    }
-                    println!(
-                        "- Fix: {} ({})",
-                        finding.remediation.summary, finding.remediation.refactoring
-                    );
-                    let fix = ovecc_graph::diagnose::fix_spec(&finding.detector);
-                    println!(
-                        "- Action: `{}` (auto-fixable: {})",
-                        fix.kind,
-                        if fix.auto_fixable { "yes" } else { "no" }
-                    );
-                    if let Some(note) = &finding.remediation.when_not_to_act {
-                        println!("- When not to act: {note}");
-                    }
-                }
-            }
-        }
-        OutputFormat::Text => {
-            println!(
-                "Diagnosis: {} finding(s) — critical {}, high {}, medium {}, low {}",
-                report.total, report.critical, report.high, report.medium, report.low
-            );
-            for (label, bucket) in group_diagnoses(&report.findings, group_by) {
-                if !label.is_empty() {
-                    println!();
-                    println!("== {} ({}) ==", label, bucket.len());
-                }
-                for finding in bucket {
-                    println!();
-                    println!(
-                        "[{:?}] {} — {} {}  (confidence {:.2})",
-                        finding.severity,
-                        finding.title,
-                        finding.target_kind,
-                        finding.target,
-                        finding.confidence
-                    );
-                    println!("  Principle: {}", finding.principle);
-                    let evidence: Vec<String> =
-                        finding.evidence.iter().map(fmt_diag_evidence).collect();
-                    println!("  Evidence: {}", evidence.join(", "));
-                    println!(
-                        "  Fix: {} [{}]",
-                        finding.remediation.summary, finding.remediation.refactoring
-                    );
-                    let fix = ovecc_graph::diagnose::fix_spec(&finding.detector);
-                    println!(
-                        "  Action: {} (auto-fixable: {})",
-                        fix.kind,
-                        if fix.auto_fixable { "yes" } else { "no" }
-                    );
-                    if let Some(note) = &finding.remediation.when_not_to_act {
-                        println!("  When not to act: {note}");
-                    }
-                }
-            }
-            if report.total == 0 {
-                println!("  (no findings)");
-            }
-        }
+        OutputFormat::Markdown => diagnose_markdown(report, group_by),
+        OutputFormat::Text => diagnose_text(report, group_by),
     }
     Ok(())
+}
+
+fn diagnose_markdown(report: &ovecc_graph::diagnose::DiagnoseReport, group_by: Option<GroupByArg>) {
+    println!("# Diagnosis ({} finding(s))", report.total);
+    println!();
+    println!(
+        "Critical: {} · High: {} · Medium: {} · Low: {}",
+        report.critical, report.high, report.medium, report.low
+    );
+    for (label, bucket) in group_diagnoses(&report.findings, group_by) {
+        if !label.is_empty() {
+            println!();
+            println!("# {} ({})", label, bucket.len());
+        }
+        for finding in bucket {
+            diagnose_markdown_finding(finding);
+        }
+    }
+}
+
+fn diagnose_markdown_finding(finding: &ovecc_graph::diagnose::Diagnosis) {
+    println!();
+    println!(
+        "## [{:?}] {} — `{}`",
+        finding.severity, finding.title, finding.target
+    );
+    println!("- Principle: {}", finding.principle);
+    println!("- Confidence: {:.2}", finding.confidence);
+    for evidence in &finding.evidence {
+        println!("- Evidence: `{}`", fmt_diag_evidence(evidence));
+    }
+    println!(
+        "- Fix: {} ({})",
+        finding.remediation.summary, finding.remediation.refactoring
+    );
+    let fix = ovecc_graph::diagnose::fix_spec(&finding.detector);
+    println!(
+        "- Action: `{}` (auto-fixable: {})",
+        fix.kind,
+        if fix.auto_fixable { "yes" } else { "no" }
+    );
+    if let Some(note) = &finding.remediation.when_not_to_act {
+        println!("- When not to act: {note}");
+    }
+}
+
+fn diagnose_text(report: &ovecc_graph::diagnose::DiagnoseReport, group_by: Option<GroupByArg>) {
+    println!(
+        "Diagnosis: {} finding(s) — critical {}, high {}, medium {}, low {}",
+        report.total, report.critical, report.high, report.medium, report.low
+    );
+    for (label, bucket) in group_diagnoses(&report.findings, group_by) {
+        if !label.is_empty() {
+            println!();
+            println!("== {} ({}) ==", label, bucket.len());
+        }
+        for finding in bucket {
+            diagnose_text_finding(finding);
+        }
+    }
+    if report.total == 0 {
+        println!("  (no findings)");
+    }
+}
+
+fn diagnose_text_finding(finding: &ovecc_graph::diagnose::Diagnosis) {
+    println!();
+    println!(
+        "[{:?}] {} — {} {}  (confidence {:.2})",
+        finding.severity, finding.title, finding.target_kind, finding.target, finding.confidence
+    );
+    println!("  Principle: {}", finding.principle);
+    let evidence: Vec<String> = finding.evidence.iter().map(fmt_diag_evidence).collect();
+    println!("  Evidence: {}", evidence.join(", "));
+    println!(
+        "  Fix: {} [{}]",
+        finding.remediation.summary, finding.remediation.refactoring
+    );
+    let fix = ovecc_graph::diagnose::fix_spec(&finding.detector);
+    println!(
+        "  Action: {} (auto-fixable: {})",
+        fix.kind,
+        if fix.auto_fixable { "yes" } else { "no" }
+    );
+    if let Some(note) = &finding.remediation.when_not_to_act {
+        println!("  When not to act: {note}");
+    }
 }
 
 /// A best-effort file/path location for a diagnosis: the first evidence with a

@@ -1074,6 +1074,29 @@ fn collect_descendant_names(node: Node<'_>, source: &[u8], names: &mut Vec<Strin
 /// kind, and the access mode. Deterministic, dependency-free token scanner;
 /// intentionally conservative to limit false positives (feeds database access facts and the
 /// future taint sinks).
+/// Where a statement's table name sits: after a clause keyword (`FROM`, `INTO`,
+/// `TABLE`) or at a fixed token position (`UPDATE users`).
+enum TableAt {
+    After(&'static str),
+    Token(usize),
+}
+
+/// `(uppercased statement prefix, where the table name is, access kind)`, tried
+/// in order. Every match is a table access.
+const SQL_STATEMENTS: &[(&str, TableAt, SchemaAccess)] = &[
+    ("SELECT ", TableAt::After("FROM"), SchemaAccess::Read),
+    ("INSERT ", TableAt::After("INTO"), SchemaAccess::Write),
+    ("UPDATE ", TableAt::Token(1), SchemaAccess::Write),
+    ("DELETE ", TableAt::After("FROM"), SchemaAccess::Write),
+    (
+        "CREATE TABLE",
+        TableAt::After("TABLE"),
+        SchemaAccess::Define,
+    ),
+    ("ALTER TABLE", TableAt::After("TABLE"), SchemaAccess::Define),
+    ("DROP TABLE", TableAt::After("TABLE"), SchemaAccess::Define),
+];
+
 fn detect_sql(text: &str) -> Option<(String, SchemaObjectKind, SchemaAccess)> {
     let trimmed = text.trim();
     // Require a statement-shaped string: a SQL verb followed by whitespace.
@@ -1082,24 +1105,14 @@ fn detect_sql(text: &str) -> Option<(String, SchemaObjectKind, SchemaAccess)> {
     if tokens.len() < 2 {
         return None;
     }
-
-    if upper.starts_with("SELECT ") {
-        table_after(&tokens, "FROM").map(|t| (t, SchemaObjectKind::Table, SchemaAccess::Read))
-    } else if upper.starts_with("INSERT ") {
-        table_after(&tokens, "INTO").map(|t| (t, SchemaObjectKind::Table, SchemaAccess::Write))
-    } else if upper.starts_with("UPDATE ") {
-        token_at(&tokens, 1).map(|t| (t, SchemaObjectKind::Table, SchemaAccess::Write))
-    } else if upper.starts_with("DELETE ") {
-        table_after(&tokens, "FROM").map(|t| (t, SchemaObjectKind::Table, SchemaAccess::Write))
-    } else if upper.starts_with("CREATE TABLE") {
-        table_after(&tokens, "TABLE").map(|t| (t, SchemaObjectKind::Table, SchemaAccess::Define))
-    } else if upper.starts_with("ALTER TABLE") {
-        table_after(&tokens, "TABLE").map(|t| (t, SchemaObjectKind::Table, SchemaAccess::Define))
-    } else if upper.starts_with("DROP TABLE") {
-        table_after(&tokens, "TABLE").map(|t| (t, SchemaObjectKind::Table, SchemaAccess::Define))
-    } else {
-        None
-    }
+    let (_, table_at, access) = SQL_STATEMENTS
+        .iter()
+        .find(|(prefix, _, _)| upper.starts_with(prefix))?;
+    let table = match table_at {
+        TableAt::After(keyword) => table_after(&tokens, keyword),
+        TableAt::Token(index) => token_at(&tokens, *index),
+    }?;
+    Some((table, SchemaObjectKind::Table, *access))
 }
 
 /// Splits SQL into bare tokens, breaking on whitespace and punctuation.

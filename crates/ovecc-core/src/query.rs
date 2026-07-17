@@ -107,36 +107,46 @@ impl TargetSelector {
     /// Parses prefixed (`table:customers`) or free-form (`Billing`) targets.
     /// Quoted strings are unwrapped.
     pub fn parse(input: &str) -> Self {
+        // Prefixes that wrap the rest of the string verbatim.
+        type Prefix = (&'static str, fn(String) -> TargetSelector);
+        const PREFIXED: &[Prefix] = &[
+            ("table:", TargetSelector::Table),
+            ("file:", TargetSelector::File),
+            ("symbol:", TargetSelector::Symbol),
+            ("finding:", TargetSelector::Finding),
+        ];
         let trimmed = unquote(input.trim());
-        if let Some(rest) = trimmed.strip_prefix("table:") {
-            Self::Table(rest.to_string())
-        } else if let Some(rest) = trimmed.strip_prefix("api:") {
-            // `api:GET:/path` or `api:/path` or `api:name`.
-            match rest.split_once(':') {
-                Some((method, path))
-                    if !method.is_empty() && method.chars().all(|c| c.is_ascii_alphabetic()) =>
-                {
-                    Self::Api {
-                        method: Some(method.to_string()),
-                        path: path.to_string(),
-                    }
-                }
-                _ => Self::Api {
-                    method: None,
-                    path: rest.to_string(),
-                },
+        if let Some(rest) = trimmed.strip_prefix("api:") {
+            return Self::parse_api(rest);
+        }
+        for (prefix, make) in PREFIXED {
+            if let Some(rest) = trimmed.strip_prefix(prefix) {
+                return make(rest.to_string());
             }
-        } else if let Some(rest) = trimmed.strip_prefix("file:") {
-            Self::File(rest.to_string())
-        } else if let Some(rest) = trimmed.strip_prefix("symbol:") {
-            Self::Symbol(rest.to_string())
-        } else if let Some(rest) = trimmed.strip_prefix("finding:") {
-            Self::Finding(rest.to_string())
-        } else if trimmed.contains('.') {
+        }
+        if trimmed.contains('.') {
             // A dotted name is a qualified symbol (`Class.method`).
             Self::QualifiedSymbol(trimmed.to_string())
         } else {
             Self::Free(trimmed.to_string())
+        }
+    }
+
+    /// `api:GET:/path` (method + path), else `api:/path` or `api:name` (path only).
+    fn parse_api(rest: &str) -> Self {
+        match rest.split_once(':') {
+            Some((method, path))
+                if !method.is_empty() && method.chars().all(|c| c.is_ascii_alphabetic()) =>
+            {
+                Self::Api {
+                    method: Some(method.to_string()),
+                    path: path.to_string(),
+                }
+            }
+            _ => Self::Api {
+                method: None,
+                path: rest.to_string(),
+            },
         }
     }
 

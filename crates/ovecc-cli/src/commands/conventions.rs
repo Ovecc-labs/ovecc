@@ -40,59 +40,60 @@ pub(crate) fn render_conventions(report: &ConventionsReport, format: OutputForma
                 println!("{}", ndjson_line("deviation", deviation)?);
             }
         }
-        OutputFormat::Markdown => {
-            println!("# Conventions");
-            println!();
-            for convention in &report.conventions {
-                println!(
-                    "- **{}** (confidence {:.2}, {}/{})",
-                    convention.description,
-                    convention.confidence,
-                    convention.matching,
-                    convention.total
-                );
-            }
-            if !report.deviations.is_empty() {
-                println!();
-                println!("## Deviations");
-                println!();
-                for deviation in &report.deviations {
-                    println!(
-                        "- [{}] {} — {}",
-                        deviation.severity, deviation.description, deviation.reason
-                    );
-                    if let Some(evidence) = &deviation.evidence {
-                        println!("  - Evidence: `{evidence}`");
-                    }
-                }
-            }
-        }
-        OutputFormat::Text => {
-            println!("Detected conventions:");
-            for convention in &report.conventions {
-                println!();
-                println!("  {}", convention.description);
-                println!(
-                    "    Confidence: {:.2} ({}/{})",
-                    convention.confidence, convention.matching, convention.total
-                );
-            }
-            if report.conventions.is_empty() {
-                println!("  (none with sufficient evidence)");
-            }
-            if !report.deviations.is_empty() {
-                println!();
-                println!("Deviations:");
-                for deviation in &report.deviations {
-                    println!();
-                    println!("  [{}] {}", deviation.severity, deviation.description);
-                    println!("    Reason: {}", deviation.reason);
-                    if let Some(evidence) = &deviation.evidence {
-                        println!("    Evidence: {evidence}");
-                    }
-                }
+        OutputFormat::Markdown => conventions_markdown(report),
+        OutputFormat::Text => conventions_text(report),
+    }
+    Ok(())
+}
+
+fn conventions_markdown(report: &ConventionsReport) {
+    println!("# Conventions");
+    println!();
+    for convention in &report.conventions {
+        println!(
+            "- **{}** (confidence {:.2}, {}/{})",
+            convention.description, convention.confidence, convention.matching, convention.total
+        );
+    }
+    if !report.deviations.is_empty() {
+        println!();
+        println!("## Deviations");
+        println!();
+        for deviation in &report.deviations {
+            println!(
+                "- [{}] {} — {}",
+                deviation.severity, deviation.description, deviation.reason
+            );
+            if let Some(evidence) = &deviation.evidence {
+                println!("  - Evidence: `{evidence}`");
             }
         }
     }
-    Ok(())
+}
+
+fn conventions_text(report: &ConventionsReport) {
+    println!("Detected conventions:");
+    for convention in &report.conventions {
+        println!();
+        println!("  {}", convention.description);
+        println!(
+            "    Confidence: {:.2} ({}/{})",
+            convention.confidence, convention.matching, convention.total
+        );
+    }
+    if report.conventions.is_empty() {
+        println!("  (none with sufficient evidence)");
+    }
+    if !report.deviations.is_empty() {
+        println!();
+        println!("Deviations:");
+        for deviation in &report.deviations {
+            println!();
+            println!("  [{}] {}", deviation.severity, deviation.description);
+            println!("    Reason: {}", deviation.reason);
+            if let Some(evidence) = &deviation.evidence {
+                println!("    Evidence: {evidence}");
+            }
+        }
+    }
 }

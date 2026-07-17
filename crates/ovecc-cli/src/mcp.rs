@@ -253,205 +253,209 @@ fn error_result(message: String) -> Value {
 
 /// Builds the CLI sub-argv for a tool, or `None` if the tool is unknown or a
 /// required argument is absent. The global `--repo`/`--format` flags are added
-/// by the caller.
+/// by the caller. The tools are grouped so each builder stays small; names are
+/// disjoint, so the first group that recognizes `name` produces the argv.
 fn build_argv(name: &str, args: &Value) -> Option<Vec<String>> {
-    let s = |key: &str| args.get(key).and_then(Value::as_str);
-    let n = |key: &str| args.get(key).and_then(Value::as_u64);
-    let flag = |key: &str| args.get(key).and_then(Value::as_bool).unwrap_or(false);
+    argv_setup(name, args)
+        .or_else(|| argv_findings(name, args))
+        .or_else(|| argv_navigation(name, args))
+        .or_else(|| argv_change(name, args))
+        .or_else(|| argv_lsp_alias(name, args))
+}
+
+fn arg_str<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
+    args.get(key).and_then(Value::as_str)
+}
+
+fn arg_u64(args: &Value, key: &str) -> Option<u64> {
+    args.get(key).and_then(Value::as_u64)
+}
+
+fn arg_flag(args: &Value, key: &str) -> bool {
+    args.get(key).and_then(Value::as_bool).unwrap_or(false)
+}
+
+/// Appends `--<flag> <value>` when the string arg is present.
+fn push_opt(argv: &mut Vec<String>, args: &Value, key: &str, flag: &str) {
+    if let Some(value) = arg_str(args, key) {
+        argv.push(flag.into());
+        argv.push(value.into());
+    }
+}
+
+/// Appends `--<flag> <value>` when the numeric arg is present.
+fn push_opt_u64(argv: &mut Vec<String>, args: &Value, key: &str, flag: &str) {
+    if let Some(value) = arg_u64(args, key) {
+        argv.push(flag.into());
+        argv.push(value.to_string());
+    }
+}
+
+/// index, init, history, and the no-argument status reports.
+fn argv_setup(name: &str, args: &Value) -> Option<Vec<String>> {
     let mut argv = Vec::new();
     match name {
         "ovecc_index" => {
             argv.push("index".into());
-            if let Some(path) = s("path") {
+            if let Some(path) = arg_str(args, "path") {
                 argv.push(path.into());
             }
         }
         "ovecc_init" => {
             argv.push("init".into());
-            if flag("force") {
+            if arg_flag(args, "force") {
                 argv.push("--force".into());
             }
         }
         "ovecc_history" => {
             argv.push("history".into());
-            if let Some(metric) = s("metric") {
+            if let Some(metric) = arg_str(args, "metric") {
                 argv.push(metric.into());
             }
-            if let Some(limit) = n("limit") {
-                argv.push("--limit".into());
-                argv.push(limit.to_string());
-            }
+            push_opt_u64(&mut argv, args, "limit", "--limit");
         }
         "ovecc_capabilities" => argv.push("capabilities".into()),
         "ovecc_summary" => argv.push("summary".into()),
         "ovecc_report" => argv.push("report".into()),
         "ovecc_health" => argv.push("health".into()),
+        "ovecc_conventions" => argv.push("conventions".into()),
+        _ => return None,
+    }
+    Some(argv)
+}
+
+/// The finding-bearing commands: their severity/baseline/changed-since filters.
+fn argv_findings(name: &str, args: &Value) -> Option<Vec<String>> {
+    let mut argv = Vec::new();
+    match name {
         "ovecc_deadcode" => {
             argv.push("deadcode".into());
-            if let Some(reference) = s("changed_since") {
-                argv.push("--changed-since".into());
-                argv.push(reference.into());
-            }
+            push_opt(&mut argv, args, "changed_since", "--changed-since");
         }
         "ovecc_fix" => {
             argv.push("fix".into());
-            if flag("apply") {
+            if arg_flag(args, "apply") {
                 argv.push("--apply".into());
             }
-            if let Some(rule) = s("rule") {
-                argv.push("--rule".into());
-                argv.push(rule.into());
-            }
+            push_opt(&mut argv, args, "rule", "--rule");
         }
         "ovecc_audit" => {
             argv.push("audit".into());
-            if flag("fetch") {
+            if arg_flag(args, "fetch") {
                 argv.push("--fetch".into());
-            }
-        }
-        "ovecc_conventions" => argv.push("conventions".into()),
-        "ovecc_impact" => {
-            argv.push("impact".into());
-            argv.push(s("target")?.into());
-            if let Some(direction) = s("direction") {
-                argv.push("--direction".into());
-                argv.push(direction.into());
-            }
-            if let Some(depth) = n("max_depth") {
-                argv.push("--max-depth".into());
-                argv.push(depth.to_string());
             }
         }
         "ovecc_violations" => {
             argv.push("violations".into());
-            if let Some(severity) = s("severity") {
-                argv.push("--severity".into());
-                argv.push(severity.into());
-            }
-            if flag("baseline") {
+            push_opt(&mut argv, args, "severity", "--severity");
+            if arg_flag(args, "baseline") {
                 argv.push("--baseline".into());
             }
-            if let Some(reference) = s("changed_since") {
-                argv.push("--changed-since".into());
-                argv.push(reference.into());
-            }
+            push_opt(&mut argv, args, "changed_since", "--changed-since");
         }
         "ovecc_security" => {
             argv.push("security".into());
-            if let Some(severity) = s("severity") {
-                argv.push("--severity".into());
-                argv.push(severity.into());
-            }
+            push_opt(&mut argv, args, "severity", "--severity");
         }
         "ovecc_hotspots" => {
             argv.push("hotspots".into());
-            if let Some(limit) = n("limit") {
-                argv.push("--limit".into());
-                argv.push(limit.to_string());
-            }
+            push_opt_u64(&mut argv, args, "limit", "--limit");
         }
         "ovecc_dupes" => {
             argv.push("dupes".into());
-            if let Some(min_tokens) = n("min_tokens") {
-                argv.push("--min-tokens".into());
-                argv.push(min_tokens.to_string());
-            }
+            push_opt_u64(&mut argv, args, "min_tokens", "--min-tokens");
+        }
+        "ovecc_metrics" => {
+            argv.push("metrics".into());
+            push_opt(&mut argv, args, "target", "--target");
+        }
+        _ => return None,
+    }
+    Some(argv)
+}
+
+/// The element-scoped navigation commands; each needs a target/query.
+fn argv_navigation(name: &str, args: &Value) -> Option<Vec<String>> {
+    let mut argv = Vec::new();
+    match name {
+        "ovecc_impact" => {
+            argv.push("impact".into());
+            argv.push(arg_str(args, "target")?.into());
+            push_opt(&mut argv, args, "direction", "--direction");
+            push_opt_u64(&mut argv, args, "max_depth", "--max-depth");
         }
         "ovecc_query" => {
             argv.push("query".into());
-            argv.push(s("query")?.into());
-            if let Some(depth) = n("depth") {
-                argv.push("--depth".into());
-                argv.push(depth.to_string());
-            }
+            argv.push(arg_str(args, "query")?.into());
+            push_opt_u64(&mut argv, args, "depth", "--depth");
         }
         "ovecc_explain" => {
             argv.push("explain".into());
-            argv.push(s("target")?.into());
+            argv.push(arg_str(args, "target")?.into());
         }
         "ovecc_context" => {
             argv.push("export".into());
             argv.push("context".into());
-            argv.push(s("target")?.into());
+            argv.push(arg_str(args, "target")?.into());
         }
         "ovecc_export_graph" => {
             argv.push("export".into());
             argv.push("graph".into());
-            if let Some(path) = s("html") {
-                argv.push("--html".into());
-                argv.push(path.into());
-            }
+            push_opt(&mut argv, args, "html", "--html");
         }
+        _ => return None,
+    }
+    Some(argv)
+}
+
+/// The change-comparison commands (drift/gate/diff/review) and diagnose/advise.
+fn argv_change(name: &str, args: &Value) -> Option<Vec<String>> {
+    let base_head_fail = |verb: &str| {
+        let mut argv = vec![verb.to_string()];
+        push_base_head(&mut argv, arg_str(args, "base"), arg_str(args, "head"));
+        push_opt(&mut argv, args, "fail_on", "--fail-on");
+        argv
+    };
+    let mut argv = Vec::new();
+    match name {
         "ovecc_drift" => {
             argv.push("drift".into());
-            if let Some(since) = s("since") {
-                argv.push("--since".into());
-                argv.push(since.into());
-            }
+            push_opt(&mut argv, args, "since", "--since");
         }
-        "ovecc_gate" => {
-            argv.push("gate".into());
-            push_base_head(&mut argv, s("base"), s("head"));
-            if let Some(fail_on) = s("fail_on") {
-                argv.push("--fail-on".into());
-                argv.push(fail_on.into());
-            }
-        }
-        "ovecc_diff" => {
-            argv.push("diff".into());
-            push_base_head(&mut argv, s("base"), s("head"));
-            if let Some(fail_on) = s("fail_on") {
-                argv.push("--fail-on".into());
-                argv.push(fail_on.into());
-            }
-        }
-        "ovecc_review" => {
-            argv.push("review".into());
-            push_base_head(&mut argv, s("base"), s("head"));
-            if let Some(fail_on) = s("fail_on") {
-                argv.push("--fail-on".into());
-                argv.push(fail_on.into());
-            }
-        }
+        "ovecc_gate" => return Some(base_head_fail("gate")),
+        "ovecc_diff" => return Some(base_head_fail("diff")),
+        "ovecc_review" => return Some(base_head_fail("review")),
         "ovecc_diagnose" => {
             argv.push("diagnose".into());
-            if let Some(target) = s("target") {
-                argv.push("--target".into());
-                argv.push(target.into());
-            }
-            if let Some(severity) = s("severity") {
-                argv.push("--severity".into());
-                argv.push(severity.into());
-            }
+            push_opt(&mut argv, args, "target", "--target");
+            push_opt(&mut argv, args, "severity", "--severity");
         }
         "ovecc_advise" => {
             argv.push("advise".into());
-            argv.push(s("target")?.into());
+            argv.push(arg_str(args, "target")?.into());
         }
-        "ovecc_metrics" => {
-            argv.push("metrics".into());
-            if let Some(target) = s("target") {
-                argv.push("--target".into());
-                argv.push(target.into());
-            }
-        }
-        // LSP-vocabulary aliases (opt-in, see `lsp_aliases_enabled`). Each is a
-        // thin renaming of an existing verb, not new analysis.
+        _ => return None,
+    }
+    Some(argv)
+}
+
+/// LSP-vocabulary aliases (opt-in, see `lsp_aliases_enabled`). Each is a thin
+/// renaming of an existing verb, not new analysis.
+fn argv_lsp_alias(name: &str, args: &Value) -> Option<Vec<String>> {
+    let mut argv = Vec::new();
+    match name {
         "find_references" => {
             argv.push("query".into());
-            argv.push(format!("rdeps {}", s("symbol")?));
+            argv.push(format!("rdeps {}", arg_str(args, "symbol")?));
         }
         "get_call_hierarchy" => {
             argv.push("impact".into());
-            argv.push(s("symbol")?.into());
-            if let Some(direction) = s("direction") {
-                argv.push("--direction".into());
-                argv.push(direction.into());
-            }
+            argv.push(arg_str(args, "symbol")?.into());
+            push_opt(&mut argv, args, "direction", "--direction");
         }
         "workspace_symbol" => {
             argv.push("explain".into());
-            argv.push(s("query")?.into());
+            argv.push(arg_str(args, "query")?.into());
         }
         _ => return None,
     }
@@ -495,7 +499,7 @@ fn tool_specs() -> Value {
         {"name": "ovecc_health", "description": "Functions over the cyclomatic/cognitive complexity thresholds (oxc TS/JS extractor).", "inputSchema": obj(json!({"repo": repo}), json!([]))},
         {"name": "ovecc_deadcode", "description": "Likely dead code: unused exports and unreachable files, from exports + entry-point reachability.", "inputSchema": obj(json!({"repo": repo, "changed_since": {"type": "string", "description": "Only findings touching files changed since this Git ref (progressive adoption)."}}), json!([]))},
         {"name": "ovecc_fix", "description": "Apply the mechanical fixes for auto-fixable findings: delete unused files, drop the export keyword on unused exports, remove unused manifest dependencies. Dry-run unless apply=true; every edit re-verifies the file against the index first and skips stale entries with a reason. After apply=true, call ovecc_index to refresh the model.", "inputSchema": obj(json!({"repo": repo, "apply": {"type": "boolean", "description": "Write the changes (default false = dry-run preview)."}, "rule": {"type": "string", "description": "Only fix findings from this rule, e.g. unused-export, unused-file."}}), json!([]))},
-        {"name": "ovecc_dupes", "description": "Duplicated code (clone families) over a normalized token stream.", "inputSchema": obj(json!({"repo": repo, "min_tokens": {"type": "integer", "description": "Minimum shared token run to report (default 50)."}}), json!([]))},
+        {"name": "ovecc_dupes", "description": "Duplicated code (clone families) over a normalized token stream.", "inputSchema": obj(json!({"repo": repo, "min_tokens": {"type": "integer", "description": "Minimum shared token run to report (default 100, PMD CPD's)."}}), json!([]))},
         {"name": "ovecc_hotspots", "description": "Technical-debt hotspot ranking: churn x coupling x ownership.", "inputSchema": obj(json!({"repo": repo, "limit": {"type": "integer", "description": "Number of hotspots to return (default 10)."}}), json!([]))},
         {"name": "ovecc_conventions", "description": "Learned repository conventions and their deviations.", "inputSchema": obj(json!({"repo": repo}), json!([]))},
         {"name": "ovecc_drift", "description": "Architecture drift over time versus a previous snapshot or Git ref.", "inputSchema": obj(json!({"repo": repo, "since": {"type": "string", "description": "Git ref or snapshot to compare against, e.g. main or v1.0.0."}}), json!([]))},

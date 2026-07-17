@@ -63,70 +63,9 @@ pub fn detect(
         return Vec::new();
     }
 
-    // Per-file sequence of k-window fingerprints: `fps[file][i]` covers tokens
-    // `i..i+k`.
-    let fps: Vec<Vec<u128>> = files
-        .iter()
-        .map(|file| {
-            let count = file.token_hashes.len();
-            if count < k {
-                Vec::new()
-            } else {
-                (0..=count - k)
-                    .map(|i| window_fingerprint(&file.token_hashes[i..i + k]))
-                    .collect()
-            }
-        })
-        .collect();
-
-    // Index every window start by its fingerprint.
-    let mut index: HashMap<u128, Vec<(usize, usize)>> = HashMap::new();
-    for (file_index, file_fps) in fps.iter().enumerate() {
-        for (start, &fingerprint) in file_fps.iter().enumerate() {
-            index
-                .entry(fingerprint)
-                .or_default()
-                .push((file_index, start));
-        }
-    }
-
-    // Distinct-file reach of each fingerprint, so the most widely-shared clone
-    // families are formed FIRST. Without this, a long run shared by two
-    // near-identical *copies* can consume their overlapping windows before the
-    // shorter run that ALSO covers the canonical original is ever considered —
-    // silently dropping the original from the family. That made membership depend
-    // on file scan order (a canonical util sorted after its copies vanished from
-    // the report). Ranking seeds by reach makes the output order-independent.
-    let mut fingerprint_reach: HashMap<u128, usize> = HashMap::with_capacity(index.len());
-    for (fingerprint, occurrences) in &index {
-        let distinct = occurrences
-            .iter()
-            .map(|(file, _)| *file)
-            .collect::<BTreeSet<_>>()
-            .len();
-        fingerprint_reach.insert(*fingerprint, distinct);
-    }
-
-    let mut seeds: Vec<(usize, usize)> = Vec::new();
-    for (file_index, file_fps) in fps.iter().enumerate() {
-        for start in 0..file_fps.len() {
-            seeds.push((file_index, start));
-        }
-    }
-    seeds.sort_by(|&(file_a, start_a), &(file_b, start_b)| {
-        let reach_a = fingerprint_reach
-            .get(&fps[file_a][start_a])
-            .copied()
-            .unwrap_or(0);
-        let reach_b = fingerprint_reach
-            .get(&fps[file_b][start_b])
-            .copied()
-            .unwrap_or(0);
-        reach_b
-            .cmp(&reach_a)
-            .then_with(|| file_a.cmp(&file_b))
-            .then_with(|| start_a.cmp(&start_b))
-    });
+    let fps = window_fingerprints(files, k);
+    let index = index_windows(&fps);
+    let seeds = rank_seeds(&fps, &index);
 
     // Window starts already absorbed into an emitted clone, so the overlapping
     // windows of one maximal clone are not re-reported as many families.
@@ -148,51 +87,13 @@ pub fn detect(
             .copied()
             .filter(|(file, pos)| !consumed[*file].contains(pos))
             .collect();
-        if members.len() < 2 {
-            continue;
-        }
-        let distinct = members
-            .iter()
-            .map(|(file, _)| *file)
-            .collect::<BTreeSet<_>>();
-        if cross_file_only && distinct.len() < 2 {
+        if members.len() < 2 || (cross_file_only && !spans_two_files(&members)) {
             continue;
         }
 
-        // Extend in lock-step while every member's next window agrees — this
-        // grows the shared run to its maximal common length.
-        let mut windows = 1usize;
-        while let Some(expected) = fps[members[0].0].get(members[0].1 + windows).copied() {
-            let all_match = members
-                .iter()
-                .all(|(file, pos)| fps[*file].get(pos + windows).copied() == Some(expected));
-            if all_match {
-                windows += 1;
-            } else {
-                break;
-            }
-        }
+        let windows = maximal_run(&members, &fps);
         let token_count = windows - 1 + k;
-
-        // Mark every covered window start consumed, then build instances.
-        let mut instances: Vec<CloneInstance> = Vec::new();
-        for (file, pos) in &members {
-            for offset in 0..windows {
-                consumed[*file].insert(pos + offset);
-            }
-            let lines = &files[*file].token_lines;
-            let start_line = lines[*pos];
-            let end_line = lines[(pos + token_count - 1).min(lines.len() - 1)];
-            if end_line.saturating_sub(start_line) + 1 < min_lines as u32 {
-                continue;
-            }
-            instances.push(CloneInstance {
-                path: files[*file].path.clone(),
-                start_line,
-                end_line,
-                token_count,
-            });
-        }
+        let instances = build_instances(&members, windows, k, files, min_lines, &mut consumed);
 
         let distinct_files = instances
             .iter()
@@ -207,11 +108,6 @@ pub fn detect(
             .map(|instance| instance.end_line.saturating_sub(instance.start_line) + 1)
             .max()
             .unwrap_or(0);
-        instances.sort_by(|a, b| {
-            a.path
-                .cmp(&b.path)
-                .then_with(|| a.start_line.cmp(&b.start_line))
-        });
         families.push(CloneFamily {
             token_length: token_count,
             line_span,
@@ -231,6 +127,139 @@ pub fn detect(
             })
     });
     families
+}
+
+/// Per-file sequence of k-window fingerprints: `fps[file][i]` covers tokens
+/// `i..i+k`. Files shorter than `k` contribute no windows.
+fn window_fingerprints(files: &[FileTokens], k: usize) -> Vec<Vec<u128>> {
+    files
+        .iter()
+        .map(|file| {
+            let count = file.token_hashes.len();
+            if count < k {
+                Vec::new()
+            } else {
+                (0..=count - k)
+                    .map(|i| window_fingerprint(&file.token_hashes[i..i + k]))
+                    .collect()
+            }
+        })
+        .collect()
+}
+
+/// Every window start indexed by its fingerprint.
+fn index_windows(fps: &[Vec<u128>]) -> HashMap<u128, Vec<(usize, usize)>> {
+    let mut index: HashMap<u128, Vec<(usize, usize)>> = HashMap::new();
+    for (file_index, file_fps) in fps.iter().enumerate() {
+        for (start, &fingerprint) in file_fps.iter().enumerate() {
+            index
+                .entry(fingerprint)
+                .or_default()
+                .push((file_index, start));
+        }
+    }
+    index
+}
+
+/// Window starts ordered by how many distinct files share their fingerprint
+/// (desc), then (file, start). Forming the most widely-shared families FIRST is
+/// what makes the output order-independent: without it, a long run shared by two
+/// near-identical copies can consume their overlapping windows before the
+/// shorter run that ALSO covers the canonical original is considered, silently
+/// dropping the original from the family (its membership then depended on file
+/// scan order, so a canonical util sorted after its copies vanished).
+fn rank_seeds(
+    fps: &[Vec<u128>],
+    index: &HashMap<u128, Vec<(usize, usize)>>,
+) -> Vec<(usize, usize)> {
+    let mut reach: HashMap<u128, usize> = HashMap::with_capacity(index.len());
+    for (fingerprint, occurrences) in index {
+        let distinct = occurrences
+            .iter()
+            .map(|(file, _)| *file)
+            .collect::<BTreeSet<_>>()
+            .len();
+        reach.insert(*fingerprint, distinct);
+    }
+    let mut seeds: Vec<(usize, usize)> = Vec::new();
+    for (file_index, file_fps) in fps.iter().enumerate() {
+        for start in 0..file_fps.len() {
+            seeds.push((file_index, start));
+        }
+    }
+    let reach_of =
+        |&(file, start): &(usize, usize)| reach.get(&fps[file][start]).copied().unwrap_or(0);
+    seeds.sort_by(|a, b| {
+        reach_of(b)
+            .cmp(&reach_of(a))
+            .then_with(|| a.0.cmp(&b.0))
+            .then_with(|| a.1.cmp(&b.1))
+    });
+    seeds
+}
+
+/// True when the members touch at least two distinct files.
+fn spans_two_files(members: &[(usize, usize)]) -> bool {
+    members
+        .iter()
+        .map(|(file, _)| *file)
+        .collect::<BTreeSet<_>>()
+        .len()
+        >= 2
+}
+
+/// Grows the shared run in lock-step to its maximal common length, returning the
+/// number of windows (>= 1) every member agrees on.
+fn maximal_run(members: &[(usize, usize)], fps: &[Vec<u128>]) -> usize {
+    let mut windows = 1usize;
+    while let Some(expected) = fps[members[0].0].get(members[0].1 + windows).copied() {
+        let all_match = members
+            .iter()
+            .all(|(file, pos)| fps[*file].get(pos + windows).copied() == Some(expected));
+        if all_match {
+            windows += 1;
+        } else {
+            break;
+        }
+    }
+    windows
+}
+
+/// Marks every covered window start consumed and builds the clone instances,
+/// dropping any that span fewer than `min_lines`. Sorted by path then line.
+fn build_instances(
+    members: &[(usize, usize)],
+    windows: usize,
+    k: usize,
+    files: &[FileTokens],
+    min_lines: usize,
+    consumed: &mut [HashSet<usize>],
+) -> Vec<CloneInstance> {
+    let token_count = windows - 1 + k;
+    let mut instances: Vec<CloneInstance> = Vec::new();
+    for (file, pos) in members {
+        for offset in 0..windows {
+            consumed[*file].insert(pos + offset);
+        }
+        let lines = &files[*file].token_lines;
+        let start_line = lines[*pos];
+        let end_line = lines[(pos + token_count - 1).min(lines.len() - 1)];
+        if end_line.saturating_sub(start_line) + 1 < min_lines as u32 {
+            continue;
+        }
+        instances.push(CloneInstance {
+            path: files[*file].path.clone(),
+            start_line,
+            end_line,
+            token_count,
+        });
+    }
+    instances.sort_by(|a, b| {
+        a.path
+            .cmp(&b.path)
+            .then_with(|| a.start_line.cmp(&b.start_line))
+    });
+    instances
 }
 
 /// Collision-free 128-bit fingerprint of a token window (two independent FNV-1a

@@ -1015,20 +1015,13 @@ fn detect_unstable_interface(
 /// the co-change is unexplained by the architecture — a Modularity Violation
 /// (Wong & Cai / Clio), the higher-signal case. When a structural edge exists,
 /// it is ordinary (lower-signal) change coupling. Silent without git history.
-fn detect_change_coupling(
+/// Sums co-change weight between distinct real source components, dropping the
+/// pairs that are process noise rather than architectural signal.
+fn aggregate_coupled_pairs(
     g: &ComponentGraph,
     co_change: &[(String, String, f64)],
     config: &DiagnoseConfig,
-    out: &mut Vec<Diagnosis>,
-) {
-    if co_change.is_empty() {
-        return;
-    }
-    // Same history floor as the other evolutionary detectors: a handful of
-    // commits co-touching files is not an architectural signal yet.
-    if g.churn.values().sum::<f64>() < config.evolutionary_min_history {
-        return;
-    }
+) -> BTreeMap<(String, String), f64> {
     let mut pairs: BTreeMap<(String, String), f64> = BTreeMap::new();
     for (a, b, n) in co_change {
         if is_excluded(a, &config.exclude) || is_excluded(b, &config.exclude) {
@@ -1056,6 +1049,24 @@ fn detect_change_coupling(
         let key = if ca < cb { (ca, cb) } else { (cb, ca) };
         *pairs.entry(key).or_default() += *n;
     }
+    pairs
+}
+
+fn detect_change_coupling(
+    g: &ComponentGraph,
+    co_change: &[(String, String, f64)],
+    config: &DiagnoseConfig,
+    out: &mut Vec<Diagnosis>,
+) {
+    if co_change.is_empty() {
+        return;
+    }
+    // Same history floor as the other evolutionary detectors: a handful of
+    // commits co-touching files is not an architectural signal yet.
+    if g.churn.values().sum::<f64>() < config.evolutionary_min_history {
+        return;
+    }
+    let pairs = aggregate_coupled_pairs(g, co_change, config);
     let min = config.change_coupling_min as f64;
     for ((ca, cb), n) in &pairs {
         if *n < min {

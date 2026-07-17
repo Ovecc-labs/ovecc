@@ -303,64 +303,93 @@ fn cycles_from_adjacency(adjacency: &ModuleAdjacency) -> Vec<Vec<String>> {
 
 /// Iterative Tarjan SCC. Returns components of size >= 2 (the cyclic ones).
 fn strongly_connected(adjacency: &ModuleAdjacency) -> Vec<Vec<usize>> {
-    let n = adjacency.names.len();
-    let mut index = vec![u32::MAX; n];
-    let mut lowlink = vec![0u32; n];
-    let mut on_stack = vec![false; n];
-    let mut stack: Vec<usize> = Vec::new();
-    let mut counter: u32 = 0;
-    let mut sccs: Vec<Vec<usize>> = Vec::new();
-
-    for start in 0..n {
-        if index[start] != u32::MAX {
-            continue;
+    let mut tarjan = Tarjan::new(adjacency);
+    for start in 0..adjacency.names.len() {
+        if tarjan.index[start] == u32::MAX {
+            tarjan.visit(start);
         }
-        index[start] = counter;
-        lowlink[start] = counter;
-        counter += 1;
-        on_stack[start] = true;
-        stack.push(start);
+    }
+    tarjan.sccs
+}
+
+/// The mutable state of one iterative Tarjan run. Kept as a struct so the DFS
+/// step splits into small methods rather than one deeply nested loop body.
+struct Tarjan<'a> {
+    adjacency: &'a ModuleAdjacency,
+    index: Vec<u32>,
+    lowlink: Vec<u32>,
+    on_stack: Vec<bool>,
+    stack: Vec<usize>,
+    counter: u32,
+    sccs: Vec<Vec<usize>>,
+}
+
+impl<'a> Tarjan<'a> {
+    fn new(adjacency: &'a ModuleAdjacency) -> Self {
+        let n = adjacency.names.len();
+        Self {
+            adjacency,
+            index: vec![u32::MAX; n],
+            lowlink: vec![0; n],
+            on_stack: vec![false; n],
+            stack: Vec::new(),
+            counter: 0,
+            sccs: Vec::new(),
+        }
+    }
+
+    /// Assigns a node its discovery index and pushes it onto the Tarjan stack.
+    fn discover(&mut self, node: usize) {
+        self.index[node] = self.counter;
+        self.lowlink[node] = self.counter;
+        self.counter += 1;
+        self.on_stack[node] = true;
+        self.stack.push(node);
+    }
+
+    /// Pops the current SCC once `node` is confirmed as its root, recording it
+    /// when it is a genuine cycle (size >= 2).
+    fn close_scc(&mut self, node: usize) {
+        let mut scc = Vec::new();
+        loop {
+            let popped = self.stack.pop().expect("SCC stack non-empty");
+            self.on_stack[popped] = false;
+            scc.push(popped);
+            if popped == node {
+                break;
+            }
+        }
+        if scc.len() >= 2 {
+            self.sccs.push(scc);
+        }
+    }
+
+    fn visit(&mut self, start: usize) {
+        self.discover(start);
         // DFS frames: (node, next successor position).
         let mut dfs: Vec<(usize, usize)> = vec![(start, 0)];
-
         while let Some(&(node, pos)) = dfs.last() {
-            if pos < adjacency.succ[node].len() {
+            if pos < self.adjacency.succ[node].len() {
                 dfs.last_mut().expect("frame present").1 += 1;
-                let next = adjacency.succ[node][pos];
-                if index[next] == u32::MAX {
-                    index[next] = counter;
-                    lowlink[next] = counter;
-                    counter += 1;
-                    on_stack[next] = true;
-                    stack.push(next);
+                let next = self.adjacency.succ[node][pos];
+                if self.index[next] == u32::MAX {
+                    self.discover(next);
                     dfs.push((next, 0));
-                } else if on_stack[next] {
-                    lowlink[node] = lowlink[node].min(index[next]);
+                } else if self.on_stack[next] {
+                    self.lowlink[node] = self.lowlink[node].min(self.index[next]);
                 }
             } else {
-                let node_lowlink = lowlink[node];
+                let node_lowlink = self.lowlink[node];
                 dfs.pop();
                 if let Some(&(parent, _)) = dfs.last() {
-                    lowlink[parent] = lowlink[parent].min(node_lowlink);
+                    self.lowlink[parent] = self.lowlink[parent].min(node_lowlink);
                 }
-                if lowlink[node] == index[node] {
-                    let mut scc = Vec::new();
-                    loop {
-                        let popped = stack.pop().expect("SCC stack non-empty");
-                        on_stack[popped] = false;
-                        scc.push(popped);
-                        if popped == node {
-                            break;
-                        }
-                    }
-                    if scc.len() >= 2 {
-                        sccs.push(scc);
-                    }
+                if self.lowlink[node] == self.index[node] {
+                    self.close_scc(node);
                 }
             }
         }
     }
-    sccs
 }
 
 /// Rotates a cycle so its lexicographically-smallest member is first — a
