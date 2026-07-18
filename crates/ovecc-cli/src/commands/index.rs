@@ -126,6 +126,15 @@ pub(crate) fn render_index_report(report: &IndexReport, format: OutputFormat) ->
             }
         }
         OutputFormat::Text => {
+            // A clean run from cache changed nothing worth fifteen lines: one
+            // line says "stop re-indexing" to a human and an agent alike.
+            if report.files_parsed == 0 && report.parse_failures.is_empty() {
+                println!(
+                    "Index up to date: {} files ({} from cache), snapshot {}.",
+                    report.files_indexed, report.files_from_cache, report.snapshot_id
+                );
+                return Ok(());
+            }
             println!("Indexed repository: {}", report.repository_root);
             println!("Database: {}", report.database_path);
             println!("Snapshot: {}", report.snapshot_id);

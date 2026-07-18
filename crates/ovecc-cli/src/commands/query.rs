@@ -246,28 +246,60 @@ fn unresolved_target(input: &str, nodes: &[BlastNode], edges: &[BlastEdge]) -> a
     .into()
 }
 
+/// Anchors listed before the output caps at [`QUERY_ITEM_CAP`]. A god node can
+/// carry hundreds of dependents; the count is the answer at that point, and an
+/// uncapped list once cost an agent session more than the grep it replaced.
+const QUERY_ITEM_CAP: usize = 50;
+
 // Echoing the resolved label matters because targets resolve by substring:
 // `deps sinc` lands on `filter_changed_since`, and a count without the
 // resolved name reads as an answer about the literal input.
 fn print_query_labels(label: &str, result: BlastResult, format: OutputFormat) -> Result<u8> {
     let items = result.impacted;
+    let shown = &items[..items.len().min(QUERY_ITEM_CAP)];
     match format {
         OutputFormat::Json | OutputFormat::Ndjson => {
-            let data = serde_json::json!({
+            let mut data = serde_json::json!({
                 "query": label.to_ascii_lowercase(),
                 "target": result.target_label,
-                "items": items,
+                "items": shown,
+                "total": items.len(),
             });
+            if shown.len() < items.len() {
+                data["truncated"] = serde_json::json!(true);
+            }
             emit_json("query", &data, meta_for("query"))?;
         }
         _ => {
             println!("{label} of {}: {}", result.target_label, items.len());
-            for item in &items {
+            for item in shown {
                 println!("  {}", format_anchor(item));
+            }
+            if shown.len() < items.len() {
+                println!(
+                    "  … and {} more (narrow the question, or `ovecc grep {}` to list use sites)",
+                    items.len() - shown.len(),
+                    result.target_label
+                );
             }
         }
     }
     Ok(0)
+}
+
+/// Truncates a JSON array field in place, recording the pre-cap length in a
+/// sibling `<field>_total`. Returns whether anything was cut.
+fn cap_array(data: &mut serde_json::Value, field: &str, cap: usize) -> bool {
+    let Some(items) = data.get_mut(field).and_then(|v| v.as_array_mut()) else {
+        return false;
+    };
+    let total = items.len();
+    if total <= cap {
+        return false;
+    }
+    items.truncate(cap);
+    data[format!("{field}_total")] = serde_json::json!(total);
+    true
 }
 
 /// `label  file:line`, or just the label when the node has no single source
@@ -464,7 +496,15 @@ pub(crate) fn load_impact(
 pub(crate) fn render_blast(result: &BlastResult, format: OutputFormat) -> Result<()> {
     match format {
         OutputFormat::Json | OutputFormat::Sarif | OutputFormat::Codeclimate => {
-            emit_json("impact", result, meta_for("impact"))?
+            // The per-kind counts already summarize the full radius; the node
+            // and path lists cap so one hub target cannot flood a session.
+            let mut data = serde_json::to_value(result)?;
+            let truncated = cap_array(&mut data, "impacted", QUERY_ITEM_CAP)
+                | cap_array(&mut data, "paths", 10);
+            if truncated {
+                data["truncated"] = serde_json::json!(true);
+            }
+            emit_json("impact", &data, meta_for("impact"))?
         }
         OutputFormat::Ndjson => {
             emit_ndjson_meta("impact", &meta_for("impact"))?;
