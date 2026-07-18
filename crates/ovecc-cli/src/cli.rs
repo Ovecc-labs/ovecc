@@ -123,7 +123,7 @@ pub enum FailOn {
 pub enum AgentHookKind {
     /// PreToolUse: block a broad text search while the graph can answer it.
     Enforce,
-    /// PostToolUse: record that an ovecc call just ran (unlocks the grace).
+    /// PostToolUse no-op kept for settings wired by earlier versions.
     Mark,
     /// SessionStart: point the agent at the graph.
     Session,
@@ -231,6 +231,31 @@ pub enum Command {
     },
     /// Learn repository conventions and detect deviations.
     Conventions,
+    /// Search the repository from the index: symbol definitions first, then
+    /// text matches from an ignore-aware scan, deduplicated and capped. Covers
+    /// everything a plain grep covers, in a fraction of the output.
+    Grep {
+        /// Regex to search for. All-lowercase searches case-insensitively
+        /// (smart case); any uppercase makes it exact.
+        pattern: String,
+        /// Optional paths (files or directories) to scope the text scan.
+        #[arg(value_name = "PATH")]
+        paths: Vec<String>,
+        /// Matches to print. 0 prints all of them; totals always cover the
+        /// whole set.
+        #[arg(long, default_value_t = crate::commands::search::DEFAULT_GREP_LIMIT)]
+        limit: usize,
+    },
+    /// Read one element instead of a whole file: a symbol's source by name, a
+    /// `file:start-end` range, a `file:line` anchor (expands to the enclosing
+    /// symbol), or a file's symbol outline.
+    Read {
+        /// Symbol name, `file:line`, `file:start-end`, or a bare file path.
+        target: String,
+        /// Maximum lines to print before truncating (0 = no cap).
+        #[arg(long, default_value_t = crate::commands::search::DEFAULT_READ_LINES)]
+        limit: usize,
+    },
     /// Run a structured architecture query.
     Query {
         /// e.g. `"deps Billing"`, `"rdeps table:customers"`, `"billing -> user"`,
@@ -502,6 +527,17 @@ fn unresolved_target_envelope(input: &str, candidates: &[(String, String)]) -> S
     .to_string()
 }
 
+/// The repo/format resolution the search primitives share; folding it keeps
+/// the two dispatch arms from cloning the setup preamble a third time.
+fn search_setup(
+    repo: Option<PathBuf>,
+    format: Option<FormatArg>,
+) -> Result<(ProjectPaths, OutputFormat)> {
+    let paths = ProjectPaths::resolve(repo.unwrap_or_else(|| PathBuf::from(".")))?;
+    let config = load_config(&paths, format)?;
+    Ok((paths, config.output.default_format))
+}
+
 /// Executes the parsed command. Split from [`run`] so the single error boundary
 /// there can render failures format-aware before they reach `main`.
 fn run_command(cli: Cli) -> Result<u8> {
@@ -683,6 +719,18 @@ fn run_command(cli: Cli) -> Result<u8> {
             let config = load_config(&paths, format_override)?;
             let parsed = Query::parse(&query)?;
             run_query(&paths, &parsed, config.output.default_format, depth)
+        }
+        Command::Grep {
+            pattern,
+            paths: scope,
+            limit,
+        } => {
+            let (paths, format) = search_setup(cli.repo, format_override)?;
+            crate::commands::search::run_grep(&paths, &pattern, &scope, limit, format)
+        }
+        Command::Read { target, limit } => {
+            let (paths, format) = search_setup(cli.repo, format_override)?;
+            crate::commands::search::run_read(&paths, &target, limit, format)
         }
         Command::Export {
             what: ExportCommand::Context { target },

@@ -144,6 +144,25 @@ runtime dependency); the file opens offline.
 { "html": "ovecc-graph.html", "bytes": 158014, "modules": 209, "files": 252, "file_edges": 535 }
 ```
 
+### `ovecc grep <pattern> [path...] [--limit]`
+
+Search served from the index: symbol definitions first (name, kind,
+`file:start-end` span), then text matches from an ignore-aware disk scan —
+configs and docs included — in the familiar `path:line: text` form. Matches are
+deduplicated and capped (5 per file, 50 overall by default; totals always cover
+the full set), with test files ranked after source. All-lowercase patterns
+search case-insensitively (smart case). Same coverage as `grep -r`, a fraction
+of the output.
+
+### `ovecc read <target> [--limit]`
+
+One element's source instead of a whole file. Accepts a symbol name (prints
+its exact body, line-numbered, with a `file:start-end` header), a `file:line`
+anchor (expands to the enclosing symbol — the form `query`, `impact`, and
+`grep` emit), a `file:start-end` range, or a bare file path (prints the file's
+symbol outline to pick from). Several definitions under one name list their
+anchors instead of guessing.
+
 ### `ovecc query "<expr>"`
 
 Structured graph queries: `deps X`, `rdeps X`, `paths X`, `module X`,

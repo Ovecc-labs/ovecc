@@ -205,6 +205,18 @@ pub struct FileGraphRow {
     pub module: String,
 }
 
+/// One symbol definition site, as `read` and `grep` consume it: enough to name
+/// the element and slice its source from disk without opening the whole file.
+#[derive(Debug, Clone)]
+pub struct SymbolDef {
+    pub name: String,
+    pub qualified_name: String,
+    pub kind: String,
+    pub path: String,
+    pub start_line: u32,
+    pub end_line: u32,
+}
+
 #[cfg(test)]
 mod testutil {
     use crate::ArchitectureStore;

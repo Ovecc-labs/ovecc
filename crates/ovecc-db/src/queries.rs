@@ -2,7 +2,8 @@
 //! code facts, ownership, and the metric history.
 
 use crate::{
-    ArchitectureStore, FileGraphRow, FileOwnership, FindingRow, MetricPoint, collect_rows,
+    ArchitectureStore, FileGraphRow, FileOwnership, FindingRow, MetricPoint, SymbolDef,
+    collect_rows,
 };
 use anyhow::Result;
 use duckdb::{Connection, params};
@@ -232,6 +233,32 @@ impl ArchitectureStore {
                 row.get::<_, i64>(1)? as u32,
                 row.get::<_, i64>(2)? as u32,
             ))
+        })?;
+        collect_rows(rows)
+    }
+
+    /// Every symbol definition with a recorded span, joined to its file path —
+    /// the lookup table behind `read` (slice one body from disk) and `grep`
+    /// (definitions ranked before text matches). Filtering happens in Rust:
+    /// the caller ranks exact/suffix/substring tiers no SQL LIKE expresses.
+    pub fn symbol_defs(&self, repository_id: &str) -> Result<Vec<SymbolDef>> {
+        let mut statement = self.conn.prepare(
+            "SELECT s.name, s.qualified_name, s.kind, f.path, s.start_line, s.end_line
+             FROM symbols s
+             JOIN files f ON f.id = s.file_id AND f.repository_id = s.repository_id
+             WHERE s.repository_id = ?
+               AND s.start_line IS NOT NULL AND s.end_line IS NOT NULL
+             ORDER BY f.path, s.start_line",
+        )?;
+        let rows = statement.query_map(params![repository_id], |row| {
+            Ok(SymbolDef {
+                name: row.get::<_, String>(0)?,
+                qualified_name: row.get::<_, String>(1)?,
+                kind: row.get::<_, String>(2)?,
+                path: row.get::<_, String>(3)?,
+                start_line: row.get::<_, i64>(4)? as u32,
+                end_line: row.get::<_, i64>(5)? as u32,
+            })
         })?;
         collect_rows(rows)
     }

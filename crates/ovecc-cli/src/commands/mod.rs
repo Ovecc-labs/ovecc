@@ -19,6 +19,7 @@ pub(crate) mod history;
 pub(crate) mod index;
 pub(crate) mod query;
 pub(crate) mod review;
+pub(crate) mod search;
 pub(crate) mod summary;
 
 /// Resolves a CLI ref argument for `diff`/`drift`. Snapshot keywords

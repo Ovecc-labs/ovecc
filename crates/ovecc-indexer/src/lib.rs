@@ -10,6 +10,7 @@ mod imports;
 mod manifests;
 pub mod resolve;
 
+pub use discover::is_excluded_component;
 pub use manifests::manifest_component_roots;
 
 use anyhow::{Context, Result};

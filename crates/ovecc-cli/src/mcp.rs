@@ -43,11 +43,14 @@ fn active_profile() -> Profile {
 }
 
 /// The agent profile, ordered by how readily a coding agent should reach for
-/// each tool. The navigation tools lead because that is where an ambiguous
-/// "search the code" impulse gets resolved, and the first listed tool wins ties
-/// under positional bias; setup (`capabilities`, `index`) trails since the
-/// SessionStart digest and the `initialize` instructions already point at it.
+/// each tool. `grep` and `read` lead: they carry the two impulses every agent
+/// session starts from (search the code, read a file), and the first listed
+/// tool wins ties under positional bias. The graph verbs follow; setup
+/// (`capabilities`, `index`) trails since the SessionStart digest and the
+/// `initialize` instructions already point at it.
 const AGENT_PROFILE: &[&str] = &[
+    "ovecc_grep",
+    "ovecc_read",
     "ovecc_query",
     "ovecc_impact",
     "ovecc_context",
@@ -125,13 +128,12 @@ fn handle(method: &str, params: Option<&Value>, exe: &Path) -> Result<Value, (i6
                 "protocolVersion": version,
                 "capabilities": {"tools": {}},
                 "serverInfo": {"name": "ovecc", "version": env!("CARGO_PKG_VERSION")},
-                "instructions": "Deterministic, offline architecture intelligence. \
-                    Reach for these tools before Grep or Read to trace code \
-                    relationships and understand an element from the index instead of \
-                    scanning files. Call ovecc_capabilities once for the full contract \
-                    and run ovecc_index before querying a repository, then use \
-                    ovecc_query, ovecc_impact, and ovecc_context. Every tool accepts an \
-                    optional `repo` path. This is the agent profile; set \
+                "instructions": "Deterministic, offline architecture intelligence over \
+                    a local index. Search with ovecc_grep and read one symbol with \
+                    ovecc_read instead of scanning files; trace relationships with \
+                    ovecc_query (rdeps/deps) and ovecc_impact. The database persists at \
+                    .ovecc/graph.db: run ovecc_index only when it is absent or files \
+                    changed. Every tool accepts an optional `repo` path. Set \
                     OVECC_MCP_PROFILE=full for the complete command surface."
             }))
         }
@@ -389,6 +391,19 @@ fn argv_navigation(name: &str, args: &Value) -> Option<Vec<String>> {
             argv.push(arg_str(args, "query")?.into());
             push_opt_u64(&mut argv, args, "depth", "--depth");
         }
+        "ovecc_grep" => {
+            argv.push("grep".into());
+            argv.push(arg_str(args, "pattern")?.into());
+            if let Some(path) = arg_str(args, "path") {
+                argv.push(path.into());
+            }
+            push_opt_u64(&mut argv, args, "limit", "--limit");
+        }
+        "ovecc_read" => {
+            argv.push("read".into());
+            argv.push(arg_str(args, "target")?.into());
+            push_opt_u64(&mut argv, args, "limit", "--limit");
+        }
         "ovecc_explain" => {
             argv.push("explain".into());
             argv.push(arg_str(args, "target")?.into());
@@ -487,12 +502,14 @@ fn tool_specs() -> Value {
     let obj = |props: Value, required: Value| json!({"type": "object", "properties": props, "required": required});
 
     json!([
-        {"name": "ovecc_capabilities", "description": "The machine-readable contract: every command, metric, rule, severity, exit code, and output format. Call this once up front for the full vocabulary. Example: {}.", "inputSchema": obj(json!({"repo": repo}), json!([]))},
-        {"name": "ovecc_index", "description": "Build or refresh the local architecture database. Run once before the other tools and again after edits. Example: {}.", "inputSchema": obj(json!({"repo": repo, "path": {"type": "string", "description": "Repository path to index (alternative to repo)."}}), json!([]))},
-        {"name": "ovecc_summary", "description": "Orient in a repo before ls/Read sweeps: architecture health at a glance (coupling, density, cycles, risk score). Example: {}.", "inputSchema": obj(json!({"repo": repo}), json!([]))},
+        {"name": "ovecc_grep", "description": "Search the repository from the index: symbol definitions first, then text matches from an ignore-aware scan, deduplicated and capped, each as path:line. Same coverage as grep/rg in a fraction of the output. Example: {\"pattern\": \"validate_expression\"}.", "inputSchema": obj(json!({"repo": repo, "pattern": {"type": "string", "description": "Regex to search for; all-lowercase searches case-insensitively."}, "path": {"type": "string", "description": "Optional file or directory to scope the text scan."}, "limit": {"type": "integer", "description": "Matches to return (default 50, 0 = all)."}}), json!(["pattern"]))},
+        {"name": "ovecc_read", "description": "Read one element instead of a whole file: a symbol's source by name, a file:start-end slice, a file:line anchor (expands to the enclosing symbol), or a file's symbol outline. Use on any anchor a search or query returned. Example: {\"target\": \"validate_expression\"}.", "inputSchema": obj(json!({"repo": repo, "target": {"type": "string", "description": "Symbol name, file:line, file:start-end, or a bare file path."}, "limit": {"type": "integer", "description": "Maximum lines to return (default 200, 0 = no cap)."}}), json!(["target"]))},
+        {"name": "ovecc_capabilities", "description": "The machine-readable contract: every command, metric, rule, severity, exit code, and output format. Call at most once per session. Example: {}.", "inputSchema": obj(json!({"repo": repo}), json!([]))},
+        {"name": "ovecc_index", "description": "Build or refresh the architecture database. Run only after file edits, or when .ovecc/graph.db is absent — never on startup when the database already exists. Example: {}.", "inputSchema": obj(json!({"repo": repo, "path": {"type": "string", "description": "Repository path to index (alternative to repo)."}}), json!([]))},
+        {"name": "ovecc_summary", "description": "Architecture health at a glance: coupling, density, cycles, risk score. Use to orient in a repository before any file sweep. Example: {}.", "inputSchema": obj(json!({"repo": repo}), json!([]))},
         {"name": "ovecc_report", "description": "One-shot architecture report: summary + cycles + violations + security + hotspots.", "inputSchema": obj(json!({"repo": repo}), json!([]))},
-        {"name": "ovecc_impact", "description": "Blast radius of changing a target: every element the change reaches (each with a file:line anchor) and the paths that carry it. Use before editing instead of grepping for usages. Targets: module, table:NAME, api:METHOD:/path. Example: {\"target\": \"Billing\", \"direction\": \"downstream\"}.", "inputSchema": obj(json!({"repo": repo, "target": {"type": "string", "description": "Element to analyze, e.g. Billing, table:customers, api:GET:/x."}, "direction": {"type": "string", "enum": ["downstream", "upstream", "both"], "description": "Traversal direction (default downstream)."}, "max_depth": {"type": "integer", "description": "Maximum traversal depth (default 6)."}}), json!(["target"]))},
-        {"name": "ovecc_query", "description": "Trace code relationships from the index instead of grepping: callers, callees, import paths, cycles, each returned with a file:line anchor for a scoped read. Use before Grep or Bash grep when the question is 'who calls X', 'what does X import', or 'is there a cycle'. Verbs: rdeps X (direct callers), deps X (direct callees), paths X, 'a -> b', cycles, hotspots, violations. For the transitive blast radius of a change, use ovecc_impact instead. Example: {\"query\": \"rdeps Billing\"}.", "inputSchema": obj(json!({"repo": repo, "query": {"type": "string", "description": "Query expression, e.g. 'cycles' or 'rdeps Billing'."}, "depth": {"type": "integer", "description": "Hops to traverse. Omit for the default: 1 for rdeps/deps, 3 for paths and 'a -> b'."}}), json!(["query"]))},
+        {"name": "ovecc_impact", "description": "Blast radius of changing a target: every element the change reaches, with file:line anchors and the paths that carry it. Use before editing. Targets: module, table:NAME, api:METHOD:/path. Example: {\"target\": \"Billing\"}.", "inputSchema": obj(json!({"repo": repo, "target": {"type": "string", "description": "Element to analyze, e.g. Billing, table:customers, api:GET:/x."}, "direction": {"type": "string", "enum": ["downstream", "upstream", "both"], "description": "Traversal direction (default downstream)."}, "max_depth": {"type": "integer", "description": "Maximum traversal depth (default 6)."}}), json!(["target"]))},
+        {"name": "ovecc_query", "description": "Trace relationships from the index, each answer with a file:line anchor: rdeps X (direct callers), deps X (direct callees), paths X, 'a -> b', cycles. Use for 'who calls X'; for the transitive blast radius use ovecc_impact. Example: {\"query\": \"rdeps Billing\"}.", "inputSchema": obj(json!({"repo": repo, "query": {"type": "string", "description": "Query expression, e.g. 'cycles' or 'rdeps Billing'."}, "depth": {"type": "integer", "description": "Hops to traverse. Omit for the default: 1 for rdeps/deps, 3 for paths and 'a -> b'."}}), json!(["query"]))},
         {"name": "ovecc_violations", "description": "Architecture and rule findings (boundaries, banned imports, cycles), with optional severity filter and baseline.", "inputSchema": obj(json!({"repo": repo, "severity": severity, "baseline": {"type": "boolean", "description": "Hide findings recorded in the baseline (show only new ones)."}, "changed_since": {"type": "string", "description": "Only findings touching files changed since this Git ref (progressive adoption)."}}), json!([]))},
         {"name": "ovecc_security", "description": "Security findings: hardcoded secrets, insecure patterns, weak crypto, tainted source->sink flows.", "inputSchema": obj(json!({"repo": repo, "severity": severity}), json!([]))},
         {"name": "ovecc_audit", "description": "OSV audit of declared dependencies against the local vulnerability database (offline). Set fetch=true to first download the advisories for the discovered packages — the only ovecc operation that touches the network.", "inputSchema": obj(json!({"repo": repo, "fetch": {"type": "boolean", "description": "Download OSV advisories into .ovecc/osv/ before auditing (network, opt-in)."}}), json!([]))},
@@ -505,14 +522,14 @@ fn tool_specs() -> Value {
         {"name": "ovecc_drift", "description": "Architecture drift over time versus a previous snapshot or Git ref.", "inputSchema": obj(json!({"repo": repo, "since": {"type": "string", "description": "Git ref or snapshot to compare against, e.g. main or v1.0.0."}}), json!([]))},
         {"name": "ovecc_history", "description": "Trend one snapshot metric across every index run (values, deltas, sparkline). Without a metric, lists everything trendable.", "inputSchema": obj(json!({"repo": repo, "metric": {"type": "string", "description": "Metric to trend, e.g. coupling_density, high_complexity_functions."}, "limit": {"type": "integer", "description": "Most recent N snapshots to keep (default 20)."}}), json!([]))},
         {"name": "ovecc_init", "description": "Set up ovecc in a repository: write a commented .ovecc/config.toml, git-ignore the local state, and return the suggested first commands.", "inputSchema": obj(json!({"repo": repo, "force": {"type": "boolean", "description": "Overwrite an existing config."}}), json!([]))},
-        {"name": "ovecc_review", "description": "Lead with this to review a change instead of reading the diff by hand: the named new defects between base and head. Reports new security/dead-code/complexity findings with file:line, new dependency cycles with their concrete import witness edges, and the duplications the change added (scoped to touched files). The actionable companion to ovecc_gate, which reports only counts. Example: {\"base\": \"main\", \"head\": \"HEAD\"}.", "inputSchema": obj(json!({"repo": repo, "base": base, "head": head, "fail_on": fail_on}), json!([]))},
+        {"name": "ovecc_review", "description": "Review a change without reading the diff by hand: new security/dead-code/complexity findings with file:line, new dependency cycles with their witness edges, and added duplications, between base and head. Example: {\"base\": \"main\", \"head\": \"HEAD\"}.", "inputSchema": obj(json!({"repo": repo, "base": base, "head": head, "fail_on": fail_on}), json!([]))},
         {"name": "ovecc_gate", "description": "CI gate: fail when a change introduces new cycles, violations, or quality regressions (security/dead-code/complexity) versus a base snapshot or Git ref. Returns a pass/fail verdict and the signals behind it. For the named defects behind the verdict, use ovecc_review.", "inputSchema": obj(json!({"repo": repo, "base": base, "head": head, "fail_on": fail_on}), json!([]))},
         {"name": "ovecc_diff", "description": "Compare two stored architecture snapshots (or Git refs): added/removed modules and dependency edges, plus the overall diff risk score.", "inputSchema": obj(json!({"repo": repo, "base": base, "head": head, "fail_on": fail_on}), json!([]))},
         {"name": "ovecc_explain", "description": "Offline, deterministic architectural explanation of a target from its context slice.", "inputSchema": obj(json!({"repo": repo, "target": {"type": "string", "description": "Element to explain, e.g. Billing."}}), json!(["target"]))},
-        {"name": "ovecc_context", "description": "Deterministic ContextSlice for a target as JSON: its neighbors, findings, and file:line anchors. Use instead of reading whole files to understand an element. Example: {\"target\": \"Billing\"}.", "inputSchema": obj(json!({"repo": repo, "target": {"type": "string", "description": "Element to slice, e.g. Billing."}}), json!(["target"]))},
+        {"name": "ovecc_context", "description": "Deterministic context slice for a target: dependencies, dependents, call paths, findings, with file:line anchors. Use to understand an element without reading whole files. Example: {\"target\": \"Billing\"}.", "inputSchema": obj(json!({"repo": repo, "target": {"type": "string", "description": "Element to slice, e.g. Billing."}}), json!(["target"]))},
         {"name": "ovecc_export_graph", "description": "The dependency graph as data: module- and file-level nodes and edges, sorted and deterministic. Pass html to instead write a self-contained offline HTML viewer for the human in the loop.", "inputSchema": obj(json!({"repo": repo, "html": {"type": "string", "description": "Optional path: write the interactive HTML viewer there instead of returning JSON."}}), json!([]))},
         {"name": "ovecc_diagnose", "description": "Deterministic architectural diagnosis: cycles, hub-like (crossing), unstable and god components, dense structure, and hotspots — each with evidence, the design principle it breaks, and an established remediation. Components are directories; no design patterns are invented.", "inputSchema": obj(json!({"repo": repo, "target": {"type": "string", "description": "Scope to findings touching this file or component (substring)."}, "severity": severity}), json!([]))},
-        {"name": "ovecc_advise", "description": "Findings touching one file, module, or component and the established fix for each. Call before editing that area so a change doesn't reintroduce a known problem. Example: {\"target\": \"src/billing\"}.", "inputSchema": obj(json!({"repo": repo, "target": {"type": "string", "description": "File, module, or component to advise on."}}), json!(["target"]))},
+        {"name": "ovecc_advise", "description": "Findings touching one file, module, or component, with the established fix for each. Call before editing that area so the change does not reintroduce a known problem. Example: {\"target\": \"src/billing\"}.", "inputSchema": obj(json!({"repo": repo, "target": {"type": "string", "description": "File, module, or component to advise on."}}), json!(["target"]))},
         {"name": "ovecc_metrics", "description": "Per-component architecture metrics: fan-in/out, coupling, Martin instability, aggregate complexity, churn, and repository coupling density.", "inputSchema": obj(json!({"repo": repo, "target": {"type": "string", "description": "Scope to a single component (substring)."}}), json!([]))}
     ])
 }
@@ -585,6 +602,18 @@ mod tests {
         assert_eq!(
             build_argv("ovecc_query", &json!({"query": "cycles"})).unwrap(),
             vec!["query", "cycles"]
+        );
+        assert_eq!(
+            build_argv(
+                "ovecc_grep",
+                &json!({"pattern": "foo", "path": "src", "limit": 20})
+            )
+            .unwrap(),
+            vec!["grep", "foo", "src", "--limit", "20"]
+        );
+        assert_eq!(
+            build_argv("ovecc_read", &json!({"target": "parser.py:10-40"})).unwrap(),
+            vec!["read", "parser.py:10-40"]
         );
         assert_eq!(
             build_argv("ovecc_context", &json!({"target": "Billing"})).unwrap(),
@@ -660,9 +689,9 @@ mod tests {
         let tools = listed_tools(Profile::Agent, false);
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert_eq!(names, AGENT_PROFILE);
-        // Navigation leads (positional bias); CI-only tools are not advertised
+        // Search leads (positional bias); CI-only tools are not advertised
         // here even though `build_argv` still dispatches them.
-        assert_eq!(names.first(), Some(&"ovecc_query"));
+        assert_eq!(names.first(), Some(&"ovecc_grep"));
         assert!(!names.contains(&"ovecc_gate"));
         assert!(!names.contains(&"ovecc_diff"));
     }

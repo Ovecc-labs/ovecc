@@ -77,6 +77,20 @@ pub const COMMANDS: &[CommandSpec] = &[
         read_only: true,
     },
     CommandSpec {
+        name: "grep",
+        summary: "Search the repository from the index: symbol definitions first, then text matches from an ignore-aware scan, deduplicated and capped.",
+        key_params: &["pattern", "path", "--limit"],
+        output: "Matching definitions with file:line spans, then path:line: text matches with totals.",
+        read_only: true,
+    },
+    CommandSpec {
+        name: "read",
+        summary: "Read one element instead of a whole file: a symbol's source by name, a file:start-end slice, a file:line anchor, or a file's symbol outline.",
+        key_params: &["target", "--limit"],
+        output: "A line-numbered source slice with a file:line header, or a symbol outline.",
+        read_only: true,
+    },
+    CommandSpec {
         name: "violations",
         summary: "Report architecture and security violations recorded at index time.",
         key_params: &[

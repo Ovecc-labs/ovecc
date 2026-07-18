@@ -2678,6 +2678,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "ignore",
  "ovecc-ai",
  "ovecc-audit",
  "ovecc-core",
@@ -2686,6 +2687,8 @@ dependencies = [
  "ovecc-graph",
  "ovecc-indexer",
  "peak_alloc",
+ "rayon",
+ "regex",
  "serde",
  "serde_json",
  "tempfile",

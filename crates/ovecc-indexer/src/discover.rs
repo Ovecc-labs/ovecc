@@ -109,7 +109,7 @@ fn config_language(language: SourceLanguage) -> ovecc_core::lang::SourceLanguage
 /// Python, Rust, Go, and JVM ecosystems. This is the built-in baseline; users
 /// add more via `[index] exclude` / `--exclude`. Kept deliberately
 /// language-agnostic so a new language inherits sane defaults.
-pub(crate) fn is_excluded_component(name: &str) -> bool {
+pub fn is_excluded_component(name: &str) -> bool {
     matches!(
         name,
         // VCS + ovecc's own state

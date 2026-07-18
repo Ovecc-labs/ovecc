@@ -34,6 +34,7 @@ duckdb = { version = "~1.10503.1", features = ["bundled"] }
 gix = "0.84"
 ignore = "0.4"
 petgraph = "0.8"
+regex = "1.11"
 rayon = "1.10"
 semver = "1.0"
 peak_alloc = "0.2"
