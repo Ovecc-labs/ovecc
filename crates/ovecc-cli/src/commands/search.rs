@@ -268,6 +268,18 @@ fn unknown_symbol(defs: &[SymbolDef], target: &str) -> anyhow::Error {
     .into()
 }
 
+/// One definition as the JSON object `read` and `grep` both emit: the element,
+/// its kind, and its file:start-end anchor.
+fn def_json(def: &SymbolDef) -> serde_json::Value {
+    serde_json::json!({
+        "name": def.qualified_name,
+        "kind": def.kind,
+        "file": def.path,
+        "start_line": def.start_line,
+        "end_line": def.end_line,
+    })
+}
+
 /// Several definitions share the name (dialect overrides, trait impls). Listing
 /// the anchors IS the answer: the agent picks one and reads that exact span.
 fn print_candidates(target: &str, defs: &[&SymbolDef], format: OutputFormat) -> Result<u8> {
@@ -275,13 +287,7 @@ fn print_candidates(target: &str, defs: &[&SymbolDef], format: OutputFormat) -> 
     if matches!(format, OutputFormat::Json | OutputFormat::Ndjson) {
         let data = serde_json::json!({
             "target": target,
-            "definitions": shown.iter().map(|def| serde_json::json!({
-                "name": def.qualified_name,
-                "kind": def.kind,
-                "file": def.path,
-                "start_line": def.start_line,
-                "end_line": def.end_line,
-            })).collect::<Vec<_>>(),
+            "definitions": shown.iter().map(|&d| def_json(d)).collect::<Vec<_>>(),
             "total": defs.len(),
             "next_call": "ovecc read <file>:<start>-<end> for one of these",
         });
@@ -547,13 +553,7 @@ fn render_grep(
     if matches!(format, OutputFormat::Json | OutputFormat::Ndjson) {
         let data = serde_json::json!({
             "pattern": pattern,
-            "definitions": shown_defs.iter().map(|def| serde_json::json!({
-                "name": def.qualified_name,
-                "kind": def.kind,
-                "file": def.path,
-                "start_line": def.start_line,
-                "end_line": def.end_line,
-            })).collect::<Vec<_>>(),
+            "definitions": shown_defs.iter().map(def_json).collect::<Vec<_>>(),
             "definitions_total": definitions.len(),
             "matches": shown.iter().map(|m| serde_json::json!({
                 "file": m.file, "line": m.line, "text": m.text,
