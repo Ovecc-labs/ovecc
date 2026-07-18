@@ -3,11 +3,14 @@
 //! wiring calls. The wiring is written for Claude Code's hook system
 //! (`.claude/settings.json`); the MCP server stays the agent-agnostic surface.
 //!
-//! The policy is graph-first, grep-fallback: a broad text search is blocked
-//! while the graph can answer it, but the block fails open the moment ovecc
-//! cannot help (no index, or a query already ran) so the agent is never
-//! trapped. Everything runs through the ovecc binary itself; no interpreter or
-//! script is written to the repo.
+//! The policy is redirect, not toll booth: a repo-wide text search is turned
+//! into an `ovecc grep` (same coverage, capped output), while a search scoped
+//! to an existing path or file always passes. The earlier design unlocked all
+//! search for five minutes after one ovecc call, and measured agent sessions
+//! showed what that buys: the ovecc call stacked on top of the unchanged
+//! grep+read routine instead of replacing it. The block still fails open when
+//! the graph is absent, so the agent is never trapped. Everything runs through
+//! the ovecc binary itself; no interpreter or script is written to the repo.
 
 use crate::cli::AgentHookKind;
 use anyhow::{Context, Result};
@@ -15,30 +18,30 @@ use ovecc_core::config::ProjectPaths;
 use serde_json::{Value, json};
 use std::io::Read;
 use std::path::Path;
-use std::time::SystemTime;
 
-/// Grace after any ovecc call during which text search is allowed, so the agent
-/// can read string literals, comments, and log lines it legitimately needs.
-const GRACE_SECONDS: u64 = 300;
-
-const MARKER: &str = "agent-graph-query";
-
-const ENFORCE_MESSAGE: &str = "\
-Broad text search is blocked here: the architecture graph already answers it.
-Query the graph instead:
-  ovecc query \"rdeps <name>\"   what depends on <name> (callers)
-  ovecc query \"deps <name>\"    what <name> depends on (callees)
-  ovecc impact <name>          blast radius of changing <name>
-  ovecc context <name>         deps, dependents, findings for one element
-Unknown names return did-you-mean suggestions. After one ovecc call, text
-search unlocks for 5 minutes. Set OVECC_AGENT_HOOKS=off to disable.
+const ENFORCE_BODY: &str = "\
+Repo-wide text search is blocked here: the index answers it in fewer tokens.
+  ovecc grep <pattern> [path]   search: definitions first, then matches
+  ovecc read <name|file:lines>  one symbol's source, or a file's outline
+  ovecc query \"rdeps <name>\"    direct callers (\"deps <name>\" for callees)
+  ovecc impact <name>           blast radius of changing <name>
 ";
+
+/// The pass-through line must match what the hook actually allows, or the
+/// agent burns a turn retrying a scope that will be blocked again.
+fn enforce_message(strict: bool) -> String {
+    let valve = if strict {
+        "A search against one existing file passes through unchanged."
+    } else {
+        "A search scoped to an existing path or file passes through unchanged."
+    };
+    format!("{ENFORCE_BODY}{valve}\nSet OVECC_AGENT_HOOKS=off to disable.\n")
+}
 
 /// The hook commands `init --agent` writes into settings, matched to the events
 /// they fire on. Kept in one place so wiring and unwiring stay in sync.
 const HOOK_WIRING: &[(&str, &str, &str)] = &[
     ("PreToolUse", "Grep|Bash", "ovecc agent-hook enforce"),
-    ("PostToolUse", "Bash|mcp__ovecc.*", "ovecc agent-hook mark"),
     ("SessionStart", "", "ovecc agent-hook session"),
 ];
 
@@ -56,6 +59,16 @@ fn hooks_disabled() -> bool {
         .unwrap_or(false)
 }
 
+/// Strict mode narrows the valve: only a search against one existing FILE
+/// passes; directory scopes are served by the index too. Opt-in per session
+/// (`OVECC_AGENT_HOOKS=strict`) while the A/B decides whether it becomes the
+/// default.
+fn strict_mode() -> bool {
+    std::env::var("OVECC_AGENT_HOOKS")
+        .map(|v| v.eq_ignore_ascii_case("strict"))
+        .unwrap_or(false)
+}
+
 fn project_root() -> std::path::PathBuf {
     std::env::var_os("CLAUDE_PROJECT_DIR")
         .map(std::path::PathBuf::from)
@@ -70,59 +83,46 @@ fn read_event() -> Value {
     serde_json::from_str(&buf).unwrap_or(Value::Null)
 }
 
-/// PreToolUse: block a broad text search while the graph can answer it. Exit 2
-/// returns the message to the agent as the tool error; exit 0 lets the call
-/// through. Fails open whenever the graph cannot answer.
+/// PreToolUse: block a repo-wide text search while the index can answer it.
+/// Exit 2 returns the message to the agent as the tool error; exit 0 lets the
+/// call through. Fails open whenever the graph cannot answer.
 fn enforce() -> u8 {
     if hooks_disabled() {
         return 0;
     }
     let root = project_root();
-    if !graph_ready(&root) || recently_queried(&root) {
+    if !graph_ready(&root) {
         return 0;
     }
     let event = read_event();
     let tool = event.get("tool_name").and_then(Value::as_str).unwrap_or("");
-    let command = event
-        .get("tool_input")
-        .and_then(|i| i.get("command"))
-        .and_then(Value::as_str)
-        .unwrap_or("");
-    if is_broad_search(tool, command) {
-        eprint!("{ENFORCE_MESSAGE}");
+    let input = event.get("tool_input").cloned().unwrap_or(Value::Null);
+    let strict = strict_mode();
+    if is_broad_search(&root, tool, &input, strict) {
+        eprint!("{}", enforce_message(strict));
         return 2;
     }
     0
 }
 
-/// PostToolUse: after any ovecc call, touch the marker so text search unlocks
-/// for the grace window.
+/// PostToolUse survivor of the grace-window design: it used to time-stamp an
+/// unlock marker. Settings wired by earlier versions still invoke it, so the
+/// verb stays as an accepted no-op instead of failing their sessions.
 fn mark() -> u8 {
-    let event = read_event();
-    let tool = event.get("tool_name").and_then(Value::as_str).unwrap_or("");
-    let command = event
-        .get("tool_input")
-        .and_then(|i| i.get("command"))
-        .and_then(Value::as_str)
-        .unwrap_or("");
-    if is_ovecc_call(tool, command) {
-        let dir = project_root().join(".ovecc");
-        if std::fs::create_dir_all(&dir).is_ok() {
-            let _ = std::fs::write(dir.join(MARKER), b"");
-        }
-    }
     0
 }
 
-/// SessionStart: a one-line pointer so the session reaches for the graph before
-/// rediscovering the repo with grep.
+/// SessionStart: a one-line pointer so the session reaches for the index
+/// before rediscovering the repo with grep, and does not waste a call
+/// re-indexing a database that is already there.
 fn session() -> u8 {
     if hooks_disabled() || !graph_ready(&project_root()) {
         return 0;
     }
     println!(
-        "The architecture graph is indexed. Query it before any text search: \
-         ovecc query \"rdeps <name>\" | \"deps <name>\" | impact <name> | context <name>."
+        "Architecture index ready (do not re-run `ovecc index` unless files changed). \
+         Search: ovecc grep <pattern> [path]. One symbol's source: ovecc read <name>. \
+         Callers: ovecc query \"rdeps <name>\". Blast radius: ovecc impact <name>."
     );
     0
 }
@@ -131,30 +131,107 @@ fn graph_ready(root: &Path) -> bool {
     root.join(".ovecc").join("graph.db").exists()
 }
 
-fn recently_queried(root: &Path) -> bool {
-    let marker = root.join(".ovecc").join(MARKER);
-    let Ok(modified) = std::fs::metadata(&marker).and_then(|m| m.modified()) else {
-        return false;
-    };
-    let Ok(age) = SystemTime::now().duration_since(modified) else {
-        return false;
-    };
-    age.as_secs() < GRACE_SECONDS
-}
-
-fn is_ovecc_call(tool: &str, command: &str) -> bool {
-    tool.starts_with("mcp__ovecc") || (tool == "Bash" && command.contains("ovecc"))
-}
-
-/// Whether the tool call is a broad text search the graph should answer first.
-/// An `ovecc` invocation on the Bash line is never a broad search.
-fn is_broad_search(tool: &str, command: &str) -> bool {
+/// Whether the tool call is a repo-wide text search the index should serve
+/// instead. A search with a real path scope passes: reading one file's matches
+/// is exactly the kind of call `ovecc grep` does not need to intercept. In
+/// strict mode only a single-file scope passes. An `ovecc` invocation on the
+/// Bash line is never blocked.
+fn is_broad_search(root: &Path, tool: &str, input: &Value, strict: bool) -> bool {
     if tool == "Grep" {
-        return true;
+        let path = input.get("path").and_then(Value::as_str).unwrap_or("");
+        return !is_scope_path(root, path, strict);
     }
-    if tool != "Bash" || command.contains("ovecc") {
+    if tool != "Bash" {
         return false;
     }
+    let command = input.get("command").and_then(Value::as_str).unwrap_or("");
+    if command.contains("ovecc") {
+        return false;
+    }
+    let mut any_search = false;
+    let mut scoped = false;
+    for segment in command.split(['|', ';', '&']) {
+        let tokens = shell_tokens(segment);
+        match searcher_position(&tokens) {
+            Some(position) => {
+                any_search = true;
+                // The first non-flag token after the searcher is the pattern;
+                // any later one naming a real path scopes the search.
+                let mut rest = tokens[position + 1..]
+                    .iter()
+                    .filter(|t| *t != "--" && !t.starts_with('-'));
+                let _pattern = rest.next();
+                if rest.any(|t| is_scope_path(root, t, strict)) {
+                    scoped = true;
+                }
+            }
+            // A non-search segment naming a real file scopes the pipeline:
+            // `cat notes.txt | grep foo` searches one file, not the repo.
+            None => {
+                if tokens.iter().any(|t| is_scope_path(root, t, strict)) {
+                    scoped = true;
+                }
+            }
+        }
+    }
+    any_search && !scoped
+}
+
+/// A token that names an existing file — or, outside strict mode, an existing
+/// directory other than the repository root itself. The root (and `.`) is what
+/// a repo-wide search passes, so it never counts as a scope.
+fn is_scope_path(root: &Path, token: &str, strict: bool) -> bool {
+    if token.is_empty() || matches!(token, "." | "./" | ".\\" | "/") {
+        return false;
+    }
+    let candidate = Path::new(token);
+    let absolute = if candidate.is_absolute() {
+        candidate.to_path_buf()
+    } else {
+        root.join(candidate)
+    };
+    if strict {
+        return absolute.is_file();
+    }
+    if !absolute.exists() {
+        return false;
+    }
+    match (absolute.canonicalize(), root.canonicalize()) {
+        (Ok(a), Ok(r)) => a != r,
+        _ => true,
+    }
+}
+
+/// Whitespace-splitting that honours single and double quotes (stripped from
+/// the token) and treats backslashes literally — they are Windows path
+/// separators here, not escapes.
+fn shell_tokens(segment: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut quote: Option<char> = None;
+    for c in segment.chars() {
+        match (quote, c) {
+            (Some(q), _) if c == q => quote = None,
+            (Some(_), _) => current.push(c),
+            (None, '\'' | '"') => quote = Some(c),
+            (None, c) if c.is_whitespace() => {
+                if !current.is_empty() {
+                    tokens.push(std::mem::take(&mut current));
+                }
+            }
+            (None, _) => current.push(c),
+        }
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    tokens
+}
+
+/// Index of the search verb in the token list. Only the command position
+/// counts — the segment's first token, or right after a wrapper like `git`
+/// or `xargs` — so `pip install grep` is not read as a search.
+fn searcher_position(tokens: &[String]) -> Option<usize> {
     const SEARCHERS: &[&str] = &[
         "grep",
         "egrep",
@@ -166,14 +243,13 @@ fn is_broad_search(tool: &str, command: &str) -> bool {
         "select-string",
         "sls",
     ];
-    command.split(['|', ';', '&']).any(|segment| {
-        let segment = segment.trim();
-        if segment.starts_with("git grep") {
-            return true;
+    const WRAPPERS: &[&str] = &["git", "xargs", "sudo", "command", "exec"];
+    tokens.iter().enumerate().position(|(index, token)| {
+        let bare = token.rsplit(['/', '\\']).next().unwrap_or(token);
+        if !SEARCHERS.contains(&bare) {
+            return false;
         }
-        let first = segment.split_whitespace().next().unwrap_or("");
-        let bare = first.rsplit(['/', '\\']).next().unwrap_or(first);
-        SEARCHERS.contains(&bare)
+        index == 0 || WRAPPERS.contains(&tokens[index - 1].as_str())
     })
 }
 
@@ -291,32 +367,148 @@ fn entry_targets_ovecc(entry: &Value) -> bool {
 mod tests {
     use super::*;
 
+    /// A little repo: `src/` and `notes.txt` exist, nothing else does.
+    fn repo() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("notes.txt"), "x").unwrap();
+        dir
+    }
+
+    fn bash(command: &str) -> Value {
+        json!({ "command": command })
+    }
+
     #[test]
-    fn grep_and_search_binaries_are_broad() {
-        assert!(is_broad_search("Grep", ""));
-        assert!(is_broad_search("Bash", "grep -r foo ."));
-        assert!(is_broad_search("Bash", "git grep foo"));
-        assert!(is_broad_search("Bash", "rg foo"));
-        assert!(is_broad_search("Bash", "cat x.txt | grep foo"));
-        assert!(is_broad_search("Bash", "/usr/bin/grep foo"));
+    fn repo_wide_searches_are_broad() {
+        let repo = repo();
+        let root = repo.path();
+        assert!(is_broad_search(root, "Grep", &json!({}), false));
+        assert!(is_broad_search(root, "Grep", &json!({"path": "."}), false));
+        assert!(is_broad_search(root, "Bash", &bash("grep -r foo ."), false));
+        assert!(is_broad_search(root, "Bash", &bash("git grep foo"), false));
+        assert!(is_broad_search(root, "Bash", &bash("rg foo"), false));
+        assert!(is_broad_search(
+            root,
+            "Bash",
+            &bash("/usr/bin/grep foo"),
+            false
+        ));
+        // The path scope must actually exist to count.
+        assert!(is_broad_search(
+            root,
+            "Bash",
+            &bash("rg foo missing/"),
+            false
+        ));
+    }
+
+    #[test]
+    fn scoped_searches_pass() {
+        let repo = repo();
+        let root = repo.path();
+        assert!(!is_broad_search(
+            root,
+            "Grep",
+            &json!({"path": "src"}),
+            false
+        ));
+        assert!(!is_broad_search(root, "Bash", &bash("rg foo src"), false));
+        assert!(!is_broad_search(
+            root,
+            "Bash",
+            &bash("grep foo notes.txt"),
+            false
+        ));
+        assert!(!is_broad_search(
+            root,
+            "Bash",
+            &bash("rg foo \"src\""),
+            false
+        ));
+        // A pipe fed from a named file is a one-file search, not a repo scan.
+        assert!(!is_broad_search(
+            root,
+            "Bash",
+            &bash("cat notes.txt | grep foo"),
+            false
+        ));
+    }
+
+    #[test]
+    fn strict_mode_only_passes_single_files() {
+        let repo = repo();
+        let root = repo.path();
+        // Directory scopes are broad under strict; a named file still passes.
+        assert!(is_broad_search(root, "Grep", &json!({"path": "src"}), true));
+        assert!(is_broad_search(root, "Bash", &bash("rg foo src"), true));
+        assert!(!is_broad_search(
+            root,
+            "Grep",
+            &json!({"path": "notes.txt"}),
+            true
+        ));
+        assert!(!is_broad_search(
+            root,
+            "Bash",
+            &bash("grep foo notes.txt"),
+            true
+        ));
+        assert!(!is_broad_search(
+            root,
+            "Bash",
+            &bash("ovecc grep foo"),
+            true
+        ));
+        // The message names what actually passes in each mode.
+        assert!(enforce_message(true).contains("one existing file"));
+        assert!(enforce_message(false).contains("path or file"));
     }
 
     #[test]
     fn ovecc_and_ordinary_commands_are_not_broad() {
-        assert!(!is_broad_search("Bash", "ovecc query \"rdeps foo\""));
-        // A pipe into ovecc must not be read as a search.
-        assert!(!is_broad_search("Bash", "echo foo | ovecc query deps"));
-        assert!(!is_broad_search("Bash", "cargo build"));
-        assert!(!is_broad_search("Read", ""));
-        assert!(!is_broad_search("Bash", "ls -la"));
+        let repo = repo();
+        let root = repo.path();
+        assert!(!is_broad_search(
+            root,
+            "Bash",
+            &bash("ovecc query \"rdeps foo\""),
+            false
+        ));
+        assert!(!is_broad_search(
+            root,
+            "Bash",
+            &bash("ovecc grep foo"),
+            false
+        ));
+        assert!(!is_broad_search(
+            root,
+            "Bash",
+            &bash("echo foo | ovecc query deps"),
+            false
+        ));
+        assert!(!is_broad_search(root, "Bash", &bash("cargo build"), false));
+        assert!(!is_broad_search(root, "Read", &json!({}), false));
+        assert!(!is_broad_search(root, "Bash", &bash("ls -la"), false));
+        // A searcher mentioned off the command position is not a search.
+        assert!(!is_broad_search(
+            root,
+            "Bash",
+            &bash("pip install grep"),
+            false
+        ));
     }
 
     #[test]
-    fn marks_only_ovecc_calls() {
-        assert!(is_ovecc_call("mcp__ovecc__ovecc_query", ""));
-        assert!(is_ovecc_call("Bash", "ovecc impact foo"));
-        assert!(!is_ovecc_call("Bash", "grep foo"));
-        assert!(!is_ovecc_call("Grep", ""));
+    fn shell_tokens_honour_quotes() {
+        assert_eq!(
+            shell_tokens("rg 'foo bar' \"my dir\""),
+            vec!["rg", "foo bar", "my dir"]
+        );
+        assert_eq!(
+            shell_tokens("grep -r x src\\sub"),
+            vec!["grep", "-r", "x", "src\\sub"]
+        );
     }
 
     #[test]
