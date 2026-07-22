@@ -1,0 +1,72 @@
+# Architecture contract: Feature-Sliced Design (https://feature-sliced.design).
+# Six layers, imports point strictly downward:
+#   app > pages > widgets > features > entities > shared
+# Written by `ovecc architecture init --template fsd`. The paths below are the
+# canonical FSD layout; if your layers live elsewhere, rebind each `paths` and
+# keep the `role` (it names the layer, component names are yours).
+#
+# A template is the target, not a mirror of today's code: expect divergences
+# on day one. The report of `ovecc architecture diff` is the migration plan.
+# Keep mode = "warn" while rebinding, then switch to "new-violations" and run
+# `ovecc architecture check --freeze` to accept the remaining debt; the
+# ratchet shrinks it from there. "strict" is the finish line.
+#
+# `slices = true` turns on FSD's slice isolation: inside pages/widgets/
+# features/entities, the first directory under the layer is a slice and slices
+# do not import each other. A slice that legitimately needs a neighbour
+# exposes a public API for it under `<neighbour>/@x/<slice>` (the FSD @x
+# notation); those imports are allowed.
+
+schema = 1
+
+# Enforcement: off | warn | new-violations | strict.
+mode = "warn"
+
+# Files no layer claims: ignore | warn | forbid.
+unassigned = "warn"
+
+# App-wide glue: entry point, providers, router, global styles.
+[[component]]
+name = "app"
+role = "fsd/app"
+paths = ["src/app/**"]
+depends_on = ["pages", "widgets", "features", "entities", "shared"]
+
+# Full pages or screens, composed from the layers below.
+[[component]]
+name = "pages"
+role = "fsd/pages"
+paths = ["src/pages/**"]
+depends_on = ["widgets", "features", "entities", "shared"]
+slices = true
+
+# Large self-sufficient blocks of UI delivering complete use cases.
+[[component]]
+name = "widgets"
+role = "fsd/widgets"
+paths = ["src/widgets/**"]
+depends_on = ["features", "entities", "shared"]
+slices = true
+
+# Reused product features: user actions that carry business value.
+[[component]]
+name = "features"
+role = "fsd/features"
+paths = ["src/features/**"]
+depends_on = ["entities", "shared"]
+slices = true
+
+# Business entities the product works with: user, order, product.
+[[component]]
+name = "entities"
+role = "fsd/entities"
+paths = ["src/entities/**"]
+depends_on = ["shared"]
+slices = true
+
+# Detached from business specifics: UI kit, API client, helpers.
+[[component]]
+name = "shared"
+role = "fsd/shared"
+paths = ["src/shared/**"]
+depends_on = []

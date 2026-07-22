@@ -19,12 +19,16 @@ use discover::{discover_source_files, infer_module_name, infer_module_prefix, la
 use entrypoints::{detect_entry_points, is_standalone_entry, is_test_file};
 use hygiene::{detect_unlisted_dependencies, detect_unused_dependencies, external_package_root};
 use imports::resolve_dependencies;
+use ovecc_core::architecture::{ArchitectureContract, assign_components, assign_slices};
 use ovecc_core::config::{ArchitectureConfig, OveccConfig, ProjectPaths, RulesConfig};
 use ovecc_core::facts::{
-    ChangeKind, CommitRecord, ComplexityRecord, ExportRecord, FileChangeRecord, FileFacts,
-    FindingKind, FindingRecord, ImportFactKind, ParseFailure, SecurityPatternFact, SourceFile,
+    CapabilityRecord, ChangeKind, CommitRecord, ComplexityRecord, ExportRecord, FileChangeRecord,
+    FileFacts, FindingKind, FindingRecord, ImportFactKind, ParseFailure, SecurityPatternFact,
+    SourceFile,
 };
-use ovecc_core::id::{CommitId, ComplexityId, ExportId, FileChangeId, FileId, RepositoryId};
+use ovecc_core::id::{
+    CapabilityUseId, CommitId, ComplexityId, ExportId, FileChangeId, FileId, RepositoryId,
+};
 use ovecc_core::legacy::{
     DependencyRecord, FileRecord, ImportFact, ImportKind, IndexFailure, IndexReport, ModuleRecord,
     SourceLanguage,
@@ -54,7 +58,9 @@ use std::path::{Path, PathBuf};
 // v16 facts would deserialize with empty names and silently skip clumps.
 // v18: Rust `?` no longer counts toward cyclomatic; cached v17 facts would
 // keep the inflated counts and their stale HighComplexity findings.
-const PARSE_CACHE_VERSION: &str = "v18";
+// v19: FileFacts gains `capability_uses`; cached v18 facts would deserialize
+// empty and every deny_capabilities check would pass vacuously.
+const PARSE_CACHE_VERSION: &str = "v19";
 
 pub fn index_repository(
     paths: &ProjectPaths,
@@ -80,6 +86,10 @@ pub fn index_repository(
     // Loaded before the sync for retention: a file that fails to parse
     // keeps the dependencies recorded by its last successful run.
     let previous_dependencies = store.current_dependencies(&repository_id)?;
+
+    // Loaded before the parse so a broken contract fails in milliseconds,
+    // not at the end of a cold index.
+    let contract = ArchitectureContract::load(&paths.root)?;
 
     let source_files = discover_source_files(&paths.root, config)?;
     let cache = ParseCache::new(paths.parse_cache_dir.join(PARSE_CACHE_VERSION));
@@ -138,7 +148,58 @@ pub fn index_repository(
         resolved: &resolved,
         entry_points: &entry_points,
     };
-    let (mut findings, security_patterns) = evaluate_rules(&input, &config.rules);
+    let indexed_paths: Vec<String> = parsed.files.iter().map(|file| file.path.clone()).collect();
+    let component_of = match &contract {
+        Some(contract) => assign_components(contract, &indexed_paths)?,
+        None => BTreeMap::new(),
+    };
+    let slice_of = match &contract {
+        Some(contract) => assign_slices(contract, &component_of),
+        None => BTreeMap::new(),
+    };
+    // Capability and budget facts come straight from this run's parse (the
+    // `capability_uses`/`complexity` tables are only written afterwards), so
+    // a cold index judges them without a second pass.
+    let capability_uses: Vec<(String, ovecc_core::facts::CapabilityFact)> = parsed
+        .file_facts
+        .iter()
+        .flat_map(|(path, facts)| {
+            facts
+                .capability_uses
+                .iter()
+                .map(move |use_| (path.clone(), use_.clone()))
+        })
+        .collect();
+    let functions: Vec<ovecc_core::facts::FunctionMetricsRow> = parsed
+        .file_facts
+        .iter()
+        .flat_map(|(path, facts)| {
+            facts
+                .complexity
+                .iter()
+                .map(move |c| ovecc_core::facts::FunctionMetricsRow {
+                    file_path: path.clone(),
+                    qualified_name: c.qualified_name.clone(),
+                    line: c.line,
+                    cyclomatic: c.cyclomatic as u32,
+                    cognitive: c.cognitive as u32,
+                })
+        })
+        .collect();
+    let baseline = ovecc_core::architecture::load_baseline(&paths.root)?;
+    let architecture_input = contract
+        .as_ref()
+        .map(|contract| ovecc_rules::ContractInput {
+            contract,
+            component_of: &component_of,
+            files: &indexed_paths,
+            baseline: &baseline,
+            slice_of: &slice_of,
+            capability_uses: &capability_uses,
+            functions: &functions,
+        });
+    let (mut findings, security_patterns) =
+        evaluate_rules(&input, &config.rules, architecture_input);
     findings.extend(taint_findings(&input));
     findings.extend(audit_findings(&mut store, paths, &input)?);
     findings.extend(complexity_findings(&input, &mut metrics));
@@ -158,7 +219,8 @@ pub fn index_repository(
         .iter()
         .filter(|dependency| dependency.is_external)
         .count();
-    let (schema_edges, complexity_records, export_records) = build_code_records(&input);
+    let (schema_edges, complexity_records, export_records, capability_records) =
+        build_code_records(&input);
     let code = ResolvedCode {
         symbols: &resolved.symbols,
         calls: &resolved.calls,
@@ -167,6 +229,7 @@ pub fn index_repository(
         schema_edges: &schema_edges,
         complexity: &complexity_records,
         exports: &export_records,
+        capability_uses: &capability_records,
     };
     phase(&mut timings.analyze_ms);
     store.sync_current_index(
@@ -394,6 +457,7 @@ struct AnalysisInput<'a> {
 fn evaluate_rules(
     input: &AnalysisInput<'_>,
     config: &RulesConfig,
+    architecture: Option<ovecc_rules::ContractInput<'_>>,
 ) -> (Vec<FindingRecord>, Vec<(String, SecurityPatternFact)>) {
     let module_names: Vec<String> = input.parsed.modules.keys().cloned().collect();
     let security_patterns: Vec<(String, SecurityPatternFact)> = input
@@ -414,6 +478,7 @@ fn evaluate_rules(
         dependencies: input.dependencies,
         config,
         security_patterns: &security_patterns,
+        architecture,
     });
     (findings, security_patterns)
 }
@@ -1012,6 +1077,7 @@ fn build_code_records(
     Vec<ovecc_db::SchemaEdge>,
     Vec<ComplexityRecord>,
     Vec<ExportRecord>,
+    Vec<CapabilityRecord>,
 ) {
     let schema_edges: Vec<ovecc_db::SchemaEdge> = input
         .resolved
@@ -1030,6 +1096,7 @@ fn build_code_records(
         .collect();
     let mut complexity_records: Vec<ComplexityRecord> = Vec::new();
     let mut export_records: Vec<ExportRecord> = Vec::new();
+    let mut capability_records: Vec<CapabilityRecord> = Vec::new();
     for (path, facts) in &input.parsed.file_facts {
         let Some(file) = input.parsed.by_path.get(path) else {
             continue;
@@ -1073,8 +1140,29 @@ fn build_code_records(
                 re_export_name: export.re_export.as_ref().map(|r| r.imported_name.clone()),
             });
         }
+        for use_ in &facts.capability_uses {
+            capability_records.push(CapabilityRecord {
+                id: CapabilityUseId::from_parts(&[
+                    input.repository_id,
+                    file_id,
+                    use_.capability.as_str(),
+                    &use_.api,
+                ]),
+                repository_id: RepositoryId::from_raw(input.repository_id),
+                file_id: FileId::from_raw(file_id.clone()),
+                capability: use_.capability,
+                api: use_.api.clone(),
+                line: use_.line,
+                count: use_.count,
+            });
+        }
     }
-    (schema_edges, complexity_records, export_records)
+    (
+        schema_edges,
+        complexity_records,
+        export_records,
+        capability_records,
+    )
 }
 
 /// Recent-history window and cap for Git ingestion: current ownership

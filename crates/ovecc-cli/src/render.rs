@@ -65,6 +65,7 @@ pub(crate) fn meta_for(command: &str) -> Meta {
             | "health"
             | "deadcode"
             | "review"
+            | "architecture"
     ) {
         meta.rules = capabilities::rule_definitions();
     }

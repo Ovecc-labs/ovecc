@@ -1,0 +1,65 @@
+# Architecture contract: Nx workspace module boundaries (https://nx.dev).
+# Nx tags each library by type and enforces which types may depend on which,
+# through @nx/enforce-module-boundaries. This template encodes the standard
+# type taxonomy:
+#   app          may import feature, ui, data-access, util
+#   feature      may import feature, ui, data-access, util
+#   ui           may import ui, util
+#   data-access  may import data-access, util
+#   util         may import util
+# Same-type imports (feature -> feature, ui -> ui, ...) stay inside a single
+# component here, so they need no depends_on entry. Written by
+# `ovecc architecture init --template nx-workspace`.
+#
+# Nx binds a type with a tag in each project's config, not with a folder name.
+# The globs below follow the conventional `libs/<domain>/<type>-<name>` and
+# `apps/<name>` layout that Nx generators produce; rebind `paths` to match your
+# workspace. Reading Nx tags directly is a planned refinement, so scope tags
+# (scope:orders vs scope:billing) are out of this template's reach for now.
+#
+# A template is the target, not a mirror of today's code: `ovecc architecture
+# diff` reports the gap as your migration plan. Keep mode = "warn" while
+# rebinding, then tighten to "new-violations" and "strict".
+
+schema = 1
+
+# Enforcement: off | warn | new-violations | strict.
+mode = "warn"
+
+# Files no library claims: ignore | warn | forbid.
+unassigned = "warn"
+
+# Deployable applications; they compose features and shared libraries.
+[[component]]
+name = "app"
+role = "nx/app"
+paths = ["apps/**"]
+depends_on = ["feature", "ui", "data-access", "util"]
+
+# Feature libraries: smart, use-case UI wired to data-access.
+[[component]]
+name = "feature"
+role = "nx/feature"
+paths = ["libs/**/feature/**", "libs/**/feature-*/**", "libs/**/features/**"]
+depends_on = ["ui", "data-access", "util"]
+
+# Presentational UI libraries: dumb components, no data fetching.
+[[component]]
+name = "ui"
+role = "nx/ui"
+paths = ["libs/**/ui/**", "libs/**/ui-*/**"]
+depends_on = ["util"]
+
+# Data-access libraries: state, API clients, side effects.
+[[component]]
+name = "data-access"
+role = "nx/data-access"
+paths = ["libs/**/data-access/**", "libs/**/data-access-*/**"]
+depends_on = ["util"]
+
+# Utility libraries: pure helpers, types, constants.
+[[component]]
+name = "util"
+role = "nx/util"
+paths = ["libs/**/util/**", "libs/**/util-*/**", "libs/**/utils/**"]
+depends_on = []

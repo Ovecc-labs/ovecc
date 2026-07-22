@@ -243,6 +243,48 @@ pub const COMMANDS: &[CommandSpec] = &[
         output: "A prose explanation plus the underlying context slice.",
         read_only: true,
     },
+    CommandSpec {
+        name: "architecture init",
+        summary: "Draft .ovecc/architecture.toml from the observed graph: every depends_on entry mirrors an existing import, so the contract starts with zero violations. With --template, write a built-in reference architecture instead (needs no index); the diff then reports the migration gap.",
+        key_params: &["--force", "--template <name>"],
+        output: "The contract file written, with component and declared-dependency counts.",
+        read_only: false,
+    },
+    CommandSpec {
+        name: "architecture templates",
+        summary: "List the built-in architecture templates: reference architectures distilled from each ecosystem's published canon, shipped in the binary.",
+        key_params: &[],
+        output: "Template names with summary, target stacks, and canonical source.",
+        read_only: true,
+    },
+    CommandSpec {
+        name: "architecture suggest",
+        summary: "Recognize which built-in template the indexed repository most resembles: a deterministic fit score (coverage x conformance) per template, the detected root, and the divergent edges. Recognition against a curated basket of archetypes, not architecture recovery.",
+        key_params: &[],
+        output: "Ranked template fits (score, root, coverage, conformance) and the best match above the recognition threshold.",
+        read_only: true,
+    },
+    CommandSpec {
+        name: "architecture show",
+        summary: "The contract resolved for given paths: owning components, what each may import (and through which interface files), what it must not. Answers the pre-edit question from the contract alone — no index required.",
+        key_params: &["paths"],
+        output: "Components with may_import (target interfaces included), interface, and external_deny.",
+        read_only: true,
+    },
+    CommandSpec {
+        name: "architecture diff",
+        summary: "Reflexion report between the contract and the stored graph: convergences, divergences, interface bypasses, and absences with file:line evidence. Re-reads the contract on every run.",
+        key_params: &["--format json|markdown"],
+        output: "Declared edges with observed occurrence counts, plus the contract findings.",
+        read_only: true,
+    },
+    CommandSpec {
+        name: "architecture check",
+        summary: "The architecture diff as a CI gate: exit 1 when a contract finding crosses the threshold. --freeze accepts the current violations into the baseline store (.ovecc/architecture/baseline/, one file per component); in new-violations mode baselined entries stop gating and the ratchet drops corrected ones.",
+        key_params: &["--fail-on medium|high|any", "--freeze"],
+        output: "The same report as architecture diff; the verdict is the exit code.",
+        read_only: false,
+    },
 ];
 
 /// One stable exit code.
@@ -503,6 +545,76 @@ pub fn rule_definitions() -> BTreeMap<String, MetaRule> {
             rule(
                 "An import matches a banned specifier pattern declared in [[rules.banned_imports]].",
                 "configurable",
+            ),
+        ),
+        (
+            "architecture/divergence".to_string(),
+            rule(
+                "A component imports another that its .ovecc/architecture.toml \
+                 depends_on does not declare.",
+                "high",
+            ),
+        ),
+        (
+            "architecture/interface-bypass".to_string(),
+            rule(
+                "A component imports another component's internals instead of its \
+                 declared interface file(s).",
+                "high",
+            ),
+        ),
+        (
+            "architecture/slice-isolation".to_string(),
+            rule(
+                "Two slices of a `slices = true` component import each other \
+                 (the @x public-API exception aside).",
+                "high",
+            ),
+        ),
+        (
+            "architecture/capability".to_string(),
+            rule(
+                "A component uses an ambient capability (network, filesystem, \
+                 storage, dom, process, time, random) its contract denies.",
+                "medium",
+            ),
+        ),
+        (
+            "architecture/complexity-budget".to_string(),
+            rule(
+                "A function exceeds the component's per-function \
+                 cyclomatic/cognitive budget (an architectural fitness function).",
+                "medium",
+            ),
+        ),
+        (
+            "architecture/deprecated-use".to_string(),
+            rule(
+                "A dependency the contract marks deprecated is still imported.",
+                "medium",
+            ),
+        ),
+        (
+            "architecture/external-deny".to_string(),
+            rule(
+                "A component imports an external package its contract denies.",
+                "medium",
+            ),
+        ),
+        (
+            "architecture/absence".to_string(),
+            rule(
+                "A declared depends_on edge no import implements (contract hygiene, \
+                 never gates).",
+                "low",
+            ),
+        ),
+        (
+            "architecture/unassigned".to_string(),
+            rule(
+                "Indexed files match no component's paths, per the contract's \
+                 unassigned policy.",
+                "low/high",
             ),
         ),
         (

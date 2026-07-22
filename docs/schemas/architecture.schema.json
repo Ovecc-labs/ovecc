@@ -1,0 +1,113 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://ovecc.dev/schemas/architecture.schema.json",
+  "title": "Ovecc architecture contract",
+  "description": "Schema for .ovecc/architecture.toml: the intended architecture as code. Components are matched to files by path globs; depends_on is the allow-list of legal component dependencies. See docs/COMMANDS.md#ovecc-architecture-init---force.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema"],
+  "properties": {
+    "schema": {
+      "description": "Contract schema version. Always 1.",
+      "type": "integer",
+      "const": 1
+    },
+    "mode": {
+      "description": "Enforcement mode. warn reports everything at low severity and never gates; new-violations and strict differ once the baseline store exists.",
+      "type": "string",
+      "enum": ["off", "warn", "new-violations", "strict"],
+      "default": "new-violations"
+    },
+    "unassigned": {
+      "description": "What to do with indexed files no component claims.",
+      "type": "string",
+      "enum": ["ignore", "warn", "forbid"],
+      "default": "warn"
+    },
+    "component": {
+      "description": "The declared components. Rules reference components only by name; paths live solely in each component's paths.",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "paths"],
+        "properties": {
+          "name": {
+            "description": "Unique component name, referenced by depends_on entries.",
+            "type": "string",
+            "minLength": 1
+          },
+          "role": {
+            "description": "Free-form label for humans and agents (e.g. domain, adapter, entrypoint). Not enforced.",
+            "type": "string"
+          },
+          "paths": {
+            "description": "Path globs claiming files for this component. * stays inside one path segment, ** crosses segments; the most specific glob wins across components.",
+            "type": "array",
+            "minItems": 1,
+            "items": { "type": "string", "minLength": 1 }
+          },
+          "depends_on": {
+            "description": "The only components this one may depend on. An import to any other component is a divergence.",
+            "type": "array",
+            "items": {
+              "oneOf": [
+                {
+                  "type": "string",
+                  "minLength": 1,
+                  "description": "A component name."
+                },
+                {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["component"],
+                  "properties": {
+                    "component": { "type": "string", "minLength": 1 },
+                    "deprecated": {
+                      "description": "Still legal, but reported so the entry can eventually be dropped.",
+                      "type": "boolean",
+                      "default": false
+                    }
+                  }
+                }
+              ]
+            }
+          },
+          "interface": {
+            "description": "Public entry files. When non-empty, other components may import only these paths; anything else is an interface bypass. Virtual: no barrel file required.",
+            "type": "array",
+            "items": { "type": "string", "minLength": 1 }
+          },
+          "external_deny": {
+            "description": "External specifier patterns this component must not import (e.g. a pure-logic component banning DB clients).",
+            "type": "array",
+            "items": { "type": "string", "minLength": 1 }
+          },
+          "slices": {
+            "description": "Isolate the component's slices: each first-level directory under the glob prefix is a slice, and slices must not import each other. A slice exposes a public API for a neighbour under <neighbour>/@x/<slice>.",
+            "type": "boolean",
+            "default": false
+          },
+          "deny_capabilities": {
+            "description": "Ambient capabilities this component must not use, matched against a curated JS/TS API basket (globals, ambient receivers, constructors, and node builtins).",
+            "type": "array",
+            "items": {
+              "type": "string",
+              "enum": ["network", "filesystem", "storage", "dom", "process", "time", "random"]
+            }
+          },
+          "max_cyclomatic": {
+            "description": "Per-function McCabe cyclomatic budget for the component. A function above it is a complexity-budget verdict. At least 1.",
+            "type": "integer",
+            "minimum": 1
+          },
+          "max_cognitive": {
+            "description": "Per-function SonarSource cognitive budget for the component. A function above it is a complexity-budget verdict.",
+            "type": "integer",
+            "minimum": 0
+          }
+        }
+      }
+    }
+  }
+}

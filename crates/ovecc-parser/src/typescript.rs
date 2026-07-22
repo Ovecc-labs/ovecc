@@ -18,9 +18,9 @@
 
 use crate::security;
 use ovecc_core::facts::{
-    ApiFact, ApiKind, CallFact, CallKind, FileFacts, ImportFact, ImportFactKind, ParseFailure,
-    SchemaAccess, SchemaObjectKind, SchemaRefFact, SecurityPatternFact, SourceFile, Span,
-    SymbolFact, SymbolKind, Visibility,
+    ApiFact, ApiKind, CallFact, CallKind, CapabilityFact, CapabilityKind, FileFacts, ImportFact,
+    ImportFactKind, ParseFailure, SchemaAccess, SchemaObjectKind, SchemaRefFact,
+    SecurityPatternFact, SourceFile, Span, SymbolFact, SymbolKind, Visibility,
 };
 use ovecc_core::lang::SourceLanguage;
 use ovecc_core::traits::LanguageAdapter;
@@ -104,6 +104,10 @@ struct Extractor<'a> {
     security: Vec<SecurityPatternFact>,
     suppressed: Vec<u32>,
     local_types: Vec<(String, String)>,
+    /// (capability, api) → (first line, occurrence count). One fact per
+    /// distinct API keeps the facts bounded on files that touch the DOM in
+    /// every function.
+    capabilities: std::collections::BTreeMap<(CapabilityKind, String), (u32, u32)>,
     /// AST node id → synthetic handler name, for inline route handlers whose
     /// body must be visited inside its own callable frame.
     pending_handlers: std::collections::HashMap<usize, String>,
@@ -122,6 +126,7 @@ impl<'a> Extractor<'a> {
             security: Vec::new(),
             suppressed: Vec::new(),
             local_types: Vec::new(),
+            capabilities: std::collections::BTreeMap::new(),
             pending_handlers: std::collections::HashMap::new(),
         }
     }
@@ -158,6 +163,17 @@ impl<'a> Extractor<'a> {
         self.security.dedup();
         self.suppressed.sort_unstable();
         self.suppressed.dedup();
+        let mut capability_uses: Vec<CapabilityFact> = self
+            .capabilities
+            .into_iter()
+            .map(|((capability, api), (line, count))| CapabilityFact {
+                capability,
+                api,
+                line,
+                count,
+            })
+            .collect();
+        capability_uses.sort_by(|a, b| a.line.cmp(&b.line).then_with(|| a.api.cmp(&b.api)));
         FileFacts {
             symbols: self.symbols,
             imports: self.imports,
@@ -167,9 +183,19 @@ impl<'a> Extractor<'a> {
             security_patterns: self.security,
             suppressed_lines: self.suppressed,
             local_types: self.local_types,
+            capability_uses,
             // complexity + exports are computed by the oxc extractor, not here.
             ..FileFacts::default()
         }
+    }
+
+    fn record_capability(&mut self, capability: CapabilityKind, api: String, line: u32) {
+        let entry = self
+            .capabilities
+            .entry((capability, api))
+            .or_insert((line, 0));
+        entry.0 = entry.0.min(line);
+        entry.1 += 1;
     }
 
     fn text(&self, node: Node<'_>) -> &str {
@@ -275,6 +301,9 @@ impl<'a> Extractor<'a> {
             }
             "new_expression" => {
                 self.extract_new(node);
+            }
+            "member_expression" => {
+                self.extract_member_capability(node);
             }
             "pair" => {
                 self.extract_permissive_cors(node);
@@ -594,13 +623,18 @@ impl<'a> Extractor<'a> {
                         self.security
                             .push(security::eval_fact(self.line(node), "eval", caller));
                     }
-                    _ => self.calls.push(CallFact {
-                        caller_qualified_name: self.current_caller(),
-                        callee_name: callee,
-                        kind: CallKind::Direct,
-                        line: self.line(node),
-                        receiver: None,
-                    }),
+                    _ => {
+                        if let Some(capability) = CapabilityKind::of_global_call(&callee) {
+                            self.record_capability(capability, callee.clone(), self.line(node));
+                        }
+                        self.calls.push(CallFact {
+                            caller_qualified_name: self.current_caller(),
+                            callee_name: callee,
+                            kind: CallKind::Direct,
+                            line: self.line(node),
+                            receiver: None,
+                        });
+                    }
                 }
             }
             // Dynamic `import("…")`: tree-sitter parses the callee as the `import`
@@ -680,6 +714,12 @@ impl<'a> Extractor<'a> {
             }
         }
 
+        if let Some(object) = receiver.as_deref()
+            && let Some(capability) = CapabilityKind::of_method_call(object, &property)
+        {
+            self.record_capability(capability, format!("{object}.{property}"), self.line(call));
+        }
+
         self.calls.push(CallFact {
             caller_qualified_name: self.current_caller(),
             callee_name: property,
@@ -687,6 +727,40 @@ impl<'a> Extractor<'a> {
             line: self.line(call),
             receiver,
         });
+    }
+
+    /// Ambient-object member access outside a call: `process.env.NODE_ENV`,
+    /// `document.cookie`, `localStorage.length`. Member calls are recorded by
+    /// `extract_member_call`, so a node that is itself a call's callee is
+    /// skipped to keep one logical use at one count. In a chain only the
+    /// innermost member has the bare ambient identifier as its object, so a
+    /// chain records once.
+    fn extract_member_capability(&mut self, node: Node<'_>) {
+        let Some(object) = node
+            .child_by_field_name("object")
+            .filter(|object| object.kind() == "identifier")
+        else {
+            return;
+        };
+        let Some(capability) = CapabilityKind::of_member_root(self.text(object)) else {
+            return;
+        };
+        if let Some(parent) = node.parent()
+            && parent.kind() == "call_expression"
+            && parent.child_by_field_name("function") == Some(node)
+        {
+            return;
+        }
+        let property = node
+            .child_by_field_name("property")
+            .map(|property| self.text(property).to_string())
+            .unwrap_or_default();
+        let api = if property.is_empty() {
+            self.text(object).to_string()
+        } else {
+            format!("{}.{property}", self.text(object))
+        };
+        self.record_capability(capability, api, self.line(node));
     }
 
     /// Value of the first string-literal argument of a call, if any.
@@ -789,6 +863,13 @@ impl<'a> Extractor<'a> {
             let caller = self.current_caller();
             self.security
                 .push(security::eval_fact(self.line(node), "new Function", caller));
+        }
+        let argless = node
+            .child_by_field_name("arguments")
+            .map(|arguments| arguments.named_child_count() == 0)
+            .unwrap_or(true);
+        if let Some(capability) = CapabilityKind::of_constructor(&callee_name, argless) {
+            self.record_capability(capability, format!("new {callee_name}"), self.line(node));
         }
         self.calls.push(CallFact {
             caller_qualified_name: self.current_caller(),
@@ -1605,6 +1686,92 @@ app.post("/users", (req, res) => {
         assert_eq!(
             sink.caller_qualified_name.as_deref(),
             Some("<POST /users handler>")
+        );
+    }
+
+    fn capability(facts: &FileFacts, api: &str) -> Option<CapabilityFact> {
+        facts
+            .capability_uses
+            .iter()
+            .find(|use_| use_.api == api)
+            .cloned()
+    }
+
+    #[test]
+    fn records_capability_uses_once_per_api_with_first_line_and_count() {
+        let facts = extract(
+            r#"
+export function load() {
+    const seed = Math.random();
+    const started = Date.now();
+    const other = Date.now();
+    return fetch("/api/items", { headers: { seed, started, other } });
+}
+"#,
+            SourceLanguage::TypeScript,
+        );
+        let now = capability(&facts, "Date.now").expect("clock use");
+        assert_eq!(now.capability, CapabilityKind::Time);
+        assert_eq!(now.line, 4, "first occurrence");
+        assert_eq!(now.count, 2, "both reads folded into one fact");
+        assert_eq!(
+            capability(&facts, "Math.random").unwrap().capability,
+            CapabilityKind::Random
+        );
+        assert_eq!(
+            capability(&facts, "fetch").unwrap().capability,
+            CapabilityKind::Network
+        );
+    }
+
+    #[test]
+    fn ambient_members_count_once_whether_called_or_read() {
+        let facts = extract(
+            r#"
+const theme = localStorage.getItem("theme");
+const env = process.env.NODE_ENV;
+document.title = env;
+const socket = new WebSocket("wss://x");
+const at = new Date(env);
+"#,
+            SourceLanguage::JavaScript,
+        );
+        assert_eq!(
+            capability(&facts, "localStorage.getItem").unwrap().count,
+            1,
+            "the call path records it, the member path skips it"
+        );
+        assert_eq!(
+            capability(&facts, "process.env").unwrap().capability,
+            CapabilityKind::Process
+        );
+        assert_eq!(
+            capability(&facts, "document.title").unwrap().capability,
+            CapabilityKind::Dom
+        );
+        assert_eq!(
+            capability(&facts, "new WebSocket").unwrap().capability,
+            CapabilityKind::Network
+        );
+        assert!(
+            capability(&facts, "new Date").is_none(),
+            "new Date(value) converts, only the argless form reads the clock"
+        );
+    }
+
+    #[test]
+    fn pure_code_records_no_capability() {
+        let facts = extract(
+            r#"
+export const total = (items: number[]) => items.reduce((sum, x) => sum + x, 0);
+const label = ["a", "b"].join("-");
+"#,
+            SourceLanguage::TypeScript,
+        );
+        assert!(
+            facts.capability_uses.is_empty(),
+            "{:?}",
+            facts.capability_uses
         );
     }
 }

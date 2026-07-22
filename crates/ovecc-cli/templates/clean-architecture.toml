@@ -1,0 +1,75 @@
+# Architecture contract: Clean / Hexagonal Architecture for TypeScript.
+# Dependencies point inward, toward the domain:
+#   presentation > application > domain
+#   infrastructure > application, domain   (adapters implement the ports)
+# Written by `ovecc architecture init --template clean-architecture`. The paths
+# below are one common layout; rebind each `paths` to your own and keep the
+# `role` (it names the ring, component names are yours).
+#
+# A template is the target, not a mirror of today's code: expect divergences
+# on day one. The report of `ovecc architecture diff` is the migration plan.
+# Keep mode = "warn" while rebinding, then switch to "new-violations" and run
+# `ovecc architecture check --freeze` to accept the remaining debt; the ratchet
+# shrinks it from there. "strict" is the finish line.
+#
+# What makes this contract more than a dependency map: the domain is a *pure*
+# ring. `deny_capabilities` forbids it from touching the network, the
+# filesystem, the DOM, the process, the clock, or randomness, so business
+# logic stays deterministic and testable (functional purity in the sense of
+# Finifter et al., CCS 2008: side-effect free and deterministic). A
+# `Date.now()` or a `fetch` inside the domain is a capability verdict with the
+# exact file:line. Injected clocks and gateways belong in application; real
+# I/O belongs in infrastructure.
+
+schema = 1
+
+# Enforcement: off | warn | new-violations | strict.
+mode = "warn"
+
+# Files no ring claims: ignore | warn | forbid.
+unassigned = "warn"
+
+# Delivery mechanism: HTTP controllers, CLI, UI. Depends on use cases, never
+# on infrastructure directly.
+[[component]]
+name = "presentation"
+role = "clean/presentation"
+paths = ["src/presentation/**", "src/controllers/**", "src/ui/**"]
+depends_on = ["application", "domain"]
+
+# Adapters that implement the ports: database repositories, HTTP clients,
+# message buses, the real clock. This is the only ring that holds capabilities.
+# Declared before application only so the file reads top-down; it sits on the
+# outer ring alongside presentation.
+[[component]]
+name = "infrastructure"
+role = "clean/infrastructure"
+paths = ["src/infrastructure/**", "src/infra/**", "src/adapters/**"]
+depends_on = ["application", "domain"]
+
+# Use cases orchestrating the domain through ports (interfaces). May read the
+# clock or reach a gateway only through an injected dependency.
+[[component]]
+name = "application"
+role = "clean/application"
+paths = ["src/application/**", "src/use-cases/**", "src/usecases/**"]
+depends_on = ["domain"]
+
+# Enterprise business rules: entities, value objects, domain services, port
+# interfaces. Pure: no I/O, no ambient clock, no randomness. Keep functions
+# small enough to reason about (a budget, not a hard law: raise it knowingly).
+[[component]]
+name = "domain"
+role = "clean/domain"
+paths = ["src/domain/**", "src/entities/**"]
+depends_on = []
+deny_capabilities = [
+  "network",
+  "filesystem",
+  "storage",
+  "dom",
+  "process",
+  "time",
+  "random",
+]
+max_cyclomatic = 15

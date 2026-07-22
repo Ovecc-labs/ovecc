@@ -19,8 +19,8 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use duckdb::{Connection, Transaction, params};
 use ovecc_core::facts::{
-    ApiRecord, CallRecord, ComplexityRecord, Evidence, ExportRecord, FindingKind, FindingRecord,
-    SchemaObjectRecord, Severity, SymbolRecord,
+    ApiRecord, CallRecord, CapabilityRecord, ComplexityRecord, Evidence, ExportRecord, FindingKind,
+    FindingRecord, SchemaObjectRecord, Severity, SymbolRecord,
 };
 use ovecc_core::id::{FindingId, RepositoryId, SnapshotId};
 use std::collections::HashSet;
@@ -41,6 +41,9 @@ pub struct ResolvedCode<'a> {
     pub complexity: &'a [ComplexityRecord],
     /// Per-file exports (oxc), persisted to the `exports` table.
     pub exports: &'a [ExportRecord],
+    /// Ambient-capability uses (tree-sitter TS/JS), persisted to the
+    /// `capability_uses` table.
+    pub capability_uses: &'a [CapabilityRecord],
 }
 
 /// A dependency row for the OSV audit inventory.

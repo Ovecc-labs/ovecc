@@ -1,4 +1,8 @@
 use crate::commands::{
+    architecture::{
+        run_architecture_check, run_architecture_diff, run_architecture_init,
+        run_architecture_show, run_architecture_suggest, run_architecture_templates,
+    },
     capabilities::render_capabilities,
     conventions::{load_conventions_report, render_conventions},
     diagnose::{
@@ -418,9 +422,69 @@ pub enum Command {
         #[arg(long, default_value_t = 20)]
         limit: usize,
     },
+    /// Architecture contracts: draft `.ovecc/architecture.toml` from the
+    /// observed graph, diff the intended architecture against the actual one,
+    /// and gate CI on the verdicts.
+    Architecture {
+        #[command(subcommand)]
+        what: ArchitectureCommand,
+    },
     /// Run an MCP (Model Context Protocol) server over stdio, exposing Ovecc's
     /// commands as tools for coding agents. Reads/writes JSON-RPC on stdin/stdout.
     Mcp,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ArchitectureCommand {
+    /// Draft `.ovecc/architecture.toml` from the observed graph. Every
+    /// depends_on entry mirrors an import that exists today, so the contract
+    /// starts with zero violations; governance is deleting what you regret.
+    /// With --template, write a built-in reference architecture instead: the
+    /// contract becomes the target and the diff is the migration plan.
+    Init {
+        /// Overwrite an existing .ovecc/architecture.toml.
+        #[arg(long)]
+        force: bool,
+        /// Start from a named template (see `architecture templates`) instead
+        /// of the observed graph. Needs no index.
+        #[arg(long, value_name = "NAME")]
+        template: Option<String>,
+    },
+    /// List the built-in architecture templates: reference architectures
+    /// distilled from each ecosystem's published canon, shipped in the binary.
+    Templates,
+    /// Recognize which built-in template the indexed repository most
+    /// resembles: a deterministic fit score (coverage x conformance) per
+    /// template, the detected root, and the divergences. Needs an index.
+    Suggest,
+    /// Reflexion report between the contract and the stored graph:
+    /// convergences, divergences, interface bypasses, and absences, each with
+    /// file:line evidence. Re-reads the contract on every run — editing it
+    /// never requires re-indexing.
+    Diff,
+    /// The contract itself, resolved: which components own the given paths,
+    /// what each may import (and through which interface files), what it must
+    /// not. Answers "I'm editing this file, what am I allowed to import?"
+    /// from the contract alone — no index required.
+    Show {
+        /// Paths to look up. Without any, the whole contract is shown.
+        #[arg(value_name = "PATH")]
+        paths: Vec<String>,
+    },
+    /// The same report as an exit code for CI: exit 1 when a finding crosses
+    /// the threshold. In new-violations mode, baselined entries are accepted
+    /// debt and the ratchet drops the corrected ones from the store.
+    Check {
+        /// Fail threshold over the contract findings.
+        #[arg(long, value_enum, default_value_t = FailOn::High)]
+        fail_on: FailOn,
+        /// Accept every current violation into the baseline store
+        /// (`.ovecc/architecture/baseline/`), one file per component. The
+        /// progressive-adoption entry point: freeze once, gate new
+        /// violations from then on.
+        #[arg(long)]
+        freeze: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -918,6 +982,34 @@ fn run_command(cli: Cli) -> Result<u8> {
             let report = load_metrics_report(&paths, &diagnose_config, target.as_deref())?;
             render_metrics(&report, config.output.default_format)?;
             Ok(0)
+        }
+        Command::Architecture { what } => {
+            let paths = ProjectPaths::resolve(cli.repo.unwrap_or_else(|| PathBuf::from(".")))?;
+            match what {
+                ArchitectureCommand::Init { force, template } => {
+                    run_architecture_init(&paths, force, template.as_deref())
+                }
+                ArchitectureCommand::Templates => {
+                    let config = load_config(&paths, format_override)?;
+                    run_architecture_templates(config.output.default_format)
+                }
+                ArchitectureCommand::Suggest => {
+                    let config = load_config(&paths, format_override)?;
+                    run_architecture_suggest(&paths, config.output.default_format)
+                }
+                ArchitectureCommand::Diff => {
+                    let config = load_config(&paths, format_override)?;
+                    run_architecture_diff(&paths, config.output.default_format)
+                }
+                ArchitectureCommand::Show { paths: query } => {
+                    let config = load_config(&paths, format_override)?;
+                    run_architecture_show(&paths, config.output.default_format, &query)
+                }
+                ArchitectureCommand::Check { fail_on, freeze } => {
+                    let config = load_config(&paths, format_override)?;
+                    run_architecture_check(&paths, config.output.default_format, fail_on, freeze)
+                }
+            }
         }
         Command::Mcp => crate::mcp::serve(),
     };

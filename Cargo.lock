@@ -2653,7 +2653,7 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
 name = "ovecc-ai"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "ovecc-core",
@@ -2661,7 +2661,7 @@ dependencies = [
 
 [[package]]
 name = "ovecc-audit"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2674,7 +2674,7 @@ dependencies = [
 
 [[package]]
 name = "ovecc-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -2686,6 +2686,7 @@ dependencies = [
  "ovecc-git",
  "ovecc-graph",
  "ovecc-indexer",
+ "ovecc-rules",
  "peak_alloc",
  "rayon",
  "regex",
@@ -2697,9 +2698,10 @@ dependencies = [
 
 [[package]]
 name = "ovecc-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
+ "globset",
  "serde",
  "serde_json",
  "sha2",
@@ -2710,7 +2712,7 @@ dependencies = [
 
 [[package]]
 name = "ovecc-dataflow"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "ovecc-core",
@@ -2719,7 +2721,7 @@ dependencies = [
 
 [[package]]
 name = "ovecc-db"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2732,7 +2734,7 @@ dependencies = [
 
 [[package]]
 name = "ovecc-git"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "gix",
@@ -2741,7 +2743,7 @@ dependencies = [
 
 [[package]]
 name = "ovecc-graph"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ovecc-core",
  "petgraph",
@@ -2750,7 +2752,7 @@ dependencies = [
 
 [[package]]
 name = "ovecc-indexer"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2772,7 +2774,7 @@ dependencies = [
 
 [[package]]
 name = "ovecc-parser"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "ovecc-core",
@@ -2793,7 +2795,7 @@ dependencies = [
 
 [[package]]
 name = "ovecc-rules"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "ovecc-core",
@@ -4958,7 +4960,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "yoke"

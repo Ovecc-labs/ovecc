@@ -1,0 +1,65 @@
+schema = 1
+mode = "new-violations"
+unassigned = "warn"
+
+[[component]]
+name = "core"
+role = "domain"
+paths = ["crates/ovecc-core/**"]
+
+[[component]]
+name = "db"
+paths = ["crates/ovecc-db/**"]
+depends_on = ["core"]
+
+[[component]]
+name = "graph"
+paths = ["crates/ovecc-graph/**"]
+depends_on = ["core"]
+
+[[component]]
+name = "parser"
+paths = ["crates/ovecc-parser/**"]
+depends_on = ["core"]
+
+[[component]]
+name = "git"
+paths = ["crates/ovecc-git/**"]
+
+[[component]]
+name = "rules"
+paths = ["crates/ovecc-rules/**"]
+depends_on = ["core", "graph"]
+
+[[component]]
+name = "dataflow"
+paths = ["crates/ovecc-dataflow/**"]
+depends_on = ["core", "graph"]
+
+[[component]]
+name = "audit"
+paths = ["crates/ovecc-audit/**"]
+depends_on = ["core"]
+
+[[component]]
+name = "ai"
+paths = ["crates/ovecc-ai/**"]
+depends_on = ["core"]
+
+[[component]]
+name = "indexer"
+paths = ["crates/ovecc-indexer/**"]
+depends_on = ["core", "db", "parser", "rules", "graph", "git", "audit", "dataflow"]
+
+[[component]]
+name = "cli"
+paths = ["crates/ovecc-cli/**"]
+depends_on = ["core", "db", "graph", "git", "audit", "ai", "indexer", "rules"]
+
+[[component]]
+name = "xtask"
+paths = ["crates/xtask/**"]
+
+[[component]]
+name = "fixtures"
+paths = ["tests/**"]

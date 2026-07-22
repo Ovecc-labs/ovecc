@@ -470,6 +470,10 @@ impl ArchitectureStore {
             "DELETE FROM exports WHERE repository_id = ?",
             params![repository_id],
         )?;
+        tx.execute(
+            "DELETE FROM capability_uses WHERE repository_id = ?",
+            params![repository_id],
+        )?;
         {
             let mut seen = HashSet::new();
             let mut appender = tx.appender("complexity")?;
@@ -506,6 +510,24 @@ impl ArchitectureStore {
                     record.is_type_only,
                     record.re_export_source.as_deref(),
                     record.re_export_name.as_deref(),
+                ])?;
+            }
+        }
+        {
+            let mut seen = HashSet::new();
+            let mut appender = tx.appender("capability_uses")?;
+            for record in code.capability_uses {
+                if !seen.insert(record.id.as_str()) {
+                    continue;
+                }
+                appender.append_row(params![
+                    record.id.as_str(),
+                    record.repository_id.as_str(),
+                    record.file_id.as_str(),
+                    record.capability.as_str(),
+                    record.api,
+                    record.line as i32,
+                    record.count as i32,
                 ])?;
             }
         }
@@ -567,6 +589,7 @@ mod tests {
             schema_edges: &[],
             complexity: &[],
             exports: &[],
+            capability_uses: &[],
         };
 
         store

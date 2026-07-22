@@ -109,6 +109,10 @@ stable_id!(
     /// `export:{repository_id}:{file_id}:{name}:{line}`
     ExportId, "export"
 );
+stable_id!(
+    /// `capability:{repository_id}:{file_id}:{capability}:{api}`
+    CapabilityUseId, "capability"
+);
 
 #[cfg(test)]
 mod tests {

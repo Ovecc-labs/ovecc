@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.96"
 license = "Apache-2.0"
@@ -32,6 +32,9 @@ chrono = { version = "0.4", features = ["clock", "serde"] }
 clap = { version = "4.5", features = ["derive"] }
 duckdb = { version = "~1.10503.1", features = ["bundled"] }
 gix = "0.84"
+# Component path matching for architecture contracts. Already in the tree
+# transitively through `ignore`, so this adds no new third-party code.
+globset = "0.4"
 ignore = "0.4"
 petgraph = "0.8"
 regex = "1.11"

@@ -7,7 +7,9 @@ use crate::{
 };
 use anyhow::Result;
 use duckdb::{Connection, params};
-use ovecc_core::facts::{FindingRecord, Severity};
+use ovecc_core::facts::{
+    CapabilityFact, CapabilityKind, FindingRecord, FunctionMetricsRow, Severity,
+};
 use ovecc_core::legacy::DependencyRecord;
 
 impl ArchitectureStore {
@@ -185,6 +187,70 @@ impl ArchitectureStore {
              WHERE e.repository_id = ? AND e.edge_kind IN ('reads', 'writes')",
         )?;
         let rows = statement.query_map(params![repository_id], |row| row.get::<_, String>(0))?;
+        collect_rows(rows)
+    }
+
+    /// Ambient-capability uses joined to file paths, for the contract's
+    /// `deny_capabilities` check without a re-parse.
+    pub fn current_capability_uses(
+        &self,
+        repository_id: &str,
+    ) -> Result<Vec<(String, CapabilityFact)>> {
+        let mut statement = self.conn.prepare(
+            "SELECT f.path, c.capability, c.api, c.line, c.occurrence_count
+             FROM capability_uses c
+             JOIN files f ON c.file_id = f.id AND c.repository_id = f.repository_id
+             WHERE c.repository_id = ?
+             ORDER BY f.path, c.line, c.api",
+        )?;
+        let rows = statement.query_map(params![repository_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+            ))
+        })?;
+        let raw: Vec<(String, String, String, i64, i64)> = collect_rows(rows)?;
+        Ok(raw
+            .into_iter()
+            .filter_map(|(path, capability, api, line, count)| {
+                // An unknown capability name means the row was written by a
+                // newer build; skip it rather than misjudge it.
+                let capability = CapabilityKind::parse(&capability)?;
+                Some((
+                    path,
+                    CapabilityFact {
+                        capability,
+                        api,
+                        line: line as u32,
+                        count: count as u32,
+                    },
+                ))
+            })
+            .collect())
+    }
+
+    /// Per-function complexity joined to file paths, for the contract's
+    /// per-component budget check.
+    pub fn current_function_metrics(&self, repository_id: &str) -> Result<Vec<FunctionMetricsRow>> {
+        let mut statement = self.conn.prepare(
+            "SELECT f.path, c.qualified_name, c.line, c.cyclomatic, c.cognitive
+             FROM complexity c
+             JOIN files f ON c.file_id = f.id AND c.repository_id = f.repository_id
+             WHERE c.repository_id = ?
+             ORDER BY f.path, c.line, c.qualified_name",
+        )?;
+        let rows = statement.query_map(params![repository_id], |row| {
+            Ok(FunctionMetricsRow {
+                file_path: row.get(0)?,
+                qualified_name: row.get(1)?,
+                line: row.get::<_, i64>(2)? as u32,
+                cyclomatic: row.get::<_, i64>(3)? as u32,
+                cognitive: row.get::<_, i64>(4)? as u32,
+            })
+        })?;
         collect_rows(rows)
     }
 

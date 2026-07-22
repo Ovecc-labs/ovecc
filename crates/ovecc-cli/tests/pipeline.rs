@@ -691,9 +691,13 @@ fn init_scaffolds_config_and_preserves_user_edits() {
     let gitignore_path = temp.path().join(".gitignore");
     let gitignore = fs::read_to_string(&gitignore_path).expect("gitignore");
     assert_eq!(
-        gitignore.matches(".ovecc/").count(),
+        gitignore.matches(".ovecc/*").count(),
         1,
-        "init must ignore .ovecc/ exactly once: {gitignore}"
+        "init must ignore the .ovecc state exactly once: {gitignore}"
+    );
+    assert!(
+        gitignore.contains("!.ovecc/architecture.toml"),
+        "the architecture contract must stay trackable: {gitignore}"
     );
 
     let mut config = fs::read_to_string(&config_path).expect("config");
@@ -714,7 +718,7 @@ fn init_scaffolds_config_and_preserves_user_edits() {
     );
     let gitignore = fs::read_to_string(&gitignore_path).expect("gitignore");
     assert_eq!(
-        gitignore.matches(".ovecc/").count(),
+        gitignore.matches(".ovecc/*").count(),
         1,
         "re-init must not duplicate the ignore entry: {gitignore}"
     );
@@ -725,6 +729,123 @@ fn init_scaffolds_config_and_preserves_user_edits() {
         "the written starter config must load as valid configuration: {}",
         String::from_utf8_lossy(&indexed.stderr)
     );
+}
+
+#[test]
+fn architecture_init_template_needs_no_index() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    fs::create_dir(temp.path().join(".git")).expect("fake git dir");
+    let repo = temp.path().to_str().expect("utf8 path").to_string();
+
+    let listed = ovecc(&repo, &["architecture", "templates"]);
+    assert_eq!(listed.status.code(), Some(0));
+    let listing = String::from_utf8_lossy(&listed.stdout);
+    for name in [
+        "fsd",
+        "bulletproof-react",
+        "nx-workspace",
+        "clean-architecture",
+    ] {
+        assert!(
+            listing.contains(name),
+            "the template listing must name {name}"
+        );
+    }
+
+    let unknown = ovecc(&repo, &["architecture", "init", "--template", "nope"]);
+    assert_eq!(
+        unknown.status.code(),
+        Some(2),
+        "an unknown template is a usage error"
+    );
+    assert!(
+        String::from_utf8_lossy(&unknown.stderr).contains("available: fsd"),
+        "the error must list the known templates"
+    );
+
+    // The contract-first workflow: template, then show — before any index.
+    let init = ovecc(&repo, &["architecture", "init", "--template", "fsd"]);
+    assert_eq!(
+        init.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&init.stderr)
+    );
+    let contract = fs::read_to_string(temp.path().join(".ovecc").join("architecture.toml"))
+        .expect("contract written");
+    assert!(contract.contains("role = \"fsd/shared\""));
+    let gitignore = fs::read_to_string(temp.path().join(".gitignore")).expect("gitignore");
+    assert!(
+        gitignore.contains("!.ovecc/architecture.toml"),
+        "the templated contract must stay trackable: {gitignore}"
+    );
+
+    let shown = ovecc(&repo, &["architecture", "show", "src/features/auth/ui.tsx"]);
+    assert_eq!(shown.status.code(), Some(0));
+    let shown_out = String::from_utf8_lossy(&shown.stdout);
+    assert!(
+        shown_out.contains("features"),
+        "show must resolve the owning layer from the contract alone: {shown_out}"
+    );
+
+    let again = ovecc(&repo, &["architecture", "init", "--template", "fsd"]);
+    assert_eq!(
+        again.status.code(),
+        Some(2),
+        "re-init must refuse to overwrite without --force"
+    );
+}
+
+#[test]
+fn architecture_suggest_recognizes_a_feature_sliced_repo() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let root = temp.path();
+    let repo = root.to_str().expect("utf8 path").to_string();
+    fs::write(root.join("package.json"), "{ \"name\": \"fsd-demo\" }").expect("manifest");
+    // A minimal FSD lattice: app -> features -> shared, nothing upward.
+    let write = |rel: &str, body: &str| {
+        let path = root.join(rel);
+        fs::create_dir_all(path.parent().unwrap()).expect("mkdir");
+        fs::write(path, body).expect("write source");
+    };
+    write("src/shared/api.ts", "export const api = 1;\n");
+    write(
+        "src/features/auth.ts",
+        "import { api } from \"../shared/api\";\nexport const auth = api;\n",
+    );
+    write(
+        "src/app/main.ts",
+        "import { auth } from \"../features/auth\";\n\
+         import { api } from \"../shared/api\";\nexport const main = auth + api;\n",
+    );
+
+    let indexed = ovecc(&repo, &["index", "--no-git"]);
+    assert!(
+        indexed.status.success(),
+        "index failed: {}",
+        String::from_utf8_lossy(&indexed.stderr)
+    );
+
+    let suggested = ovecc(&repo, &["architecture", "suggest", "--format", "json"]);
+    assert_eq!(suggested.status.code(), Some(0));
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&suggested.stdout).expect("suggest json");
+    let data = &envelope["data"];
+    assert_eq!(
+        data["best"],
+        "fsd",
+        "the lattice is Feature-Sliced: {}",
+        String::from_utf8_lossy(&suggested.stdout)
+    );
+    let fsd = data["suggestions"]
+        .as_array()
+        .expect("suggestions array")
+        .iter()
+        .find(|suggestion| suggestion["template"] == "fsd")
+        .expect("fsd is ranked");
+    assert_eq!(fsd["root"], "src/", "the detected root is src/");
+    assert_eq!(fsd["conformance"], 1.0, "every edge is allowed");
+    assert_eq!(fsd["divergent_edges"], 0);
 }
 
 #[test]

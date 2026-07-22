@@ -109,16 +109,30 @@ runs:
           > "$RUNNER_TEMP/ovecc-review.md"
         code=$?
         set -euo pipefail
-        echo "exit-code=$code" >> "$GITHUB_OUTPUT"
-        if [ "$code" -eq 1 ]; then verdict=fail; else verdict=pass; fi
-        echo "verdict=$verdict" >> "$GITHUB_OUTPUT"
-        cat "$RUNNER_TEMP/ovecc-review.md" >> "$GITHUB_STEP_SUMMARY"
         # Tool errors (codes 2..7) fail immediately; a fail verdict is
         # enforced only after the comment step had its chance to post.
         if [ "$code" -ne 0 ] && [ "$code" -ne 1 ]; then
           echo "ovecc review failed with exit code $code" >&2
           exit "$code"
         fi
+        # When the repository declares an architecture contract, its verdicts
+        # join the comment and the gate.
+        if [ -f .ovecc/architecture.toml ]; then
+          set +e
+          { echo; ovecc architecture check --fail-on "${{ inputs.fail-on }}" --format markdown; } \
+            >> "$RUNNER_TEMP/ovecc-review.md"
+          arch_code=$?
+          set -euo pipefail
+          if [ "$arch_code" -ne 0 ] && [ "$arch_code" -ne 1 ]; then
+            echo "ovecc architecture check failed with exit code $arch_code" >&2
+            exit "$arch_code"
+          fi
+          if [ "$arch_code" -eq 1 ]; then code=1; fi
+        fi
+        echo "exit-code=$code" >> "$GITHUB_OUTPUT"
+        if [ "$code" -eq 1 ]; then verdict=fail; else verdict=pass; fi
+        echo "verdict=$verdict" >> "$GITHUB_OUTPUT"
+        cat "$RUNNER_TEMP/ovecc-review.md" >> "$GITHUB_STEP_SUMMARY"
 
     - name: Comment on the PR
       if: ${{ inputs.comment == 'true' && github.event_name == 'pull_request' }}

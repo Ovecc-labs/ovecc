@@ -161,6 +161,74 @@ Portions of Ovecc are adapted from [fallow](https://github.com/fallow-rs/fallow)
 
 ## Governance
 
+### Architecture contracts
+
+`.ovecc/architecture.toml` declares the intended architecture as code: the
+components, and the only dependencies each one may have.
+
+```toml
+[[component]]
+name = "api"
+paths = ["src/api/**"]
+depends_on = ["core"]
+
+[[component]]
+name = "features"
+paths = ["src/features/**"]
+depends_on = ["core"]
+slices = true                       # features must not import each other
+
+[[component]]
+name = "core"
+paths = ["src/core/**"]
+interface = ["src/core/index.ts"]   # the only legal door into core
+external_deny = ["pg*"]             # pure logic: no DB client imports
+deny_capabilities = ["network", "time", "random"]  # a pure, deterministic core
+max_cyclomatic = 15                 # a per-function fitness budget
+```
+
+`ovecc architecture init` drafts the contract from the observed graph — every
+entry mirrors an import that exists today, so day one has zero violations and
+governance is deleting the entries you regret. Or start from the canon:
+`init --template <name>` writes a reference architecture as the contract (no
+index required) from the built-ins `fsd`, `bulletproof-react`, `nx-workspace`,
+or `clean-architecture`, and the diff against it is your migration plan. From
+then on every index diffs the code against the contract in reflexion-model
+verdicts: an undeclared dependency is a **divergence**, an import that skips a
+declared interface is a **bypass**, a declared edge nobody implements is an
+**absence**. Interfaces are virtual — enforced on the observed edges, no barrel
+files required, so encapsulation costs neither tree-shaking nor an extra
+re-export layer.
+
+The contract governs more than the import graph. `slices = true` turns on
+slice isolation: sibling slices of a component (each first-level directory)
+may not import each other, the rule behind Feature-Sliced Design and
+bulletproof-react, with FSD's `@x` public-API exception honored. Two verdicts
+read the code itself: `deny_capabilities` forbids a component the ambient
+capabilities that break functional purity (network, filesystem, storage, dom,
+process, the clock, randomness), so a `Date.now()` in a pure domain is a
+verdict with its `file:line`; and `max_cyclomatic` / `max_cognitive` set a
+per-function complexity budget, a fitness function that lives in the contract.
+
+`ovecc architecture suggest` closes the loop: point it at an indexed repository
+and it recognizes which built-in template the code most resembles, detects the
+root (`src/`, or `apps/web/src/` in a monorepo), and scores the fit as
+coverage times conformance. A repository that follows a known architecture gets
+the matching contract bound to its real paths; one that follows none is told
+so. It is recognition against a curated basket, not architecture recovery from
+scratch, so it stays deterministic and offline.
+
+`ovecc architecture check` turns the verdicts into a CI gate. Progressive
+adoption is built in: `check --freeze` accepts today's violations into a
+per-component baseline store (line-per-violation files that merge cleanly),
+new violations gate from then on, and a ratchet drops corrected entries so the
+debt only shrinks. Agents ask the contract before editing —
+`ovecc architecture show <path>`, or the `ovecc_architecture` MCP tool — and
+the same verdicts come back through `violations`, `review`, and the PR
+comment of the GitHub Action.
+
+### Rules
+
 Declarative, language-neutral policy lives in `.ovecc/config.toml`, is enforced
 at index time, and is surfaced by `violations` (and the `gate` CI check):
 

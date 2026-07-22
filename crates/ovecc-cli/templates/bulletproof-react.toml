@@ -1,0 +1,63 @@
+# Architecture contract: bulletproof-react
+# (https://github.com/alan2207/bulletproof-react).
+# A unidirectional codebase: imports flow shared -> features -> app.
+#   app       may import features and shared
+#   features  may import shared, never app and never another feature
+#   shared    imports nothing above it
+# Written by `ovecc architecture init --template bulletproof-react`. The paths
+# below are the canonical layout; rebind each `paths` if your code lives
+# elsewhere and keep the `role` (it names the tier, component names are yours).
+#
+# A template is the target, not a mirror of today's code: expect divergences
+# on day one. The report of `ovecc architecture diff` is the migration plan.
+# Keep mode = "warn" while rebinding, then switch to "new-violations" and run
+# `ovecc architecture check --freeze` to accept the remaining debt; the ratchet
+# shrinks it from there. "strict" is the finish line.
+#
+# `slices = true` on `features` enforces the rule that gives bulletproof-react
+# its name: each directory under src/features is a feature, and features do not
+# import each other. A feature that must reach a neighbour exposes a public API
+# for it under `<neighbour>/@x/<feature>`; those imports are allowed.
+
+schema = 1
+
+# Enforcement: off | warn | new-violations | strict.
+mode = "warn"
+
+# Files no tier claims: ignore | warn | forbid.
+unassigned = "warn"
+
+# Application layer: routes, providers, app-wide configuration, entry point.
+[[component]]
+name = "app"
+role = "bulletproof/app"
+paths = ["src/app/**"]
+depends_on = ["features", "shared"]
+
+# Feature modules, each a self-contained slice (api, components, hooks, ...).
+[[component]]
+name = "features"
+role = "bulletproof/features"
+paths = ["src/features/**"]
+depends_on = ["shared"]
+slices = true
+
+# Everything not tied to a single feature: UI kit, hooks, lib wrappers,
+# global config, stores, shared types, utils, assets. `src/testing` is left
+# out on purpose: test utilities render components inside the app providers, so
+# they legitimately import upward and belong outside the production lattice
+# (they land in `unassigned`, like the rest of the tooling).
+[[component]]
+name = "shared"
+role = "bulletproof/shared"
+paths = [
+  "src/components/**",
+  "src/hooks/**",
+  "src/lib/**",
+  "src/config/**",
+  "src/stores/**",
+  "src/types/**",
+  "src/utils/**",
+  "src/assets/**",
+]
+depends_on = []

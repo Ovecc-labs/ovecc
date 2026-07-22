@@ -72,6 +72,139 @@ one call: the dashboard payload. Best consumed as `--format markdown|json`.
 
 ## Architecture intelligence
 
+### `ovecc architecture init [--force] [--template <name>]`
+
+Drafts `.ovecc/architecture.toml` — the intended architecture as code — from
+the observed graph: one component per detected module (narrowed to its common
+directory), `depends_on` set to exactly the module-to-module imports that
+exist today, and a commented `interface` suggestion when one file already
+receives at least 80% of a component's incoming imports. Because every entry
+mirrors a real import, the contract starts with zero violations; governance is
+deleting the entries you regret. `--force` regenerates over an existing file.
+
+`--template <name>` writes a built-in reference architecture instead of
+mirroring the graph, and needs no index — the contract-first workflow starts
+on an empty repository. A templated contract is the target, not a mirror:
+divergences on day one are expected, and the `diff` report is the migration
+plan. Templates ship with `mode = "warn"`; tighten to `new-violations` plus
+`check --freeze` once the paths are rebound, and let the ratchet shrink the
+rest. Each component carries a `role` (`"fsd/shared"`) naming its layer in
+the source architecture, so paths can be rebound without losing the mapping.
+
+### `ovecc architecture templates`
+
+The built-in templates: reference architectures distilled from each
+ecosystem's published canon (name, summary, target stacks, canonical source).
+JavaScript/TypeScript today:
+
+- `fsd` — Feature-Sliced Design: six layers importing strictly downward
+  (app > pages > widgets > features > entities > shared), with slice isolation
+  on pages/widgets/features/entities.
+- `bulletproof-react` — a unidirectional codebase where imports flow
+  shared > features > app and features never import each other (slice
+  isolation on features).
+- `nx-workspace` — Nx module boundaries by library type
+  (app > feature > (ui, data-access) > util). Nx binds types with tags, not
+  folders, so this template approximates them by the conventional
+  `libs/<domain>/<type>-<name>` layout; rebind `paths` if yours differs.
+- `clean-architecture` — Clean/Hexagonal: dependencies point inward
+  (presentation > application > domain, infrastructure implements the ports),
+  and the domain is a pure ring — `deny_capabilities` forbids it network,
+  filesystem, storage, dom, process, clock, and randomness, with a per-function
+  complexity budget.
+
+### `ovecc architecture suggest`
+
+Recognizes which built-in template the indexed repository most resembles, and
+binds it to the repository's real root. For each template it detects the root
+(`src/`, `apps/web/src/` in a monorepo, or the repository root), rebinds the
+template there, and scores the fit as coverage × conformance: coverage is the
+share of the repository's source files a component claims, conformance the
+share of the internal import edges the template allows. It reports the ranked
+fits and, above a 50% threshold, the best match with the command that applies
+it.
+
+```
+Best match: fsd (fit 1.00)
+  root: src/
+  coverage: 100% (64/64 source files, 3 components)
+  conformance: 100% (0 divergent edge(s) of 143)
+  apply: ovecc architecture init --template fsd
+```
+
+This is recognition against a curated basket of archetypes, not architecture
+recovery from scratch: automatic recovery of an arbitrary architecture is a
+hard, low-accuracy problem, but classifying a repository against a handful of
+known targets is well-posed. A repository that follows none of them is told so
+rather than pushed a template it does not fit. Needs an index.
+
+### `ovecc architecture show [paths...]`
+
+The contract resolved, from the contract alone — no index required. Without
+paths, every component; with paths, the components owning them. Each component
+lists what it may import (with the target's interface files as the legal
+doors), its own interface, its external deny-list, whether its slices are
+isolated, the capabilities it denies, and any per-function budget. This is the
+pre-edit question — "I'm editing this file, what am I allowed to import and
+do?" — and what the `ovecc_architecture` MCP tool serves to agents.
+
+```
+Contract mode new-violations, 1 component(s):
+
+cli (crates/ovecc-cli/**)
+  may import: core, db, graph, git, audit, ai, indexer, rules
+```
+
+### `ovecc architecture diff`
+
+The reflexion report between the contract and the stored graph, in the
+Murphy/Notkin/Sullivan vocabulary: convergences (declared and implemented,
+with import counts), divergences (imports the contract does not allow),
+slice-isolation breaches (imports between sibling slices of a `slices = true`
+component), interface bypasses (imports that skip a component's declared entry
+files), deprecated dependencies still in use, banned external packages, denied
+capabilities used, complexity budgets exceeded, unassigned files, and absences
+(declared but never implemented). Divergences, slice breaches, and bypasses are
+High; deprecated, banned, capability, and budget are Medium; hygiene is Low.
+`mode = "warn"` caps everything at Low so nothing gates.
+
+Beyond the import graph, two verdicts read the code itself (JS/TS): a
+`deny_capabilities` list forbids a component the ambient capabilities that
+break functional purity (network, filesystem, storage, dom, process, the
+clock, randomness), reported with the exact `file:line` and API; and
+`max_cyclomatic` / `max_cognitive` set a per-function complexity budget, an
+architectural fitness function checked against every function the component
+owns.
+
+```
+Architecture contract: 13 components, 25/25 declared dependencies implemented, mode new-violations
+
+Divergences (1):
+  [High] cli -> parser is not in the contract
+    crates/ovecc-cli/src/render.rs:12 (ovecc_parser::outline)
+```
+
+The contract file is re-read on every run and judged against the persisted
+graph, so editing `architecture.toml` never requires re-indexing. The same
+findings also land in `violations`/`gate` at each `ovecc index`.
+
+### `ovecc architecture check [--fail-on medium|high|any] [--freeze]`
+
+The same report as an exit code for CI: `1` when a contract finding crosses
+the threshold (default `high`, i.e. any divergence or interface bypass).
+
+Progressive adoption runs through the baseline store. `--freeze` accepts every
+current violation into `.ovecc/architecture/baseline/` — one file per
+component, one sorted `rule<TAB>file<TAB>specifier` line per violation, so
+concurrent branches merge line by line. No line numbers: an entry survives
+edits around the import; renaming the file resurrects the violation on
+purpose, because moving a file is the moment to pay its debt.
+
+In `new-violations` mode, baselined entries stop gating (the report header
+counts them) and every `check` ratchets: entries whose violation no longer
+exists leave the store, so the debt counter never climbs back. `strict`
+ignores the baseline entirely — the whole debt gates again.
+
 ### `ovecc diagnose`
 
 Named architectural smells at component (directory) granularity: cycles with

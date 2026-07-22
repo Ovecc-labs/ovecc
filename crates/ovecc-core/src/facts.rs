@@ -12,9 +12,9 @@
 
 use crate::graph::NodeKind;
 use crate::id::{
-    ApiId, CallId, CommitId, ComplexityId, DependencyId, ExportId, FileChangeId, FileId, FindingId,
-    MetricId, MigrationId, ModuleId, OwnershipId, RepositoryId, SchemaObjectId, SnapshotId,
-    SymbolId,
+    ApiId, CallId, CapabilityUseId, CommitId, ComplexityId, DependencyId, ExportId, FileChangeId,
+    FileId, FindingId, MetricId, MigrationId, ModuleId, OwnershipId, RepositoryId, SchemaObjectId,
+    SnapshotId, SymbolId,
 };
 use crate::lang::SourceLanguage;
 use chrono::{DateTime, Utc};
@@ -449,6 +449,10 @@ pub enum FindingKind {
     /// An `ovecc-ignore` comment that suppresses no finding — it will silently
     /// swallow the next real finding on its line.
     StaleSuppression,
+    /// The observed dependencies deviate from the intended architecture
+    /// declared in `.ovecc/architecture.toml` (undeclared edge, bypassed
+    /// interface, banned external import, deprecated edge still in use).
+    ArchitectureViolation,
 }
 
 /// A machine-actionable fix descriptor attached to a finding so an agent can act
@@ -539,6 +543,13 @@ impl FindingKind {
                 true,
                 "Delete the ovecc-ignore comment: it suppresses nothing and will \
                  silently swallow the next real finding on this line.",
+            ),
+            FindingKind::ArchitectureViolation => FixSpec::new(
+                "restore_architecture_contract",
+                false,
+                "Route the dependency through the target component's interface or \
+                 remove it; if the edge is intended, declare it in \
+                 .ovecc/architecture.toml and let the review record the decision.",
             ),
             FindingKind::HardcodedSecret => FixSpec::new(
                 "rotate_and_externalize_secret",
@@ -637,6 +648,12 @@ pub struct FileFacts {
     /// TS/JS extractor; feeds dead-code analysis.
     #[serde(default)]
     pub exports: Vec<ExportFact>,
+    /// Ambient capability uses (network, storage, clock, ...), one entry per
+    /// distinct API with its first line and occurrence count. Populated by
+    /// the TS/JS extractor; judged by the architecture contract's
+    /// `deny_capabilities`.
+    #[serde(default)]
+    pub capability_uses: Vec<CapabilityFact>,
 }
 
 /// A security-relevant pattern found in source, classified into a finding by
@@ -680,6 +697,143 @@ impl SecurityPatternKind {
     /// (untrusted input reaching them is code/command injection).
     pub fn is_taint_sink(self) -> bool {
         matches!(self, Self::DynamicEval | Self::CommandExec)
+    }
+}
+
+/// A use of an ambient JS/TS capability: an API that performs I/O or draws on
+/// a source of non-determinism. Detected unconditionally during the AST pass
+/// and deduplicated per file and API; the architecture contract decides which
+/// components may not hold which capability (`deny_capabilities`), so the
+/// facts stay contract-independent. The taxonomy follows the two halves of
+/// functional purity (Finifter et al., CCS 2008): side effects (network,
+/// filesystem, storage, dom, process) and non-determinism (time, random).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CapabilityFact {
+    pub capability: CapabilityKind,
+    /// The concrete API as written, e.g. `fetch`, `Date.now`, `new WebSocket`.
+    pub api: String,
+    /// 1-based line of the first occurrence in the file.
+    pub line: u32,
+    /// Occurrences of this API in the file.
+    pub count: u32,
+}
+
+/// The ambient capabilities the contract can deny per component. The API
+/// basket per capability is curated and closed — globals, receiver methods,
+/// constructors, and module specifiers below — so a verdict is always
+/// traceable to a named API, never a heuristic. Packages outside the basket
+/// are a job for `external_deny`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CapabilityKind {
+    /// `fetch`, `WebSocket`, `XMLHttpRequest`, `EventSource`,
+    /// `navigator.sendBeacon`; node `http`/`https`/`http2`/`net`/`tls`/
+    /// `dgram`/`dns`; `axios`, `node-fetch`, `undici`, `got`, `ky`.
+    Network,
+    /// node `fs`, `fs/promises`, `fs-extra`.
+    Filesystem,
+    /// `localStorage`, `sessionStorage`, `indexedDB`.
+    Storage,
+    /// `document.*` — any DOM access.
+    Dom,
+    /// `process.*` (env, exit, cwd); node `child_process`.
+    Process,
+    /// The ambient clock: `Date.now`, zero-argument `new Date`,
+    /// `performance.now`.
+    Time,
+    /// `Math.random`, `crypto.getRandomValues` / `randomUUID` /
+    /// `randomBytes` / `randomInt`.
+    Random,
+}
+
+impl CapabilityKind {
+    pub const ALL: &'static [CapabilityKind] = &[
+        CapabilityKind::Network,
+        CapabilityKind::Filesystem,
+        CapabilityKind::Storage,
+        CapabilityKind::Dom,
+        CapabilityKind::Process,
+        CapabilityKind::Time,
+        CapabilityKind::Random,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CapabilityKind::Network => "network",
+            CapabilityKind::Filesystem => "filesystem",
+            CapabilityKind::Storage => "storage",
+            CapabilityKind::Dom => "dom",
+            CapabilityKind::Process => "process",
+            CapabilityKind::Time => "time",
+            CapabilityKind::Random => "random",
+        }
+    }
+
+    /// Inverse of [`as_str`](Self::as_str), for rows read back from storage.
+    pub fn parse(name: &str) -> Option<Self> {
+        Self::ALL.iter().copied().find(|kind| kind.as_str() == name)
+    }
+
+    /// A bare-identifier call: `fetch(...)`.
+    pub fn of_global_call(name: &str) -> Option<Self> {
+        match name {
+            "fetch" => Some(CapabilityKind::Network),
+            _ => None,
+        }
+    }
+
+    /// A method call `receiver.property(...)`. Ambient receivers (`process`,
+    /// `document`, the storage globals) grant their capability whatever the
+    /// method; the rest need the exact pair.
+    pub fn of_method_call(receiver: &str, property: &str) -> Option<Self> {
+        if let Some(kind) = Self::of_member_root(receiver) {
+            return Some(kind);
+        }
+        match (receiver, property) {
+            ("Date", "now") | ("performance", "now") => Some(CapabilityKind::Time),
+            ("Math", "random") => Some(CapabilityKind::Random),
+            ("crypto", "getRandomValues" | "randomUUID" | "randomBytes" | "randomInt") => {
+                Some(CapabilityKind::Random)
+            }
+            ("navigator", "sendBeacon") => Some(CapabilityKind::Network),
+            _ => None,
+        }
+    }
+
+    /// A `new Name(...)` expression. `Date` counts only with zero arguments:
+    /// an argless `new Date()` reads the clock, `new Date(value)` converts.
+    pub fn of_constructor(name: &str, argless: bool) -> Option<Self> {
+        match name {
+            "WebSocket" | "XMLHttpRequest" | "EventSource" => Some(CapabilityKind::Network),
+            "Date" if argless => Some(CapabilityKind::Time),
+            _ => None,
+        }
+    }
+
+    /// An ambient object whose *any* member access carries the capability:
+    /// `process.env`, `document.cookie`, `localStorage.length`.
+    pub fn of_member_root(object: &str) -> Option<Self> {
+        match object {
+            "process" => Some(CapabilityKind::Process),
+            "localStorage" | "sessionStorage" | "indexedDB" => Some(CapabilityKind::Storage),
+            "document" => Some(CapabilityKind::Dom),
+            _ => None,
+        }
+    }
+
+    /// An import specifier: node builtins (with or without the `node:`
+    /// prefix) plus the mainstream HTTP clients.
+    pub fn of_module_specifier(specifier: &str) -> Option<Self> {
+        let bare = specifier.strip_prefix("node:").unwrap_or(specifier);
+        match bare {
+            "fs" | "fs/promises" | "fs-extra" => Some(CapabilityKind::Filesystem),
+            "http" | "https" | "http2" | "net" | "tls" | "dgram" | "dns" => {
+                Some(CapabilityKind::Network)
+            }
+            "axios" | "node-fetch" | "undici" | "got" | "ky" => Some(CapabilityKind::Network),
+            "child_process" | "process" => Some(CapabilityKind::Process),
+            _ => None,
+        }
     }
 }
 
@@ -815,6 +969,31 @@ pub struct ComplexityRecord {
     pub cognitive: u16,
     pub line_count: u32,
     pub param_count: u8,
+}
+
+/// Persisted ambient-capability use, one row per file and API, so the
+/// contract's `deny_capabilities` check reads the current state without
+/// re-parsing (same lifecycle as the `complexity` table).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CapabilityRecord {
+    pub id: CapabilityUseId,
+    pub repository_id: RepositoryId,
+    pub file_id: FileId,
+    pub capability: CapabilityKind,
+    pub api: String,
+    pub line: u32,
+    pub count: u32,
+}
+
+/// One function's metrics as the contract's budget check consumes them: a
+/// slim per-file view over [`ComplexityFact`] / the `complexity` table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FunctionMetricsRow {
+    pub file_path: String,
+    pub qualified_name: String,
+    pub line: u32,
+    pub cyclomatic: u32,
+    pub cognitive: u32,
 }
 
 /// Persisted export, with re-export provenance flattened, so the `exports`

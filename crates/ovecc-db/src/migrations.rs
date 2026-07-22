@@ -318,6 +318,21 @@ const MIGRATION_V5_SNAPSHOT_RETENTION: &str = r#"
             CREATE INDEX IF NOT EXISTS idx_snapshot_files_snap ON snapshot_files (snapshot_id);
             "#;
 
+/// Ambient-capability uses (network, storage, clock, ...), one row per file
+/// and API, judged by the architecture contract's `deny_capabilities`.
+const MIGRATION_V6_CAPABILITIES: &str = r#"
+            CREATE TABLE IF NOT EXISTS capability_uses (
+                id TEXT PRIMARY KEY,
+                repository_id TEXT NOT NULL,
+                file_id TEXT NOT NULL,
+                capability TEXT NOT NULL,
+                api TEXT NOT NULL,
+                line INTEGER NOT NULL,
+                occurrence_count INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_capability_uses_repo ON capability_uses (repository_id);
+            "#;
+
 const SCHEMA_MIGRATIONS: &[SchemaMigration] = &[
     SchemaMigration {
         version: 1,
@@ -343,6 +358,11 @@ const SCHEMA_MIGRATIONS: &[SchemaMigration] = &[
         version: 5,
         name: "snapshot_retention",
         sql: MIGRATION_V5_SNAPSHOT_RETENTION,
+    },
+    SchemaMigration {
+        version: 6,
+        name: "capabilities",
+        sql: MIGRATION_V6_CAPABILITIES,
     },
 ];
 
@@ -424,8 +444,8 @@ mod tests {
 
         let version = store.migrate_to_latest().unwrap();
 
-        assert_eq!(version, 5);
-        assert_eq!(store.schema_version().unwrap(), Some(5));
+        assert_eq!(version, 6);
+        assert_eq!(store.schema_version().unwrap(), Some(6));
         for table in [
             "repositories",
             "files",
@@ -449,6 +469,7 @@ mod tests {
             "exports",
             "snapshot_findings",
             "snapshot_files",
+            "capability_uses",
         ] {
             assert!(table_exists(&store, table), "missing table {table}");
         }
@@ -460,12 +481,12 @@ mod tests {
         store.migrate_to_latest().unwrap();
         store.migrate_to_latest().unwrap();
 
-        assert_eq!(store.schema_version().unwrap(), Some(5));
+        assert_eq!(store.schema_version().unwrap(), Some(6));
         let applied: i64 = store
             .conn
             .query_row("SELECT count(*) FROM ovecc_schema", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(applied, 5, "each migration must be recorded exactly once");
+        assert_eq!(applied, 6, "each migration must be recorded exactly once");
     }
 
     #[test]
@@ -478,12 +499,13 @@ mod tests {
 
         let version = store.migrate_to_latest().unwrap();
 
-        assert_eq!(version, 5);
+        assert_eq!(version, 6);
         assert!(table_exists(&store, "findings"));
         assert!(table_exists(&store, "packages"));
         assert!(table_exists(&store, "complexity"));
         assert!(table_exists(&store, "exports"));
         assert!(table_exists(&store, "snapshot_findings"));
         assert!(table_exists(&store, "snapshot_files"));
+        assert!(table_exists(&store, "capability_uses"));
     }
 }

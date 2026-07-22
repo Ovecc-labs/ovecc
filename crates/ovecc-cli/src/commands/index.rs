@@ -4,6 +4,7 @@ use crate::render::{emit_json, emit_ndjson_meta, meta_for, ndjson_line};
 use anyhow::Result;
 use ovecc_core::config::{OutputFormat, ProjectPaths};
 use ovecc_core::legacy::IndexReport;
+use std::path::Path;
 
 pub(crate) fn render_index_timings(timings: &ovecc_core::report::IndexTimings) {
     eprintln!("index phases (ms):");
@@ -61,24 +62,7 @@ pub(crate) fn run_init(paths: &ProjectPaths, force: bool) -> Result<u8> {
         println!("Wrote {}", config_path.display());
     }
 
-    if paths.root.join(".git").exists() {
-        let gitignore = paths.root.join(".gitignore");
-        let current = std::fs::read_to_string(&gitignore).unwrap_or_default();
-        let already = current
-            .lines()
-            .any(|line| matches!(line.trim(), ".ovecc" | ".ovecc/" | "/.ovecc" | "/.ovecc/"));
-        if already {
-            println!(".gitignore already covers .ovecc/");
-        } else {
-            let mut updated = current;
-            if !updated.is_empty() && !updated.ends_with('\n') {
-                updated.push('\n');
-            }
-            updated.push_str("# ovecc local state (database + parse cache)\n.ovecc/\n");
-            std::fs::write(&gitignore, updated)?;
-            println!("Added .ovecc/ to .gitignore");
-        }
-    }
+    wire_gitignore(&paths.root)?;
 
     println!();
     println!("Next steps:");
@@ -87,6 +71,58 @@ pub(crate) fn run_init(paths: &ProjectPaths, force: bool) -> Result<u8> {
     println!("  ovecc diagnose       named architecture smells, each with a fix");
     println!("  ovecc mcp            expose every command to your coding agent");
     println!("  ovecc init --agent   make the agent query the graph before grepping");
+    Ok(0)
+}
+
+/// The ignore block for `.ovecc/`: the machine state stays local, but the
+/// architecture contract and its baseline are shared team state, so the
+/// pattern is `.ovecc/*` with re-inclusions rather than a blanket `.ovecc/`
+/// (git cannot re-include below an excluded directory).
+const OVECC_IGNORE_BLOCK: &str = "# ovecc local state (database + parse cache); the architecture contract\n\
+     # and its baseline are shared and stay tracked\n\
+     .ovecc/*\n\
+     !.ovecc/architecture.toml\n\
+     !.ovecc/architecture/\n";
+
+/// Git-ignores the local `.ovecc/` state while keeping the architecture
+/// contract trackable. An ovecc-written blanket `.ovecc/` line from an
+/// earlier version is upgraded in place; a granular block is left alone.
+pub(crate) fn wire_gitignore(root: &Path) -> Result<u8> {
+    if !root.join(".git").exists() {
+        return Ok(0);
+    }
+    let gitignore = root.join(".gitignore");
+    let current = std::fs::read_to_string(&gitignore).unwrap_or_default();
+    if current.lines().any(|line| line.trim() == ".ovecc/*") {
+        println!(".gitignore already covers .ovecc/");
+        return Ok(0);
+    }
+    let blanket = |line: &str| matches!(line.trim(), ".ovecc" | ".ovecc/" | "/.ovecc" | "/.ovecc/");
+    if current.lines().any(blanket) {
+        let updated: Vec<&str> = current
+            .lines()
+            .map(|line| {
+                if blanket(line) {
+                    ".ovecc/*\n!.ovecc/architecture.toml\n!.ovecc/architecture/"
+                } else {
+                    line
+                }
+            })
+            .collect();
+        std::fs::write(&gitignore, updated.join("\n") + "\n")?;
+        println!(
+            "Upgraded the .ovecc/ ignore to keep .ovecc/architecture.toml and its \
+             baseline trackable"
+        );
+        return Ok(0);
+    }
+    let mut updated = current;
+    if !updated.is_empty() && !updated.ends_with('\n') {
+        updated.push('\n');
+    }
+    updated.push_str(OVECC_IGNORE_BLOCK);
+    std::fs::write(&gitignore, updated)?;
+    println!("Added .ovecc/* to .gitignore (contract and baseline stay trackable)");
     Ok(0)
 }
 

@@ -142,8 +142,9 @@ so a scripted caller naming `ovecc_gate` keeps working under either profile — 
 profile only controls what the agent *discovers*.
 
 - **`agent`** (default): a small, ordered set tuned for an interactive coding agent —
-  `ovecc_query`, `ovecc_impact`, `ovecc_context`, `ovecc_advise`, `ovecc_review`,
-  `ovecc_summary`, `ovecc_capabilities`, `ovecc_index`. Fewer tools and a deliberate
+  `ovecc_grep`, `ovecc_read`, `ovecc_query`, `ovecc_impact`, `ovecc_context`,
+  `ovecc_advise`, `ovecc_architecture`, `ovecc_review`, `ovecc_summary`,
+  `ovecc_capabilities`, `ovecc_index`. Fewer tools and a deliberate
   order both help adoption: a bloated list is a known failure mode, and the first
   listed tool tends to win when a request maps to several. Navigation leads because
   that is where an ambiguous "search the code" impulse gets decided.
@@ -156,12 +157,15 @@ profile only controls what the agent *discovers*.
 
 ## Tool catalog
 
-The full surface — 27 tools (every one takes an optional `repo`; `*` marks required
-arguments). The eight in the agent profile are listed under
+The full surface — 30 tools (every one takes an optional `repo`; `*` marks required
+arguments). The eleven in the agent profile are listed under
 [Tool profiles](#tool-profiles) above.
 
 | Tool | Maps to | Key arguments |
 | --- | --- | --- |
+| `ovecc_grep` | `grep` | `pattern*`, `path`, `limit`: symbol definitions first, then an ignore-aware text scan |
+| `ovecc_read` | `read` | `target*` (symbol, `file:line`, `file:start-end`, or path), `limit` |
+| `ovecc_architecture` | `architecture show` | `paths`: owning components, what each may import and through which interfaces |
 | `ovecc_init` | `init` | `force`: write the starter config, git-ignore `.ovecc/` |
 | `ovecc_capabilities` | `capabilities` | — (call first: the full contract) |
 | `ovecc_index` | `index` | `path` |

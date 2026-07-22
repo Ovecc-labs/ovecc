@@ -11,14 +11,18 @@
 //! database-access rules need module-layer detection and the
 //! `reads`/`writes` schema edges — are intentionally deferred and noted.
 
+mod contract;
 pub mod deadcode;
 pub mod smells;
 
+use std::collections::{BTreeMap, BTreeSet};
+
 use chrono::Utc;
+use ovecc_core::architecture::ArchitectureContract;
 use ovecc_core::config::RulesConfig;
 use ovecc_core::facts::{
-    EntityRef, Evidence, FindingKind, FindingRecord, SecurityPatternFact, SecurityPatternKind,
-    Severity,
+    CapabilityFact, EntityRef, Evidence, FindingKind, FindingRecord, FunctionMetricsRow,
+    SecurityPatternFact, SecurityPatternKind, Severity,
 };
 use ovecc_core::graph::NodeKind;
 use ovecc_core::id::{FindingId, RepositoryId, SnapshotId};
@@ -34,6 +38,34 @@ pub struct RuleInput<'a> {
     /// Security patterns detected by the parser, paired with their file path
     /// Empty when security analysis is not run.
     pub security_patterns: &'a [(String, SecurityPatternFact)],
+    /// The intended architecture, when `.ovecc/architecture.toml` exists.
+    pub architecture: Option<ContractInput<'a>>,
+}
+
+/// The architecture contract and its resolution against this snapshot's
+/// files. Assembled by the caller (the indexer today) so the contract check
+/// itself never touches the database and can later judge unsaved edges.
+#[derive(Clone, Copy)]
+pub struct ContractInput<'a> {
+    pub contract: &'a ArchitectureContract,
+    /// File path -> owning component, from
+    /// [`ovecc_core::architecture::assign_components`].
+    pub component_of: &'a BTreeMap<String, String>,
+    /// Every indexed file path, for the unassigned policy.
+    pub files: &'a [String],
+    /// Accepted violations ([`ovecc_core::architecture::baseline_entry`]
+    /// keys), subtracted in `new-violations` mode. Empty when no baseline
+    /// store exists.
+    pub baseline: &'a BTreeSet<String>,
+    /// File path -> qualified slice (`features/auth`) for `slices = true`
+    /// components, from [`ovecc_core::architecture::assign_slices`].
+    pub slice_of: &'a BTreeMap<String, String>,
+    /// `(file path, capability use)` pairs for the `deny_capabilities`
+    /// check — fresh parse facts at index time, `capability_uses` rows at
+    /// check time.
+    pub capability_uses: &'a [(String, CapabilityFact)],
+    /// Per-function metrics for the per-component budget check.
+    pub functions: &'a [FunctionMetricsRow],
 }
 
 /// Evaluates every enabled rule family and returns the findings, sorted by ID
@@ -44,8 +76,54 @@ pub fn evaluate(input: &RuleInput<'_>) -> Vec<FindingRecord> {
     findings.extend(banned_import_rules(input));
     findings.extend(circular_dependency_rule(input));
     findings.extend(security_rules(input));
+    findings.extend(contract::contract_rules(input));
     findings.sort_by(|a, b| a.id.0.cmp(&b.id.0));
     findings
+}
+
+/// The contract check alone, over an arbitrary edge set. This is how
+/// `ovecc architecture diff`/`check` judge a freshly edited contract against
+/// the stored graph without re-indexing: same verdicts as `evaluate`, none of
+/// the other rule families.
+pub fn contract_findings(
+    repository_id: &str,
+    dependencies: &[DependencyRecord],
+    architecture: ContractInput<'_>,
+) -> Vec<FindingRecord> {
+    let config = RulesConfig::default();
+    let input = RuleInput {
+        repository_id,
+        snapshot_id: None,
+        modules: &[],
+        dependencies,
+        config: &config,
+        security_patterns: &[],
+        architecture: Some(architecture),
+    };
+    let mut findings = contract::contract_rules(&input);
+    findings.sort_by(|a, b| a.id.0.cmp(&b.id.0));
+    findings
+}
+
+/// Every current violation as a baseline entry, grouped by source component
+/// and ignoring the existing baseline: the full present debt. `check
+/// --freeze` writes this to the store; the ratchet intersects the store with
+/// it so corrected entries disappear.
+pub fn contract_entries(
+    dependencies: &[DependencyRecord],
+    architecture: ContractInput<'_>,
+) -> BTreeMap<String, BTreeSet<String>> {
+    let config = RulesConfig::default();
+    let input = RuleInput {
+        repository_id: "",
+        snapshot_id: None,
+        modules: &[],
+        dependencies,
+        config: &config,
+        security_patterns: &[],
+        architecture: Some(architecture),
+    };
+    contract::violation_entries(&input)
 }
 
 /// Declarative banned-import rule pack: one finding per `[[rules.banned_imports]]`
@@ -109,7 +187,7 @@ fn banned_import_rules(input: &RuleInput<'_>) -> Vec<FindingRecord> {
 }
 
 /// Minimal specifier glob: exact, `prefix*`, `*suffix`, or `*infix*`.
-fn specifier_matches(specifier: &str, pattern: &str) -> bool {
+pub(crate) fn specifier_matches(specifier: &str, pattern: &str) -> bool {
     match (pattern.strip_prefix('*'), pattern.strip_suffix('*')) {
         (Some(_), Some(_)) => specifier.contains(pattern.trim_matches('*')),
         (None, Some(prefix)) => specifier.starts_with(prefix),
@@ -393,6 +471,7 @@ mod tests {
             dependencies: &deps,
             config: &config,
             security_patterns: &[],
+            architecture: None,
         };
 
         let findings = evaluate(&input);
@@ -416,6 +495,7 @@ mod tests {
             dependencies: &deps,
             config: &config,
             security_patterns: &[],
+            architecture: None,
         };
         assert!(evaluate(&input).is_empty());
     }
@@ -452,6 +532,7 @@ mod tests {
             dependencies: &[],
             config: &config,
             security_patterns: &patterns,
+            architecture: None,
         };
         let findings = evaluate(&input);
         let secret = findings
@@ -491,6 +572,7 @@ mod tests {
             dependencies: &[],
             config: &config,
             security_patterns: &patterns,
+            architecture: None,
         };
         let by_path = |path: &str| {
             evaluate(&input)
@@ -519,6 +601,7 @@ mod tests {
             dependencies: &deps,
             config: &config,
             security_patterns: &[],
+            architecture: None,
         };
         let findings = evaluate(&input);
         let cycles: Vec<_> = findings
@@ -563,6 +646,7 @@ mod tests {
             dependencies: &deps,
             config: &config,
             security_patterns: &[],
+            architecture: None,
         };
         let findings = evaluate(&input);
         let banned: Vec<_> = findings

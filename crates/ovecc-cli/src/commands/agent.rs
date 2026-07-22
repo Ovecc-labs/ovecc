@@ -116,7 +116,8 @@ fn mark() -> u8 {
 /// before rediscovering the repo with grep, and does not waste a call
 /// re-indexing a database that is already there.
 fn session() -> u8 {
-    if hooks_disabled() || !graph_ready(&project_root()) {
+    let root = project_root();
+    if hooks_disabled() || !graph_ready(&root) {
         return 0;
     }
     println!(
@@ -124,7 +125,18 @@ fn session() -> u8 {
          Search: ovecc grep <pattern> [path]. One symbol's source: ovecc read <name>. \
          Callers: ovecc query \"rdeps <name>\". Blast radius: ovecc impact <name>."
     );
+    if contract_present(&root) {
+        println!(
+            "This repository declares an architecture contract. Before editing a file, \
+             run `ovecc architecture show <path>` to see what it may import; \
+             `ovecc architecture check` verdicts the result."
+        );
+    }
     0
+}
+
+fn contract_present(root: &Path) -> bool {
+    root.join(".ovecc").join("architecture.toml").is_file()
 }
 
 fn graph_ready(root: &Path) -> bool {

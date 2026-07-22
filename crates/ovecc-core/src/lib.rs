@@ -6,6 +6,7 @@
 //! (`ovecc-parser`, `ovecc-db`, `ovecc-git`, `ovecc-graph`, `ovecc-rules`,
 //! `ovecc-query`, `ovecc-export`, `ovecc-ai`) implement.
 
+pub mod architecture;
 pub mod capabilities;
 pub mod config;
 pub mod error;
