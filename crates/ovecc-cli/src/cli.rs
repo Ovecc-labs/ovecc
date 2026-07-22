@@ -1011,7 +1011,14 @@ fn run_command(cli: Cli) -> Result<u8> {
                 }
             }
         }
-        Command::Mcp => crate::mcp::serve(),
+        Command::Mcp => {
+            let default_repo = cli
+                .repo
+                .as_deref()
+                .map(|path| path.to_string_lossy().into_owned())
+                .unwrap_or_else(|| ".".to_string());
+            crate::mcp::serve(&default_repo)
+        }
     };
 
     if stats {

@@ -77,7 +77,11 @@ fn lsp_aliases_enabled() -> bool {
 
 /// Runs the stdio server loop until stdin closes. Always exits 0: a transport
 /// read error ends the session cleanly rather than failing the process.
-pub fn serve() -> Result<u8> {
+///
+/// `default_repo` is the `--repo` the server was launched with; a tool call
+/// that omits its own `repo` argument runs against it, so `ovecc --repo X mcp`
+/// serves X rather than the process's working directory.
+pub fn serve(default_repo: &str) -> Result<u8> {
     let exe = std::env::current_exe()?;
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();
@@ -93,7 +97,7 @@ pub fn serve() -> Result<u8> {
         let id = request.get("id").cloned();
         let method = request.get("method").and_then(Value::as_str).unwrap_or("");
         let params = request.get("params");
-        let response = handle(method, params, &exe);
+        let response = handle(method, params, &exe, default_repo);
 
         // Notifications (no `id`) never get a reply.
         let Some(id) = id else { continue };
@@ -118,7 +122,12 @@ fn write_message(out: &mut impl Write, message: &Value) -> Result<()> {
 /// Dispatches one JSON-RPC method. `Ok` carries the `result` object; `Err`
 /// carries a `(code, message)` JSON-RPC error. Tool *execution* failures are
 /// reported in-band as a result with `isError: true`, per MCP convention.
-fn handle(method: &str, params: Option<&Value>, exe: &Path) -> Result<Value, (i64, String)> {
+fn handle(
+    method: &str,
+    params: Option<&Value>,
+    exe: &Path,
+    default_repo: &str,
+) -> Result<Value, (i64, String)> {
     match method {
         "initialize" => {
             let version = params
@@ -149,7 +158,7 @@ fn handle(method: &str, params: Option<&Value>, exe: &Path) -> Result<Value, (i6
                 .ok_or((-32602, "missing tool name".to_string()))?;
             let empty = json!({});
             let arguments = params.get("arguments").unwrap_or(&empty);
-            Ok(call_tool(name, arguments, exe))
+            Ok(call_tool(name, arguments, exe, default_repo))
         }
         "ping" => Ok(json!({})),
         _ => Err((-32601, format!("method not found: {method}"))),
@@ -162,14 +171,14 @@ fn handle(method: &str, params: Option<&Value>, exe: &Path) -> Result<Value, (i6
 ///
 /// When `OVECC_MCP_LOG` is set, each call is traced to stderr (never stdout, so
 /// the JSON-RPC stream stays clean) — drives a live "backend" panel in demos.
-fn call_tool(name: &str, arguments: &Value, exe: &Path) -> Value {
+fn call_tool(name: &str, arguments: &Value, exe: &Path, default_repo: &str) -> Value {
     let log = std::env::var_os("OVECC_MCP_LOG").is_some();
     let started = std::time::Instant::now();
     if log {
         let args = serde_json::to_string(arguments).unwrap_or_default();
         eprintln!("[ovecc-mcp] → {name} {}", truncate(&args, 80));
     }
-    let result = run_tool(name, arguments, exe);
+    let result = run_tool(name, arguments, exe, default_repo);
     if log {
         let is_err = result
             .get("isError")
@@ -198,14 +207,14 @@ fn truncate(s: &str, max: usize) -> String {
     }
 }
 
-fn run_tool(name: &str, arguments: &Value, exe: &Path) -> Value {
+fn run_tool(name: &str, arguments: &Value, exe: &Path, default_repo: &str) -> Value {
     let Some(sub_argv) = build_argv(name, arguments) else {
         return error_result(format!("unknown tool or missing required argument: {name}"));
     };
     let repo = arguments
         .get("repo")
         .and_then(Value::as_str)
-        .unwrap_or(".")
+        .unwrap_or(default_repo)
         .to_string();
 
     // `--no-meta`: the agent reads the metric/rule dictionaries once via
@@ -758,13 +767,14 @@ mod tests {
             "initialize",
             Some(&json!({"protocolVersion": "2025-03-26"})),
             &exe,
+            ".",
         )
         .unwrap();
         assert_eq!(init["protocolVersion"], "2025-03-26");
         assert_eq!(init["serverInfo"]["name"], "ovecc");
 
         // The default (no OVECC_MCP_PROFILE) is the agent profile.
-        let listed = handle("tools/list", None, &exe).unwrap();
+        let listed = handle("tools/list", None, &exe, ".").unwrap();
         let tools = listed["tools"].as_array().unwrap();
         assert!(tools.iter().any(|t| t["name"] == "ovecc_query"));
         assert!(!tools.is_empty());
@@ -773,6 +783,6 @@ mod tests {
     #[test]
     fn unknown_method_is_a_jsonrpc_error() {
         let exe = std::path::PathBuf::from("ovecc");
-        assert!(handle("frobnicate", None, &exe).is_err());
+        assert!(handle("frobnicate", None, &exe, ".").is_err());
     }
 }

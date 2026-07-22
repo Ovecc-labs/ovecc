@@ -63,7 +63,9 @@ re-run this after changes. For the regression tools (`gate`/`diff`/`drift`) you 
 ## 3. Register the server with your MCP client
 
 Each tool accepts an optional `repo` argument; when omitted it defaults to the
-server's working directory. Point the client at the binary with `mcp` as the argument.
+`--repo` the server was launched with (`ovecc --repo <path> mcp`), falling back to
+the server's working directory. Point the client at the binary with `mcp` as the
+argument.
 
 ### Claude Code (CLI)
 
