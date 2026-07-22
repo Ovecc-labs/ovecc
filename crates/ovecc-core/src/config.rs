@@ -101,6 +101,11 @@ pub struct IndexConfig {
     pub include: Vec<String>,
     /// Glob patterns added to the built-in exclusions.
     pub exclude: Vec<String>,
+    /// Skip files larger than this many bytes. `None` applies
+    /// [`DEFAULT_MAX_FILE_SIZE_BYTES`]: a file above it is almost always a
+    /// generated or vendored blob, and parsing one into the AST is a memory
+    /// and latency risk with no analysis value. Set an explicit value to
+    /// override (a very large one effectively disables the cap).
     pub max_file_size_bytes: Option<u64>,
     /// Index files that look generated or vendored (minified bundles, WASM/
     /// emscripten glue, `@generated` / `DO NOT EDIT` markers). Off by default:
@@ -133,6 +138,11 @@ pub struct ArchitectureConfig {
     /// Explicit module mapping, used when strategy is not pure `auto`.
     pub modules: Vec<ModuleMapping>,
 }
+
+/// Default cap for [`IndexConfig::max_file_size_bytes`] when unset (5 MiB).
+/// Hand-written source almost never exceeds it; a file that does is a
+/// generated bundle whose AST parse costs memory and time for no signal.
+pub const DEFAULT_MAX_FILE_SIZE_BYTES: u64 = 5 * 1024 * 1024;
 
 /// Default module-inference depth: one segment below the source container,
 /// preserving the historical `src/<name>` → `<name>` behavior.

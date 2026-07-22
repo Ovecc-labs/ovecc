@@ -4,7 +4,9 @@
 use anyhow::{Context, Result};
 use ignore::WalkBuilder;
 use ignore::overrides::OverrideBuilder;
-use ovecc_core::config::{ArchitectureConfig, ModuleMapping, ModuleStrategy, OveccConfig};
+use ovecc_core::config::{
+    ArchitectureConfig, DEFAULT_MAX_FILE_SIZE_BYTES, ModuleMapping, ModuleStrategy, OveccConfig,
+};
 use ovecc_core::legacy::SourceLanguage;
 use std::path::{Path, PathBuf};
 
@@ -72,9 +74,14 @@ pub(crate) fn discover_source_files(root: &Path, config: &OveccConfig) -> Result
         if !config.language_enabled(config_language(language)) {
             continue;
         }
-        // Max file size bytes / size limit.
-        if let Some(limit) = config.index.max_file_size_bytes
-            && let Ok(metadata) = entry.metadata()
+        // Skip oversized files. An unset limit is not "no limit": a huge file
+        // is a generated blob whose AST parse is a memory/latency risk, so an
+        // unconfigured repo still gets the built-in cap.
+        let limit = config
+            .index
+            .max_file_size_bytes
+            .unwrap_or(DEFAULT_MAX_FILE_SIZE_BYTES);
+        if let Ok(metadata) = entry.metadata()
             && metadata.len() > limit
         {
             continue;
@@ -314,6 +321,28 @@ mod tests {
         )
         .unwrap();
         assert!(!looks_generated(&documenting));
+    }
+
+    #[test]
+    fn an_oversized_file_is_skipped_even_without_a_configured_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("small.ts"), "export const x = 1;\n").unwrap();
+        // Just over the built-in cap, with no `max_file_size_bytes` set.
+        let big = vec![b'/'; (DEFAULT_MAX_FILE_SIZE_BYTES + 1) as usize];
+        std::fs::write(dir.path().join("huge.ts"), big).unwrap();
+
+        let config = OveccConfig::default();
+        assert!(config.index.max_file_size_bytes.is_none());
+        let found = discover_source_files(dir.path(), &config).unwrap();
+        let names: Vec<String> = found
+            .iter()
+            .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+            .collect();
+        assert!(names.contains(&"small.ts".to_string()), "{names:?}");
+        assert!(
+            !names.contains(&"huge.ts".to_string()),
+            "the oversized file must be skipped by the built-in default: {names:?}"
+        );
     }
 
     #[test]
