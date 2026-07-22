@@ -8,7 +8,8 @@
 
   <p>
     Turn your repository into a deterministic architecture graph.<br/>
-    Analyze impact, drift, coupling, and ownership directly from the CLI.
+    Analyze impact, drift, coupling, and ownership, and enforce the intended
+    architecture as code, directly from the CLI.
   </p>
 
   <!-- Badges -->
@@ -94,6 +95,9 @@ ovecc query "cycles"          # actual elementary dependency cycles (A -> B -> A
 ovecc report                  # one-shot architecture report (markdown or json)
 ovecc gate                    # CI gate: fail a PR on new cycles / violations
 ovecc review                  # the NAMED new defects a change introduced (file:line + cycle witnesses)
+ovecc architecture init       # draft .ovecc/architecture.toml from the graph, or from a built-in --template
+ovecc architecture check      # gate the code against the contract: divergences, slice/capability/budget verdicts
+ovecc architecture suggest    # recognize which built-in architecture the repo already follows
 ovecc explain Billing         # offline, deterministic explanation
 ovecc export graph --html     # interactive dependency-graph viewer, one self-contained offline file
 ovecc mcp                     # MCP server over stdio: expose every command as an agent tool

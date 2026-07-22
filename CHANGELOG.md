@@ -5,7 +5,7 @@ Notable changes to ovecc are documented here. The format follows
 [SemVer](https://semver.org/) (pre-1.0, minor releases may contain breaking
 changes).
 
-## [Unreleased]
+## [0.2.0] - 2026-07-22
 
 ### Added
 
@@ -62,11 +62,6 @@ changes).
 - A JSON Schema for the contract at `docs/schemas/architecture.schema.json`.
 - `ovecc init` now writes a granular `.ovecc/*` ignore (upgrading an existing
   blanket `.ovecc/` line) so the contract and its baseline stay trackable.
-
-## [0.2.0] - 2026-07-18
-
-### Added
-
 - `ovecc grep <pattern> [paths]`: a symbol-aware search built for coding
   agents. It answers from the index first (matching symbol definitions with
   their `file:start-end`), then scans the working tree like an ignore-aware
@@ -102,6 +97,22 @@ changes).
   and a no-op `index` collapses to a single up-to-date line.
 - Contributions are Apache-2.0 inbound and carry a Developer Certificate of
   Origin sign-off (`git commit -s`); see CONTRIBUTING.md.
+
+### Fixed
+
+- Rust import resolution no longer resolves a bare external-crate path
+  (`use tracing::…`, `std::fs`) to a homonymous local file, which produced
+  phantom internal edges and dependency cycles on Rust monorepos.
+- `ovecc --repo <path> mcp` runs its tools against that repository by default
+  instead of the server's working directory.
+- Oversized files are skipped by a built-in 5 MiB default, not only when
+  `max_file_size_bytes` is set, so an unconfigured repo never tries to parse a
+  multi-megabyte generated blob.
+- Complexity findings in test files are down-ranked to Low, and clone families
+  made only of test files sink below production duplication, so `health` and
+  `dupes` lead with what is worth acting on.
+- `index` reports how many files parsed with syntax errors, so a partial
+  extraction from invalid source is no longer silent.
 
 ## [0.1.0] - 2026-07-11
 
