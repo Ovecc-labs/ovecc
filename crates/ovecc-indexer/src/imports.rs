@@ -561,17 +561,21 @@ fn rust_import_candidates(source_path: &str, specifier: &str) -> Vec<String> {
         .collect();
     let mut up = 0usize;
     let mut relative = false;
+    let mut anchored = false;
     while let Some(&first) = segments.first() {
         match first {
             "crate" => {
+                anchored = true;
                 segments.remove(0); // crate root; suffix match finds it
                 break;
             }
             "self" => {
+                anchored = true;
                 relative = true;
                 segments.remove(0);
             }
             "super" => {
+                anchored = true;
                 relative = true;
                 up += 1;
                 segments.remove(0);
@@ -579,7 +583,14 @@ fn rust_import_candidates(source_path: &str, specifier: &str) -> Vec<String> {
             _ => break,
         }
     }
-    if segments.is_empty() {
+    // A bare path (`tracing::info`, `std::fs`) names an external crate in Rust
+    // 2018+; only crate/self/super reach a local module. Workspace crates are
+    // already resolved by name in `resolve_rust_workspace_import`, so a bare
+    // path that falls through to here is external. Producing suffix candidates
+    // for it would let an external crate name collide with a local file's tail
+    // (a `tracing.rs` module) and resolve to a false internal edge — the source
+    // of the phantom cycles seen on Rust monorepos.
+    if !anchored || segments.is_empty() {
         return Vec::new();
     }
     let base_dir = if relative {
@@ -754,6 +765,15 @@ mod tests {
         let glob = rust_import_candidates("src/main.rs", "crate::user::*");
         assert!(glob.contains(&"user.rs".to_string()), "{glob:?}");
 
+        // A bare path names an external crate (Rust 2018+), never a local file:
+        // no candidates, so it can never suffix-match a homonymous local module.
+        assert!(
+            rust_import_candidates("src/main.rs", "tracing::info").is_empty(),
+            "bare external crate must yield no local candidates"
+        );
+        assert!(rust_import_candidates("src/main.rs", "std::fs").is_empty());
+        assert!(rust_import_candidates("src/main.rs", "serde::Deserialize").is_empty());
+
         assert!(
             cpp_import_candidates("src/user/session.cpp", "session.h")
                 .contains(&"src/user/session.h".to_string())
@@ -893,6 +913,59 @@ mod tests {
         );
         // Unknown crates stay external for the caller's fallback.
         assert_eq!(path_of("serde::Deserialize"), None);
+    }
+
+    #[test]
+    fn a_bare_external_crate_does_not_resolve_to_a_homonymous_local_file() {
+        // The Turborepo regression: a crate ships a local `tracing.rs` module,
+        // and other files `use tracing::…` the external crate. Neither the
+        // workspace map (tracing is not a workspace crate) nor the suffix
+        // fallback (bare paths yield no candidates now) may link them, or the
+        // graph grows a phantom edge and, closing back, a phantom cycle.
+        let file = |path: &str| FileRecord {
+            id: format!("f:{path}"),
+            repository_id: "r".to_string(),
+            path: path.to_string(),
+            absolute_path: PathBuf::from(path),
+            language: SourceLanguage::Rust,
+            content_hash: "h".to_string(),
+            size_bytes: 0,
+            module_id: "m".to_string(),
+            module_name: "m".to_string(),
+        };
+        let files = [
+            file("crates/telemetry/src/tracing.rs"),
+            file("crates/telemetry/src/lib.rs"),
+        ];
+        let by_path: HashMap<String, FileRecord> =
+            files.iter().map(|f| (f.path.clone(), f.clone())).collect();
+        let suffix = build_path_suffix_index(&files);
+        // No workspace crate named `tracing`.
+        let crates: HashMap<String, String> = HashMap::new();
+
+        let workspace =
+            resolve_rust_workspace_import(&crates, "tracing::info", &by_path).map(|f| f.path);
+        assert_eq!(workspace, None, "tracing is not a workspace crate");
+
+        let fallback = resolve_suffix_unique(
+            &rust_import_candidates("crates/telemetry/src/lib.rs", "tracing::info"),
+            &suffix,
+            &by_path,
+        )
+        .map(|f| f.path);
+        assert_eq!(
+            fallback, None,
+            "the external use must not resolve to the local tracing.rs"
+        );
+
+        // A genuine local import still resolves.
+        let local = resolve_suffix_unique(
+            &rust_import_candidates("crates/telemetry/src/lib.rs", "crate::tracing"),
+            &suffix,
+            &by_path,
+        )
+        .map(|f| f.path);
+        assert_eq!(local, Some("crates/telemetry/src/tracing.rs".to_string()));
     }
 
     #[test]
