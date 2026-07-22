@@ -74,7 +74,11 @@ jobs:
   build-test:
     name: Build & test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 45
+    # Raised from 45: GitHub evicts a cache after ~7 idle days, and a cold
+    # release build of DuckDB's bundled C++ (plus oxc / tree-sitter) on the
+    # Windows GNU runner overran the old limit. 120 lets a cold run finish and
+    # rewarm the cache; lower it again once warm runs are consistently fast.
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
