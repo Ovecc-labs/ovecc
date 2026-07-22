@@ -212,6 +212,7 @@ pub fn index_repository(
     ));
     findings.extend(smell_findings(&input, &mut metrics));
     downrank_test_security(&mut findings, &security_patterns);
+    downrank_test_complexity(&mut findings);
     apply_suppressions(&mut findings, &input, &mut metrics);
     finalize_findings(&mut findings, &mut metrics);
 
@@ -927,6 +928,31 @@ fn downrank_test_security(
                         test_scoped_patterns.contains(&(evidence.file_path.as_str(), line))
                     })
             })
+        {
+            finding.severity = ovecc_core::facts::Severity::Low;
+        }
+    }
+}
+
+/// A long or complex *test* function is test scaffolding, not production debt:
+/// a table-driven test or a fixture builder legitimately runs long. Down-rank
+/// complexity and size findings on test files to Low so `health` leads with
+/// production hotspots and a test block never trips a high-severity gate.
+/// Down-ranked, not dropped: a genuinely unwieldy test helper still shows.
+fn downrank_test_complexity(findings: &mut [FindingRecord]) {
+    for finding in findings.iter_mut() {
+        let is_code_health = matches!(
+            finding.kind,
+            FindingKind::HighComplexity
+                | FindingKind::LongFunction
+                | FindingKind::LongParameterList
+        );
+        if is_code_health
+            && finding.severity != ovecc_core::facts::Severity::Low
+            && finding
+                .evidence
+                .iter()
+                .any(|evidence| is_test_file(&evidence.file_path))
         {
             finding.severity = ovecc_core::facts::Severity::Low;
         }
@@ -1683,6 +1709,44 @@ fn function_metric_finding(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_file_complexity_findings_are_downranked_to_low() {
+        use ovecc_core::facts::{Evidence, Severity};
+        let finding = |path: &str| FindingRecord {
+            id: ovecc_core::id::FindingId::from_parts(&["r", "complexity", path]),
+            repository_id: RepositoryId::from_raw("r"),
+            snapshot_id: None,
+            kind: FindingKind::HighComplexity,
+            severity: Severity::High,
+            rule_name: Some("complexity".to_string()),
+            target: None,
+            title: "High complexity".to_string(),
+            description: String::new(),
+            evidence: vec![Evidence {
+                file_path: path.to_string(),
+                line: Some(1),
+                symbol: None,
+                detail: None,
+            }],
+            created_at: chrono::Utc::now(),
+        };
+        let mut findings = vec![
+            finding("src/billing/service.ts"),
+            finding("src/billing/service.test.ts"),
+        ];
+        downrank_test_complexity(&mut findings);
+        assert_eq!(
+            findings[0].severity,
+            Severity::High,
+            "production stays High"
+        );
+        assert_eq!(
+            findings[1].severity,
+            Severity::Low,
+            "a complex test function is scaffolding, down-ranked to Low"
+        );
+    }
 
     #[test]
     fn python_cross_file_imports_resolve_internally() {
