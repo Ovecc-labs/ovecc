@@ -65,7 +65,9 @@ impl LanguageAdapter for TypeScriptAdapter {
 
         let mut extractor = Extractor::new(file.contents.as_bytes());
         extractor.visit(tree.root_node(), false);
-        Ok(extractor.into_facts())
+        let mut facts = extractor.into_facts();
+        facts.parse_errors = tree.root_node().has_error();
+        Ok(facts)
     }
 }
 
@@ -1757,6 +1759,17 @@ const at = new Date(env);
             capability(&facts, "new Date").is_none(),
             "new Date(value) converts, only the argless form reads the clock"
         );
+    }
+
+    #[test]
+    fn parse_errors_flag_tracks_broken_syntax() {
+        let clean = extract("export const x = 1;\n", SourceLanguage::TypeScript);
+        assert!(!clean.parse_errors, "valid source parses cleanly");
+        let broken = extract(
+            "export function f( { const = = ;\n",
+            SourceLanguage::TypeScript,
+        );
+        assert!(broken.parse_errors, "syntax errors are flagged");
     }
 
     #[test]

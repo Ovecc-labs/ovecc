@@ -60,7 +60,9 @@ use std::path::{Path, PathBuf};
 // keep the inflated counts and their stale HighComplexity findings.
 // v19: FileFacts gains `capability_uses`; cached v18 facts would deserialize
 // empty and every deny_capabilities check would pass vacuously.
-const PARSE_CACHE_VERSION: &str = "v19";
+// v20: FileFacts gains `parse_errors`; cached v19 facts would deserialize
+// `false` and hide the parse-error diagnostic on unchanged files.
+const PARSE_CACHE_VERSION: &str = "v20";
 
 pub fn index_repository(
     paths: &ProjectPaths,
@@ -264,6 +266,11 @@ pub fn index_repository(
         apis: resolved.apis.len(),
         tables: resolved.schema_objects.len(),
         commits_ingested,
+        files_with_parse_errors: parsed
+            .file_facts
+            .values()
+            .filter(|facts| facts.parse_errors)
+            .count(),
         parse_failures: parsed.parse_failures,
         timings,
     })

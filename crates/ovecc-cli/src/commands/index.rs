@@ -152,6 +152,12 @@ pub(crate) fn render_index_report(report: &IndexReport, format: OutputFormat) ->
             println!("- APIs: {}", report.apis);
             println!("- Tables: {}", report.tables);
             println!("- Commits ingested: {}", report.commits_ingested);
+            if report.files_with_parse_errors > 0 {
+                println!(
+                    "- Files with syntax errors: {} (facts may be partial)",
+                    report.files_with_parse_errors
+                );
+            }
             if !report.parse_failures.is_empty() {
                 println!();
                 println!("## Parse failures");
@@ -186,6 +192,12 @@ pub(crate) fn render_index_report(report: &IndexReport, format: OutputFormat) ->
             println!("APIs: {}", report.apis);
             println!("Tables: {}", report.tables);
             println!("Commits ingested: {}", report.commits_ingested);
+            if report.files_with_parse_errors > 0 {
+                println!(
+                    "Files with syntax errors: {} (facts may be partial)",
+                    report.files_with_parse_errors
+                );
+            }
             if !report.parse_failures.is_empty() {
                 println!();
                 println!("Parse failures: {}", report.parse_failures.len());

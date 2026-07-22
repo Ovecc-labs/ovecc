@@ -79,7 +79,9 @@ impl LanguageAdapter for GenericAdapter {
 
         let mut walk = Walk::new(self.language, file.contents.as_bytes(), &file.path);
         walk.visit(tree.root_node());
-        Ok(walk.into_facts())
+        let mut facts = walk.into_facts();
+        facts.parse_errors = tree.root_node().has_error();
+        Ok(facts)
     }
 }
 

@@ -654,6 +654,11 @@ pub struct FileFacts {
     /// `deny_capabilities`.
     #[serde(default)]
     pub capability_uses: Vec<CapabilityFact>,
+    /// The parse tree contained `ERROR`/`MISSING` nodes: the file has syntax
+    /// the grammar could not fully parse. Tree-sitter recovers and still
+    /// yields facts, so this is the only signal that the extraction is partial.
+    #[serde(default)]
+    pub parse_errors: bool,
 }
 
 /// A security-relevant pattern found in source, classified into a finding by

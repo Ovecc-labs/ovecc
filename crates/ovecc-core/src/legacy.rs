@@ -151,6 +151,10 @@ pub struct IndexReport {
     pub tables: usize,
     /// New Git commits ingested this run.
     pub commits_ingested: usize,
+    /// Indexed files whose parse tree had syntax errors: extraction recovered
+    /// but is partial, so their facts may be incomplete.
+    #[serde(default)]
+    pub files_with_parse_errors: usize,
     /// Per-file failures that did not abort the run.
     pub parse_failures: Vec<IndexFailure>,
     /// Per-phase wall-clock breakdown, surfaced by `--stats`.
