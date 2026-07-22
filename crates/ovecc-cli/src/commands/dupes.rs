@@ -22,7 +22,8 @@ pub(crate) fn load_dupes_report(
     cross_file_only: bool,
 ) -> Result<DupesReport> {
     let files = ovecc_indexer::collect_file_tokens(paths, config)?;
-    let families = ovecc_graph::dupes::detect(&files, min_tokens, min_lines, cross_file_only);
+    let mut families = ovecc_graph::dupes::detect(&files, min_tokens, min_lines, cross_file_only);
+    sink_test_only_families(&mut families);
     let duplicated_lines: u32 = families.iter().map(|family| family.line_span).sum();
     Ok(DupesReport {
         files_scanned: files.len(),
@@ -32,6 +33,20 @@ pub(crate) fn load_dupes_report(
         duplicated_lines,
         families,
     })
+}
+
+/// Sinks clone families whose every instance is a test file below the
+/// production ones. Repeated fixtures and boilerplate test setup are the
+/// dominant duplication noise; kept in the totals, they just stop crowding
+/// out production clones at the top of the `--limit` page. The sort is stable,
+/// so detection's longest-run-first order is preserved within each group.
+fn sink_test_only_families(families: &mut [ovecc_graph::dupes::CloneFamily]) {
+    families.sort_by_key(|family| {
+        family
+            .instances
+            .iter()
+            .all(|instance| ovecc_core::util::is_test_path(&instance.path))
+    });
 }
 
 /// `limit` cuts the families printed, never the counts. Detection sorts them
@@ -142,4 +157,46 @@ pub(crate) fn render_dupes(report: &DupesReport, format: OutputFormat, limit: us
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ovecc_graph::dupes::{CloneFamily, CloneInstance};
+
+    fn family(paths: &[&str], token_length: usize) -> CloneFamily {
+        CloneFamily {
+            token_length,
+            line_span: token_length as u32,
+            instances: paths
+                .iter()
+                .map(|path| CloneInstance {
+                    path: path.to_string(),
+                    start_line: 1,
+                    end_line: 10,
+                    token_count: token_length,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn test_only_families_sink_below_production_ones() {
+        // Detection order is longest-run first; the test-only family is longer
+        // here, yet must still sink below the shorter production family.
+        let mut families = vec![
+            family(&["src/a.test.ts", "src/b.test.ts"], 200),
+            family(&["src/service.ts", "src/handler.ts"], 120),
+            family(&["src/util.ts", "src/util.test.ts"], 80),
+        ];
+        sink_test_only_families(&mut families);
+        // Production and mixed families first (stable, so 120 before 80), the
+        // all-test family last.
+        assert_eq!(families[0].token_length, 120, "production family leads");
+        assert_eq!(
+            families[1].token_length, 80,
+            "a mixed family stays production-side"
+        );
+        assert_eq!(families[2].token_length, 200, "the all-test family sinks");
+    }
 }
