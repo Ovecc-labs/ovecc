@@ -48,8 +48,7 @@ from the CLI, in CI, or by a coding agent over MCP.
 <img src="docs/img/graph-inspect.png" alt="Inspecting one file's dependencies in the viewer" width="100%" />
 <p align="center"><i>Click any file to see its language, size, everything it imports, and everything that imports it.</i></p>
 
-The full design is in [ARCHITECTURE.md](ARCHITECTURE.md); measured performance and
-answer accuracy on real repositories are in
+Measured performance and answer accuracy on real repositories are in
 [docs/benchmark/BENCHMARKS.md](docs/benchmark/BENCHMARKS.md).
 
 ## Write your architecture down, and hold the code to it
