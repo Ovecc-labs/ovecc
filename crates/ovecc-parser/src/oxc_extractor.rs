@@ -8,8 +8,8 @@
 //! this module behind the parser boundary; only neutral `ovecc_core::facts`
 //! types cross out.
 //!
-//! Ported from fallow (research/fallow/crates/extract/src/{parse.rs,
-//! complexity.rs, visitor/visit_impl.rs, visitor/declarations.rs}), MIT (c) 2026
+//! Ported from fallow (crates/extract/src/{parse.rs, complexity.rs,
+//! visitor/visit_impl.rs, visitor/declarations.rs}), MIT (c) 2026
 //! Bart Waardenburg. See THIRD-PARTY-NOTICES.md.
 
 use ovecc_core::facts::{ComplexityFact, ExportFact, ReExportFact};

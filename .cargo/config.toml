@@ -20,7 +20,7 @@ CXXFLAGS_x86_64_pc_windows_gnu = "-Wa,-mbig-obj -g0 -O1"
 CXXSTDLIB_x86_64_pc_windows_gnu = ""
 
 # Static-link the MinGW runtime (libstdc++, libgcc, winpthread) so ovecc.exe
-# runs without C:\msys64\mingw64\bin on PATH (§7.1: portable single binaries).
+# runs without C:\msys64\mingw64\bin on PATH (portable single binaries).
 #
 # Everything here must land AFTER the rlibs (GNU ld resolves archives strictly
 # left-to-right, and the libduckdb-sys rlib needs both libstdc++ and the

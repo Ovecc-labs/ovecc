@@ -918,7 +918,7 @@ pub enum SchemaAccess {
 }
 
 /// Per-function complexity metrics. Ported from fallow's `FunctionComplexity`
-/// (research/fallow/crates/types/src/extract.rs), reduced to the
+/// (crates/types/src/extract.rs), reduced to the
 /// language-agnostic core (React-specific fields dropped).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ComplexityFact {

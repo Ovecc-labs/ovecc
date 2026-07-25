@@ -10,7 +10,7 @@
 //! files, and barrels with reachable sources, and reports nothing at all when no
 //! entry points are detected — better silent than crying wolf.
 //!
-//! Ported from fallow (research/fallow/crates/{graph/src/graph/reachability.rs,
+//! Ported from fallow (crates/{graph/src/graph/reachability.rs,
 //! graph/src/graph/re_exports, core/src/analyze/unused_exports.rs,
 //! unused_files.rs}), MIT (c) 2026 Bart Waardenburg. See THIRD-PARTY-NOTICES.md.
 

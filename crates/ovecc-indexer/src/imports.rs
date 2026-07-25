@@ -167,8 +167,8 @@ pub(crate) fn resolve_dependencies(
 
 // --- oxc_resolver-backed JS/TS resolution ------------------------------------
 //
-// Portions adapted from fallow (research/fallow/crates/graph/src/resolve/
-// specifier.rs), MIT (c) 2026 Bart Waardenburg. See THIRD-PARTY-NOTICES.md.
+// Portions adapted from fallow (crates/graph/src/resolve/specifier.rs),
+// MIT (c) 2026 Bart Waardenburg. See THIRD-PARTY-NOTICES.md.
 // SPDX-License-Identifier: MIT
 //
 // Real tsconfig paths/baseUrl, package `exports`, and extension/index fallbacks
