@@ -52,7 +52,7 @@ tree-sitter = "0.25"
 tree-sitter-javascript = "0.25"
 tree-sitter-typescript = "0.23"
 tree-sitter-python = "0.23"
-tree-sitter-go = "0.23"
+tree-sitter-go = "0.25"
 tree-sitter-rust = "0.23"
 tree-sitter-cpp = "0.23"
 # JS/TS module resolution (tsconfig paths/baseUrl, package exports, extension
