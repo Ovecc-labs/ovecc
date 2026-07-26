@@ -55,4 +55,9 @@ rustflags = [
     "-C", "link-arg=-luser32",
     "-C", "link-arg=-ladvapi32",
     "-C", "link-arg=-lshell32",
+    # Workaround for a GCC 16.1.0 / MSYS2 libstdc++ packaging regression that
+    # emits duplicate (identical) template-instantiation symbols, e.g.
+    # basic_string<wchar_t> in wstring-inst.o. Not caused by our own code;
+    # drop this once msys2/MINGW-packages#29279 is fixed upstream.
+    "-C", "link-arg=-Wl,--allow-multiple-definition",
 ]
