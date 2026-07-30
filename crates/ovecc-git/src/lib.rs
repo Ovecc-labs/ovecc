@@ -1,6 +1,10 @@
 //! Git history read from the object database with `gix`.
 
+mod fix;
+
 use anyhow::Result;
+
+pub use fix::{FIX_CONFIDENCE_THRESHOLD, FixClassification, classify_fix_message};
 
 /// Kind of change a commit applied to a file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
