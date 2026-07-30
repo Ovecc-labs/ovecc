@@ -1,19 +1,4 @@
-//! Native Git history extraction via gitoxide.
-//!
-//! Replaces the temporary `git rev-parse` shell-out: commits, authors, and
-//! per-commit changed files are read directly from the object database with
-//! `gix`, with no child process.
-//!
-//! Scope is deliberately bounded for performance (research brief
-//! `docs/research-code-churn-ownership.md`): recent history only, capped by a
-//! day window and a maximum commit count — current ownership/churn does not
-//! need a decade of history. Line-level additions/deletions are a later
-//! refinement; this layer reports commit metadata and changed-file events,
-//! which is all the ownership model needs (author commits per file).
-//!
-//! Extraction is resilient: a repository that cannot be opened (no `.git`)
-//! yields an empty history rather than an error, and a commit that fails to
-//! decode is skipped rather than aborting the run.
+//! Git history read from the object database with `gix`.
 
 use anyhow::Result;
 
@@ -66,13 +51,10 @@ pub struct GitHistory {
     pub commits: Vec<GitCommit>,
 }
 
-/// Collects recent commits reachable from `HEAD`.
+/// Collects recent commits reachable from `HEAD`, at most `max_commits` of
+/// them and none older than `window_days` (`0` = no age limit).
 ///
-/// - `window_days`: keep commits no older than this many days (`0` = no limit).
-/// - `max_commits`: hard cap on commits inspected, bounding cost on large
-///   repositories.
-///
-/// Returns an empty history (not an error) when `root` is not a Git working
+/// Returns an empty history, not an error, when `root` is not a Git working
 /// tree or has no commits yet.
 pub fn collect_history(
     root: &std::path::Path,
@@ -159,10 +141,8 @@ pub fn changed_files_since(
 /// keyed by repo-relative path. An added file maps to a single range spanning
 /// the whole file. Renames are tracked at git's default 50% similarity, so a
 /// pure `git mv` touches no line at the destination and a moved-and-edited
-/// file carries only its edited lines. Diffs the reference tree against the
-/// committed HEAD, so uncommitted working-tree edits are not reflected.
-/// Returns `None` outside a Git repository or when the reference does not
-/// resolve to a commit.
+/// file carries only its edited lines. Tree-to-tree like
+/// [`changed_files_since`], and `None` under the same conditions.
 pub fn changed_line_ranges(
     root: &std::path::Path,
     reference: &str,
@@ -264,8 +244,8 @@ fn change_head_ranges(
     }
 }
 
-/// Decodes one commit's metadata and the files it changed against its first
-/// parent. Returns `None` if the essential metadata cannot be read.
+/// `None` when the commit's essential metadata cannot be read, so a single
+/// undecodable object does not abort the walk.
 fn decode_commit(repo: &gix::Repository, commit: &gix::Commit<'_>) -> Option<GitCommit> {
     let sha = commit.id().to_string();
     let parent_shas: Vec<String> = commit.parent_ids().map(|id| id.to_string()).collect();
@@ -292,9 +272,8 @@ fn decode_commit(repo: &gix::Repository, commit: &gix::Commit<'_>) -> Option<Git
     })
 }
 
-/// Diffs the commit's tree against its first parent (or the empty tree for a
-/// root commit) and maps each entry to a [`GitFileChange`]. Best-effort: any
-/// failure yields no changes for that commit rather than aborting.
+/// Best-effort: any diff failure yields no changes for that commit rather
+/// than aborting.
 fn changed_files(
     repo: &gix::Repository,
     commit: &gix::Commit<'_>,
@@ -433,9 +412,6 @@ mod tests {
 
         let head = collect_history(root, 0, 10).unwrap().head_sha.unwrap();
         assert_eq!(resolve_ref(root, "HEAD").as_deref(), Some(head.as_str()));
-        // The default branch name resolves to the same commit.
-        let branch = resolve_ref(root, "HEAD").unwrap();
-        assert_eq!(branch, head);
         assert!(resolve_ref(root, "does-not-exist").is_none());
     }
 
@@ -454,14 +430,12 @@ mod tests {
         git(root, &["init", "-q"]);
         git(root, &["config", "user.email", "dev@example.com"]);
         git(root, &["config", "user.name", "Dev"]);
-        // A five-line file; a second file that will stay untouched.
         std::fs::write(root.join("a.ts"), "one\ntwo\nthree\nfour\nfive\n").unwrap();
         std::fs::write(root.join("keep.ts"), "kept\n").unwrap();
         git(root, &["add", "."]);
         git(root, &["commit", "-q", "-m", "base"]);
         let base = resolve_ref(root, "HEAD").unwrap();
 
-        // Edit only line 3 of a.ts, and add a brand-new file.
         std::fs::write(root.join("a.ts"), "one\ntwo\nTHREE\nfour\nfive\n").unwrap();
         std::fs::write(root.join("added.ts"), "x\ny\n").unwrap();
         git(root, &["add", "."]);
@@ -493,7 +467,6 @@ mod tests {
         git(root, &["commit", "-q", "-m", "base"]);
         let base = resolve_ref(root, "HEAD").unwrap();
 
-        // A pure move: same content, new path.
         git(root, &["mv", "a.ts", "b.ts"]);
         git(root, &["commit", "-q", "-m", "move"]);
         let ranges = changed_line_ranges(root, &base).unwrap();
@@ -502,7 +475,6 @@ mod tests {
             "a pure rename touches no line: {ranges:?}"
         );
 
-        // A move that also edits one line carries only that line.
         std::fs::write(root.join("b.ts"), "one\ntwo\nTHREE\nfour\nfive\n").unwrap();
         git(root, &["add", "."]);
         git(root, &["mv", "b.ts", "c.ts"]);

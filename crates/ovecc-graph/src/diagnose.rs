@@ -13,9 +13,6 @@
 //! N path segments). This makes the structural detectors see the real
 //! architecture, and makes `god_component` language-agnostic (size = file
 //! count), so it works on Rust/C++ as well as TS/JS.
-//!
-//! See `docs/dev/DIAGNOSE.md` for the design and the research basis of each
-//! detector.
 
 use crate::cycles;
 use crate::instability;

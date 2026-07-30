@@ -255,7 +255,7 @@ pub struct OutputConfig {
 /// Thresholds and toggles for `ovecc diagnose` / `advise` / `metrics`. Tuned for
 /// precision; override any field under `[diagnose]` in `.ovecc/config.toml`.
 /// Detection runs at *component* (directory) granularity derived from the
-/// file→file graph. See `docs/dev/DIAGNOSE.md`.
+/// file→file graph.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DiagnoseConfig {
