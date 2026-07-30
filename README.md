@@ -11,7 +11,7 @@
     then answers the hard questions: what breaks if I change this, where are the
     cycles, what's coupled, dead, or insecure. And it lets you write your
     architecture down as a contract, so the build fails when the code drifts.<br/>
-    Local, deterministic, no LLM in the loop.
+    It runs locally, stays fully deterministic, and never puts an LLM in the loop.
   </p>
 
   <p>
@@ -37,28 +37,24 @@ questions you actually ask about a codebase:
 - What is insecure, and which dependencies have known CVEs? (`security`, `audit`)
 - Where is the churn, and who owns this code? (`hotspots`)
 
-It runs on your machine, gives byte-identical answers every run, and never treats
-an LLM as the source of truth. It is not a code generator, a chat tool, or a
-dashboard: it is an architecture database with deterministic commands, usable
-from the CLI, in CI, or by a coding agent over MCP.
+It runs on your machine, gives byte-identical answers every run, and never
+treats an LLM as the source of truth: it's an architecture database with
+deterministic commands, usable from the CLI, in CI, or by a coding agent over
+MCP.
 
 <img src="docs/img/graph-hero.png" alt="React's dependency graph in ovecc's offline viewer" width="100%" />
-<p align="center"><i>React's dependency graph, rendered by <code>ovecc export graph --html</code> into one self-contained offline file. No CDN, opens offline.</i></p>
-
-<img src="docs/img/graph-inspect.png" alt="Inspecting one file's dependencies in the viewer" width="100%" />
-<p align="center"><i>Click any file to see its language, size, everything it imports, and everything that imports it.</i></p>
+<p align="center"><i>React's dependency graph, rendered by <code>ovecc export graph --html</code> into a single file you can open directly, no server or CDN needed.</i></p>
 
 Measured performance and answer accuracy on real repositories are in
 [docs/benchmark/BENCHMARKS.md](docs/benchmark/BENCHMARKS.md).
 
 ## Write your architecture down, and hold the code to it
 
-Most tools stop at reading the code. Ovecc goes one step further: because it
-already understands your architecture, it can enforce it. You declare your
-components and the dependencies each is allowed in one small file, and every
-build checks the whole repo against it.
+Most tools stop at reading the code. Ovecc goes one step further: you write
+down which parts of your codebase are allowed to depend on which, in one small
+file, and every build checks the real code against it.
 
-Here is the entire contract for a small app:
+Here's one for a small app:
 
 ```toml
 # .ovecc/architecture.toml
@@ -108,12 +104,12 @@ pure, and a function creeping past the budget you set. Put `ovecc architecture
 check` in CI and the pull request fails on the drift, instead of a reviewer
 noticing three months later, or nobody noticing at all.
 
-**No contract yet?** `ovecc architecture suggest` reads the repo, recognizes the
-architecture you already follow (Feature-Sliced, bulletproof-react,
-Clean/Hexagonal, an Nx workspace) and writes the contract bound to your real
-folders. Or `ovecc architecture init` drafts it from your actual import graph, so
-day one starts green and you tighten from there. The details are in
-[the contract reference below](#the-architecture-contract-in-depth).
+**Don't have one yet?** `ovecc architecture suggest` recognizes the architecture
+you already follow (Feature-Sliced, bulletproof-react, Clean/Hexagonal, an Nx
+workspace) and writes the file bound to your real folders. Or `ovecc
+architecture init` drafts it from your actual import graph, so day one starts
+green and you tighten from there. The details are in [the contract reference
+below](#the-architecture-contract-in-depth).
 
 ## Install
 
