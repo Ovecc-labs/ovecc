@@ -1,5 +1,4 @@
-//! Per-run replacement writes: the findings (with their per-snapshot
-//! retention), the Git facts, and the package inventory.
+//! Per-run replacement writes: findings, Git facts, packages.
 
 use crate::{ArchitectureStore, PackageRow, enum_str, existing_ids};
 use anyhow::Result;
@@ -8,28 +7,17 @@ use ovecc_core::facts::{CommitRecord, FileChangeRecord, FindingRecord};
 use ovecc_core::util::stable_id;
 use std::collections::{HashMap, HashSet};
 
-/// The ordinal-0 identity: the key every instance of the same pattern in the
-/// same file shares. Ordinals are assigned in the findings' persisted order,
-/// which follows their hashed ids — not their lines — so the diff cannot say
-/// *which* instance of a repeated pattern is the new one. Review therefore
-/// charges the group as a unit, via this key.
+/// The ordinal-0 identity, shared by every instance of a repeated pattern in
+/// one file: the diff cannot tell them apart, so review charges the group.
 pub fn finding_group_key(finding: &FindingRecord) -> String {
     finding_identity(finding, 0)
 }
 
-/// Stable, snapshot-independent content identity of a finding, so the *same*
-/// defect in two snapshots collapses to one key and a set-difference yields the
-/// genuinely new ones. Keyed by kind + severity + first-evidence location
-/// (path, then the enclosing symbol when known, else the pattern detail, else
-/// the line) + rule — stable across unrelated edits elsewhere in the repo,
-/// where the volatile per-run `FindingId` is not. Line numbers are the locator
-/// of last resort: identifying by line blames a finding that merely *moved*
-/// (an edit above it) on the change under review. Severity is part of the
-/// identity so a defect that crosses a band — a function pushed from medium to
-/// high complexity — reads as a new fact (and the old band as resolved), not
-/// as nothing. `ordinal` disambiguates several otherwise identical findings
-/// (e.g. two `eval` calls in one file), so only the extra occurrence reads as
-/// new.
+/// Content identity of a finding, stable across snapshots where the per-run
+/// `FindingId` is not, so a set difference yields the genuinely new ones. The
+/// line comes last: identifying by line blames a finding that an edit above it
+/// merely moved. Severity is part of the key, so a function pushed from medium
+/// to high complexity reads as one new finding and one resolved.
 fn finding_identity(finding: &FindingRecord, ordinal: usize) -> String {
     let kind = enum_str(&finding.kind);
     let severity = enum_str(&finding.severity);
@@ -68,10 +56,8 @@ fn finding_identity(finding: &FindingRecord, ordinal: usize) -> String {
 }
 
 impl ArchitectureStore {
-    /// Ingests Git commits and per-file change events. Commits are
-    /// immutable by SHA, so this is an idempotent insert keyed by stable ID:
-    /// re-indexing ingests only commits not already stored. Returns the number
-    /// of newly ingested commits.
+    /// Ingests commits and per-file change events, returning how many commits
+    /// were new. Commits are immutable by SHA, so the insert is idempotent.
     pub fn upsert_git_facts(
         &mut self,
         repository_id: &str,
@@ -85,8 +71,8 @@ impl ArchitectureStore {
         let mut ingested = 0;
         {
             let mut insert_commit = tx.prepare(
-                "INSERT INTO commits (id, repository_id, sha, parent_shas, author_name, author_email, committed_at, message)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO commits (id, repository_id, sha, parent_shas, author_name, author_email, committed_at, message, is_fix, fix_confidence)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             )?;
             for commit in commits {
                 if known_commits.contains(commit.id.as_str()) {
@@ -101,6 +87,8 @@ impl ArchitectureStore {
                     commit.author_email,
                     commit.committed_at.to_rfc3339(),
                     commit.message,
+                    commit.is_fix,
+                    commit.fix_confidence as f64,
                 ])?;
                 ingested += 1;
             }
@@ -129,9 +117,22 @@ impl ArchitectureStore {
         Ok(ingested)
     }
 
-    /// Replaces the repository's current findings. Findings are
-    /// recomputed every index run, so a full per-repository replace is correct
-    /// and simpler than a diff. Evidence is stored as JSON text.
+    /// Backfills the fix classification of commits already stored.
+    pub fn set_fix_classification(&mut self, rows: &[(String, bool, f64)]) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        {
+            let mut update =
+                tx.prepare("UPDATE commits SET is_fix = ?, fix_confidence = ? WHERE id = ?")?;
+            for (id, is_fix, confidence) in rows {
+                update.execute(params![is_fix, confidence, id])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Replaces the repository's findings. They are recomputed every index run,
+    /// so a full replace is correct and simpler than a diff.
     pub fn replace_findings(
         &mut self,
         repository_id: &str,
@@ -165,13 +166,9 @@ impl ArchitectureStore {
             }
         }
         {
-            // Retain each finding under its snapshot (append-only) so a change
-            // review can diff base→head findings by stable identity and report
-            // the *named* new ones, not just a count delta. The current-state
-            // `findings` table above still backs the point-in-time commands.
-            // Ordinals count repeated content identities within the snapshot
-            // (findings arrive in deterministic order), so duplicates stay
-            // distinct without falling back to volatile line numbers.
+            // Retained per snapshot (append-only) so review can name the new
+            // findings instead of counting them. Ordinals keep repeated
+            // identities distinct without falling back to line numbers.
             let mut appender = tx.appender("snapshot_findings")?;
             let mut identity_counts: HashMap<String, usize> = HashMap::new();
             for finding in findings {
@@ -206,8 +203,7 @@ impl ArchitectureStore {
         Ok(())
     }
 
-    /// Replaces the repository's package inventory. Recomputed each
-    /// index run, so a full per-repository replace is correct.
+    /// Replaces the repository's package inventory: recomputed every index run.
     pub fn replace_packages(&mut self, repository_id: &str, packages: &[PackageRow]) -> Result<()> {
         let tx = self.conn.transaction()?;
         tx.execute(
@@ -322,6 +318,8 @@ mod tests {
                 committed_at: chrono::DateTime::from_timestamp(1_700_000_000 + i as i64, 0)
                     .unwrap(),
                 message: Some(format!("commit {sha}")),
+                is_fix: false,
+                fix_confidence: 0.0,
             });
             changes.push(FileChangeRecord {
                 id: FileChangeId::from_parts(&[repo, sha, path]),
@@ -355,5 +353,59 @@ mod tests {
         let f2 = ownership.iter().find(|o| o.file_path == "f2.ts").unwrap();
         assert!((f2.ownership - 1.0).abs() < 1e-9);
         assert_eq!(f2.total_commits, 1);
+    }
+
+    #[test]
+    fn fix_classification_round_trips_and_backfills() {
+        use ovecc_core::facts::CommitRecord;
+        use ovecc_core::id::{CommitId, RepositoryId};
+
+        let (_dir, mut store) = temp_store();
+        store.migrate_to_latest().unwrap();
+        let repo = "repo:test";
+
+        let commit = |sha: &str, is_fix: bool, confidence: f32| CommitRecord {
+            id: CommitId::from_parts(&[repo, sha]),
+            repository_id: RepositoryId::from_raw(repo),
+            sha: sha.to_string(),
+            parent_shas: Vec::new(),
+            author_name: None,
+            author_email: None,
+            committed_at: chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+            message: Some(format!("subject {sha}")),
+            is_fix,
+            fix_confidence: confidence,
+        };
+        let commits = [commit("c1", true, 0.9), commit("c2", false, 0.0)];
+        store.upsert_git_facts(repo, &commits, &[]).unwrap();
+
+        let (is_fix, confidence): (bool, f64) = store
+            .conn
+            .query_row(
+                "SELECT is_fix, fix_confidence FROM commits WHERE sha = 'c1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert!(is_fix);
+        assert!((confidence - 0.9).abs() < 1e-6, "confidence: {confidence}");
+        assert!(store.unclassified_commits(repo).unwrap().is_empty());
+
+        // A row from a database indexed before the columns existed.
+        store
+            .conn
+            .execute(
+                "UPDATE commits SET is_fix = NULL, fix_confidence = NULL WHERE sha = 'c1'",
+                [],
+            )
+            .unwrap();
+        let pending = store.unclassified_commits(repo).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].1, "subject c1");
+
+        store
+            .set_fix_classification(&[(pending[0].0.clone(), true, 0.9)])
+            .unwrap();
+        assert!(store.unclassified_commits(repo).unwrap().is_empty());
     }
 }

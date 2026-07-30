@@ -1,5 +1,4 @@
-//! Read queries over the current state: modules, dependencies, findings,
-//! code facts, ownership, and the metric history.
+//! Read queries over the current state of the index.
 
 use crate::{
     ArchitectureStore, FileGraphRow, FileOwnership, FindingRow, MetricPoint, SymbolDef,
@@ -63,8 +62,8 @@ impl ArchitectureStore {
         self.count_rows("files", repository_id)
     }
 
-    /// Loads the repository's findings, optionally filtered to a minimum
-    /// severity, ordered by severity (most severe first) then title.
+    /// The repository's findings, optionally filtered to a minimum severity,
+    /// most severe first then stable by title.
     pub fn findings(
         &self,
         repository_id: &str,
@@ -96,7 +95,6 @@ impl ArchitectureStore {
                 None => true,
             })
             .collect();
-        // Most severe first, then stable by title.
         findings.sort_by(|a, b| {
             b.severity
                 .cmp(&a.severity)
@@ -105,9 +103,8 @@ impl ArchitectureStore {
         Ok(findings)
     }
 
-    /// Per-file ownership metrics: the majority contributor's share, and the
-    /// count of major (≥5%) and minor (<5%) contributors. Computed in DuckDB
-    /// over the ingested Git history.
+    /// Per-file ownership: the majority contributor's share, and the count of
+    /// major (≥5%) and minor (<5%) contributors.
     pub fn ownership_metrics(&self, repository_id: &str) -> Result<Vec<FileOwnership>> {
         let mut statement = self.conn.prepare(
             "WITH per_author AS (
@@ -159,6 +156,20 @@ impl ArchitectureStore {
         Ok(count as usize)
     }
 
+    /// Commits with no fix classification yet, as `(id, message)`. Classifying
+    /// them is the caller's job: this crate cannot reach the classifier.
+    pub fn unclassified_commits(&self, repository_id: &str) -> Result<Vec<(String, String)>> {
+        let mut statement = self.conn.prepare(
+            "SELECT id, COALESCE(message, '')
+             FROM commits
+             WHERE repository_id = ? AND is_fix IS NULL",
+        )?;
+        let rows = statement.query_map(params![repository_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        collect_rows(rows)
+    }
+
     /// Commits touching each module's files (module churn).
     pub fn module_churn(&self, repository_id: &str) -> Result<Vec<(String, f64)>> {
         let mut statement = self.conn.prepare(
@@ -175,9 +186,7 @@ impl ArchitectureStore {
         collect_rows(rows)
     }
 
-    /// Files that access the database
-    /// (a `reads`/`writes` edge from one of their symbols), for the
-    /// database-access convention.
+    /// Files that access the database: a symbol with a `reads`/`writes` edge.
     pub fn db_accessing_files(&self, repository_id: &str) -> Result<Vec<String>> {
         let mut statement = self.conn.prepare(
             "SELECT DISTINCT f.path
@@ -232,8 +241,8 @@ impl ArchitectureStore {
             .collect())
     }
 
-    /// Per-function complexity joined to file paths, for the contract's
-    /// per-component budget check.
+    /// Per-function complexity joined to file paths, for the contract's budget
+    /// check.
     pub fn current_function_metrics(&self, repository_id: &str) -> Result<Vec<FunctionMetricsRow>> {
         let mut statement = self.conn.prepare(
             "SELECT f.path, c.qualified_name, c.line, c.cyclomatic, c.cognitive
@@ -254,9 +263,8 @@ impl ArchitectureStore {
         collect_rows(rows)
     }
 
-    /// Total cognitive complexity per module, aggregated from the per-function
-    /// `complexity` table (oxc). Feeds the hotspot debt score so a module heavy
-    /// with complex functions ranks higher even with low churn/coupling.
+    /// Total cognitive complexity per module. Feeds the hotspot score, so a
+    /// module full of complex functions ranks high even with low churn.
     pub fn module_complexity(&self, repository_id: &str) -> Result<Vec<(String, f64)>> {
         let mut statement = self.conn.prepare(
             "SELECT f.module_name, SUM(c.cognitive)::BIGINT
@@ -303,10 +311,9 @@ impl ArchitectureStore {
         collect_rows(rows)
     }
 
-    /// Every symbol definition with a recorded span, joined to its file path —
-    /// the lookup table behind `read` (slice one body from disk) and `grep`
-    /// (definitions ranked before text matches). Filtering happens in Rust:
-    /// the caller ranks exact/suffix/substring tiers no SQL LIKE expresses.
+    /// Every symbol definition with a recorded span, joined to its file path.
+    /// Ranking (exact, suffix, substring) happens in Rust: no SQL LIKE
+    /// expresses those tiers.
     pub fn symbol_defs(&self, repository_id: &str) -> Result<Vec<SymbolDef>> {
         let mut statement = self.conn.prepare(
             "SELECT s.name, s.qualified_name, s.kind, f.path, s.start_line, s.end_line
@@ -346,8 +353,8 @@ impl ArchitectureStore {
         collect_rows(rows)
     }
 
-    /// Commits touching each file (per-file churn), so callers can aggregate
-    /// churn to any component granularity (e.g. directories), not just modules.
+    /// Commits touching each file, so callers can aggregate churn at any
+    /// granularity, not just modules.
     pub fn file_churn(&self, repository_id: &str) -> Result<Vec<(String, f64)>> {
         let mut statement = self.conn.prepare(
             "SELECT f.path, COUNT(fc.id)
@@ -379,11 +386,7 @@ impl ArchitectureStore {
     }
 
     /// Per-file `(abstract_types, total_types)` for Martin's Abstractness
-    /// `A = abstract / total`. Abstract types are interfaces and traits; the
-    /// denominator counts the type-defining symbols (class, struct, enum,
-    /// interface, trait), not functions or variables. Files with no type
-    /// declarations are omitted. Feeds the `metrics` report and the
-    /// `zone_of_pain` detector.
+    /// `A = abstract / total`. Files declaring no type are omitted.
     pub fn file_abstractness(&self, repository_id: &str) -> Result<Vec<(String, f64, f64)>> {
         let mut statement = self.conn.prepare(
             "SELECT f.path,
@@ -406,11 +409,8 @@ impl ArchitectureStore {
     }
 
     /// Pairs of files that changed together in the same commit, with how many
-    /// times — the evolutionary "change coupling" signal. Bulk commits (more
-    /// than 30 files: merges, mass reformats) are excluded as noise, and only
-    /// pairs that co-changed at least 3 times are returned. Empty without git
-    /// history. Feeds the `change_coupling` and `modularity_violation`
-    /// detectors.
+    /// times. Bulk commits are excluded as noise (merges, mass reformats).
+    /// Empty without git history.
     pub fn co_change_pairs(&self, repository_id: &str) -> Result<Vec<(String, String, f64)>> {
         let mut statement = self.conn.prepare(
             "WITH sized AS (
@@ -468,10 +468,9 @@ impl ArchitectureStore {
         collect_rows(rows)
     }
 
-    /// Source anchors `(node_id, file_path, line)` for graph nodes that have a
-    /// single definition site: symbols (their file + start line), apis and
-    /// schema objects (their evidence file + line). Modules and files are
-    /// absent. A read-time join, so anchors need no reindex to appear.
+    /// Source anchors for graph nodes with a single definition site: symbols,
+    /// apis, and schema objects. Modules and files are absent. A read-time
+    /// join, so anchors need no reindex.
     pub fn node_source_locations(&self, repository_id: &str) -> Result<Vec<(String, String, i64)>> {
         let mut statement = self.conn.prepare(
             "SELECT s.id, f.path, s.start_line \
@@ -514,9 +513,8 @@ impl ArchitectureStore {
         collect_rows(rows)
     }
 
-    /// One metric's value across every snapshot, oldest first — the raw series
-    /// behind `ovecc history`. `limit` keeps only the most recent N points
-    /// (still returned oldest-first for rendering).
+    /// One metric's value across every snapshot, oldest first. `limit` keeps
+    /// the most recent N points, still returned oldest-first.
     pub fn metric_history(
         &self,
         repository_id: &str,
@@ -545,8 +543,7 @@ impl ArchitectureStore {
         Ok(points)
     }
 
-    /// Every metric name recorded for this repository, sorted — so `history`
-    /// without an argument can list what is trendable.
+    /// Every metric name recorded for this repository, sorted.
     pub fn metric_names(&self, repository_id: &str) -> Result<Vec<String>> {
         let mut statement = self.conn.prepare(
             "SELECT DISTINCT m.metric_name

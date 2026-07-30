@@ -111,10 +111,8 @@ const MIGRATION_V1_BASELINE: &str = r#"
             );
             "#;
 
-/// Full architecture schema: symbols, calls, APIs,
-/// database schema objects, repository migrations, ownership, Git facts,
-/// scoped metrics, and findings. `evidence_json` columns stay TEXT so the
-/// schema does not depend on the DuckDB JSON extension being loaded.
+/// Full architecture schema. `evidence_json` columns stay TEXT so the schema
+/// does not depend on the DuckDB JSON extension being loaded.
 const MIGRATION_V2_FULL_SCHEMA: &str = r#"
             CREATE TABLE IF NOT EXISTS symbols (
                 id TEXT PRIMARY KEY,
@@ -259,9 +257,8 @@ const MIGRATION_V3_PACKAGES: &str = r#"
             CREATE INDEX IF NOT EXISTS idx_packages_repo ON packages (repository_id);
             "#;
 
-/// First-class per-function complexity and per-file exports, so they are
-/// queryable as data (not just transient findings) and back dead-code and
-/// code-health inspection over the architecture database.
+/// Per-function complexity and per-file exports as first-class rows, queryable
+/// instead of surfacing only as transient findings.
 const MIGRATION_V4_CODE_HEALTH: &str = r#"
             CREATE TABLE IF NOT EXISTS complexity (
                 id TEXT PRIMARY KEY,
@@ -289,11 +286,9 @@ const MIGRATION_V4_CODE_HEALTH: &str = r#"
             CREATE INDEX IF NOT EXISTS idx_exports_repo ON exports (repository_id);
             "#;
 
-/// Per-snapshot retention of findings and file hashes. The base schema only
-/// snapshots modules/dependencies/metrics (so drift could trend *counts*); this
-/// retains the findings themselves and the file content hashes, so a change
-/// between two snapshots can be reported as the **named** new defects and scoped
-/// to the files it touched. Append-only, exactly like `snapshot_modules`.
+/// Per-snapshot retention of findings and file hashes. The base schema
+/// snapshots counts only, which can trend a change but never name the defects
+/// behind it or the files it touched.
 const MIGRATION_V5_SNAPSHOT_RETENTION: &str = r#"
             CREATE TABLE IF NOT EXISTS snapshot_findings (
                 snapshot_id TEXT NOT NULL,
@@ -333,6 +328,13 @@ const MIGRATION_V6_CAPABILITIES: &str = r#"
             CREATE INDEX IF NOT EXISTS idx_capability_uses_repo ON capability_uses (repository_id);
             "#;
 
+/// Whether each commit subject describes a bug fix. `NULL` marks a commit
+/// ingested before the classifier existed; the indexer backfills those.
+const MIGRATION_V7_FIX_CLASSIFICATION: &str = r#"
+            ALTER TABLE commits ADD COLUMN IF NOT EXISTS is_fix BOOLEAN;
+            ALTER TABLE commits ADD COLUMN IF NOT EXISTS fix_confidence DOUBLE;
+            "#;
+
 const SCHEMA_MIGRATIONS: &[SchemaMigration] = &[
     SchemaMigration {
         version: 1,
@@ -363,6 +365,11 @@ const SCHEMA_MIGRATIONS: &[SchemaMigration] = &[
         version: 6,
         name: "capabilities",
         sql: MIGRATION_V6_CAPABILITIES,
+    },
+    SchemaMigration {
+        version: 7,
+        name: "fix_classification",
+        sql: MIGRATION_V7_FIX_CLASSIFICATION,
     },
 ];
 
@@ -444,8 +451,8 @@ mod tests {
 
         let version = store.migrate_to_latest().unwrap();
 
-        assert_eq!(version, 6);
-        assert_eq!(store.schema_version().unwrap(), Some(6));
+        assert_eq!(version, 7);
+        assert_eq!(store.schema_version().unwrap(), Some(7));
         for table in [
             "repositories",
             "files",
@@ -481,12 +488,12 @@ mod tests {
         store.migrate_to_latest().unwrap();
         store.migrate_to_latest().unwrap();
 
-        assert_eq!(store.schema_version().unwrap(), Some(6));
+        assert_eq!(store.schema_version().unwrap(), Some(7));
         let applied: i64 = store
             .conn
             .query_row("SELECT count(*) FROM ovecc_schema", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(applied, 6, "each migration must be recorded exactly once");
+        assert_eq!(applied, 7, "each migration must be recorded exactly once");
     }
 
     #[test]
@@ -499,7 +506,7 @@ mod tests {
 
         let version = store.migrate_to_latest().unwrap();
 
-        assert_eq!(version, 6);
+        assert_eq!(version, 7);
         assert!(table_exists(&store, "findings"));
         assert!(table_exists(&store, "packages"));
         assert!(table_exists(&store, "complexity"));

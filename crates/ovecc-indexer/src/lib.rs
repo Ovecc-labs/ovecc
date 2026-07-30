@@ -1,7 +1,6 @@
 //! Indexing pipeline: discover source files, parse them in parallel through a
-//! content-addressed cache, resolve imports and code facts, run the analyses
-//! (rules, security patterns, taint, OSV audit, complexity, dead code,
-//! dependency hygiene), and persist everything as one snapshot.
+//! content-addressed cache, resolve imports and code facts, run the analyses,
+//! and persist everything as one snapshot.
 
 mod discover;
 mod entrypoints;
@@ -69,8 +68,7 @@ pub fn index_repository(
     config: &OveccConfig,
     skip_git: bool,
 ) -> Result<IndexReport> {
-    // Phase instrumentation: measured unconditionally (negligible cost),
-    // surfaced by `--stats`. Each `phase` records elapsed time since the last.
+    // Phase timings: measured unconditionally, surfaced by `--stats`.
     let run_start = std::time::Instant::now();
     let mut timings = ovecc_core::report::IndexTimings::default();
     let mut phase_start = run_start;
@@ -98,8 +96,7 @@ pub fn index_repository(
     cache.ensure_dir()?;
     phase(&mut timings.discovery_ms);
 
-    // Hashing and parsing are per-file and independent — parallelize.
-    // Results keep the discovery order, so output stays deterministic.
+    // Per-file and independent; results keep discovery order for determinism.
     let processed: Vec<ProcessedFile> = source_files
         .par_iter()
         .map(|source_file| {
@@ -159,9 +156,8 @@ pub fn index_repository(
         Some(contract) => assign_slices(contract, &component_of),
         None => BTreeMap::new(),
     };
-    // Capability and budget facts come straight from this run's parse (the
-    // `capability_uses`/`complexity` tables are only written afterwards), so
-    // a cold index judges them without a second pass.
+    // Straight from this run's parse: the `capability_uses`/`complexity` tables
+    // are written afterwards, so a cold index would judge them empty.
     let capability_uses: Vec<(String, ovecc_core::facts::CapabilityFact)> = parsed
         .file_facts
         .iter()
@@ -338,9 +334,8 @@ fn collect_processed(
             outcome.imports
         };
         parsed.parsed_imports.insert(file.path.clone(), imports);
-        // On parse failure `facts` is empty; code-level retention across a
-        // failed re-parse is a later refinement (the module graph is retained
-        // via `parsed_imports` above).
+        // On parse failure `facts` is empty: only the module graph survives,
+        // via `parsed_imports` above.
         parsed.file_facts.insert(file.path.clone(), outcome.facts);
         parsed.by_path.insert(file.path.clone(), file.clone());
         parsed.files.push(file);
@@ -348,11 +343,10 @@ fn collect_processed(
     parsed
 }
 
-/// Code-fact resolution: build per-file import bindings, then resolve
-/// grammar-level facts into typed records with a linked call graph. Bindings
-/// reuse the already-resolved dependency edges (oxc_resolver), so calls
-/// through aliased (`@/x`) and monorepo (`@scope/pkg`) imports link, not just
-/// relative ones.
+/// Code-fact resolution: per-file import bindings, then grammar-level facts
+/// into typed records with a linked call graph. Bindings reuse the resolved
+/// dependency edges, so calls through aliased (`@/x`) and monorepo
+/// (`@scope/pkg`) imports link too, not just relative ones.
 fn resolve_code_facts(
     repository_id: &str,
     parsed: &ParsedFiles,
@@ -459,9 +453,8 @@ struct AnalysisInput<'a> {
     entry_points: &'a HashSet<String>,
 }
 
-/// Rule evaluation: turn the architecture into findings (boundary violations,
-/// cycles), persisted for `summary`/`violations` to read. Also returns the
-/// flattened per-file security patterns for the test-code down-ranking pass.
+/// Turns the architecture into findings. Also returns the flattened per-file
+/// security patterns, for the test-code down-ranking pass.
 fn evaluate_rules(
     input: &AnalysisInput<'_>,
     config: &RulesConfig,
@@ -595,9 +588,9 @@ fn complexity_findings(
     findings
 }
 
-/// Unit size (Long Method) — independent of the branching thresholds: a
-/// linear-but-endless function is a maintainability risk too. Low below 150
-/// lines so it informs without tripping medium/high gates.
+/// Unit size (Long Method), independent of the branching thresholds: a
+/// linear-but-endless function is a maintainability risk too. Capped at Medium,
+/// so it informs without tripping a high-severity gate.
 fn long_function_finding(
     input: &AnalysisInput<'_>,
     path: &str,
@@ -670,14 +663,10 @@ fn high_complexity_finding(
     path: &str,
     complexity: &ovecc_core::facts::ComplexityFact,
 ) -> Option<FindingRecord> {
-    // Severity is driven by cognitive complexity: how hard the function is to
-    // hold in your head. A high branch count alone does not make High, because
-    // a flat exhaustive `match` (a dispatch table, an enum classifier) has one
-    // path per arm yet reads top-to-bottom with nothing to track. Cyclomatic
-    // still raises Medium so a very branchy function gets a glance. This is the
-    // distinction SonarSource built cognitive complexity to make; scoring the
-    // branch count as High flagged our own command dispatch and node
-    // classifiers, which are long but not complex.
+    // Severity follows cognitive complexity, not the branch count: a flat
+    // exhaustive `match` has one path per arm yet nothing to track. Scoring
+    // branches as High flagged our own dispatch and classifiers, long but not
+    // complex. Cyclomatic still raises Medium, for a glance.
     let severity = if complexity.cognitive >= 25 {
         ovecc_core::facts::Severity::High
     } else if complexity.cognitive >= 15 || complexity.cyclomatic >= 10 {
@@ -726,9 +715,7 @@ fn high_complexity_finding(
 
 /// Dead-code analysis (unused exports/files) over the in-memory facts: oxc
 /// exports + resolved internal import edges (carrying the imported names) +
-/// detected entry points. Runs at index time and persists only findings, plus
-/// aggregate counts on the snapshot so `diff`/`drift` can trend them ("dead
-/// code grew this quarter").
+/// detected entry points.
 fn deadcode_findings(
     input: &AnalysisInput<'_>,
     metrics: &mut Vec<(String, f64)>,
@@ -805,11 +792,9 @@ fn deadcode_findings(
 }
 
 /// Dependency-hygiene findings. Unused dependencies are opt-in
-/// (`detect_unused_deps`): real-repo measurement showed a high false-positive
-/// rate — config files, `scripts` entries, side-effect imports, and test
-/// fixtures use a package without an import the graph can see. Unlisted
-/// (phantom) dependencies are precise by construction, so always on (silent
-/// on repos with no package.json).
+/// (`detect_unused_deps`): measured false-positive rate is high, since config
+/// files, `scripts` entries and test fixtures use a package without an import
+/// the graph can see. Phantom dependencies are precise, so always on.
 fn hygiene_findings(
     root: &Path,
     input: &AnalysisInput<'_>,
@@ -818,10 +803,9 @@ fn hygiene_findings(
 ) -> Vec<FindingRecord> {
     let mut findings = Vec::new();
     if detect_unused {
-        // Any bare-specifier import counts as using the package — including
-        // workspace packages (`@scope/pkg`) that resolve to an internal file
-        // (`is_external == false`), so monorepo packages are not falsely
-        // flagged. `external_package_root` drops relative imports and built-ins.
+        // Any bare-specifier import counts as using the package, including a
+        // workspace package that resolves to an internal file, so monorepo
+        // packages are not falsely flagged.
         let imported_roots: HashSet<String> = input
             .dependencies
             .iter()
@@ -903,15 +887,10 @@ fn smell_findings(
     findings
 }
 
-/// Security findings in test, fixture, and example files are usually test
-/// data or deliberate test scaffolding (fake secrets, an `eval` under test, a
-/// weak hash in a vector), not production risk — the canonical secret/SAST
-/// false positive. Down-rank them to Low so they stay visible in `security`
-/// but do not trip a high-severity gate. Down-ranked, not dropped: a real
-/// issue committed to a test file is still reported. Rust's inline
-/// `#[cfg(test)]` scopes are test code the path heuristics can't see; the
-/// parser stamped their patterns, so those (file, line) sites down-rank
-/// exactly like test files.
+/// Security findings in test, fixture, and example files are usually test data
+/// or deliberate scaffolding: the canonical secret/SAST false positive. Down to
+/// Low, not dropped. Rust's inline `#[cfg(test)]` scopes are invisible to the
+/// path heuristics, so the parser stamps those (file, line) sites instead.
 fn downrank_test_security(
     findings: &mut [FindingRecord],
     security_patterns: &[(String, SecurityPatternFact)],
@@ -941,11 +920,9 @@ fn downrank_test_security(
     }
 }
 
-/// A long or complex *test* function is test scaffolding, not production debt:
-/// a table-driven test or a fixture builder legitimately runs long. Down-rank
-/// complexity and size findings on test files to Low so `health` leads with
-/// production hotspots and a test block never trips a high-severity gate.
-/// Down-ranked, not dropped: a genuinely unwieldy test helper still shows.
+/// A long or complex test function is scaffolding, not production debt: a
+/// table-driven test legitimately runs long. Down to Low, not dropped, so
+/// `health` leads with production hotspots.
 fn downrank_test_complexity(findings: &mut [FindingRecord]) {
     for finding in findings.iter_mut() {
         let is_code_health = matches!(
@@ -1004,9 +981,8 @@ fn apply_suppressions(
         }
         !suppressed
     });
-    // A suppression that silenced nothing is stale: it documents a finding
-    // that no longer exists and will silently swallow the next real one on
-    // its line. Surface it (Low) so it gets cleaned up.
+    // A suppression that silenced nothing is stale: it will swallow the next
+    // real finding on its line.
     let mut stale = 0usize;
     for (path, lines) in &suppressions {
         for line in lines {
@@ -1050,11 +1026,9 @@ fn stale_suppression_finding(input: &AnalysisInput<'_>, path: &str, line: u32) -
     }
 }
 
-/// A stable finding ID encodes the finding's identity (rule + target +
-/// location), so two findings with the same ID are the same finding — e.g.
-/// two same-kind security patterns on one line. Collapse them so the unique
-/// `findings.id` primary key never collides on write, then derive the
-/// trendable finding counts.
+/// A stable finding ID encodes rule + target + location, so two findings with
+/// the same ID are the same finding. Collapse them: `findings.id` is a primary
+/// key.
 fn finalize_findings(findings: &mut Vec<FindingRecord>, metrics: &mut Vec<(String, f64)>) {
     findings.sort_by(|a, b| a.id.0.cmp(&b.id.0));
     findings.dedup_by(|a, b| a.id.0 == b.id.0);
@@ -1069,10 +1043,9 @@ fn finalize_findings(findings: &mut Vec<FindingRecord>, metrics: &mut Vec<(Strin
             )
         })
         .count();
-    // Code security only: dependency advisories (OSV) are counted separately —
-    // folding them in would make the trend depend on when advisories were last
-    // fetched, so `drift` would report "worsening" on a commit that merely ran
-    // `audit --fetch`.
+    // Code security only. Folding in OSV advisories would tie the trend to when
+    // advisories were last fetched, so `drift` would report worsening on a
+    // commit that merely ran `audit --fetch`.
     let security_findings = findings
         .iter()
         .filter(|finding| {
@@ -1101,9 +1074,8 @@ fn finalize_findings(findings: &mut Vec<FindingRecord>, metrics: &mut Vec<(Strin
     ));
 }
 
-/// First-class persistence records derived from the resolved code facts:
-/// symbol→table access edges plus the per-function complexity and per-file
-/// export rows (oxc), keyed by file id.
+/// Persistence records derived from the resolved code facts: symbol→table
+/// access edges, per-function complexity, per-file exports, keyed by file id.
 fn build_code_records(
     input: &AnalysisInput<'_>,
 ) -> (
@@ -1198,8 +1170,8 @@ fn build_code_records(
     )
 }
 
-/// Recent-history window and cap for Git ingestion: current ownership
-/// does not need a decade of history). Configurable via `[analysis]` later.
+/// Recent-history window and cap for Git ingestion: current ownership does not
+/// need a decade of history.
 const GIT_WINDOW_DAYS: u32 = 365;
 const GIT_MAX_COMMITS: usize = 5000;
 
@@ -1215,6 +1187,7 @@ fn ingest_git(
     let mut changes = Vec::new();
     for commit in &history.commits {
         let commit_id = CommitId::from_parts(&[repository_id, &commit.sha]);
+        let fix = ovecc_git::classify_fix_message(commit.message.as_deref().unwrap_or(""));
         commits.push(CommitRecord {
             id: commit_id.clone(),
             repository_id: RepositoryId::from_raw(repository_id),
@@ -1225,6 +1198,8 @@ fn ingest_git(
             committed_at: chrono::DateTime::from_timestamp(commit.committed_at, 0)
                 .unwrap_or_else(|| chrono::DateTime::from_timestamp(0, 0).expect("epoch")),
             message: commit.message.clone(),
+            is_fix: fix.is_fix,
+            fix_confidence: fix.confidence,
         });
         for change in &commit.changes {
             changes.push(FileChangeRecord {
@@ -1239,8 +1214,27 @@ fn ingest_git(
         }
     }
     let ingested = store.upsert_git_facts(repository_id, &commits, &changes)?;
+    backfill_fix_classification(store, repository_id)?;
     let ownership = store.ownership_metrics(repository_id)?;
     Ok((history.head_sha, ingested, ownership))
+}
+
+/// Classifies commits stored before the `is_fix` columns existed, from the
+/// persisted message. Only unclassified rows are touched: retuning the
+/// classifier never restates an old verdict.
+fn backfill_fix_classification(store: &mut ArchitectureStore, repository_id: &str) -> Result<()> {
+    let pending = store.unclassified_commits(repository_id)?;
+    if pending.is_empty() {
+        return Ok(());
+    }
+    let classified: Vec<(String, bool, f64)> = pending
+        .into_iter()
+        .map(|(id, message)| {
+            let fix = ovecc_git::classify_fix_message(&message);
+            (id, fix.is_fix, fix.confidence as f64)
+        })
+        .collect();
+    store.set_fix_classification(&classified)
 }
 
 /// Builds the in-memory graph views (symbol/api/table nodes + handles/calls/
@@ -1339,9 +1333,7 @@ struct ProcessedFile {
     imports: Vec<ImportFact>,
     /// Full grammar-level facts for code-fact resolution.
     facts: FileFacts,
-    /// True when the file was parsed during this run (cache miss).
     parsed: bool,
-    /// True when facts were served from the parse cache.
     from_cache: bool,
     failure: Option<IndexFailure>,
 }
@@ -1424,9 +1416,8 @@ fn process_file(
     };
     match extracted {
         Ok(mut facts) => {
-            // For the JS/TS family, enrich with oxc-computed exports + per-function
-            // complexity — the semantically-hard facts tree-sitter cannot produce.
-            // oxc is confined behind the parser boundary; only neutral facts return.
+            // Exports and per-function complexity come from oxc: tree-sitter
+            // cannot produce them. oxc stays behind the parser boundary.
             if core_lang.is_js_family()
                 && let Some((exports, complexity)) =
                     ovecc_parser::oxc_extractor::extract(&source_input.contents, core_lang)
@@ -1496,9 +1487,8 @@ fn legacy_imports(facts: &FileFacts) -> Vec<ImportFact> {
         .collect()
 }
 
-/// Builds the imported-name → target-file bindings for one file, by resolving
-/// each relative import to a known file and pairing it with its imported
-/// names. Feeds cross-file callee resolution.
+/// Imported-name → target-file bindings for one file, for cross-file callee
+/// resolution.
 fn build_import_bindings(
     file: &FileRecord,
     facts: &FileFacts,
@@ -1541,9 +1531,8 @@ fn retained_imports(previous: &[DependencyRecord], path: &str) -> Vec<ImportFact
 /// Content-addressed parse cache.
 ///
 /// Entries are immutable (keyed by content hash) and path-independent, so
-/// renames and branch switches still hit. Corrupted or unreadable entries
-/// fall back to a re-parse. The cache is an optimization: writes are
-/// best-effort and never fail the run.
+/// renames and branch switches still hit. Corrupted entries fall back to a
+/// re-parse; writes are best-effort and never fail the run.
 struct ParseCache {
     dir: PathBuf,
 }
@@ -1575,8 +1564,7 @@ impl ParseCache {
         // Write-then-rename: concurrent writers of the same hash produce
         // identical bytes, so losing the race is harmless. Windows refuses to
         // rename over an existing file, so corrupted entries (the only way a
-        // target can already exist here, since load() missed) are removed and
-        // replaced — the cache self-heals.
+        // target can already exist here, since load() missed) are removed first.
         let temp = self.dir.join(format!(
             "{content_hash}.{}.{:?}.tmp",
             std::process::id(),
@@ -1640,10 +1628,8 @@ fn compute_snapshot_metrics(
 }
 
 /// Tokenizes every indexed source file into a normalized token stream for
-/// clone detection. Reuses the same discovery and excludes as `index`, so
-/// `dupes` sees exactly the indexed set. Parallel and best-effort: unreadable
-/// or ungrammared files are skipped. Output keeps discovery order (sorted) for
-/// determinism.
+/// clone detection. Same discovery and excludes as `index`, so `dupes` sees
+/// exactly the indexed set. Best-effort: unreadable files are skipped.
 pub fn collect_file_tokens(
     paths: &ProjectPaths,
     config: &OveccConfig,
@@ -1981,6 +1967,48 @@ export function createInvoice(id: string): string {
             store.count_rows("exports", &repository_id).unwrap(),
             export_rows,
             "re-index must not duplicate exports rows"
+        );
+    }
+
+    #[test]
+    fn ingested_commits_carry_their_fix_classification() {
+        fn git(root: &Path, args: &[&str]) {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .status()
+                .expect("run git");
+            assert!(status.success(), "git {args:?}");
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        git(root, &["init", "-q"]);
+        git(root, &["config", "user.email", "dev@example.com"]);
+        git(root, &["config", "user.name", "Dev"]);
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src").join("a.ts"), "export const a = 1;\n").unwrap();
+        git(root, &["add", "."]);
+        git(root, &["commit", "-q", "-m", "add the a module"]);
+        std::fs::write(root.join("src").join("a.ts"), "export const a = 2;\n").unwrap();
+        git(root, &["add", "."]);
+        git(
+            root,
+            &["commit", "-q", "-m", "fix: a crashed on an empty input"],
+        );
+
+        let paths = ProjectPaths::resolve(root).unwrap();
+        index_repository(&paths, &OveccConfig::default(), false).unwrap();
+
+        let repository_id = paths.repository_id().0;
+        let store = ovecc_db::ArchitectureStore::open(&paths.db_path).unwrap();
+        assert_eq!(store.count_rows("commits", &repository_id).unwrap(), 2);
+        assert!(
+            store
+                .unclassified_commits(&repository_id)
+                .unwrap()
+                .is_empty(),
+            "indexing must classify every commit it ingests"
         );
     }
 }

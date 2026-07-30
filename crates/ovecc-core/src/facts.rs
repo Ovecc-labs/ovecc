@@ -217,10 +217,9 @@ pub enum CallKind {
     Route,
     Rpc,
     Event,
-    /// A callable named in value position (passed as an argument, stored in a
-    /// registry dict, used as a decorator or default) rather than invoked. Not
-    /// a call, but a real dependency: changing the callee's signature breaks the
-    /// reference site, so `rdeps`/`impact` must see it.
+    /// A callable named in value position (an argument, a registry entry, a
+    /// decorator) rather than invoked. Not a call, but changing the callee's
+    /// signature still breaks the reference site.
     Reference,
 }
 
@@ -328,6 +327,9 @@ pub struct CommitRecord {
     pub author_email: Option<String>,
     pub committed_at: DateTime<Utc>,
     pub message: Option<String>,
+    pub is_fix: bool,
+    /// Score behind `is_fix`, in `[0.0, 1.0]`. Ordinal, not a probability.
+    pub fix_confidence: f32,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -455,11 +457,10 @@ pub enum FindingKind {
     ArchitectureViolation,
 }
 
-/// A machine-actionable fix descriptor attached to a finding so an agent can act
-/// without re-deriving the remedy. `auto_fixable` is true only when a purely
-/// mechanical edit fully resolves the finding (safe to apply unattended);
-/// otherwise the fix needs judgement and `instruction` is the guidance.
-/// Deterministic — derived from the finding kind, never invented at runtime.
+/// A fix descriptor attached to a finding so an agent can act without
+/// re-deriving the remedy. `auto_fixable` only when a mechanical edit fully
+/// resolves it; otherwise `instruction` is guidance for a human decision.
+/// Derived from the finding kind, never invented at runtime.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FixSpec {
     pub kind: String,
@@ -478,9 +479,7 @@ impl FixSpec {
 }
 
 impl FindingKind {
-    /// The deterministic fix descriptor for this kind of finding. Only the
-    /// mechanical dead-code removals are `auto_fixable`; everything that needs a
-    /// refactoring or a human decision is guidance-only.
+    /// Only the mechanical dead-code removals are `auto_fixable`.
     pub fn fix_spec(&self) -> FixSpec {
         match self {
             FindingKind::UnusedFile => FixSpec::new(
@@ -662,9 +661,7 @@ pub struct FileFacts {
 }
 
 /// A security-relevant pattern found in source, classified into a finding by
-/// `ovecc-rules`. Detection is deterministic and AST/literal-based;
-/// provider-pattern secret matching uses exact prefixes and charset scanners,
-/// and the high-entropy secret heuristic.
+/// `ovecc-rules`. Detection is deterministic and AST/literal-based.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SecurityPatternFact {
     pub kind: SecurityPatternKind,
@@ -675,9 +672,8 @@ pub struct SecurityPatternFact {
     /// engine treat dangerous calls (`eval`, `exec`) as sinks.
     #[serde(default)]
     pub caller_qualified_name: Option<String>,
-    /// True when the pattern sits in test scaffolding that path-based
-    /// heuristics can't see — Rust's inline `#[cfg(test)] mod` / `#[test]`
-    /// idiom. Findings on such patterns down-rank to Low like test files do.
+    /// True for Rust's inline `#[cfg(test)]` scaffolding, which the path-based
+    /// heuristics cannot see. Down-ranks to Low like a test file.
     #[serde(default)]
     pub in_test_code: bool,
 }
@@ -698,20 +694,17 @@ pub enum SecurityPatternKind {
 }
 
 impl SecurityPatternKind {
-    /// True for kinds that are dangerous *call* sinks for taint analysis
-    /// (untrusted input reaching them is code/command injection).
+    /// True for the kinds that are call sinks for taint analysis: untrusted
+    /// input reaching them is code or command injection.
     pub fn is_taint_sink(self) -> bool {
         matches!(self, Self::DynamicEval | Self::CommandExec)
     }
 }
 
 /// A use of an ambient JS/TS capability: an API that performs I/O or draws on
-/// a source of non-determinism. Detected unconditionally during the AST pass
-/// and deduplicated per file and API; the architecture contract decides which
-/// components may not hold which capability (`deny_capabilities`), so the
-/// facts stay contract-independent. Split along the two halves of functional
-/// purity: side effects (network, filesystem, storage, dom, process) and
-/// non-determinism (time, random).
+/// a source of non-determinism. Detected unconditionally and deduplicated per
+/// file and API, so the facts stay independent of the contract that judges
+/// them (`deny_capabilities`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CapabilityFact {
     pub capability: CapabilityKind,
@@ -723,11 +716,9 @@ pub struct CapabilityFact {
     pub count: u32,
 }
 
-/// The ambient capabilities the contract can deny per component. The API
-/// basket per capability is curated and closed — globals, receiver methods,
-/// constructors, and module specifiers below — so a verdict is always
-/// traceable to a named API, never a heuristic. Packages outside the basket
-/// are a job for `external_deny`.
+/// The ambient capabilities the contract can deny per component. The API basket
+/// per capability is closed, so a verdict always traces to a named API, never a
+/// heuristic. Packages outside the basket are a job for `external_deny`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CapabilityKind {
@@ -815,7 +806,7 @@ impl CapabilityKind {
         }
     }
 
-    /// An ambient object whose *any* member access carries the capability:
+    /// An ambient object where every member access carries the capability:
     /// `process.env`, `document.cookie`, `localStorage.length`.
     pub fn of_member_root(object: &str) -> Option<Self> {
         match object {
@@ -976,9 +967,8 @@ pub struct ComplexityRecord {
     pub param_count: u8,
 }
 
-/// Persisted ambient-capability use, one row per file and API, so the
-/// contract's `deny_capabilities` check reads the current state without
-/// re-parsing (same lifecycle as the `complexity` table).
+/// Persisted ambient-capability use, one row per file and API, so the contract
+/// check reads the current state without re-parsing.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CapabilityRecord {
     pub id: CapabilityUseId,
