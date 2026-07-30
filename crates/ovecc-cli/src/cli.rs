@@ -547,9 +547,9 @@ pub fn run() -> Result<u8> {
 }
 
 /// Renders a command failure to stderr. Under `--format json`/`ndjson` an
-/// unresolved target becomes a machine-readable envelope (structured recovery
-/// data beats prose for agents, arXiv 2606.05037); every other error stays the
-/// one-line human message `main` used to print.
+/// unresolved target becomes a machine-readable envelope carrying the
+/// candidates, so a caller can retry without parsing prose; every other error
+/// stays the one-line human message `main` used to print.
 fn print_cli_error(err: &anyhow::Error, format: Option<FormatArg>) {
     let structured = matches!(format, Some(FormatArg::Json) | Some(FormatArg::Ndjson));
     if structured

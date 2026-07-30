@@ -709,9 +709,9 @@ impl SecurityPatternKind {
 /// a source of non-determinism. Detected unconditionally during the AST pass
 /// and deduplicated per file and API; the architecture contract decides which
 /// components may not hold which capability (`deny_capabilities`), so the
-/// facts stay contract-independent. The taxonomy follows the two halves of
-/// functional purity (Finifter et al., CCS 2008): side effects (network,
-/// filesystem, storage, dom, process) and non-determinism (time, random).
+/// facts stay contract-independent. Split along the two halves of functional
+/// purity: side effects (network, filesystem, storage, dom, process) and
+/// non-determinism (time, random).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CapabilityFact {
     pub capability: CapabilityKind,

@@ -24,11 +24,10 @@ const DEFAULT_PROTOCOL_VERSION: &str = "2025-06-18";
 /// dispatches every tool regardless — the profile only controls discovery, so a
 /// scripted CI caller naming `ovecc_gate` keeps working under either.
 ///
-/// `Agent` is the default: a small, ordered set for interactive coding agents.
-/// A bloated list and weak positional ordering both suppress adoption (a full
-/// ~25-tool surface is the "too many tools" failure mode, and list order biases
-/// the pick when descriptions are close — arXiv 2505.18135). `Full` exposes
-/// everything for humans and CI automation.
+/// `Agent` is the default: a small, ordered set for interactive coding agents,
+/// because a ~25-tool surface dilutes the pick and list order decides ties when
+/// two descriptions are close. `Full` exposes everything for humans and CI
+/// automation.
 #[derive(Clone, Copy)]
 enum Profile {
     Agent,
@@ -63,11 +62,10 @@ const AGENT_PROFILE: &[&str] = &[
 ];
 
 /// Opt-in LSP-vocabulary aliases (`find_references`, `get_call_hierarchy`,
-/// `workspace_symbol`) over the existing commands. The hypothesis (arXiv
-/// 2505.18135: renaming a tool shifts its use >10x) is that a name the model
-/// already knows from language servers attracts the call a proprietary name
-/// misses. Additive and off by default so the baseline agent profile stays
-/// clean; the Phase 4 A/B flips this on to measure which name gets called.
+/// `workspace_symbol`) over the existing commands: a name the model already
+/// knows from language servers should attract calls that a proprietary name
+/// misses. Additive and off by default, so the baseline agent profile stays
+/// clean and the two namings can be compared.
 fn lsp_aliases_enabled() -> bool {
     matches!(
         std::env::var("OVECC_MCP_LSP_ALIASES").ok().as_deref(),

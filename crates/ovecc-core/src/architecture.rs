@@ -5,9 +5,8 @@
 //! allow-list of legal dependencies between them (`depends_on` — anything
 //! undeclared is a violation), optional public interface files, and external
 //! packages a component must not import. `ovecc-rules` diffs the contract
-//! against the observed dependency edges; the verdict vocabulary
-//! (convergence, divergence, absence) follows the software reflexion models
-//! of Murphy, Notkin and Sullivan (FSE '95).
+//! against the observed dependency edges and reports each one as a
+//! convergence, a divergence, or an absence.
 //!
 //! Rules reference components only by name; paths live solely in each
 //! component's `paths`. That split is what makes a contract portable: strip
@@ -550,10 +549,9 @@ pub fn x_notation_allows(source_slice: &str, target_path: &str) -> bool {
 // edges, score how well it matches each built-in template and, when it fits,
 // bind the template to the repository's real root. This is recognition against
 // a curated basket of archetypes, not architecture recovery from scratch:
-// Garcia/Medvidović (ASE 2013) put automatic recovery under 20% accuracy, but
-// classifying a repo against a handful of known targets is a well-posed
-// problem. The score is coverage x conformance, both in [0, 1], so it reads as
-// a single fraction.
+// recovering an unknown structure is unsolved, classifying a repo against a
+// handful of known targets is not. The score is coverage x conformance, both
+// in [0, 1], so it reads as a single fraction.
 
 /// How one template fits one repository, at the best root the detector found.
 #[derive(Debug, Clone, PartialEq)]
