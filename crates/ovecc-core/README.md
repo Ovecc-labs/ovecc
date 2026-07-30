@@ -22,10 +22,9 @@ Modules:
 - `config`: `OveccConfig`, `ProjectPaths`, CLI overrides, and the
   `[languages]` gate.
 - `error`: `OveccError` and the stable `ExitCode` mapping.
-- `traits`: the cross-crate contracts (`LanguageAdapter`, `GitProvider`,
-  `ArchitectureStore`, `Rule`, `ConventionLearner`, `ExplanationProvider`,
-  `Renderable`), so the implementing crates never depend on each other
-  directly.
+- `traits`: the cross-crate contracts (`LanguageAdapter`,
+  `ExplanationProvider`), so the implementing crates never depend on each
+  other directly.
 - `graph`: graph value types (`NodeKind`, `GraphNode`, `GraphEdge`, layers).
 - `query`: the structured query grammar (`Query`, `TargetSelector`) and the
   shared target syntax.

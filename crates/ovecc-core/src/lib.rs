@@ -1,10 +1,8 @@
 //! ovecc-core — shared domain types, stable identifiers, configuration,
-//! errors, and the contracts implemented by every other Ovecc crate.
+//! errors, and the contracts the other Ovecc crates build on.
 //!
-//! This crate depends on no concrete tooling (tree-sitter, DuckDB, gitoxide):
-//! it only defines the data model and the traits that the specialized crates
-//! (`ovecc-parser`, `ovecc-db`, `ovecc-git`, `ovecc-graph`, `ovecc-rules`,
-//! `ovecc-query`, `ovecc-export`, `ovecc-ai`) implement.
+//! It depends on no concrete tooling (tree-sitter, DuckDB, gitoxide), so
+//! every other crate can depend on it without creating a cycle.
 
 pub mod architecture;
 pub mod capabilities;

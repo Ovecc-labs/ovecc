@@ -1,7 +1,7 @@
 //! Command result models.
 //!
-//! Every report serializes to JSON via `Serialize` and renders to
-//! text/markdown through `traits::Renderable` (implemented in `ovecc-export`).
+//! Every report serializes to JSON via `Serialize`; text and Markdown are
+//! rendered per command in `ovecc-cli`.
 
 use crate::facts::{
     ApiRecord, Confidence, Evidence, FindingRecord, OwnershipRecord, ParseFailure,
