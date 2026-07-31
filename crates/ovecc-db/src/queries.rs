@@ -1,8 +1,8 @@
 //! Read queries over the current state of the index.
 
 use crate::{
-    ArchitectureStore, FileGraphRow, FileOwnership, FindingRow, MetricPoint, SymbolDef,
-    collect_rows,
+    ArchitectureStore, FileFixHistory, FileGraphRow, FileOwnership, FindingRow, MetricPoint,
+    SymbolDef, collect_rows,
 };
 use anyhow::Result;
 use duckdb::{Connection, params};
@@ -367,6 +367,60 @@ impl ArchitectureStore {
         let rows = statement.query_map(params![repository_id], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as f64))
         })?;
+        collect_rows(rows)
+    }
+
+    /// Per-file fix history, weighted so that an old correction counts for less
+    /// than a recent one: each fix contributes `0.5 ^ (age / half_life_days)`.
+    /// Age is measured from the newest commit in the index rather than from the
+    /// clock, so two runs over the same database agree.
+    ///
+    /// A file no fix touched is absent, not zero. Paths come from the history,
+    /// like [`Self::ownership_metrics`]: a fix that only edited documentation
+    /// lands on a path nothing ranks.
+    pub fn file_fix_history(
+        &self,
+        repository_id: &str,
+        half_life_days: f64,
+    ) -> Result<Vec<FileFixHistory>> {
+        // Anything under a day leaves every older fix weightless, and zero
+        // divides by zero.
+        let half_life_seconds = half_life_days.max(1.0) * 86_400.0;
+        // `committed_at` is RFC 3339 in UTC, so its first 19 characters are a
+        // plain timestamp and both its lexical and chronological order agree.
+        // Casting to TIMESTAMPTZ instead aborts the process: the bundled DuckDB
+        // ships without ICU.
+        let mut statement = self.conn.prepare(
+            "WITH fixes AS (
+                 SELECT fc.file_path AS file_path, c.committed_at AS committed_at,
+                        epoch(CAST(substr(c.committed_at, 1, 19) AS TIMESTAMP)) AS at
+                 FROM file_changes fc
+                 JOIN commits c ON fc.commit_id = c.id
+                 WHERE fc.repository_id = ? AND c.is_fix
+             ),
+             newest AS (
+                 SELECT MAX(epoch(CAST(substr(committed_at, 1, 19) AS TIMESTAMP))) AS at
+                 FROM commits WHERE repository_id = ?
+             )
+             SELECT f.file_path,
+                    COUNT(*)::BIGINT,
+                    SUM(POWER(0.5, (n.at - f.at) / CAST(? AS DOUBLE))),
+                    MAX(f.committed_at)
+             FROM fixes f, newest n
+             GROUP BY f.file_path
+             ORDER BY 3 DESC, 1",
+        )?;
+        let rows = statement.query_map(
+            params![repository_id, repository_id, half_life_seconds],
+            |row| {
+                Ok(FileFixHistory {
+                    file_path: row.get(0)?,
+                    fixes: row.get::<_, i64>(1)? as usize,
+                    mass: row.get(2)?,
+                    last_fix_at: row.get(3)?,
+                })
+            },
+        )?;
         collect_rows(rows)
     }
 

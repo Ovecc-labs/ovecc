@@ -79,6 +79,25 @@ pub struct FileOwnership {
     pub total_commits: usize,
 }
 
+/// Half-life of a fix's weight, in days. Over the 365-day window the indexer
+/// ingests, a one-year half-life separates almost nothing: the oldest commit
+/// would still weigh 0.47. 180 days is a chosen compromise, not a measured
+/// constant.
+pub const FIX_HALF_LIFE_DAYS: f64 = 180.0;
+
+/// Per-file fix history: how often bug-fix commits touched a file, and how
+/// recent those fixes are.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FileFixHistory {
+    pub file_path: String,
+    /// Fix commits that touched the file, unweighted.
+    pub fixes: usize,
+    /// The same fixes, each weighted by its age.
+    pub mass: f64,
+    /// RFC 3339 timestamp of the most recent fix.
+    pub last_fix_at: String,
+}
+
 /// Differential statistics returned by [`ArchitectureStore::sync_current_index`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SyncStats {

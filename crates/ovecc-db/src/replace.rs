@@ -356,6 +356,79 @@ mod tests {
     }
 
     #[test]
+    fn fix_mass_fades_with_the_age_of_each_fix() {
+        use ovecc_core::facts::{ChangeKind, CommitRecord, FileChangeRecord};
+        use ovecc_core::id::{CommitId, FileChangeId, RepositoryId};
+
+        let (_dir, mut store) = temp_store();
+        store.migrate_to_latest().unwrap();
+        let repo = "repo:test";
+
+        // (sha, days before the newest commit, fix, path)
+        let plan = [
+            ("head", 0, false, "f1.ts"),
+            ("today", 0, true, "f1.ts"),
+            ("half", 180, true, "f1.ts"),
+            ("stale", 360, true, "f2.ts"),
+            ("chore", 10, false, "f3.ts"),
+        ];
+        let mut commits = Vec::new();
+        let mut changes = Vec::new();
+        for (sha, age_days, is_fix, path) in plan {
+            let at = 1_700_000_000 - age_days * 86_400;
+            commits.push(CommitRecord {
+                id: CommitId::from_parts(&[repo, sha]),
+                repository_id: RepositoryId::from_raw(repo),
+                sha: sha.to_string(),
+                parent_shas: Vec::new(),
+                author_name: None,
+                author_email: None,
+                committed_at: chrono::DateTime::from_timestamp(at, 0).unwrap(),
+                message: Some(format!("subject {sha}")),
+                is_fix,
+                fix_confidence: if is_fix { 0.9 } else { 0.0 },
+            });
+            changes.push(FileChangeRecord {
+                id: FileChangeId::from_parts(&[repo, sha, path]),
+                repository_id: RepositoryId::from_raw(repo),
+                commit_id: CommitId::from_parts(&[repo, sha]),
+                file_path: path.to_string(),
+                kind: ChangeKind::Modified,
+                additions: None,
+                deletions: None,
+            });
+        }
+        store.upsert_git_facts(repo, &commits, &changes).unwrap();
+
+        let history = store.file_fix_history(repo, 180.0).unwrap();
+        assert_eq!(
+            history
+                .iter()
+                .map(|h| h.file_path.as_str())
+                .collect::<Vec<_>>(),
+            ["f1.ts", "f2.ts"],
+            "a file no fix touched is absent, and the heaviest comes first"
+        );
+
+        let f1 = &history[0];
+        assert_eq!(f1.fixes, 2, "the non-fix commit on f1 is not a correction");
+        // One fix at the reference date and one a half-life old: 1 + 0.5.
+        assert!((f1.mass - 1.5).abs() < 1e-9, "f1 mass: {}", f1.mass);
+        assert!(
+            f1.last_fix_at.starts_with("2023-11-14"),
+            "{}",
+            f1.last_fix_at
+        );
+
+        let f2 = &history[1];
+        assert!(
+            (f2.mass - 0.25).abs() < 1e-6,
+            "two half-lives old weighs a quarter: {}",
+            f2.mass
+        );
+    }
+
+    #[test]
     fn fix_classification_round_trips_and_backfills() {
         use ovecc_core::facts::CommitRecord;
         use ovecc_core::id::{CommitId, RepositoryId};
