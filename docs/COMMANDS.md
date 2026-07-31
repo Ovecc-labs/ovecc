@@ -427,7 +427,10 @@ The named, new defects a change introduced between two snapshots: new findings
 with `file:line`, new dependency cycles **with their concrete import witness
 edges**, and added duplication. Findings are matched by content identity
 (enclosing symbol / pattern), not by line, so a pre-existing finding that
-merely moved is not blamed on the change. The actionable PR artifact
+merely moved is not blamed on the change. A clone family is charged only when
+the change touched one of the tokens it is made of, so reflowing the comments
+around a clone does not report it as new. Works on the uncommitted working tree
+too, not only between two commits. The actionable PR artifact
 (`--format markdown` is a ready-to-post PR comment). Defaults:
 `previous → latest`.
 

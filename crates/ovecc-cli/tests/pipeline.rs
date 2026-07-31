@@ -1237,6 +1237,28 @@ fn review_scopes_new_duplications_to_touched_lines() {
         "an unrelated edit must pass --fail-on any: {summary}"
     );
 
+    // A comment inside a clone shifts its line span without changing a token
+    // of it, so the family is still the code it was before the change.
+    source = source.replacen(
+        "  let total = 0;\n",
+        "  let total = 0;\n  // running total\n",
+        1,
+    );
+    fs::write(root.join("src").join("util.ts"), &source).expect("insert comment");
+    git(root, &["add", "."]);
+    git(root, &["commit", "-q", "-m", "comment"]);
+    index_repo(&repo);
+
+    let (passed, summary) = review(&repo);
+    assert_eq!(
+        summary["new_duplications"], 0,
+        "a comment inside a pre-existing clone does not make it new: {summary}"
+    );
+    assert!(
+        passed,
+        "a comment-only edit must pass --fail-on any: {summary}"
+    );
+
     // Pasting a third copy is what introducing duplication looks like.
     source.push_str(&clone_copy("gamma"));
     fs::write(root.join("src").join("util.ts"), &source).expect("append gamma");

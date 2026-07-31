@@ -33,9 +33,9 @@ pub(crate) struct ReviewReport {
     /// New dependency cycles, each carrying the file-level witness edges that
     /// form it (so a consumer never has to guess — and mis-guess — the edges).
     new_cycles: Vec<graph::cycles::CycleWitness>,
-    /// Clone families the change introduced (scoped to the touched lines when
-    /// git attests them, else to touched files), so new duplication is not
-    /// buried under pre-existing repo-wide clones.
+    /// Clone families the change introduced (scoped to the tokens it touched
+    /// when git attests the lines, else to touched files), so new duplication is
+    /// not buried under pre-existing repo-wide clones.
     new_duplications: Vec<graph::dupes::CloneFamily>,
     changed_files: ChangedFiles,
 }
@@ -101,12 +101,13 @@ pub(crate) fn build_review_report(
         .filter(|finding| finding.kind != FindingKind::CircularDependency)
         .collect();
 
-    let change_ranges = attested_change_ranges(paths, &base_snapshot, &head_snapshot);
-    let (new_findings, shifted_findings) =
-        scope_to_touched_lines(store, &repository_id, change_ranges.as_ref(), new_findings)?;
-
     let changed_files =
         store.changed_files(&repository_id, &base_snapshot.id, &head_snapshot.id)?;
+
+    let change_ranges =
+        attested_change_ranges(paths, &base_snapshot, &head_snapshot, &changed_files);
+    let (new_findings, shifted_findings) =
+        scope_to_touched_lines(store, &repository_id, change_ranges.as_ref(), new_findings)?;
 
     let head_modules = store.current_modules(&repository_id)?;
     let head_dependencies = store.current_dependencies(&repository_id)?;
@@ -124,31 +125,30 @@ pub(crate) fn build_review_report(
 
     // Duplication is scanned repo-wide (that is how a new block is matched
     // against an existing utility) but only families the change plausibly
-    // introduced are reported: an instance must overlap a touched line when
-    // git attests them, or merely sit in a touched file when it cannot. So
-    // pre-existing clones elsewhere in an edited file do not drown out what
-    // THIS change added.
+    // introduced are reported: an instance must carry a token the change
+    // touched when git attests the lines, or merely sit in a touched file when
+    // it cannot. So pre-existing clones elsewhere in an edited file do not
+    // drown out what THIS change added.
     let touched: std::collections::HashSet<&str> =
         changed_files.touched().map(String::as_str).collect();
     let new_duplications: Vec<graph::dupes::CloneFamily> = if touched.is_empty() {
         Vec::new()
     } else {
-        ovecc_indexer::collect_file_tokens(paths, config)
-            // Same-file families count too: a PR that pastes a block twice
-            // into one file is still introducing duplication.
-            .map(|files| graph::dupes::detect(&files, 100, 10, false))
-            .unwrap_or_default()
+        let files = ovecc_indexer::collect_file_tokens(paths, config).unwrap_or_default();
+        let token_lines: std::collections::HashMap<&str, &[u32]> = files
+            .iter()
+            .map(|file| (file.path.as_str(), file.token_lines.as_slice()))
+            .collect();
+        // Same-file families count too: a PR that pastes a block twice into
+        // one file is still introducing duplication.
+        graph::dupes::detect(&files, 100, 10, false)
             .into_iter()
             .filter(|family| {
                 family
                     .instances
                     .iter()
                     .any(|instance| match &change_ranges {
-                        Some(ranges) => ranges.get(instance.path.as_str()).is_some_and(|changed| {
-                            changed.iter().any(|(start, end)| {
-                                *start <= instance.end_line && instance.start_line <= *end
-                            })
-                        }),
+                        Some(ranges) => holds_changed_token(&token_lines, ranges, instance),
                         None => touched.contains(instance.path.as_str()),
                     })
             })
@@ -230,26 +230,60 @@ pub(crate) fn build_review_report(
     })
 }
 
-/// The head lines this change touched, when git can attest them: both
-/// snapshots carry commit shas, they differ, and head is still what is checked
-/// out — otherwise the git diff would not describe this comparison.
+/// The head lines this change touched, when git can attest them: both snapshots
+/// carry commit shas and head is still what is checked out — otherwise the git
+/// diff would not describe this comparison. Two snapshots on the same commit are
+/// the index-edit-index loop, where the change is the uncommitted edit against
+/// the working tree. Falling back to `None` there charged every finding and
+/// every clone family in a touched file to the change.
 fn attested_change_ranges(
     paths: &ProjectPaths,
     base_snapshot: &ovecc_core::legacy::SnapshotRecord,
     head_snapshot: &ovecc_core::legacy::SnapshotRecord,
+    changed_files: &ChangedFiles,
 ) -> Option<std::collections::BTreeMap<String, Vec<(u32, u32)>>> {
     match (
         base_snapshot.commit_sha.as_deref(),
         head_snapshot.commit_sha.as_deref(),
     ) {
         (Some(base_sha), Some(head_sha))
-            if base_sha != head_sha
-                && ovecc_git::resolve_ref(&paths.root, "HEAD").as_deref() == Some(head_sha) =>
+            if ovecc_git::resolve_ref(&paths.root, "HEAD").as_deref() == Some(head_sha) =>
         {
-            ovecc_git::changed_line_ranges(&paths.root, base_sha)
+            if base_sha == head_sha {
+                let touched: Vec<String> = changed_files.touched().cloned().collect();
+                ovecc_git::worktree_line_ranges(&paths.root, base_sha, &touched)
+            } else {
+                ovecc_git::changed_line_ranges(&paths.root, base_sha)
+            }
         }
         _ => None,
     }
+}
+
+/// Whether the change reaches the code this clone instance is made of: one of
+/// its tokens sits on a line git attests the change touched. Comments and blank
+/// lines carry no token, so reflowing the prose around a clone leaves the family
+/// exactly the code it was — the same reason `finding_identity` keys on content
+/// and not on the line a finding sits at. Testing the instance's line span
+/// instead charged every pre-existing clone in an edited region to the change.
+fn holds_changed_token(
+    token_lines: &std::collections::HashMap<&str, &[u32]>,
+    ranges: &std::collections::BTreeMap<String, Vec<(u32, u32)>>,
+    instance: &graph::dupes::CloneInstance,
+) -> bool {
+    let (Some(changed), Some(lines)) = (
+        ranges.get(instance.path.as_str()),
+        token_lines.get(instance.path.as_str()),
+    ) else {
+        return false;
+    };
+    lines.iter().any(|line| {
+        *line >= instance.start_line
+            && *line <= instance.end_line
+            && changed
+                .iter()
+                .any(|(start, end)| start <= line && line <= end)
+    })
 }
 
 /// Drops from `new_findings` the lexical findings that only moved: a finding id

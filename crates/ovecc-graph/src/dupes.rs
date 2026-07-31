@@ -226,7 +226,8 @@ fn maximal_run(members: &[(usize, usize)], fps: &[Vec<u128>]) -> usize {
 }
 
 /// Marks every covered window start consumed and builds the clone instances,
-/// dropping any that span fewer than `min_lines`. Sorted by path then line.
+/// dropping any that span fewer than `min_lines` and any that overlap one
+/// already kept. Sorted by path then line.
 fn build_instances(
     members: &[(usize, usize)],
     windows: usize,
@@ -259,6 +260,12 @@ fn build_instances(
             .cmp(&b.path)
             .then_with(|| a.start_line.cmp(&b.start_line))
     });
+    // A periodic run (a block of near-identical lines, once identifiers are
+    // normalized) gives consecutive window starts the same fingerprint, so one
+    // region would be reported as several copies of itself. Duplication means
+    // disjoint regions: keep the first of any overlapping run, and let the
+    // caller's two-instance minimum drop what collapses to a single region.
+    instances.dedup_by(|later, kept| later.path == kept.path && later.start_line <= kept.end_line);
     instances
 }
 
@@ -324,6 +331,28 @@ mod tests {
         let a = file("a.ts", &run);
         let b = file("b.ts", &run);
         assert!(detect(&[a, b], 4, 3, true).is_empty());
+    }
+
+    /// A block of near-identical lines (`row.get(0)?, row.get(1)?, ...` once
+    /// identifiers normalize away) gives consecutive window starts the same
+    /// fingerprint. One region is not several copies of itself.
+    #[test]
+    fn instances_of_a_family_do_not_overlap() {
+        let run: Vec<(u64, u32)> = (0..40)
+            .map(|i| (1 + i as u64 % 2, i as u32 / 2 + 1))
+            .collect();
+        let families = detect(&[file("a.ts", &run)], 8, 1, false);
+        assert!(!families.is_empty(), "the repeated pair is still a family");
+        for family in &families {
+            for pair in family.instances.windows(2) {
+                assert!(
+                    pair[0].path != pair[1].path || pair[0].end_line < pair[1].start_line,
+                    "overlapping instances: {:?} and {:?}",
+                    pair[0],
+                    pair[1]
+                );
+            }
+        }
     }
 
     #[test]

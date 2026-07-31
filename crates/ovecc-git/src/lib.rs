@@ -248,6 +248,57 @@ fn change_head_ranges(
     }
 }
 
+/// Head-side line ranges of a change that is not committed yet: the files on
+/// disk against `reference`. `paths` bounds the walk to what the caller already
+/// knows changed. A path absent from the base tree is new and maps to its whole
+/// span; one absent from disk was deleted and touches no head line.
+pub fn worktree_line_ranges(
+    root: &std::path::Path,
+    reference: &str,
+    paths: &[String],
+) -> Option<std::collections::BTreeMap<String, Vec<(u32, u32)>>> {
+    let repo = gix::discover(root).ok()?;
+    let workdir = repo.workdir()?.to_path_buf();
+    let base_id = repo.rev_parse_single(reference).ok()?;
+    let base_tree = repo.find_commit(base_id.detach()).ok()?.tree().ok()?;
+
+    let mut ranges: std::collections::BTreeMap<String, Vec<(u32, u32)>> =
+        std::collections::BTreeMap::new();
+    for path in paths {
+        let Ok(after) = std::fs::read(workdir.join(path)) else {
+            continue;
+        };
+        let before = base_tree
+            .lookup_entry_by_path(path)
+            .ok()
+            .flatten()
+            .and_then(|entry| entry.object().ok())
+            .map(|object| object.data.clone());
+        let after = with_lf_endings(&after);
+        let hunks = match before {
+            Some(before) => hunk_ranges(&with_lf_endings(&before), &after),
+            None => vec![(1, line_count(&after).max(1))],
+        };
+        if !hunks.is_empty() {
+            ranges.insert(path.clone(), hunks);
+        }
+    }
+    Some(ranges)
+}
+
+/// Drops the CR of every CRLF. Blobs hold LF; a checkout under `core.autocrlf`
+/// or a `text` attribute writes CRLF, and diffing the raw bytes would report
+/// every line of every file as changed. Line count is unaffected.
+fn with_lf_endings(data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(data.len());
+    for (at, &byte) in data.iter().enumerate() {
+        if byte != b'\r' || data.get(at + 1) != Some(&b'\n') {
+            out.push(byte);
+        }
+    }
+    out
+}
+
 /// `None` when the commit's essential metadata cannot be read, so a single
 /// undecodable object does not abort the walk.
 fn decode_commit(repo: &gix::Repository, commit: &gix::Commit<'_>) -> Option<GitCommit> {
@@ -351,13 +402,20 @@ mod tests {
         assert!(status.success(), "git {args:?} failed");
     }
 
+    /// An empty repository with an identity set, so committing works whatever
+    /// the machine's git config says.
+    fn repo() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        git(dir.path(), &["init", "-q"]);
+        git(dir.path(), &["config", "user.email", "dev@example.com"]);
+        git(dir.path(), &["config", "user.name", "Dev"]);
+        dir
+    }
+
     #[test]
     fn extracts_commits_and_changed_files() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = repo();
         let root = dir.path();
-        git(root, &["init", "-q"]);
-        git(root, &["config", "user.email", "dev@example.com"]);
-        git(root, &["config", "user.name", "Dev"]);
 
         std::fs::write(root.join("a.ts"), "export const a = 1;\n").unwrap();
         git(root, &["add", "."]);
@@ -405,11 +463,8 @@ mod tests {
 
     #[test]
     fn resolves_refs_to_commit_sha() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = repo();
         let root = dir.path();
-        git(root, &["init", "-q"]);
-        git(root, &["config", "user.email", "dev@example.com"]);
-        git(root, &["config", "user.name", "Dev"]);
         std::fs::write(root.join("a.ts"), "export const a = 1;\n").unwrap();
         git(root, &["add", "."]);
         git(root, &["commit", "-q", "-m", "c1"]);
@@ -429,11 +484,8 @@ mod tests {
 
     #[test]
     fn changed_line_ranges_report_only_the_edited_lines() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = repo();
         let root = dir.path();
-        git(root, &["init", "-q"]);
-        git(root, &["config", "user.email", "dev@example.com"]);
-        git(root, &["config", "user.name", "Dev"]);
         std::fs::write(root.join("a.ts"), "one\ntwo\nthree\nfour\nfive\n").unwrap();
         std::fs::write(root.join("keep.ts"), "kept\n").unwrap();
         git(root, &["add", "."]);
@@ -460,12 +512,51 @@ mod tests {
     }
 
     #[test]
-    fn changed_line_ranges_see_through_renames() {
-        let dir = tempfile::tempdir().unwrap();
+    fn worktree_line_ranges_read_the_uncommitted_edit() {
+        let dir = repo();
         let root = dir.path();
-        git(root, &["init", "-q"]);
-        git(root, &["config", "user.email", "dev@example.com"]);
-        git(root, &["config", "user.name", "Dev"]);
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/a.ts"), "one\ntwo\nthree\nfour\n").unwrap();
+        std::fs::write(root.join("src/b.ts"), "alpha\nbeta\ngamma\n").unwrap();
+        git(root, &["add", "."]);
+        git(root, &["commit", "-q", "-m", "base"]);
+        let base = resolve_ref(root, "HEAD").unwrap();
+
+        // CRLF on disk against an LF blob is what a checkout under
+        // `core.autocrlf` leaves behind; only line 3 actually changed.
+        std::fs::write(root.join("src/a.ts"), "one\r\ntwo\r\nTHREE\r\nfour\r\n").unwrap();
+        std::fs::write(root.join("src/b.ts"), "alpha\ngamma\n").unwrap();
+        std::fs::write(root.join("src/new.ts"), "x\ny\n").unwrap();
+
+        let touched: Vec<String> = ["src/a.ts", "src/b.ts", "src/new.ts", "src/gone.ts"]
+            .iter()
+            .map(|path| path.to_string())
+            .collect();
+        let ranges = worktree_line_ranges(root, &base, &touched).unwrap();
+        assert_eq!(
+            ranges.get("src/a.ts"),
+            Some(&vec![(3, 3)]),
+            "only the rewritten line"
+        );
+        assert_eq!(
+            ranges.get("src/new.ts"),
+            Some(&vec![(1, 2)]),
+            "a file absent from the base tree is all new"
+        );
+        assert!(
+            !ranges.contains_key("src/b.ts"),
+            "a deletion touches no head line"
+        );
+        assert!(
+            !ranges.contains_key("src/gone.ts"),
+            "a path that is not on disk touches no head line"
+        );
+    }
+
+    #[test]
+    fn changed_line_ranges_see_through_renames() {
+        let dir = repo();
+        let root = dir.path();
         std::fs::write(root.join("a.ts"), "one\ntwo\nthree\nfour\nfive\n").unwrap();
         git(root, &["add", "."]);
         git(root, &["commit", "-q", "-m", "base"]);
