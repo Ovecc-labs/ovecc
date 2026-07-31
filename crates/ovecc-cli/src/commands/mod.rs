@@ -12,6 +12,7 @@ pub(crate) mod agent;
 pub(crate) mod architecture;
 pub(crate) mod capabilities;
 pub(crate) mod conventions;
+pub(crate) mod coupling;
 pub(crate) mod diagnose;
 pub(crate) mod diff;
 pub(crate) mod dupes;

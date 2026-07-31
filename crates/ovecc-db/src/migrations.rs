@@ -363,6 +363,25 @@ const MIGRATION_V9_RENAME_SOURCE: &str = r#"
             DELETE FROM file_changes;
             "#;
 
+/// File pairs that keep changing together, recomputed from the commit walk on
+/// every index. `commit_shas` holds a few witnesses, comma-separated, so a
+/// reported pair can be checked against the history it came from.
+const MIGRATION_V10_CO_CHANGES: &str = r#"
+            CREATE TABLE IF NOT EXISTS co_changes (
+                id TEXT PRIMARY KEY,
+                repository_id TEXT NOT NULL,
+                left_path TEXT NOT NULL,
+                right_path TEXT NOT NULL,
+                support INTEGER NOT NULL,
+                jaccard DOUBLE NOT NULL,
+                lift DOUBLE NOT NULL,
+                confidence_left DOUBLE NOT NULL,
+                confidence_right DOUBLE NOT NULL,
+                commit_shas TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_co_changes_repo ON co_changes (repository_id);
+            "#;
+
 const SCHEMA_MIGRATIONS: &[SchemaMigration] = &[
     SchemaMigration {
         version: 1,
@@ -408,6 +427,11 @@ const SCHEMA_MIGRATIONS: &[SchemaMigration] = &[
         version: 9,
         name: "rename_source",
         sql: MIGRATION_V9_RENAME_SOURCE,
+    },
+    SchemaMigration {
+        version: 10,
+        name: "co_changes",
+        sql: MIGRATION_V10_CO_CHANGES,
     },
 ];
 
@@ -489,8 +513,8 @@ mod tests {
 
         let version = store.migrate_to_latest().unwrap();
 
-        assert_eq!(version, 9);
-        assert_eq!(store.schema_version().unwrap(), Some(9));
+        assert_eq!(version, 10);
+        assert_eq!(store.schema_version().unwrap(), Some(10));
         for table in [
             "repositories",
             "files",
@@ -515,6 +539,7 @@ mod tests {
             "snapshot_findings",
             "snapshot_files",
             "capability_uses",
+            "co_changes",
         ] {
             assert!(table_exists(&store, table), "missing table {table}");
         }
@@ -526,12 +551,12 @@ mod tests {
         store.migrate_to_latest().unwrap();
         store.migrate_to_latest().unwrap();
 
-        assert_eq!(store.schema_version().unwrap(), Some(9));
+        assert_eq!(store.schema_version().unwrap(), Some(10));
         let applied: i64 = store
             .conn
             .query_row("SELECT count(*) FROM ovecc_schema", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(applied, 9, "each migration must be recorded exactly once");
+        assert_eq!(applied, 10, "each migration must be recorded exactly once");
     }
 
     #[test]
@@ -544,7 +569,7 @@ mod tests {
 
         let version = store.migrate_to_latest().unwrap();
 
-        assert_eq!(version, 9);
+        assert_eq!(version, 10);
         assert!(table_exists(&store, "findings"));
         assert!(table_exists(&store, "packages"));
         assert!(table_exists(&store, "complexity"));

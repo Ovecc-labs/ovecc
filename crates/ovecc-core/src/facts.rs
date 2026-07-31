@@ -354,6 +354,29 @@ pub struct CommitFiles {
     pub files: Vec<String>,
 }
 
+/// Two files that keep changing in the same commit, with every measure behind
+/// the verdict so a reader can disagree with the thresholds rather than with a
+/// bare pair. Computed in `ovecc-graph`, persisted by `ovecc-db`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CoChangedPair {
+    pub left: String,
+    pub right: String,
+    /// Commits that touched both.
+    pub support: usize,
+    /// `support / (commits touching either)`, the symmetric strength.
+    pub jaccard: f64,
+    /// How much more often the two meet than chance would give them. At or
+    /// below 1 they are simply both busy.
+    pub lift: f64,
+    /// The chance the right one changes when the left does, and the reverse.
+    /// Asymmetric on purpose: a test always following its subject is not the
+    /// same relation as a subject always dragging its test along.
+    pub confidence_left_to_right: f64,
+    pub confidence_right_to_left: f64,
+    /// A few commits where both changed, newest first, as evidence.
+    pub commits: Vec<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ChangeKind {

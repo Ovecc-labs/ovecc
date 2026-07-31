@@ -375,6 +375,10 @@ fn argv_findings(name: &str, args: &Value) -> Option<Vec<String>> {
             argv.push("dupes".into());
             push_opt_u64(&mut argv, args, "min_tokens", "--min-tokens");
         }
+        "ovecc_coupling" => {
+            argv.push("coupling".into());
+            push_opt_u64(&mut argv, args, "limit", "--limit");
+        }
         "ovecc_metrics" => {
             argv.push("metrics".into());
             push_opt(&mut argv, args, "target", "--target");
@@ -533,6 +537,7 @@ fn tool_specs() -> Value {
         {"name": "ovecc_health", "description": "Functions over the cyclomatic/cognitive complexity thresholds (oxc TS/JS extractor).", "inputSchema": obj(json!({"repo": repo}), json!([]))},
         {"name": "ovecc_deadcode", "description": "Likely dead code: unused exports and unreachable files, from exports + entry-point reachability.", "inputSchema": obj(json!({"repo": repo, "changed_since": {"type": "string", "description": "Only findings touching files changed since this Git ref (progressive adoption)."}}), json!([]))},
         {"name": "ovecc_fix", "description": "Apply the mechanical fixes for auto-fixable findings: delete unused files, drop the export keyword on unused exports, remove unused manifest dependencies. Dry-run unless apply=true; every edit re-verifies the file against the index first and skips stale entries with a reason. After apply=true, call ovecc_index to refresh the model.", "inputSchema": obj(json!({"repo": repo, "apply": {"type": "boolean", "description": "Write the changes (default false = dry-run preview)."}, "rule": {"type": "string", "description": "Only fix findings from this rule, e.g. unused-export, unused-file."}}), json!([]))},
+        {"name": "ovecc_coupling", "description": "File pairs the history keeps changing together, with support, Jaccard, lift and both directed confidences. Catches the coupling no import declares.", "inputSchema": obj(json!({"repo": repo, "limit": {"type": "integer", "description": "Pairs to return, strongest first (default 20)."}}), json!([]))},
         {"name": "ovecc_dupes", "description": "Duplicated code (clone families) over a normalized token stream.", "inputSchema": obj(json!({"repo": repo, "min_tokens": {"type": "integer", "description": "Minimum shared token run to report (default 100, PMD CPD's)."}}), json!([]))},
         {"name": "ovecc_hotspots", "description": "Technical-debt hotspot ranking: churn x coupling x ownership, with each module's bug-fix history beside its score.", "inputSchema": obj(json!({"repo": repo, "limit": {"type": "integer", "description": "Number of hotspots to return (default 10)."}}), json!([]))},
         {"name": "ovecc_conventions", "description": "Learned repository conventions and their deviations.", "inputSchema": obj(json!({"repo": repo}), json!([]))},

@@ -5,6 +5,7 @@ use crate::commands::{
     },
     capabilities::render_capabilities,
     conventions::{load_conventions_report, render_conventions},
+    coupling::{load_coupling, render_coupling},
     diagnose::{
         diagnose_config_for, diagnose_exit, load_advise, load_metrics_report, render_advise,
         render_diagnose, render_metrics, run_diagnose,
@@ -321,6 +322,17 @@ pub enum Command {
         /// Fail threshold: `any` new change, or new findings at `medium`/`high`.
         #[arg(long, value_enum, default_value_t = FailOn::Any)]
         fail_on: FailOn,
+    },
+    /// List the file pairs the history keeps changing together, whether or not
+    /// anything in the code connects them.
+    Coupling {
+        /// Drop pairs where neither file reaches this share of changes to the
+        /// other (0.0 keeps every stored pair).
+        #[arg(long, default_value_t = 0.0)]
+        min_confidence: f64,
+        /// Pairs to print, strongest first. 0 prints all of them.
+        #[arg(long, default_value_t = DEFAULT_FINDING_LIMIT)]
+        limit: usize,
     },
     /// Detect duplicated code (clone families) over a normalized token stream.
     Dupes {
@@ -886,6 +898,16 @@ fn run_command(cli: Cli) -> Result<u8> {
             let failed = report.verdict == "fail";
             render_gate(&report, config.output.default_format)?;
             Ok(u8::from(failed))
+        }
+        Command::Coupling {
+            min_confidence,
+            limit,
+        } => {
+            let paths = ProjectPaths::resolve(cli.repo.unwrap_or_else(|| PathBuf::from(".")))?;
+            let config = load_config(&paths, format_override)?;
+            let report = load_coupling(&paths, min_confidence)?;
+            render_coupling(&report, config.output.default_format, limit)?;
+            Ok(0)
         }
         Command::Dupes {
             min_tokens,

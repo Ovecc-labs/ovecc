@@ -242,6 +242,16 @@ pub fn index_repository(
         &metrics,
         &code,
     )?;
+    // After the sync, not with the rest of the git ingestion: the pairs are
+    // scoped to the files the index knows, and those rows land just above.
+    // Recomputed whole rather than incrementally, since every new commit moves
+    // the denominators of every pair it touches.
+    let co_changes = ovecc_graph::cochange::co_changed_pairs(
+        &store.commit_file_sets(&repository_id)?,
+        ovecc_graph::cochange::MIN_SUPPORT,
+        ovecc_graph::cochange::MIN_JACCARD,
+    );
+    store.replace_co_changes(&repository_id, &co_changes)?;
     store.replace_findings(&repository_id, &findings)?;
     phase(&mut timings.persist_ms);
     timings.total_ms = run_start.elapsed().as_millis() as u64;

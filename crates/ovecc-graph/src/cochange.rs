@@ -1,30 +1,8 @@
 //! Evolutionary coupling: the file pairs that keep changing in the same commit,
 //! whether or not anything in the code connects them.
 
-pub use ovecc_core::facts::CommitFiles;
+pub use ovecc_core::facts::{CoChangedPair, CommitFiles};
 use std::collections::HashMap;
-
-/// Two files that change together, with every measure behind the verdict so a
-/// reader can disagree with the thresholds rather than with a bare pair.
-#[derive(Debug, Clone, PartialEq)]
-pub struct CoChangedPair {
-    pub left: String,
-    pub right: String,
-    /// Commits that touched both.
-    pub support: usize,
-    /// `support / (commits touching either)`, the symmetric strength.
-    pub jaccard: f64,
-    /// How much more often the two meet than chance would give them. At or
-    /// below 1 they are simply both busy.
-    pub lift: f64,
-    /// The chance the right one changes when the left does, and the reverse.
-    /// Asymmetric on purpose: a test always following its subject is not the
-    /// same relation as a subject always dragging its test along.
-    pub confidence_left_to_right: f64,
-    pub confidence_right_to_left: f64,
-    /// A few commits where both changed, newest first, as evidence.
-    pub commits: Vec<String>,
-}
 
 /// Commits touching more files than this say nothing about any particular pair:
 /// a license-header sweep, a formatter run, a merge. Both of the studies this

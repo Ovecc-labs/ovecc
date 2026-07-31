@@ -3,7 +3,7 @@
 use crate::{ArchitectureStore, PackageRow, enum_str, existing_ids};
 use anyhow::Result;
 use duckdb::params;
-use ovecc_core::facts::{CommitRecord, FileChangeRecord, FindingRecord};
+use ovecc_core::facts::{CoChangedPair, CommitRecord, FileChangeRecord, FindingRecord};
 use ovecc_core::util::stable_id;
 use std::collections::{HashMap, HashSet};
 
@@ -116,6 +116,43 @@ impl ArchitectureStore {
 
         tx.commit()?;
         Ok(ingested)
+    }
+
+    /// Replaces the repository's co-change pairs. They are recomputed from the
+    /// whole commit walk on every index, so a full replace is what keeps them
+    /// honest: a pair that stopped meeting has to disappear.
+    pub fn replace_co_changes(
+        &mut self,
+        repository_id: &str,
+        pairs: &[CoChangedPair],
+    ) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "DELETE FROM co_changes WHERE repository_id = ?",
+            params![repository_id],
+        )?;
+        {
+            let mut insert = tx.prepare(
+                "INSERT INTO co_changes (id, repository_id, left_path, right_path, support, jaccard, lift, confidence_left, confidence_right, commit_shas)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )?;
+            for pair in pairs {
+                insert.execute(params![
+                    stable_id("co-change", &[repository_id, &pair.left, &pair.right]),
+                    repository_id,
+                    pair.left,
+                    pair.right,
+                    pair.support as i64,
+                    pair.jaccard,
+                    pair.lift,
+                    pair.confidence_left_to_right,
+                    pair.confidence_right_to_left,
+                    pair.commits.join(","),
+                ])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     /// Backfills the fix classification of commits already stored.

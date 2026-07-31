@@ -77,6 +77,29 @@ fn index_repo(repo: &str) {
     );
 }
 
+fn git(root: &Path, args: &[&str]) {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(root)
+        .output()
+        .expect("run git");
+    assert!(
+        output.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// An empty repository with an identity set, so committing works whatever the
+/// machine's git config says.
+fn git_repo() -> tempfile::TempDir {
+    let temp = tempfile::tempdir().expect("temp dir");
+    git(temp.path(), &["init", "-q"]);
+    git(temp.path(), &["config", "user.email", "dev@example.com"]);
+    git(temp.path(), &["config", "user.name", "Dev"]);
+    temp
+}
+
 fn plant_banned_import_rule(root: &Path) {
     let dir = root.join(".ovecc");
     fs::create_dir_all(&dir).expect("create .ovecc");
@@ -1018,24 +1041,8 @@ fn advise_reports_without_opening_the_database_twice() {
 /// charges a lexical finding to the change if its lines were actually touched.
 #[test]
 fn review_does_not_charge_findings_a_file_move_renamed() {
-    fn git(root: &Path, args: &[&str]) {
-        let output = Command::new("git")
-            .args(args)
-            .current_dir(root)
-            .output()
-            .expect("run git");
-        assert!(
-            output.status.success(),
-            "git {args:?}: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-
-    let temp = tempfile::tempdir().expect("temp dir");
+    let temp = git_repo();
     let root = temp.path();
-    git(root, &["init", "-q"]);
-    git(root, &["config", "user.email", "dev@example.com"]);
-    git(root, &["config", "user.name", "Dev"]);
     fs::create_dir_all(root.join("src")).expect("mkdir");
     // A committed provider token is a Critical finding, enough to trip
     // --fail-on high if review were to charge it to the wrong change.
@@ -1154,19 +1161,6 @@ fn review_does_not_charge_findings_a_file_move_renamed() {
 
 #[test]
 fn review_scopes_new_duplications_to_touched_lines() {
-    fn git(root: &Path, args: &[&str]) {
-        let output = Command::new("git")
-            .args(args)
-            .current_dir(root)
-            .output()
-            .expect("run git");
-        assert!(
-            output.status.success(),
-            "git {args:?}: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-
     // ~160 normalized tokens over 16 lines: identical copies form a clone
     // family above the 100-token / 10-line defaults (names normalize away).
     fn clone_copy(name: &str) -> String {
@@ -1189,11 +1183,8 @@ fn review_scopes_new_duplications_to_touched_lines() {
         format!("function {name}(a: number, b: number): number {{\n{body}")
     }
 
-    let temp = tempfile::tempdir().expect("temp dir");
+    let temp = git_repo();
     let root = temp.path();
-    git(root, &["init", "-q"]);
-    git(root, &["config", "user.email", "dev@example.com"]);
-    git(root, &["config", "user.name", "Dev"]);
     fs::create_dir_all(root.join("src")).expect("mkdir");
     let copies = format!("{}{}", clone_copy("alpha"), clone_copy("beta"));
     fs::write(root.join("src").join("util.ts"), &copies).expect("write util.ts");
@@ -1274,5 +1265,68 @@ fn review_scopes_new_duplications_to_touched_lines() {
     assert!(
         !passed,
         "new duplication must fail --fail-on any: {summary}"
+    );
+}
+
+/// Evolutionary coupling is the signal no import declares: two files that keep
+/// being edited together, with nothing in the code tying them.
+#[test]
+fn coupling_reports_files_that_keep_changing_together() {
+    let temp = git_repo();
+    let root = temp.path();
+    fs::create_dir_all(root.join("src")).expect("mkdir");
+
+    // The registry and its schema are edited in lockstep, four times over. Each
+    // round also carries a commit over two throwaway files: with no other
+    // multi-file work to compare against, the pair would be the whole window
+    // and its lift would fall back to 1.
+    for round in 0..4 {
+        for name in ["registry.ts", "schema.ts"] {
+            fs::write(
+                root.join("src").join(name),
+                format!("export const entries{round} = {round};\n"),
+            )
+            .expect("write paired file");
+        }
+        git(root, &["add", "."]);
+        git(root, &["commit", "-q", "-m", &format!("pair {round}")]);
+
+        for side in ["a", "b"] {
+            fs::write(
+                root.join("src").join(format!("other{round}{side}.ts")),
+                format!("export const other{round}{side} = {round};\n"),
+            )
+            .expect("write background file");
+        }
+        git(root, &["add", "."]);
+        git(
+            root,
+            &["commit", "-q", "-m", &format!("background {round}")],
+        );
+    }
+
+    let repo = root.to_str().expect("utf8 path").to_string();
+    index_repo(&repo);
+
+    let coupling = ovecc(&repo, &["coupling", "--format", "json"]);
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&coupling.stdout).expect("coupling json");
+    let pairs = envelope["data"]["pairs"]
+        .as_array()
+        .expect("pairs array")
+        .clone();
+    assert_eq!(pairs.len(), 1, "one pair, and only one: {pairs:?}");
+    let pair = &pairs[0];
+    assert_eq!(pair["left"], "src/registry.ts");
+    assert_eq!(pair["right"], "src/schema.ts");
+    assert_eq!(pair["support"], 4);
+    assert!(
+        pair["lift"].as_f64().expect("lift") > 1.0,
+        "the pair meets more often than chance: {pair}"
+    );
+    assert_eq!(
+        pair["commits"].as_array().expect("witnesses").len(),
+        4,
+        "each meeting is witnessed by its commit: {pair}"
     );
 }

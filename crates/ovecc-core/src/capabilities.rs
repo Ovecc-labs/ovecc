@@ -125,6 +125,13 @@ pub const COMMANDS: &[CommandSpec] = &[
         read_only: true,
     },
     CommandSpec {
+        name: "coupling",
+        summary: "List the file pairs the history keeps changing together (evolutionary coupling).",
+        key_params: &["--min-confidence", "--limit"],
+        output: "File pairs with commits-together, Jaccard, lift, both directed confidences, and witness commit shas; empty without git history.",
+        read_only: true,
+    },
+    CommandSpec {
         name: "dupes",
         summary: "Detect duplicated code (clone families) over a normalized token stream.",
         key_params: &["--min-tokens", "--min-lines", "--include-intra-file"],

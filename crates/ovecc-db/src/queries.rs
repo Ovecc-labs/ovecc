@@ -7,7 +7,8 @@ use crate::{
 use anyhow::Result;
 use duckdb::{Connection, params};
 use ovecc_core::facts::{
-    CapabilityFact, CapabilityKind, CommitFiles, FindingRecord, FunctionMetricsRow, Severity,
+    CapabilityFact, CapabilityKind, CoChangedPair, CommitFiles, FindingRecord, FunctionMetricsRow,
+    Severity,
 };
 use ovecc_core::legacy::{DependencyRecord, FixHistory};
 
@@ -460,6 +461,41 @@ impl ArchitectureStore {
                 })
             },
         )?;
+        collect_rows(rows)
+    }
+
+    /// The stored co-change pairs, strongest first. `min_confidence` filters on
+    /// the stronger of the two directions: a pair earns its place if either file
+    /// reliably drags the other along.
+    pub fn co_changes(
+        &self,
+        repository_id: &str,
+        min_confidence: f64,
+    ) -> Result<Vec<CoChangedPair>> {
+        let mut statement = self.conn.prepare(
+            "SELECT left_path, right_path, support, jaccard, lift,
+                    confidence_left, confidence_right, commit_shas
+             FROM co_changes
+             WHERE repository_id = ? AND GREATEST(confidence_left, confidence_right) >= ?
+             ORDER BY support DESC, jaccard DESC, left_path, right_path",
+        )?;
+        let rows = statement.query_map(params![repository_id, min_confidence], |row| {
+            Ok(CoChangedPair {
+                left: row.get(0)?,
+                right: row.get(1)?,
+                support: row.get::<_, i64>(2)? as usize,
+                jaccard: row.get(3)?,
+                lift: row.get(4)?,
+                confidence_left_to_right: row.get(5)?,
+                confidence_right_to_left: row.get(6)?,
+                commits: row
+                    .get::<_, String>(7)?
+                    .split(',')
+                    .filter(|sha| !sha.is_empty())
+                    .map(str::to_string)
+                    .collect(),
+            })
+        })?;
         collect_rows(rows)
     }
 

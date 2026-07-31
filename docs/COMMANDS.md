@@ -406,6 +406,18 @@ duplicated logic before it propagates. Same-file duplication is reported by
 default (copy-paste within one file is still duplication); pass
 `--cross-file-only` to keep only families spanning at least two files.
 
+### `ovecc coupling [--min-confidence] [--limit]`
+
+The file pairs the history keeps changing in the same commit, whether or not
+anything in the code connects them. Each pair carries the commits they met in,
+the Jaccard strength, the lift (how much more often than chance), and both
+directed confidences, plus witness shas.
+
+Only commits touching between 2 and 30 indexed files count: one file says
+nothing about a pair, and a sweep across the tree says nothing about any of
+them. A pair is stored when it met at least 3 times, with Jaccard at least 0.35
+and lift above 1 — the lift is what keeps two merely busy files apart.
+
 ### `ovecc hotspots [--limit]`
 
 Technical-debt ranking: churn × coupling × fan-in/out × ownership
