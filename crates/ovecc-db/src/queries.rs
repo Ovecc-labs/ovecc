@@ -11,6 +11,34 @@ use ovecc_core::facts::{
 };
 use ovecc_core::legacy::DependencyRecord;
 
+/// Resolves every path the history mentions to the name it ends up under, by
+/// following rename records forward. Prefix of the queries that roll a file's
+/// history up; it binds the repository id twice, before their own parameters.
+///
+/// Two limits it cannot lift. A file that was *split* keeps only the history of
+/// the part that kept its path: git records the other part as a plain addition.
+/// And a path that is renamed away and later reused by a new file hands its
+/// successor's history to that new file.
+const CANONICAL_PATHS: &str = "WITH RECURSIVE renames AS (
+             SELECT DISTINCT previous_path, file_path
+             FROM file_changes
+             WHERE repository_id = ?
+               AND previous_path IS NOT NULL
+               AND previous_path <> file_path
+         ),
+         walk(path, current_path, depth) AS (
+             SELECT DISTINCT file_path, file_path, 0
+             FROM file_changes WHERE repository_id = ?
+             UNION ALL
+             SELECT w.path, r.file_path, w.depth + 1
+             FROM walk w JOIN renames r ON r.previous_path = w.current_path
+             WHERE w.depth < 20
+         ),
+         canonical AS (
+             SELECT path, arg_max(current_path, depth) AS current_path
+             FROM walk GROUP BY path
+         )";
+
 impl ArchitectureStore {
     pub fn repository_root(&self, repository_id: &str) -> Result<Option<String>> {
         optional_string(
@@ -170,20 +198,9 @@ impl ArchitectureStore {
         collect_rows(rows)
     }
 
-    /// Commits touching each module's files (module churn).
+    /// Commits touching each module's files (module churn), renames followed.
     pub fn module_churn(&self, repository_id: &str) -> Result<Vec<(String, f64)>> {
-        let mut statement = self.conn.prepare(
-            "SELECT f.module_name, COUNT(fc.id)
-             FROM files f
-             LEFT JOIN file_changes fc
-               ON fc.file_path = f.path AND fc.repository_id = f.repository_id
-             WHERE f.repository_id = ?
-             GROUP BY f.module_name",
-        )?;
-        let rows = statement.query_map(params![repository_id], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as f64))
-        })?;
-        collect_rows(rows)
+        self.churn_by("f.module_name", repository_id)
     }
 
     /// Files that access the database: a symbol with a `reads`/`writes` edge.
@@ -354,19 +371,29 @@ impl ArchitectureStore {
     }
 
     /// Commits touching each file, so callers can aggregate churn at any
-    /// granularity, not just modules.
+    /// granularity, not just modules. Renames followed.
     pub fn file_churn(&self, repository_id: &str) -> Result<Vec<(String, f64)>> {
-        let mut statement = self.conn.prepare(
-            "SELECT f.path, COUNT(fc.id)
+        self.churn_by("f.path", repository_id)
+    }
+
+    /// Commits per file grouped by one of the `files` columns. Distinct commits
+    /// rather than change rows, so the commit that renames a file and the one
+    /// that edits it count the same.
+    fn churn_by(&self, group: &str, repository_id: &str) -> Result<Vec<(String, f64)>> {
+        let mut statement = self.conn.prepare(&format!(
+            "{CANONICAL_PATHS}
+             SELECT {group}, COUNT(DISTINCT fc.commit_id)
              FROM files f
+             LEFT JOIN canonical c ON c.current_path = f.path
              LEFT JOIN file_changes fc
-               ON fc.file_path = f.path AND fc.repository_id = f.repository_id
+               ON fc.file_path = c.path AND fc.repository_id = f.repository_id
              WHERE f.repository_id = ?
-             GROUP BY f.path",
+             GROUP BY {group}"
+        ))?;
+        let rows = statement.query_map(
+            params![repository_id, repository_id, repository_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as f64)),
         )?;
-        let rows = statement.query_map(params![repository_id], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as f64))
-        })?;
         collect_rows(rows)
     }
 
@@ -375,27 +402,33 @@ impl ArchitectureStore {
     /// Age is measured from the newest commit in the index rather than from the
     /// clock, so two runs over the same database agree.
     ///
-    /// A file no fix touched is absent, not zero. Paths come from the history,
-    /// like [`Self::ownership_metrics`]: a fix that only edited documentation
-    /// lands on a path nothing ranks.
+    /// A file no fix touched is absent, not zero. Renames are followed, so a
+    /// moved file keeps the corrections it earned under its old name. Paths come
+    /// from the history, like [`Self::ownership_metrics`]: a fix that only
+    /// edited documentation lands on a path nothing ranks.
     pub fn file_fix_history(
         &self,
         repository_id: &str,
         half_life_days: f64,
     ) -> Result<Vec<FileFixHistory>> {
         // Anything under a day leaves every older fix weightless, and zero
-        // divides by zero.
+        // divides by zero. One row per (commit, file) so that a commit reaching
+        // a file under two of its names weighs once.
         let half_life_seconds = half_life_days.max(1.0) * 86_400.0;
         // `committed_at` is RFC 3339 in UTC, so its first 19 characters are a
         // plain timestamp and both its lexical and chronological order agree.
         // Casting to TIMESTAMPTZ instead aborts the process: the bundled DuckDB
         // ships without ICU.
-        let mut statement = self.conn.prepare(
-            "WITH fixes AS (
-                 SELECT fc.file_path AS file_path, c.committed_at AS committed_at,
+        let mut statement = self.conn.prepare(&format!(
+            "{CANONICAL_PATHS},
+             fixes AS (
+                 SELECT DISTINCT c.id AS commit_id,
+                        canonical.current_path AS file_path,
+                        c.committed_at AS committed_at,
                         epoch(CAST(substr(c.committed_at, 1, 19) AS TIMESTAMP)) AS at
                  FROM file_changes fc
                  JOIN commits c ON fc.commit_id = c.id
+                 JOIN canonical ON canonical.path = fc.file_path
                  WHERE fc.repository_id = ? AND c.is_fix
              ),
              newest AS (
@@ -408,10 +441,16 @@ impl ArchitectureStore {
                     MAX(f.committed_at)
              FROM fixes f, newest n
              GROUP BY f.file_path
-             ORDER BY 3 DESC, 1",
-        )?;
+             ORDER BY 3 DESC, 1"
+        ))?;
         let rows = statement.query_map(
-            params![repository_id, repository_id, half_life_seconds],
+            params![
+                repository_id,
+                repository_id,
+                repository_id,
+                repository_id,
+                half_life_seconds
+            ],
             |row| {
                 Ok(FileFixHistory {
                     file_path: row.get(0)?,

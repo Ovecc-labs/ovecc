@@ -33,6 +33,9 @@ impl GitChangeKind {
 pub struct GitFileChange {
     pub path: String,
     pub kind: GitChangeKind,
+    /// Where the file came from, for a rename or a copy. Following it is what
+    /// keeps a file's history when it moves.
+    pub previous_path: Option<String>,
 }
 
 /// A single commit with the files it changed against its first parent.
@@ -345,11 +348,11 @@ fn changed_files(
         repo.find_commit(id).ok()?.tree().ok()
     });
 
-    let changes = repo.diff_tree_to_tree(
-        parent_tree.as_ref(),
-        Some(&new_tree),
-        gix::diff::Options::default(),
-    );
+    // Without rewrite tracking a rename reads as a deletion plus an addition,
+    // and the file's history stops at the old path.
+    let mut options = gix::diff::Options::default();
+    options.track_rewrites(Some(gix::diff::Rewrites::default()));
+    let changes = repo.diff_tree_to_tree(parent_tree.as_ref(), Some(&new_tree), options);
     let Ok(changes) = changes else {
         return Vec::new();
     };
@@ -365,22 +368,31 @@ fn changed_files(
             Change::Addition { location, .. } => GitFileChange {
                 path: location.to_string(),
                 kind: GitChangeKind::Added,
+                previous_path: None,
             },
             Change::Deletion { location, .. } => GitFileChange {
                 path: location.to_string(),
                 kind: GitChangeKind::Deleted,
+                previous_path: None,
             },
             Change::Modification { location, .. } => GitFileChange {
                 path: location.to_string(),
                 kind: GitChangeKind::Modified,
+                previous_path: None,
             },
-            Change::Rewrite { location, copy, .. } => GitFileChange {
+            Change::Rewrite {
+                location,
+                source_location,
+                copy,
+                ..
+            } => GitFileChange {
                 path: location.to_string(),
                 kind: if copy {
                     GitChangeKind::Copied
                 } else {
                     GitChangeKind::Renamed
                 },
+                previous_path: Some(source_location.to_string()),
             },
         })
         .collect()
@@ -496,6 +508,31 @@ mod tests {
             paths,
             ["src/cli/main.ts"],
             "the tree diff walks src and src/cli on the way: {paths:?}"
+        );
+    }
+
+    #[test]
+    fn a_rename_carries_the_path_it_came_from() {
+        let dir = repo();
+        let root = dir.path();
+        commit(root, "base", &[("src/a.ts", "one\ntwo\nthree\nfour\n")]);
+        git(root, &["mv", "src/a.ts", "src/b.ts"]);
+        git(root, &["commit", "-q", "-m", "move"]);
+
+        let history = collect_history(root, 0, 10).unwrap();
+        let moved = history
+            .commits
+            .iter()
+            .find(|c| c.message.as_deref() == Some("move"))
+            .expect("move present");
+        assert_eq!(
+            moved.changes,
+            [GitFileChange {
+                path: "src/b.ts".to_string(),
+                kind: GitChangeKind::Renamed,
+                previous_path: Some("src/a.ts".to_string()),
+            }],
+            "one rename, not a deletion and an addition"
         );
     }
 

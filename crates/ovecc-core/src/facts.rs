@@ -339,6 +339,8 @@ pub struct FileChangeRecord {
     pub commit_id: CommitId,
     pub file_path: String,
     pub kind: ChangeKind,
+    /// The path this file was renamed or copied from, when it was.
+    pub previous_path: Option<String>,
     pub additions: Option<u32>,
     pub deletions: Option<u32>,
 }

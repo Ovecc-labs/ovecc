@@ -350,6 +350,19 @@ const MIGRATION_V8_LEAF_FILE_CHANGES: &str = r#"
             );
             "#;
 
+/// Where a renamed or copied file came from, `NULL` on every other change.
+///
+/// The stored changes are dropped with it: a rename ingested before the tree
+/// diff tracked rewrites reads as a deletion plus an addition, and re-ingesting
+/// is the only way to link the two. They are a cache of the object database, so
+/// the next `index` refills them from the same commit walk. Changes older than
+/// that walk's window are not restored, which is also how far the churn and
+/// ownership signals look.
+const MIGRATION_V9_RENAME_SOURCE: &str = r#"
+            ALTER TABLE file_changes ADD COLUMN IF NOT EXISTS previous_path TEXT;
+            DELETE FROM file_changes;
+            "#;
+
 const SCHEMA_MIGRATIONS: &[SchemaMigration] = &[
     SchemaMigration {
         version: 1,
@@ -390,6 +403,11 @@ const SCHEMA_MIGRATIONS: &[SchemaMigration] = &[
         version: 8,
         name: "leaf_file_changes",
         sql: MIGRATION_V8_LEAF_FILE_CHANGES,
+    },
+    SchemaMigration {
+        version: 9,
+        name: "rename_source",
+        sql: MIGRATION_V9_RENAME_SOURCE,
     },
 ];
 
@@ -471,8 +489,8 @@ mod tests {
 
         let version = store.migrate_to_latest().unwrap();
 
-        assert_eq!(version, 8);
-        assert_eq!(store.schema_version().unwrap(), Some(8));
+        assert_eq!(version, 9);
+        assert_eq!(store.schema_version().unwrap(), Some(9));
         for table in [
             "repositories",
             "files",
@@ -508,12 +526,12 @@ mod tests {
         store.migrate_to_latest().unwrap();
         store.migrate_to_latest().unwrap();
 
-        assert_eq!(store.schema_version().unwrap(), Some(8));
+        assert_eq!(store.schema_version().unwrap(), Some(9));
         let applied: i64 = store
             .conn
             .query_row("SELECT count(*) FROM ovecc_schema", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(applied, 8, "each migration must be recorded exactly once");
+        assert_eq!(applied, 9, "each migration must be recorded exactly once");
     }
 
     #[test]
@@ -526,7 +544,7 @@ mod tests {
 
         let version = store.migrate_to_latest().unwrap();
 
-        assert_eq!(version, 8);
+        assert_eq!(version, 9);
         assert!(table_exists(&store, "findings"));
         assert!(table_exists(&store, "packages"));
         assert!(table_exists(&store, "complexity"));

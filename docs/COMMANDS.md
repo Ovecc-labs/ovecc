@@ -410,6 +410,9 @@ default (copy-paste within one file is still duplication); pass
 
 Technical-debt ranking: churn × coupling × fan-in/out × ownership
 fragmentation × violations, normalized 0–100. Where refactoring pays first.
+Churn follows renames, so moving a file does not reset its history. A file that
+was split keeps it under whichever part kept the path: git records the other
+part as a new file.
 
 ### `ovecc conventions`
 

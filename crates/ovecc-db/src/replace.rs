@@ -94,8 +94,8 @@ impl ArchitectureStore {
             }
 
             let mut insert_change = tx.prepare(
-                "INSERT INTO file_changes (id, repository_id, commit_id, file_path, change_kind, additions, deletions)
-                 VALUES (?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO file_changes (id, repository_id, commit_id, file_path, change_kind, previous_path, additions, deletions)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             )?;
             for change in changes {
                 if known_changes.contains(change.id.as_str()) {
@@ -107,6 +107,7 @@ impl ArchitectureStore {
                     change.commit_id.as_str(),
                     change.file_path,
                     enum_str(&change.kind),
+                    change.previous_path,
                     change.additions.map(|v| v as i64),
                     change.deletions.map(|v| v as i64),
                 ])?;
@@ -327,6 +328,7 @@ mod tests {
                 commit_id: CommitId::from_parts(&[repo, sha]),
                 file_path: path.to_string(),
                 kind: ChangeKind::Modified,
+                previous_path: None,
                 additions: None,
                 deletions: None,
             });
@@ -355,26 +357,19 @@ mod tests {
         assert_eq!(f2.total_commits, 1);
     }
 
-    #[test]
-    fn fix_mass_fades_with_the_age_of_each_fix() {
+    /// One commit per entry of `(sha, days before the reference date, fix,
+    /// path, renamed from)`, each touching its single file.
+    fn ingest_history(
+        store: &mut ArchitectureStore,
+        repo: &str,
+        plan: &[(&str, i64, bool, &str, Option<&str>)],
+    ) {
         use ovecc_core::facts::{ChangeKind, CommitRecord, FileChangeRecord};
         use ovecc_core::id::{CommitId, FileChangeId, RepositoryId};
 
-        let (_dir, mut store) = temp_store();
-        store.migrate_to_latest().unwrap();
-        let repo = "repo:test";
-
-        // (sha, days before the newest commit, fix, path)
-        let plan = [
-            ("head", 0, false, "f1.ts"),
-            ("today", 0, true, "f1.ts"),
-            ("half", 180, true, "f1.ts"),
-            ("stale", 360, true, "f2.ts"),
-            ("chore", 10, false, "f3.ts"),
-        ];
         let mut commits = Vec::new();
         let mut changes = Vec::new();
-        for (sha, age_days, is_fix, path) in plan {
+        for (sha, age_days, is_fix, path, renamed_from) in plan {
             let at = 1_700_000_000 - age_days * 86_400;
             commits.push(CommitRecord {
                 id: CommitId::from_parts(&[repo, sha]),
@@ -385,20 +380,43 @@ mod tests {
                 author_email: None,
                 committed_at: chrono::DateTime::from_timestamp(at, 0).unwrap(),
                 message: Some(format!("subject {sha}")),
-                is_fix,
-                fix_confidence: if is_fix { 0.9 } else { 0.0 },
+                is_fix: *is_fix,
+                fix_confidence: if *is_fix { 0.9 } else { 0.0 },
             });
             changes.push(FileChangeRecord {
                 id: FileChangeId::from_parts(&[repo, sha, path]),
                 repository_id: RepositoryId::from_raw(repo),
                 commit_id: CommitId::from_parts(&[repo, sha]),
                 file_path: path.to_string(),
-                kind: ChangeKind::Modified,
+                kind: match renamed_from {
+                    Some(_) => ChangeKind::Renamed,
+                    None => ChangeKind::Modified,
+                },
+                previous_path: renamed_from.map(str::to_string),
                 additions: None,
                 deletions: None,
             });
         }
         store.upsert_git_facts(repo, &commits, &changes).unwrap();
+    }
+
+    #[test]
+    fn fix_mass_fades_with_the_age_of_each_fix() {
+        let (_dir, mut store) = temp_store();
+        store.migrate_to_latest().unwrap();
+        let repo = "repo:test";
+
+        ingest_history(
+            &mut store,
+            repo,
+            &[
+                ("head", 0, false, "f1.ts", None),
+                ("today", 0, true, "f1.ts", None),
+                ("half", 180, true, "f1.ts", None),
+                ("stale", 360, true, "f2.ts", None),
+                ("chore", 10, false, "f3.ts", None),
+            ],
+        );
 
         let history = store.file_fix_history(repo, 180.0).unwrap();
         assert_eq!(
@@ -425,6 +443,53 @@ mod tests {
             (f2.mass - 0.25).abs() < 1e-6,
             "two half-lives old weighs a quarter: {}",
             f2.mass
+        );
+    }
+
+    #[test]
+    fn a_renamed_file_keeps_the_history_of_its_old_names() {
+        let (_dir, mut store) = temp_store();
+        store.migrate_to_latest().unwrap();
+        let repo = "repo:test";
+
+        // a.ts is fixed twice, moved to b.ts, then to c.ts, then fixed again.
+        ingest_history(
+            &mut store,
+            repo,
+            &[
+                ("one", 0, true, "a.ts", None),
+                ("two", 0, true, "a.ts", None),
+                ("move", 0, false, "b.ts", Some("a.ts")),
+                ("move-again", 0, false, "c.ts", Some("b.ts")),
+                ("three", 0, true, "c.ts", None),
+                ("other", 0, true, "z.ts", None),
+            ],
+        );
+
+        let history = store.file_fix_history(repo, 180.0).unwrap();
+        let c = history
+            .iter()
+            .find(|row| row.file_path == "c.ts")
+            .expect("the file is reported under its current name");
+        assert_eq!(c.fixes, 3, "two fixes under a.ts and one under c.ts");
+        assert!(
+            !history.iter().any(|row| row.file_path == "a.ts"),
+            "the old name is gone: {history:?}"
+        );
+
+        store
+            .conn
+            .execute(
+                "INSERT INTO files (id, repository_id, path, language, content_hash, size_bytes, module_id, module_name, last_indexed_at)
+                 VALUES ('file:c', ?, 'c.ts', 'typescript', 'h', 1, 'module:src', 'src', '2023-11-14T00:00:00+00:00')",
+                params![repo],
+            )
+            .unwrap();
+        let churn: HashMap<String, f64> = store.file_churn(repo).unwrap().into_iter().collect();
+        assert_eq!(
+            churn.get("c.ts").copied(),
+            Some(5.0),
+            "every commit that touched the file under any of its names"
         );
     }
 

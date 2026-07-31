@@ -1208,6 +1208,7 @@ fn ingest_git(
                 commit_id: commit_id.clone(),
                 file_path: change.path.clone(),
                 kind: map_change_kind(change.kind),
+                previous_path: change.previous_path.clone(),
                 additions: None,
                 deletions: None,
             });
