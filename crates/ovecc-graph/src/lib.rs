@@ -6,6 +6,7 @@
 //! classify drift without depending on this crate.
 
 pub mod blast;
+pub mod cochange;
 pub mod conventions;
 pub mod cycles;
 pub mod diagnose;

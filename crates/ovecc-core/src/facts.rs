@@ -345,6 +345,15 @@ pub struct FileChangeRecord {
     pub deletions: Option<u32>,
 }
 
+/// The files one commit touched, under their current names. Lives here rather
+/// than in `ovecc-graph` so that `ovecc-db` can produce it without depending on
+/// the analysis crate.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommitFiles {
+    pub sha: String,
+    pub files: Vec<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ChangeKind {
