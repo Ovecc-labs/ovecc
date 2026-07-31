@@ -5,6 +5,31 @@ Notable changes to ovecc are documented here. The format follows
 [SemVer](https://semver.org/) (pre-1.0, minor releases may contain breaking
 changes).
 
+## [0.2.1] - 2026-07-31
+
+### Fixed
+
+- `review` no longer blames pre-existing clone families on the change. A family
+  is charged only when the change touched one of the tokens it is made of, so
+  reflowing the comments around a clone does not report it as new duplication.
+- `review` scopes an uncommitted change to the lines it touched, by diffing the
+  working tree against the base commit. Two snapshots sitting on the same commit
+  — the index, edit, index loop an agent runs — used to fall back to charging
+  every finding and every clone family in an edited file to the change.
+- Diffs normalize CRLF, so a working copy checked out under `core.autocrlf` no
+  longer reads as if every line of every file had changed.
+- `dupes` folds overlapping instances of one family: a block of near-identical
+  lines gives consecutive sliding windows the same fingerprint, and one region
+  was reported as several copies of itself. Duplicated-line counts drop 17 to
+  30 percent on the six repositories benchmarked.
+- Building from source on Windows works around the multiple-definition bug in
+  GCC 16.1.0's libstdc++.
+
+### Changed
+
+- The commit index stores whether a commit's subject describes a bug fix
+  (schema 7). Existing databases gain the columns on the next `index`.
+
 ## [0.2.0] - 2026-07-22
 
 ### Added
