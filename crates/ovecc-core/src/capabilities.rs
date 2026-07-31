@@ -621,7 +621,8 @@ pub fn rule_definitions() -> BTreeMap<String, MetaRule> {
             rule(
                 "Two components the contract declares independent, and no import \
                  connects, that the history keeps changing in the same commits. \
-                 Advisory: the evidence is the commits, the call is the reader's.",
+                 Advisory: the evidence is the commits, the call is the reader's. \
+                 Raise or silence it with `coupling` in the contract.",
                 "low",
             ),
         ),

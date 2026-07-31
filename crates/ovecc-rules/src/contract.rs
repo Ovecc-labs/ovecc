@@ -86,7 +86,9 @@ pub(crate) fn contract_rules(input: &RuleInput<'_>) -> Vec<FindingRecord> {
         groups = prune_baselined(groups, architecture.baseline);
     }
     let mut findings = pair_findings(input, &groups);
-    findings.extend(coupling_findings(input, &groups));
+    if let Some(severity) = contract.coupling.severity() {
+        findings.extend(coupling_findings(input, &groups, severity));
+    }
     findings.extend(absence_findings(input, contract, &groups.observed));
     findings.extend(unassigned_finding(input, architecture));
 
@@ -153,6 +155,20 @@ pub(crate) fn violation_entries(input: &RuleInput<'_>) -> BTreeMap<String, BTree
                 ));
         }
     }
+    // Owned by the first component of the ordered pair, so the entry lands in
+    // one file whichever side the reader looks from.
+    for (&(component, _), pairs) in &groups.coupling {
+        for pair in pairs {
+            entries
+                .entry(component.to_string())
+                .or_default()
+                .insert(baseline_entry(
+                    "behavioral-coupling",
+                    &pair.left,
+                    &pair.right,
+                ));
+        }
+    }
     entries
 }
 
@@ -163,9 +179,28 @@ fn prune_baselined<'a>(groups: EdgeGroups<'a>, baseline: &BTreeSet<String>) -> E
         deprecated: without_baselined(groups.deprecated, "deprecated-use", baseline),
         banned: without_baselined(groups.banned, "external-deny", baseline),
         slices: without_baselined(groups.slices, "slice-isolation", baseline),
-        // Behavioral coupling has no baseline entry: it is advisory, so there
-        // is nothing to accept as debt.
-        coupling: groups.coupling,
+        // Accepted one coupled file pair at a time, and the pair count filter
+        // is not re-applied afterwards: it asks whether the coupling is real,
+        // and a baselined pair is the answer that it is. So a team that has
+        // read today's coupling and chosen to live with it still hears about
+        // the next file that joins it.
+        coupling: groups
+            .coupling
+            .into_iter()
+            .filter_map(|(components, pairs)| {
+                let kept: Vec<&CoChangedPair> = pairs
+                    .into_iter()
+                    .filter(|pair| {
+                        !baseline.contains(&baseline_entry(
+                            "behavioral-coupling",
+                            &pair.left,
+                            &pair.right,
+                        ))
+                    })
+                    .collect();
+                (!kept.is_empty()).then_some((components, kept))
+            })
+            .collect(),
         capabilities: groups
             .capabilities
             .into_iter()
@@ -251,6 +286,9 @@ fn classify_edges<'a>(input: &RuleInput<'a>, architecture: ContractInput<'a>) ->
 /// dependency, or any observed import, which is either legal or already reported
 /// as a divergence. What is left is coupling no one named.
 fn classify_coupling<'a>(architecture: ContractInput<'a>, groups: &mut EdgeGroups<'a>) {
+    if architecture.contract.coupling.severity().is_none() {
+        return;
+    }
     let connected: BTreeSet<(&str, &str)> = groups
         .observed
         .iter()
@@ -484,7 +522,11 @@ fn classify_internal<'a>(
 /// commits that witnessed it. Low by design: the deviation is a question for the
 /// reader, not a verdict, and a hard gate on a signal this uncertain would be
 /// dishonest.
-fn coupling_findings(input: &RuleInput<'_>, groups: &EdgeGroups<'_>) -> Vec<FindingRecord> {
+fn coupling_findings(
+    input: &RuleInput<'_>,
+    groups: &EdgeGroups<'_>,
+    severity: Severity,
+) -> Vec<FindingRecord> {
     groups
         .coupling
         .iter()
@@ -499,7 +541,7 @@ fn coupling_findings(input: &RuleInput<'_>, groups: &EdgeGroups<'_>) -> Vec<Find
             repository_id: RepositoryId::from_raw(input.repository_id),
             snapshot_id: input.snapshot_id.map(SnapshotId::from_raw),
             kind: FindingKind::BehavioralCoupling,
-            severity: Severity::Low,
+            severity,
             rule_name: Some("architecture/behavioral-coupling".to_string()),
             target: Some(EntityRef {
                 kind: NodeKind::Module,
@@ -858,7 +900,7 @@ fn pair_finding(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ovecc_core::architecture::{ComponentSpec, DependsOn};
+    use ovecc_core::architecture::{ComponentSpec, CouplingPolicy, DependsOn};
     use ovecc_core::config::RulesConfig;
     use ovecc_core::facts::CapabilityFact;
 
@@ -882,6 +924,7 @@ mod tests {
             schema: 1,
             mode: EnforcementMode::NewViolations,
             unassigned: UnassignedPolicy::Ignore,
+            coupling: CouplingPolicy::default(),
             components,
         }
     }
@@ -1008,11 +1051,10 @@ mod tests {
         }
     }
 
-    /// The signal no static analysis can produce: two components with nothing
-    /// between them in the code, that the history keeps editing together.
-    #[test]
-    fn components_that_change_together_without_depending_on_each_other_are_flagged() {
-        let fixture = Fixture {
+    /// Two components the contract keeps apart, coupled by two file pairs: the
+    /// smallest history that clears the pair-count filter.
+    fn coupled_fixture() -> Fixture {
+        Fixture {
             contract: contract(vec![
                 component("billing", &["src/billing/**"]),
                 component("shipping", &["src/shipping/**"]),
@@ -1028,7 +1070,14 @@ mod tests {
                 coupled("src/billing/invoice.ts", "src/shipping/label.ts"),
             ],
             ..Fixture::default()
-        };
+        }
+    }
+
+    /// The signal no static analysis can produce: two components with nothing
+    /// between them in the code, that the history keeps editing together.
+    #[test]
+    fn components_that_change_together_without_depending_on_each_other_are_flagged() {
+        let fixture = coupled_fixture();
         let findings = run(&fixture);
         assert_eq!(
             rules_of(&findings),
@@ -1074,29 +1123,13 @@ mod tests {
     /// divergence. Reporting both would charge one deviation twice.
     #[test]
     fn coupling_an_import_already_explains_is_left_to_the_divergence() {
-        let fixture = Fixture {
-            contract: contract(vec![
-                component("billing", &["src/billing/**"]),
-                component("shipping", &["src/shipping/**"]),
-            ]),
-            component_of: assign(&[
-                ("src/billing/rates.ts", "billing"),
-                ("src/billing/invoice.ts", "billing"),
-                ("src/shipping/zones.ts", "shipping"),
-                ("src/shipping/label.ts", "shipping"),
-            ]),
-            dependencies: vec![edge(
-                "src/billing/rates.ts",
-                "src/shipping/zones.ts",
-                "../shipping/zones",
-                3,
-            )],
-            co_changes: vec![
-                coupled("src/billing/rates.ts", "src/shipping/zones.ts"),
-                coupled("src/billing/invoice.ts", "src/shipping/label.ts"),
-            ],
-            ..Fixture::default()
-        };
+        let mut fixture = coupled_fixture();
+        fixture.dependencies = vec![edge(
+            "src/billing/rates.ts",
+            "src/shipping/zones.ts",
+            "../shipping/zones",
+            3,
+        )];
         assert_eq!(rules_of(&run(&fixture)), vec!["architecture/divergence"]);
     }
 
@@ -1104,28 +1137,94 @@ mod tests {
     /// the history agreeing with it is not a deviation.
     #[test]
     fn a_declared_dependency_explains_the_coupling() {
-        let mut billing = component("billing", &["src/billing/**"]);
-        billing.depends_on = vec![DependsOn::Name("shipping".to_string())];
-        let fixture = Fixture {
-            contract: contract(vec![billing, component("shipping", &["src/shipping/**"])]),
-            component_of: assign(&[
-                ("src/billing/rates.ts", "billing"),
-                ("src/billing/invoice.ts", "billing"),
-                ("src/shipping/zones.ts", "shipping"),
-                ("src/shipping/label.ts", "shipping"),
-            ]),
-            co_changes: vec![
-                coupled("src/billing/rates.ts", "src/shipping/zones.ts"),
-                coupled("src/billing/invoice.ts", "src/shipping/label.ts"),
-            ],
-            ..Fixture::default()
-        };
+        let mut fixture = coupled_fixture();
+        fixture.contract.components[0].depends_on = vec![DependsOn::Name("shipping".to_string())];
         assert!(
             rules_of(&run(&fixture))
                 .iter()
                 .all(|rule| *rule != "architecture/behavioral-coupling"),
             "{:?}",
             rules_of(&run(&fixture))
+        );
+    }
+
+    /// `check --freeze` writes the coupling into the same store as the rest of
+    /// the debt, one line per coupled file pair.
+    #[test]
+    fn coupling_joins_the_frozen_debt() {
+        assert_eq!(
+            entries(&coupled_fixture()).get("billing"),
+            Some(&BTreeSet::from([
+                baseline_entry(
+                    "behavioral-coupling",
+                    "src/billing/invoice.ts",
+                    "src/shipping/label.ts"
+                ),
+                baseline_entry(
+                    "behavioral-coupling",
+                    "src/billing/rates.ts",
+                    "src/shipping/zones.ts"
+                ),
+            ]))
+        );
+    }
+
+    /// Accepted one pair at a time. The two pairs the team read and kept go
+    /// quiet; the third still speaks, even though one pair alone would never
+    /// have raised the finding — the baseline already answered that the
+    /// coupling is real.
+    #[test]
+    fn a_baselined_pair_leaves_the_rest_of_the_coupling_visible() {
+        let mut fixture = coupled_fixture();
+        fixture
+            .component_of
+            .insert("src/billing/tax.ts".to_string(), "billing".to_string());
+        fixture.component_of.insert(
+            "src/shipping/carrier.ts".to_string(),
+            "shipping".to_string(),
+        );
+        fixture
+            .co_changes
+            .push(coupled("src/billing/tax.ts", "src/shipping/carrier.ts"));
+        for (left, right) in [
+            ("src/billing/rates.ts", "src/shipping/zones.ts"),
+            ("src/billing/invoice.ts", "src/shipping/label.ts"),
+        ] {
+            fixture
+                .baseline
+                .insert(baseline_entry("behavioral-coupling", left, right));
+        }
+
+        let findings = run(&fixture);
+        assert_eq!(
+            rules_of(&findings),
+            vec!["architecture/behavioral-coupling"]
+        );
+        assert_eq!(findings[0].evidence.len(), 1, "only the pair nobody read");
+        assert_eq!(findings[0].evidence[0].file_path, "src/billing/tax.ts");
+
+        fixture.baseline.insert(baseline_entry(
+            "behavioral-coupling",
+            "src/billing/tax.ts",
+            "src/shipping/carrier.ts",
+        ));
+        assert!(run(&fixture).is_empty(), "the whole coupling is accepted");
+    }
+
+    /// Low keeps the family under every gate's default threshold; a team that
+    /// has checked a few and found them right raises it, one that has not
+    /// turns it off.
+    #[test]
+    fn the_contract_sets_the_coupling_severity() {
+        let mut fixture = coupled_fixture();
+        fixture.contract.coupling = CouplingPolicy::High;
+        assert_eq!(run(&fixture)[0].severity, Severity::High);
+
+        fixture.contract.coupling = CouplingPolicy::Off;
+        assert!(run(&fixture).is_empty());
+        assert!(
+            entries(&fixture).is_empty(),
+            "nor is there anything to freeze"
         );
     }
 

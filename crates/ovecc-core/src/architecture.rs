@@ -19,7 +19,7 @@ use globset::GlobBuilder;
 use serde::Deserialize;
 
 use crate::error::{OveccError, Result};
-use crate::facts::CapabilityKind;
+use crate::facts::{CapabilityKind, Severity};
 
 /// Contract schema version this build reads. Bumped on breaking changes so
 /// yesterday's contract fails loudly instead of being misread.
@@ -39,6 +39,9 @@ pub struct ArchitectureContract {
     /// What to do with files no component claims.
     #[serde(default)]
     pub unassigned: UnassignedPolicy,
+    /// How loudly behavioral coupling is reported.
+    #[serde(default)]
+    pub coupling: CouplingPolicy,
     #[serde(default, rename = "component")]
     pub components: Vec<ComponentSpec>,
 }
@@ -60,6 +63,34 @@ pub enum UnassignedPolicy {
     #[default]
     Warn,
     Forbid,
+}
+
+/// The severity behavioral-coupling verdicts carry, `off` to stop reporting
+/// them. Its own knob because the signal is weaker than the others: it reads
+/// the history rather than the code, and published precision on this family
+/// sits between 40 and 66%. Low keeps it out of every gate's default
+/// threshold; a team that has read a few of them and found them right can
+/// raise it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CouplingPolicy {
+    Off,
+    #[default]
+    Low,
+    Medium,
+    High,
+}
+
+impl CouplingPolicy {
+    /// What to report at, or `None` when the family is off.
+    pub fn severity(self) -> Option<Severity> {
+        match self {
+            CouplingPolicy::Off => None,
+            CouplingPolicy::Low => Some(Severity::Low),
+            CouplingPolicy::Medium => Some(Severity::Medium),
+            CouplingPolicy::High => Some(Severity::High),
+        }
+    }
 }
 
 /// One declared component.
@@ -795,6 +826,7 @@ mod tests {
         contract.validate().expect("valid");
         assert_eq!(contract.mode, EnforcementMode::NewViolations);
         assert_eq!(contract.unassigned, UnassignedPolicy::Warn);
+        assert_eq!(contract.coupling, CouplingPolicy::Low);
         let api = contract.component("api").expect("api exists");
         assert_eq!(api.depends_on.len(), 1);
         assert_eq!(api.depends_on[0].component(), "core");
@@ -821,6 +853,15 @@ mod tests {
         let entry = &contract.component("api").unwrap().depends_on[0];
         assert_eq!(entry.component(), "legacy");
         assert!(entry.deprecated());
+    }
+
+    #[test]
+    fn coupling_reads_a_severity_or_silences_the_family() {
+        let raised = contract(&MINIMAL.replace("schema = 1", "schema = 1\ncoupling = \"medium\""));
+        assert_eq!(raised.coupling.severity(), Some(Severity::Medium));
+
+        let off = contract(&MINIMAL.replace("schema = 1", "schema = 1\ncoupling = \"off\""));
+        assert_eq!(off.coupling.severity(), None);
     }
 
     #[test]
@@ -1140,6 +1181,7 @@ mod tests {
             schema: 1,
             mode: EnforcementMode::Warn,
             unassigned: UnassignedPolicy::Warn,
+            coupling: CouplingPolicy::default(),
             components,
         }
     }

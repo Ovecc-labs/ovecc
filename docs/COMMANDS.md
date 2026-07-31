@@ -171,11 +171,12 @@ High; deprecated, banned, capability, and budget are Medium; hygiene is Low.
 One verdict reads no code at all. **Behavioral coupling** names two components
 the contract declares independent, and that no import connects, whose files the
 history keeps changing in the same commits. No static analysis can see it: the
-only witness is the commits, and they come with the finding. It stays Low and
-never gates — the deviation is a question for the reader, and the honest
-exception is real (a version field every implementer of a protocol must bump).
-Two components must share at least two coupled file pairs before it is reported:
-one is an accident.
+only witness is the commits, and they come with the finding. Two components must
+share at least two coupled file pairs before it is reported: one is an accident,
+and the honest exception is real (a version field every implementer of a
+protocol must bump). It is Low by default, under every gate's threshold, because
+the deviation is a question for the reader; `coupling = "medium"` (or `"high"`)
+in the contract puts it in the gate, `coupling = "off"` stops reporting it.
 
 Beyond the import graph, two verdicts read the code itself (JS/TS): a
 `deny_capabilities` list forbids a component the ambient capabilities that
@@ -213,6 +214,12 @@ In `new-violations` mode, baselined entries stop gating (the report header
 counts them) and every `check` ratchets: entries whose violation no longer
 exists leave the store, so the debt counter never climbs back. `strict`
 ignores the baseline entirely — the whole debt gates again.
+
+Behavioral coupling goes into the same store, one line per coupled file pair
+(`behavioral-coupling<TAB>left file<TAB>right file`). Accepting today's pairs
+does not silence the component pair for good: the next file that joins the
+coupling comes back on its own, even though a single pair would never have
+raised the finding.
 
 ### `ovecc diagnose`
 

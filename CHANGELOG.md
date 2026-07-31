@@ -5,6 +5,36 @@ Notable changes to ovecc are documented here. The format follows
 [SemVer](https://semver.org/) (pre-1.0, minor releases may contain breaking
 changes).
 
+## [Unreleased]
+
+### Added
+
+- Behavioral coupling: the files a repository keeps changing in the same
+  commits, mined from the history and persisted in a `co_changes` table. `ovecc
+  coupling` ranks the pairs by support, Jaccard and lift, with the witness
+  commits.
+- The contract verdict on top of it, `architecture/behavioral-coupling`: two
+  components no import and no `depends_on` connects, whose files keep changing
+  together across at least two file pairs. No static analysis can produce this
+  one — the only witness is the history, and the commits ship with the finding.
+  Low by default, `coupling = "medium" | "high" | "off"` in the contract moves
+  or silences it, and `check --freeze` accepts the pairs one at a time like any
+  other debt.
+- `hotspots` and `summary` report each module's fix history: how many bug-fix
+  commits touched it, the same count weighted by age (180-day half-life), and
+  the date of the last one.
+
+### Fixed
+
+- Churn follows renames: a file's history no longer restarts at its new path.
+  Tree diffs also stopped counting directories as files.
+
+### Changed
+
+- The commit index records where a renamed file came from, and the co-change
+  pairs get their own table (schema 10). Existing databases migrate on the next
+  `index`, which re-ingests the commit history so old renames get linked.
+
 ## [0.2.1] - 2026-07-31
 
 ### Fixed
