@@ -9,7 +9,7 @@ use duckdb::{Connection, params};
 use ovecc_core::facts::{
     CapabilityFact, CapabilityKind, FindingRecord, FunctionMetricsRow, Severity,
 };
-use ovecc_core::legacy::DependencyRecord;
+use ovecc_core::legacy::{DependencyRecord, FixHistory};
 
 /// Resolves every path the history mentions to the name it ends up under, by
 /// following rename records forward. Prefix of the queries that roll a file's
@@ -458,6 +458,60 @@ impl ArchitectureStore {
                     mass: row.get(2)?,
                     last_fix_at: row.get(3)?,
                 })
+            },
+        )?;
+        collect_rows(rows)
+    }
+
+    /// The same weighting as [`Self::file_fix_history`], rolled up to the module
+    /// each file belongs to. A module with no correction is absent.
+    pub fn module_fix_history(
+        &self,
+        repository_id: &str,
+        half_life_days: f64,
+    ) -> Result<Vec<(String, FixHistory)>> {
+        let half_life_seconds = half_life_days.max(1.0) * 86_400.0;
+        let mut statement = self.conn.prepare(&format!(
+            "{CANONICAL_PATHS},
+             fixes AS (
+                 SELECT DISTINCT c.id AS commit_id, f.module_name AS module_name,
+                        c.committed_at AS committed_at,
+                        epoch(CAST(substr(c.committed_at, 1, 19) AS TIMESTAMP)) AS at
+                 FROM file_changes fc
+                 JOIN commits c ON fc.commit_id = c.id
+                 JOIN canonical ON canonical.path = fc.file_path
+                 JOIN files f
+                   ON f.path = canonical.current_path AND f.repository_id = fc.repository_id
+                 WHERE fc.repository_id = ? AND c.is_fix
+             ),
+             newest AS (
+                 SELECT MAX(epoch(CAST(substr(committed_at, 1, 19) AS TIMESTAMP))) AS at
+                 FROM commits WHERE repository_id = ?
+             )
+             SELECT f.module_name,
+                    COUNT(*)::BIGINT,
+                    SUM(POWER(0.5, (n.at - f.at) / CAST(? AS DOUBLE))),
+                    MAX(f.committed_at)
+             FROM fixes f, newest n
+             GROUP BY f.module_name"
+        ))?;
+        let rows = statement.query_map(
+            params![
+                repository_id,
+                repository_id,
+                repository_id,
+                repository_id,
+                half_life_seconds
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    FixHistory {
+                        fixes: row.get::<_, i64>(1)? as usize,
+                        mass: row.get(2)?,
+                        last_fix_at: row.get(3)?,
+                    },
+                ))
             },
         )?;
         collect_rows(rows)

@@ -121,7 +121,7 @@ pub const COMMANDS: &[CommandSpec] = &[
         name: "hotspots",
         summary: "Rank technical-debt hotspots (churn x coupling x ownership x violations).",
         key_params: &["--limit"],
-        output: "Ranked modules with the explainable components of each score; churn/ownership labeled n/a without git.",
+        output: "Ranked modules with the explainable components of each score, plus the bug-fix commits each carries (count, age-weighted mass, last one) beside it; churn/ownership labeled n/a without git.",
         read_only: true,
     },
     CommandSpec {

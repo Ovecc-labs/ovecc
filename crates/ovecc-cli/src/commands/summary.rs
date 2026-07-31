@@ -59,6 +59,10 @@ pub(crate) fn load_hotspots(paths: &ProjectPaths, limit: usize) -> Result<Hotspo
         .module_complexity(&repository_id)?
         .into_iter()
         .collect();
+    let fixes: HashMap<String, ovecc_core::legacy::FixHistory> = store
+        .module_fix_history(&repository_id, ovecc_db::FIX_HALF_LIFE_DAYS)?
+        .into_iter()
+        .collect();
 
     Ok(HotspotsReport {
         hotspots: graph::compute_hotspots(
@@ -68,10 +72,25 @@ pub(crate) fn load_hotspots(paths: &ProjectPaths, limit: usize) -> Result<Hotspo
             &fragmentation,
             &violations,
             &complexity,
+            &fixes,
             limit,
         ),
         has_git_history,
     })
+}
+
+/// A module's corrections as text: the count, then the age-weighted mass and
+/// the last one, so the reader can weigh the number instead of taking a verdict.
+fn fix_history(history: &ovecc_core::legacy::FixHistory) -> String {
+    match &history.last_fix_at {
+        Some(last) => format!(
+            "{} (weight {:.1}, last {})",
+            history.fixes,
+            history.mass,
+            &last[..10.min(last.len())]
+        ),
+        None => "0".to_string(),
+    }
 }
 
 pub(crate) fn render_hotspots(report: &HotspotsReport, format: OutputFormat) -> Result<()> {
@@ -93,9 +112,9 @@ pub(crate) fn render_hotspots(report: &HotspotsReport, format: OutputFormat) -> 
                 println!();
             }
             println!(
-                "| # | Module | Score | Churn | Coupling | Fan-in | Fan-out | Owner frag. | Violations |"
+                "| # | Module | Score | Churn | Corrections | Coupling | Fan-in | Fan-out | Owner frag. | Violations |"
             );
-            println!("| --- | --- | --- | --- | --- | --- | --- | --- | --- |");
+            println!("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |");
             for (rank, hotspot) in report.hotspots.iter().enumerate() {
                 let churn = if report.has_git_history {
                     format!("{:.0}", hotspot.churn)
@@ -107,12 +126,18 @@ pub(crate) fn render_hotspots(report: &HotspotsReport, format: OutputFormat) -> 
                 } else {
                     "n/a".to_string()
                 };
+                let fixes = if report.has_git_history {
+                    fix_history(&hotspot.fix_history)
+                } else {
+                    "n/a".to_string()
+                };
                 println!(
-                    "| {} | {} | {:.0} | {} | {} | {} | {} | {} | {} |",
+                    "| {} | {} | {:.0} | {} | {} | {} | {} | {} | {} | {} |",
                     rank + 1,
                     hotspot.module,
                     hotspot.score,
                     churn,
+                    fixes,
                     hotspot.coupling,
                     hotspot.fan_in,
                     hotspot.fan_out,
@@ -132,6 +157,7 @@ pub(crate) fn render_hotspots(report: &HotspotsReport, format: OutputFormat) -> 
                 println!("   Score: {:.0}", hotspot.score);
                 if report.has_git_history {
                     println!("   Churn: {:.0}", hotspot.churn);
+                    println!("   Corrections: {}", fix_history(&hotspot.fix_history));
                     println!(
                         "   Ownership fragmentation: {:.0}%",
                         hotspot.ownership_fragmentation * 100.0

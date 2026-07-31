@@ -12,7 +12,7 @@ pub mod diagnose;
 pub mod dupes;
 
 use ovecc_core::legacy::{
-    DependencyRecord, Hotspot, HotspotEntry, ImpactDirection, ImpactReport, RiskLevel,
+    DependencyRecord, FixHistory, Hotspot, HotspotEntry, ImpactDirection, ImpactReport, RiskLevel,
     SummaryReport,
 };
 use petgraph::algo::kosaraju_scc;
@@ -150,6 +150,9 @@ pub fn instability(fan_in: usize, fan_out: usize) -> f64 {
 /// component is normalized to `[0,1]` against the repository maximum, so the
 /// score is relative and explainable; the result is sorted by score, highest
 /// first, and truncated to `limit`.
+///
+/// `fixes` rides along untouched: it is reported next to the score, not scored.
+#[allow(clippy::too_many_arguments)]
 pub fn compute_hotspots(
     modules: &[String],
     dependencies: &[DependencyRecord],
@@ -157,6 +160,7 @@ pub fn compute_hotspots(
     fragmentation: &HashMap<String, f64>,
     violations: &HashMap<String, usize>,
     complexity: &HashMap<String, f64>,
+    fixes: &HashMap<String, FixHistory>,
     limit: usize,
 ) -> Vec<HotspotEntry> {
     let mut fan_in = HashMap::<String, usize>::new();
@@ -223,6 +227,7 @@ pub fn compute_hotspots(
                 ownership_fragmentation: frag,
                 violations: *violations.get(module).unwrap_or(&0),
                 complexity: complexity_of(module),
+                fix_history: fixes.get(module).cloned().unwrap_or_default(),
             }
         })
         .filter(|hotspot| hotspot.score > 0.0)
@@ -457,6 +462,14 @@ mod hotspot_tests {
         let violations = HashMap::from([("billing".to_string(), 3usize)]);
         let complexity =
             HashMap::from([("billing".to_string(), 120.0), ("util".to_string(), 30.0)]);
+        let fixes = HashMap::from([(
+            "user".to_string(),
+            FixHistory {
+                fixes: 4,
+                mass: 3.5,
+                last_fix_at: Some("2026-07-30T12:00:00+00:00".to_string()),
+            },
+        )]);
 
         let hotspots = compute_hotspots(
             &modules,
@@ -465,6 +478,7 @@ mod hotspot_tests {
             &fragmentation,
             &violations,
             &complexity,
+            &fixes,
             10,
         );
 
@@ -477,6 +491,11 @@ mod hotspot_tests {
         assert!((hotspots[0].complexity - 120.0).abs() < 1e-9);
         let billing_score = hotspots[0].score;
         assert!(hotspots[1..].iter().all(|h| h.score < billing_score));
+        // Corrections are carried, not scored: user has them all and still ranks
+        // below billing.
+        let user = hotspots.iter().find(|h| h.module == "user").unwrap();
+        assert_eq!(user.fix_history.fixes, 4);
+        assert_eq!(hotspots[0].fix_history, FixHistory::default());
         // The limit is respected.
         assert_eq!(
             compute_hotspots(
@@ -486,6 +505,7 @@ mod hotspot_tests {
                 &fragmentation,
                 &violations,
                 &complexity,
+                &fixes,
                 1
             )
             .len(),

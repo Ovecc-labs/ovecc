@@ -234,6 +234,23 @@ pub struct HotspotEntry {
     pub violations: usize,
     /// Total cognitive complexity of the module's functions (oxc).
     pub complexity: f64,
+    /// Bug-fix commits that landed on the module. Reported beside the score,
+    /// not folded into it: what a correction says about a file is a judgment
+    /// call, and the number is there to be argued with.
+    #[serde(default)]
+    pub fix_history: FixHistory,
+}
+
+/// The corrections a module (or a file) has accumulated.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct FixHistory {
+    /// Commits classified as bug fixes that touched it.
+    pub fixes: usize,
+    /// The same commits, each weighted by age: a fix loses half its weight
+    /// every `FIX_HALF_LIFE_DAYS`.
+    pub mass: f64,
+    /// RFC 3339 timestamp of the most recent fix.
+    pub last_fix_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

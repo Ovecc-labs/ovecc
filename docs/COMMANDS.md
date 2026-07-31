@@ -414,6 +414,12 @@ Churn follows renames, so moving a file does not reset its history. A file that
 was split keeps it under whichever part kept the path: git records the other
 part as a new file.
 
+Each module also carries its bug-fix history: how many commits classified as
+fixes touched it, the same count weighted so a fix loses half its weight every
+180 days, and the date of the last one. It sits beside the score rather than
+inside it — what a correction says about a module is a judgment call, so the
+number is there to be argued with, not to hand down a verdict.
+
 ### `ovecc conventions`
 
 Conventions learned from the repository itself (naming roles, dependency

@@ -844,12 +844,18 @@ pub(crate) fn render_full_report(
             }
             for (rank, hotspot) in hotspots.hotspots.iter().enumerate() {
                 println!(
-                    "{}. {} (score {:.0}, fan-in {}, fan-out {})",
+                    "{}. {} (score {:.0}, fan-in {}, fan-out {}, {} fix commit{})",
                     rank + 1,
                     hotspot.module,
                     hotspot.score,
                     hotspot.fan_in,
-                    hotspot.fan_out
+                    hotspot.fan_out,
+                    hotspot.fix_history.fixes,
+                    if hotspot.fix_history.fixes == 1 {
+                        ""
+                    } else {
+                        "s"
+                    }
                 );
             }
         }
