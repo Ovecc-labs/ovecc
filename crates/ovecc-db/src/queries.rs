@@ -499,12 +499,9 @@ impl ArchitectureStore {
         collect_rows(rows)
     }
 
-    /// The indexed files each commit touched, newest commit first, under their
-    /// current names. The raw material of evolutionary coupling.
-    ///
-    /// Only files the index knows are returned: a lockfile or a CI config rides
-    /// along with everything and would pair with everything, and dropping them
-    /// also measures the size of a commit by the code it changed.
+    /// The files each commit touched, newest commit first, under their current
+    /// names. The raw material of evolutionary coupling; the caller narrows it
+    /// to the files it cares about.
     pub fn commit_file_sets(&self, repository_id: &str) -> Result<Vec<CommitFiles>> {
         let mut statement = self.conn.prepare(&format!(
             "{CANONICAL_PATHS}
@@ -512,8 +509,6 @@ impl ArchitectureStore {
              FROM file_changes fc
              JOIN commits c ON fc.commit_id = c.id
              JOIN canonical ON canonical.path = fc.file_path
-             JOIN files f
-               ON f.path = canonical.current_path AND f.repository_id = fc.repository_id
              WHERE fc.repository_id = ?
              GROUP BY c.sha, c.committed_at, canonical.current_path
              ORDER BY c.committed_at DESC, c.sha, canonical.current_path"

@@ -168,6 +168,15 @@ capabilities used, complexity budgets exceeded, unassigned files, and absences
 High; deprecated, banned, capability, and budget are Medium; hygiene is Low.
 `mode = "warn"` caps everything at Low so nothing gates.
 
+One verdict reads no code at all. **Behavioral coupling** names two components
+the contract declares independent, and that no import connects, whose files the
+history keeps changing in the same commits. No static analysis can see it: the
+only witness is the commits, and they come with the finding. It stays Low and
+never gates — the deviation is a question for the reader, and the honest
+exception is real (a version field every implementer of a protocol must bump).
+Two components must share at least two coupled file pairs before it is reported:
+one is an accident.
+
 Beyond the import graph, two verdicts read the code itself (JS/TS): a
 `deny_capabilities` list forbids a component the ambient capabilities that
 break functional purity (network, filesystem, storage, dom, process, the

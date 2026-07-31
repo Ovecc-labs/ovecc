@@ -156,6 +156,28 @@ pub fn index_repository(
         Some(contract) => assign_slices(contract, &component_of),
         None => BTreeMap::new(),
     };
+    // Narrowed to the files this run indexed: a lockfile or a CI config travels
+    // with everything and would pair with everything, and the per-commit cap
+    // then measures a commit by the code it changed. Recomputed whole rather
+    // than incrementally, since a new commit moves the denominator of every
+    // pair it touches.
+    let co_changes = {
+        let indexed: std::collections::HashSet<&str> =
+            indexed_paths.iter().map(String::as_str).collect();
+        let commit_sets: Vec<ovecc_core::facts::CommitFiles> = store
+            .commit_file_sets(&repository_id)?
+            .into_iter()
+            .map(|mut commit| {
+                commit.files.retain(|path| indexed.contains(path.as_str()));
+                commit
+            })
+            .collect();
+        ovecc_graph::cochange::co_changed_pairs(
+            &commit_sets,
+            ovecc_graph::cochange::MIN_SUPPORT,
+            ovecc_graph::cochange::MIN_JACCARD,
+        )
+    };
     // Straight from this run's parse: the `capability_uses`/`complexity` tables
     // are written afterwards, so a cold index would judge them empty.
     let capability_uses: Vec<(String, ovecc_core::facts::CapabilityFact)> = parsed
@@ -195,6 +217,7 @@ pub fn index_repository(
             slice_of: &slice_of,
             capability_uses: &capability_uses,
             functions: &functions,
+            co_changes: &co_changes,
         });
     let (mut findings, security_patterns) =
         evaluate_rules(&input, &config.rules, architecture_input);
@@ -242,15 +265,6 @@ pub fn index_repository(
         &metrics,
         &code,
     )?;
-    // After the sync, not with the rest of the git ingestion: the pairs are
-    // scoped to the files the index knows, and those rows land just above.
-    // Recomputed whole rather than incrementally, since every new commit moves
-    // the denominators of every pair it touches.
-    let co_changes = ovecc_graph::cochange::co_changed_pairs(
-        &store.commit_file_sets(&repository_id)?,
-        ovecc_graph::cochange::MIN_SUPPORT,
-        ovecc_graph::cochange::MIN_JACCARD,
-    );
     store.replace_co_changes(&repository_id, &co_changes)?;
     store.replace_findings(&repository_id, &findings)?;
     phase(&mut timings.persist_ms);

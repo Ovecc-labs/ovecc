@@ -489,6 +489,9 @@ pub enum FindingKind {
     /// declared in `.ovecc/architecture.toml` (undeclared edge, bypassed
     /// interface, banned external import, deprecated edge still in use).
     ArchitectureViolation,
+    /// Two components the contract declares independent, and no import
+    /// connects, that the history keeps changing in the same commits.
+    BehavioralCoupling,
 }
 
 /// A fix descriptor attached to a finding so an agent can act without
@@ -583,6 +586,14 @@ impl FindingKind {
                 "Route the dependency through the target component's interface or \
                  remove it; if the edge is intended, declare it in \
                  .ovecc/architecture.toml and let the review record the decision.",
+            ),
+            FindingKind::BehavioralCoupling => FixSpec::new(
+                "name_the_hidden_dependency",
+                false,
+                "Read the commits: either the two components share something that \
+                 belongs in one place, or the dependency is real and belongs in \
+                 .ovecc/architecture.toml. A shared version field every \
+                 implementer must bump is the honest exception.",
             ),
             FindingKind::HardcodedSecret => FixSpec::new(
                 "rotate_and_externalize_secret",

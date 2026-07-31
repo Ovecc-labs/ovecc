@@ -617,6 +617,15 @@ pub fn rule_definitions() -> BTreeMap<String, MetaRule> {
             ),
         ),
         (
+            "architecture/behavioral-coupling".to_string(),
+            rule(
+                "Two components the contract declares independent, and no import \
+                 connects, that the history keeps changing in the same commits. \
+                 Advisory: the evidence is the commits, the call is the reader's.",
+                "low",
+            ),
+        ),
+        (
             "architecture/unassigned".to_string(),
             rule(
                 "Indexed files match no component's paths, per the contract's \

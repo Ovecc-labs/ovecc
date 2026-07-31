@@ -21,8 +21,8 @@ use chrono::Utc;
 use ovecc_core::architecture::ArchitectureContract;
 use ovecc_core::config::RulesConfig;
 use ovecc_core::facts::{
-    CapabilityFact, EntityRef, Evidence, FindingKind, FindingRecord, FunctionMetricsRow,
-    SecurityPatternFact, SecurityPatternKind, Severity,
+    CapabilityFact, CoChangedPair, EntityRef, Evidence, FindingKind, FindingRecord,
+    FunctionMetricsRow, SecurityPatternFact, SecurityPatternKind, Severity,
 };
 use ovecc_core::graph::NodeKind;
 use ovecc_core::id::{FindingId, RepositoryId, SnapshotId};
@@ -66,6 +66,9 @@ pub struct ContractInput<'a> {
     pub capability_uses: &'a [(String, CapabilityFact)],
     /// Per-function metrics for the per-component budget check.
     pub functions: &'a [FunctionMetricsRow],
+    /// File pairs the history keeps changing together, for the behavioral
+    /// coupling check. Empty when no git history was ingested.
+    pub co_changes: &'a [CoChangedPair],
 }
 
 /// Evaluates every enabled rule family and returns the findings, sorted by ID

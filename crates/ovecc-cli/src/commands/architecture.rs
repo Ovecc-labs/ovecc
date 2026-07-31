@@ -16,7 +16,7 @@ use ovecc_core::architecture::{
 use ovecc_core::config::{OutputFormat, ProjectPaths};
 use ovecc_core::error::OveccError;
 use ovecc_core::facts::FindingRecord;
-use ovecc_core::facts::{CapabilityFact, FunctionMetricsRow};
+use ovecc_core::facts::{CapabilityFact, CoChangedPair, FunctionMetricsRow};
 use ovecc_core::legacy::DependencyRecord;
 use ovecc_db::FileGraphRow;
 use ovecc_rules::ContractInput;
@@ -71,6 +71,10 @@ const VERDICTS: &[(&str, &str)] = &[
         "architecture/absence",
         "Absences (declared, never implemented)",
     ),
+    (
+        "architecture/behavioral-coupling",
+        "Components that change together without depending on each other",
+    ),
 ];
 
 /// Everything `diff` and `check` need, loaded once: the contract plus the
@@ -84,6 +88,7 @@ struct ArchitectureData {
     slice_of: BTreeMap<String, String>,
     capability_uses: Vec<(String, CapabilityFact)>,
     functions: Vec<FunctionMetricsRow>,
+    co_changes: Vec<CoChangedPair>,
 }
 
 impl ArchitectureData {
@@ -96,6 +101,7 @@ impl ArchitectureData {
             slice_of: &self.slice_of,
             capability_uses: &self.capability_uses,
             functions: &self.functions,
+            co_changes: &self.co_changes,
         }
     }
 }
@@ -137,6 +143,9 @@ fn load_architecture_data(paths: &ProjectPaths) -> Result<ArchitectureData> {
     } else {
         Vec::new()
     };
+    // Read from the table the last index wrote: `check` judges the stored
+    // graph, and the history behind it is just as stored.
+    let co_changes = store.co_changes(&repository_id, 0.0)?;
     Ok(ArchitectureData {
         repository_id,
         contract,
@@ -146,6 +155,7 @@ fn load_architecture_data(paths: &ProjectPaths) -> Result<ArchitectureData> {
         slice_of,
         capability_uses,
         functions,
+        co_changes,
     })
 }
 
