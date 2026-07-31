@@ -356,6 +356,11 @@ fn changed_files(
 
     changes
         .into_iter()
+        // A tree diff also reports every directory on the way to a changed file,
+        // and a submodule as a commit entry. Only the blobs are files: without
+        // this, `crates` and `crates/ovecc-cli/src` accumulate their subtree's
+        // history as if they were source files.
+        .filter(|change| change.entry_mode().is_blob_or_symlink())
         .map(|change| match change {
             Change::Addition { location, .. } => GitFileChange {
                 path: location.to_string(),
@@ -412,19 +417,32 @@ mod tests {
         dir
     }
 
+    /// Writes each `(path, contents)` pair, creating parent directories, and
+    /// commits them under `message`.
+    fn commit(root: &std::path::Path, message: &str, files: &[(&str, &str)]) {
+        for (path, contents) in files {
+            let file = root.join(path);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(file, contents).unwrap();
+        }
+        git(root, &["add", "."]);
+        git(root, &["commit", "-q", "-m", message]);
+    }
+
     #[test]
     fn extracts_commits_and_changed_files() {
         let dir = repo();
         let root = dir.path();
 
-        std::fs::write(root.join("a.ts"), "export const a = 1;\n").unwrap();
-        git(root, &["add", "."]);
-        git(root, &["commit", "-q", "-m", "c1"]);
-
-        std::fs::write(root.join("a.ts"), "export const a = 2;\n").unwrap();
-        std::fs::write(root.join("b.ts"), "export const b = 1;\n").unwrap();
-        git(root, &["add", "."]);
-        git(root, &["commit", "-q", "-m", "c2"]);
+        commit(root, "c1", &[("a.ts", "export const a = 1;\n")]);
+        commit(
+            root,
+            "c2",
+            &[
+                ("a.ts", "export const a = 2;\n"),
+                ("b.ts", "export const b = 1;\n"),
+            ],
+        );
 
         let history = collect_history(root, 0, 100).unwrap();
         assert!(history.head_sha.is_some());
@@ -462,12 +480,30 @@ mod tests {
     }
 
     #[test]
+    fn changed_files_are_leaves_not_the_directories_above_them() {
+        let dir = repo();
+        let root = dir.path();
+
+        commit(root, "c1", &[("src/cli/main.ts", "const a = 1;\n")]);
+
+        let history = collect_history(root, 0, 100).unwrap();
+        let paths: Vec<_> = history.commits[0]
+            .changes
+            .iter()
+            .map(|c| c.path.as_str())
+            .collect();
+        assert_eq!(
+            paths,
+            ["src/cli/main.ts"],
+            "the tree diff walks src and src/cli on the way: {paths:?}"
+        );
+    }
+
+    #[test]
     fn resolves_refs_to_commit_sha() {
         let dir = repo();
         let root = dir.path();
-        std::fs::write(root.join("a.ts"), "export const a = 1;\n").unwrap();
-        git(root, &["add", "."]);
-        git(root, &["commit", "-q", "-m", "c1"]);
+        commit(root, "c1", &[("a.ts", "export const a = 1;\n")]);
 
         let head = collect_history(root, 0, 10).unwrap().head_sha.unwrap();
         assert_eq!(resolve_ref(root, "HEAD").as_deref(), Some(head.as_str()));
@@ -486,16 +522,24 @@ mod tests {
     fn changed_line_ranges_report_only_the_edited_lines() {
         let dir = repo();
         let root = dir.path();
-        std::fs::write(root.join("a.ts"), "one\ntwo\nthree\nfour\nfive\n").unwrap();
-        std::fs::write(root.join("keep.ts"), "kept\n").unwrap();
-        git(root, &["add", "."]);
-        git(root, &["commit", "-q", "-m", "base"]);
+        commit(
+            root,
+            "base",
+            &[
+                ("a.ts", "one\ntwo\nthree\nfour\nfive\n"),
+                ("keep.ts", "kept\n"),
+            ],
+        );
         let base = resolve_ref(root, "HEAD").unwrap();
 
-        std::fs::write(root.join("a.ts"), "one\ntwo\nTHREE\nfour\nfive\n").unwrap();
-        std::fs::write(root.join("added.ts"), "x\ny\n").unwrap();
-        git(root, &["add", "."]);
-        git(root, &["commit", "-q", "-m", "head"]);
+        commit(
+            root,
+            "head",
+            &[
+                ("a.ts", "one\ntwo\nTHREE\nfour\nfive\n"),
+                ("added.ts", "x\ny\n"),
+            ],
+        );
 
         let ranges = changed_line_ranges(root, &base).unwrap();
         assert_eq!(
@@ -515,11 +559,14 @@ mod tests {
     fn worktree_line_ranges_read_the_uncommitted_edit() {
         let dir = repo();
         let root = dir.path();
-        std::fs::create_dir_all(root.join("src")).unwrap();
-        std::fs::write(root.join("src/a.ts"), "one\ntwo\nthree\nfour\n").unwrap();
-        std::fs::write(root.join("src/b.ts"), "alpha\nbeta\ngamma\n").unwrap();
-        git(root, &["add", "."]);
-        git(root, &["commit", "-q", "-m", "base"]);
+        commit(
+            root,
+            "base",
+            &[
+                ("src/a.ts", "one\ntwo\nthree\nfour\n"),
+                ("src/b.ts", "alpha\nbeta\ngamma\n"),
+            ],
+        );
         let base = resolve_ref(root, "HEAD").unwrap();
 
         // CRLF on disk against an LF blob is what a checkout under
@@ -557,9 +604,7 @@ mod tests {
     fn changed_line_ranges_see_through_renames() {
         let dir = repo();
         let root = dir.path();
-        std::fs::write(root.join("a.ts"), "one\ntwo\nthree\nfour\nfive\n").unwrap();
-        git(root, &["add", "."]);
-        git(root, &["commit", "-q", "-m", "base"]);
+        commit(root, "base", &[("a.ts", "one\ntwo\nthree\nfour\nfive\n")]);
         let base = resolve_ref(root, "HEAD").unwrap();
 
         git(root, &["mv", "a.ts", "b.ts"]);

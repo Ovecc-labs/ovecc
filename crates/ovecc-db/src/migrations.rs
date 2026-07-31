@@ -335,6 +335,21 @@ const MIGRATION_V7_FIX_CLASSIFICATION: &str = r#"
             ALTER TABLE commits ADD COLUMN IF NOT EXISTS fix_confidence DOUBLE;
             "#;
 
+/// Drops the directory rows a tree diff used to record alongside the files it
+/// walked through. A path that is a parent of another path changed by the same
+/// commit is a directory: git cannot hold a blob and a tree at one path.
+const MIGRATION_V8_LEAF_FILE_CHANGES: &str = r#"
+            DELETE FROM file_changes
+            WHERE id IN (
+                SELECT parent.id
+                FROM file_changes parent
+                JOIN file_changes child
+                  ON child.repository_id = parent.repository_id
+                 AND child.commit_id = parent.commit_id
+                 AND child.file_path LIKE parent.file_path || '/%'
+            );
+            "#;
+
 const SCHEMA_MIGRATIONS: &[SchemaMigration] = &[
     SchemaMigration {
         version: 1,
@@ -370,6 +385,11 @@ const SCHEMA_MIGRATIONS: &[SchemaMigration] = &[
         version: 7,
         name: "fix_classification",
         sql: MIGRATION_V7_FIX_CLASSIFICATION,
+    },
+    SchemaMigration {
+        version: 8,
+        name: "leaf_file_changes",
+        sql: MIGRATION_V8_LEAF_FILE_CHANGES,
     },
 ];
 
@@ -451,8 +471,8 @@ mod tests {
 
         let version = store.migrate_to_latest().unwrap();
 
-        assert_eq!(version, 7);
-        assert_eq!(store.schema_version().unwrap(), Some(7));
+        assert_eq!(version, 8);
+        assert_eq!(store.schema_version().unwrap(), Some(8));
         for table in [
             "repositories",
             "files",
@@ -488,12 +508,12 @@ mod tests {
         store.migrate_to_latest().unwrap();
         store.migrate_to_latest().unwrap();
 
-        assert_eq!(store.schema_version().unwrap(), Some(7));
+        assert_eq!(store.schema_version().unwrap(), Some(8));
         let applied: i64 = store
             .conn
             .query_row("SELECT count(*) FROM ovecc_schema", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(applied, 7, "each migration must be recorded exactly once");
+        assert_eq!(applied, 8, "each migration must be recorded exactly once");
     }
 
     #[test]
@@ -506,7 +526,7 @@ mod tests {
 
         let version = store.migrate_to_latest().unwrap();
 
-        assert_eq!(version, 7);
+        assert_eq!(version, 8);
         assert!(table_exists(&store, "findings"));
         assert!(table_exists(&store, "packages"));
         assert!(table_exists(&store, "complexity"));
@@ -514,5 +534,42 @@ mod tests {
         assert!(table_exists(&store, "snapshot_findings"));
         assert!(table_exists(&store, "snapshot_files"));
         assert!(table_exists(&store, "capability_uses"));
+    }
+
+    #[test]
+    fn v8_drops_the_directories_a_tree_diff_recorded_as_files() {
+        let (_dir, mut store) = temp_store();
+        store.migrate_to_latest().unwrap();
+        for (id, path) in [
+            ("1", "crates"),
+            ("2", "crates/ovecc-db"),
+            ("3", "crates/ovecc-db/src/lib.rs"),
+            ("4", "README.md"),
+        ] {
+            store
+                .conn
+                .execute(
+                    "INSERT INTO file_changes (id, repository_id, commit_id, file_path, change_kind)
+                     VALUES (?, 'repo', 'c1', ?, 'modified')",
+                    duckdb::params![id, path],
+                )
+                .unwrap();
+        }
+
+        store
+            .conn
+            .execute_batch(MIGRATION_V8_LEAF_FILE_CHANGES)
+            .unwrap();
+
+        let mut statement = store
+            .conn
+            .prepare("SELECT file_path FROM file_changes ORDER BY file_path")
+            .unwrap();
+        let paths: Vec<String> = statement
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(paths, ["README.md", "crates/ovecc-db/src/lib.rs"]);
     }
 }
