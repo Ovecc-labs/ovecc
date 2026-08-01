@@ -108,12 +108,14 @@ fn tally_line(tally: &[(&'static str, usize)]) -> String {
 }
 
 /// Tells the reader the list is a slice and how to move it. A silent cut would
-/// read as "that is all there is".
+/// read as "that is all there is". The ordering is worth stating: with the
+/// highest severity first, a page can hold nothing but the top band, and
+/// `--severity` (a floor, not a selection) then looks like it did nothing.
 fn truncation_note(total: usize, shown: usize, offset: usize) -> Option<String> {
     (shown < total).then(|| {
         format!(
-            "Showing {}-{} of {total}. Narrow with --severity, page with --offset, \
-             or pass --limit 0 for the full list.",
+            "Showing {}-{} of {total}, highest severity first. Page with --offset, \
+             raise the floor with --severity, or pass --limit 0 for the full list.",
             offset + 1,
             offset + shown,
         )
@@ -426,7 +428,10 @@ pub(crate) fn render_audit(report: &AuditReport, format: OutputFormat) -> Result
                 anstream::println!("{} {}", severity_tag(finding.severity), finding.title);
             }
             if report.advisories_loaded == 0 {
-                println!("  (no OSV database in .ovecc/osv/ — sync advisories to enable matching)");
+                println!(
+                    "  (no OSV database in .ovecc/osv/ — run `ovecc audit --fetch` once to \
+                     download the advisories for these packages)"
+                );
             } else if report.vulnerabilities == 0 {
                 println!("  (no known vulnerabilities)");
             }

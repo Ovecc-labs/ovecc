@@ -216,6 +216,20 @@ pub(crate) fn load_summary(paths: &ProjectPaths) -> Result<SummaryReport> {
     ))
 }
 
+/// Warns when no component imports another. Every relational metric is then 0
+/// for want of edges, not for want of problems, and the summary reads as a clean
+/// bill of health. A directory holding several unrelated projects lands here.
+fn isolated_components_note(report: &SummaryReport) -> Option<String> {
+    (report.modules > 1 && report.coupling_density < f64::EPSILON).then(|| {
+        format!(
+            "{} components, none importing another: cycles, boundary violations and \
+             coupling density are 0 for want of edges, not for want of problems. \
+             Independent projects in one directory read like this — index each on its own.",
+            report.modules
+        )
+    })
+}
+
 pub(crate) fn render_summary_report(report: &SummaryReport, format: OutputFormat) -> Result<()> {
     match format {
         OutputFormat::Json | OutputFormat::Sarif | OutputFormat::Codeclimate => {
@@ -246,6 +260,10 @@ pub(crate) fn render_summary_report(report: &SummaryReport, format: OutputFormat
                 report.coupling_density * 100.0
             );
             println!("- Risk score: **{}**", report.risk_score.as_str());
+            if let Some(note) = isolated_components_note(report) {
+                println!();
+                println!("> {note}");
+            }
             if !report.hotspots.is_empty() {
                 println!();
                 println!("## Hotspots");
@@ -277,6 +295,9 @@ pub(crate) fn render_summary_report(report: &SummaryReport, format: OutputFormat
             println!("Boundary violations: {}", report.boundary_violations);
             println!("Coupling density: {:.2}%", report.coupling_density * 100.0);
             anstream::println!("Risk score: {}", risk_tag(report.risk_score));
+            if let Some(note) = isolated_components_note(report) {
+                println!("  ({note})");
+            }
 
             if !report.hotspots.is_empty() {
                 println!();
