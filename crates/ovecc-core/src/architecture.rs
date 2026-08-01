@@ -46,6 +46,20 @@ pub struct ArchitectureContract {
     pub components: Vec<ComponentSpec>,
 }
 
+impl Default for ArchitectureContract {
+    fn default() -> Self {
+        Self {
+            // Not `u32::default()`: 0 is not a schema anyone ever wrote, and
+            // [`ArchitectureContract::validate`] rejects it.
+            schema: CONTRACT_SCHEMA,
+            mode: EnforcementMode::default(),
+            unassigned: UnassignedPolicy::default(),
+            coupling: CouplingPolicy::default(),
+            components: Vec::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum EnforcementMode {
@@ -94,7 +108,7 @@ impl CouplingPolicy {
 }
 
 /// One declared component.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ComponentSpec {
     pub name: String,
@@ -1164,25 +1178,16 @@ mod tests {
     fn component(name: &str, paths: &[&str]) -> ComponentSpec {
         ComponentSpec {
             name: name.to_string(),
-            role: None,
             paths: paths.iter().map(|p| p.to_string()).collect(),
-            depends_on: Vec::new(),
-            interface: Vec::new(),
-            external_deny: Vec::new(),
-            slices: false,
-            deny_capabilities: Vec::new(),
-            max_cyclomatic: None,
-            max_cognitive: None,
+            ..ComponentSpec::default()
         }
     }
 
     fn contract_of(components: Vec<ComponentSpec>) -> ArchitectureContract {
         ArchitectureContract {
-            schema: 1,
             mode: EnforcementMode::Warn,
-            unassigned: UnassignedPolicy::Warn,
-            coupling: CouplingPolicy::default(),
             components,
+            ..ArchitectureContract::default()
         }
     }
 

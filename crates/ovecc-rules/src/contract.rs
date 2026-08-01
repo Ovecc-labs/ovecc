@@ -907,25 +907,16 @@ mod tests {
     fn component(name: &str, paths: &[&str]) -> ComponentSpec {
         ComponentSpec {
             name: name.to_string(),
-            role: None,
             paths: paths.iter().map(|p| p.to_string()).collect(),
-            depends_on: Vec::new(),
-            interface: Vec::new(),
-            external_deny: Vec::new(),
-            slices: false,
-            deny_capabilities: Vec::new(),
-            max_cyclomatic: None,
-            max_cognitive: None,
+            ..ComponentSpec::default()
         }
     }
 
     fn contract(components: Vec<ComponentSpec>) -> ArchitectureContract {
         ArchitectureContract {
-            schema: 1,
-            mode: EnforcementMode::NewViolations,
             unassigned: UnassignedPolicy::Ignore,
-            coupling: CouplingPolicy::default(),
             components,
+            ..ArchitectureContract::default()
         }
     }
 
