@@ -178,6 +178,11 @@ pub struct SummaryReport {
     #[serde(skip_serializing)]
     pub snapshot_id: Option<String>,
     pub files: usize,
+    /// Files the last index found but could not turn into facts, whether the
+    /// read failed or the parse did. Every count below describes the rest, so a
+    /// repository that is mostly unreadable summarizes as a small, clean one.
+    #[serde(default)]
+    pub parse_failures: usize,
     pub modules: usize,
     pub dependencies: usize,
     pub external_dependencies: usize,

@@ -403,6 +403,14 @@ pub fn metric_definitions() -> BTreeMap<String, MetaMetric> {
             ),
         ),
         (
+            "parse_failures".to_string(),
+            metric(
+                "Files found but not indexed; every other metric covers the rest.",
+                "[0, inf)",
+                "lower is better",
+            ),
+        ),
+        (
             "dependencies".to_string(),
             metric(
                 "Number of resolved import dependencies.",

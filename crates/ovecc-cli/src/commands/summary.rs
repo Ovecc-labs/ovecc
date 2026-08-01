@@ -206,6 +206,14 @@ pub(crate) fn load_summary(paths: &ProjectPaths) -> Result<SummaryReport> {
         })
         .count();
 
+    // Recorded by `index` as a snapshot metric, so the failure outlives the run
+    // that produced it: the numbers below are only as complete as the index.
+    let parse_failures = store
+        .metric_history(&repository_id, "parse_failures", 1)?
+        .last()
+        .map(|(_, _, _, value)| value.max(0.0) as usize)
+        .unwrap_or(0);
+
     Ok(graph::summarize(
         repository_root,
         snapshot_id,
@@ -213,7 +221,22 @@ pub(crate) fn load_summary(paths: &ProjectPaths) -> Result<SummaryReport> {
         modules,
         &dependencies,
         boundary_violations,
+        parse_failures,
     ))
+}
+
+/// Warns that the index is missing files the last run found. Unreadable files
+/// are not rare in the wild — cloud placeholders that never hydrated, a
+/// permissions problem — and they shrink every number here, not the problem.
+fn incomplete_index_note(report: &SummaryReport) -> Option<String> {
+    (report.parse_failures > 0).then(|| {
+        format!(
+            "{} of {} files found were not indexed, so every count here covers the rest. \
+             Re-run `ovecc index` to see which and why.",
+            report.parse_failures,
+            report.files + report.parse_failures,
+        )
+    })
 }
 
 /// Warns when no component imports another. Every relational metric is then 0
@@ -245,6 +268,11 @@ pub(crate) fn render_summary_report(report: &SummaryReport, format: OutputFormat
         OutputFormat::Markdown => {
             println!("# Architecture summary");
             println!();
+            // Ahead of the list, since it qualifies every figure in it.
+            if let Some(note) = incomplete_index_note(report) {
+                println!("> {note}");
+                println!();
+            }
             println!("- Repository: `{}`", report.repository_root);
             if let Some(snapshot_id) = &report.snapshot_id {
                 println!("- Snapshot: `{snapshot_id}`");
@@ -288,6 +316,9 @@ pub(crate) fn render_summary_report(report: &SummaryReport, format: OutputFormat
                 println!("Snapshot: {snapshot_id}");
             }
             println!("Files: {}", report.files);
+            if let Some(note) = incomplete_index_note(report) {
+                println!("  Warning: {note}");
+            }
             println!("Modules: {}", report.modules);
             println!("Dependencies: {}", report.dependencies);
             println!("External dependencies: {}", report.external_dependencies);
@@ -316,4 +347,42 @@ pub(crate) fn render_summary_report(report: &SummaryReport, format: OutputFormat
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ovecc_core::legacy::RiskLevel;
+
+    fn report(files: usize, parse_failures: usize, modules: usize, density: f64) -> SummaryReport {
+        SummaryReport {
+            repository_root: "/repo".to_string(),
+            snapshot_id: None,
+            files,
+            parse_failures,
+            modules,
+            dependencies: 0,
+            external_dependencies: 0,
+            circular_dependencies: 0,
+            boundary_violations: 0,
+            coupling_density: density,
+            hotspots: Vec::new(),
+            risk_score: RiskLevel::Low,
+        }
+    }
+
+    #[test]
+    fn an_incomplete_index_counts_the_files_it_never_saw() {
+        assert!(incomplete_index_note(&report(36, 0, 4, 0.2)).is_none());
+        let note = incomplete_index_note(&report(1, 35, 1, 0.0)).expect("35 files missing");
+        assert!(note.starts_with("35 of 36 files"), "{note}");
+    }
+
+    #[test]
+    fn one_component_alone_earns_no_isolation_note() {
+        // A lone module has nothing to import from, so its 0 density says nothing.
+        assert!(isolated_components_note(&report(9, 0, 1, 0.0)).is_none());
+        assert!(isolated_components_note(&report(9, 0, 4, 0.0)).is_some());
+        assert!(isolated_components_note(&report(9, 0, 4, 0.05)).is_none());
+    }
 }

@@ -54,7 +54,8 @@ calls this first and needs nothing else to drive the tool.
 ### `ovecc summary`
 
 One-screen health: files, modules, dependency counts, circular deps, coupling
-density, risk score.
+density, risk score. Files the last index found but could not read or parse are
+counted here too, since every other figure covers only the rest.
 
 ```
 Files: 52          Modules: 13

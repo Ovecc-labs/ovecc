@@ -27,6 +27,7 @@ pub fn summarize(
     modules: Vec<String>,
     dependencies: &[DependencyRecord],
     boundary_violations: usize,
+    parse_failures: usize,
 ) -> SummaryReport {
     let analysis = analyze_modules(&modules, dependencies);
     let external_dependencies = dependencies
@@ -43,6 +44,7 @@ pub fn summarize(
         repository_root,
         snapshot_id,
         files,
+        parse_failures,
         modules: modules.len(),
         dependencies: dependencies.len(),
         external_dependencies,
@@ -584,7 +586,7 @@ mod analysis_tests {
         let modules = vec!["a".to_string(), "b".to_string(), "c".to_string()];
         // 3 edges forming one 3-cycle: a -> b -> c -> a.
         let deps = vec![dep("a", "b"), dep("b", "c"), dep("c", "a")];
-        let report = summarize("/repo".to_string(), None, 9, modules, &deps, 0);
+        let report = summarize("/repo".to_string(), None, 9, modules, &deps, 0, 0);
 
         assert_eq!(report.modules, 3);
         assert_eq!(report.dependencies, 3);
