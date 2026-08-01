@@ -126,6 +126,19 @@ pub(crate) fn wire_gitignore(root: &Path) -> Result<u8> {
     Ok(0)
 }
 
+/// What the coverage step did, or `None` when no tracefile was configured and
+/// none of the conventional paths exist — the common case, and not worth a line.
+fn coverage_line(report: &IndexReport) -> Option<String> {
+    let coverage = report.coverage.as_ref()?;
+    Some(match &coverage.error {
+        Some(error) => format!("Coverage: {} unusable ({error})", coverage.path),
+        None => format!(
+            "Coverage: {} file(s) from {}",
+            coverage.files, coverage.path
+        ),
+    })
+}
+
 pub(crate) fn render_index_report(report: &IndexReport, format: OutputFormat) -> Result<()> {
     match format {
         OutputFormat::Json | OutputFormat::Sarif | OutputFormat::Codeclimate => {
@@ -152,6 +165,9 @@ pub(crate) fn render_index_report(report: &IndexReport, format: OutputFormat) ->
             println!("- APIs: {}", report.apis);
             println!("- Tables: {}", report.tables);
             println!("- Commits ingested: {}", report.commits_ingested);
+            if let Some(line) = coverage_line(report) {
+                println!("- {line}");
+            }
             if report.files_with_parse_errors > 0 {
                 println!(
                     "- Files with syntax errors: {} (facts may be partial)",
@@ -175,6 +191,11 @@ pub(crate) fn render_index_report(report: &IndexReport, format: OutputFormat) ->
                     "Index up to date: {} files ({} from cache), snapshot {}.",
                     report.files_indexed, report.files_from_cache, report.snapshot_id
                 );
+                // Coverage is read on every run, unchanged tree or not, so a
+                // tracefile that broke since last time has to say so here too.
+                if let Some(line) = coverage_line(report) {
+                    println!("{line}");
+                }
                 return Ok(());
             }
             println!("Indexed repository: {}", report.repository_root);
@@ -192,6 +213,9 @@ pub(crate) fn render_index_report(report: &IndexReport, format: OutputFormat) ->
             println!("APIs: {}", report.apis);
             println!("Tables: {}", report.tables);
             println!("Commits ingested: {}", report.commits_ingested);
+            if let Some(line) = coverage_line(report) {
+                println!("{line}");
+            }
             if report.files_with_parse_errors > 0 {
                 println!(
                     "Files with syntax errors: {} (facts may be partial)",

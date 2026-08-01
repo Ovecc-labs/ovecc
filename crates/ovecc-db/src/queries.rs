@@ -6,6 +6,7 @@ use crate::{
 };
 use anyhow::Result;
 use duckdb::{Connection, params};
+use ovecc_core::coverage::FileCoverage;
 use ovecc_core::facts::{
     CapabilityFact, CapabilityKind, CoChangedPair, CommitFiles, FindingRecord, FunctionMetricsRow,
     Severity,
@@ -349,6 +350,25 @@ impl ArchitectureStore {
                 path: row.get::<_, String>(3)?,
                 start_line: row.get::<_, i64>(4)? as u32,
                 end_line: row.get::<_, i64>(5)? as u32,
+            })
+        })?;
+        collect_rows(rows)
+    }
+
+    /// Per-file line coverage from the last tracefile read, by path. Empty when
+    /// no tracefile was ever found: absent coverage is not zero coverage.
+    pub fn file_coverage(&self, repository_id: &str) -> Result<Vec<FileCoverage>> {
+        let mut statement = self.conn.prepare(
+            "SELECT file_path, lines_found, lines_hit, functions_found, functions_hit
+             FROM coverage WHERE repository_id = ? ORDER BY file_path",
+        )?;
+        let rows = statement.query_map(params![repository_id], |row| {
+            Ok(FileCoverage {
+                path: row.get(0)?,
+                lines_found: row.get::<_, i64>(1)? as usize,
+                lines_hit: row.get::<_, i64>(2)? as usize,
+                functions_found: row.get::<_, i64>(3)? as usize,
+                functions_hit: row.get::<_, i64>(4)? as usize,
             })
         })?;
         collect_rows(rows)

@@ -19,7 +19,10 @@ use entrypoints::{detect_entry_points, is_standalone_entry, is_test_file};
 use hygiene::{detect_unlisted_dependencies, detect_unused_dependencies, external_package_root};
 use imports::resolve_dependencies;
 use ovecc_core::architecture::{ArchitectureContract, assign_components, assign_slices};
-use ovecc_core::config::{ArchitectureConfig, OveccConfig, ProjectPaths, RulesConfig};
+use ovecc_core::config::{
+    ArchitectureConfig, DEFAULT_COVERAGE_PATHS, OveccConfig, ProjectPaths, RulesConfig,
+};
+use ovecc_core::coverage::{CoverageIngest, FileCoverage};
 use ovecc_core::facts::{
     CapabilityRecord, ChangeKind, CommitRecord, ComplexityRecord, ExportRecord, FileChangeRecord,
     FileFacts, FindingKind, FindingRecord, ImportFactKind, ParseFailure, SecurityPatternFact,
@@ -267,6 +270,16 @@ pub fn index_repository(
     )?;
     store.replace_co_changes(&repository_id, &co_changes)?;
     store.replace_findings(&repository_id, &findings)?;
+    let coverage = read_coverage(paths, config);
+    // A tracefile that could not be used leaves the previous run's coverage
+    // alone: wiping it because today's read failed would report the tests as
+    // gone rather than the file as unreadable.
+    if let Some((_, files)) = coverage
+        .as_ref()
+        .filter(|(ingest, _)| ingest.error.is_none())
+    {
+        store.replace_coverage(&repository_id, files)?;
+    }
     phase(&mut timings.persist_ms);
     timings.total_ms = run_start.elapsed().as_millis() as u64;
 
@@ -292,6 +305,7 @@ pub fn index_repository(
             .filter(|facts| facts.parse_errors)
             .count(),
         parse_failures: parsed.parse_failures,
+        coverage: coverage.map(|(ingest, _)| ingest),
         timings,
     })
 }
@@ -1361,6 +1375,52 @@ struct ProcessedFile {
     parsed: bool,
     from_cache: bool,
     failure: Option<IndexFailure>,
+}
+
+/// Reads line coverage for this run: the configured tracefile, or the first
+/// conventional location that exists.
+///
+/// A missing tracefile is not an error — most repositories have none, and CI
+/// that indexes before it tests has none yet — so auto-detection finding
+/// nothing returns `None`. A tracefile that *was* named and cannot be used says
+/// so, because a silent zero here reads as "the tests cover nothing".
+fn read_coverage(
+    paths: &ProjectPaths,
+    config: &OveccConfig,
+) -> Option<(CoverageIngest, Vec<FileCoverage>)> {
+    let path = match config.index.coverage.as_deref() {
+        Some(configured) => configured.to_string(),
+        None => DEFAULT_COVERAGE_PATHS
+            .iter()
+            .find(|name| paths.root.join(name).is_file())?
+            .to_string(),
+    };
+    let fail = |error: String| {
+        Some((
+            CoverageIngest {
+                path: path.clone(),
+                files: 0,
+                error: Some(error),
+            },
+            Vec::new(),
+        ))
+    };
+    let content = match std::fs::read_to_string(paths.root.join(&path)) {
+        Ok(content) => content,
+        Err(error) => return fail(format!("{error}")),
+    };
+    let files = ovecc_core::coverage::parse_lcov(&content, &paths.root);
+    if files.is_empty() {
+        return fail("no source file in the tracefile sits under this repository".to_string());
+    }
+    Some((
+        CoverageIngest {
+            path,
+            files: files.len(),
+            error: None,
+        },
+        files,
+    ))
 }
 
 /// Hashes, caches, and parses one file. Never aborts the run: every error

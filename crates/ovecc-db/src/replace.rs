@@ -1,8 +1,9 @@
-//! Per-run replacement writes: findings, Git facts, packages.
+//! Per-run replacement writes: findings, Git facts, packages, coverage.
 
 use crate::{ArchitectureStore, PackageRow, enum_str, existing_ids};
 use anyhow::Result;
 use duckdb::params;
+use ovecc_core::coverage::FileCoverage;
 use ovecc_core::facts::{CoChangedPair, CommitRecord, FileChangeRecord, FindingRecord};
 use ovecc_core::util::stable_id;
 use std::collections::{HashMap, HashSet};
@@ -116,6 +117,40 @@ impl ArchitectureStore {
 
         tx.commit()?;
         Ok(ingested)
+    }
+
+    /// Swaps in the coverage from one tracefile. Wholesale: a file that
+    /// disappeared from the tracefile has no coverage any more, and keeping the
+    /// old row would report a deleted test suite as still passing over it.
+    pub fn replace_coverage(
+        &mut self,
+        repository_id: &str,
+        coverage: &[FileCoverage],
+    ) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "DELETE FROM coverage WHERE repository_id = ?",
+            params![repository_id],
+        )?;
+        {
+            let mut insert = tx.prepare(
+                "INSERT INTO coverage (id, repository_id, file_path, lines_found, lines_hit, functions_found, functions_hit)
+                 VALUES (?, ?, ?, ?, ?, ?, ?)",
+            )?;
+            for file in coverage {
+                insert.execute(params![
+                    stable_id("coverage", &[repository_id, &file.path]),
+                    repository_id,
+                    file.path,
+                    file.lines_found as i64,
+                    file.lines_hit as i64,
+                    file.functions_found as i64,
+                    file.functions_hit as i64,
+                ])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     /// Replaces the repository's co-change pairs. They are recomputed from the
@@ -287,6 +322,35 @@ impl ArchitectureStore {
 mod tests {
     use super::*;
     use crate::testutil::*;
+
+    fn coverage(path: &str, found: usize, hit: usize) -> FileCoverage {
+        FileCoverage {
+            path: path.to_string(),
+            lines_found: found,
+            lines_hit: hit,
+            functions_found: 1,
+            functions_hit: usize::from(hit > 0),
+        }
+    }
+
+    #[test]
+    fn a_second_tracefile_replaces_the_first_rather_than_adding_to_it() {
+        let (_dir, mut store) = temp_store();
+        store.migrate_to_latest().unwrap();
+        let repo = "repo:test";
+
+        store
+            .replace_coverage(repo, &[coverage("a.ts", 10, 7), coverage("gone.ts", 4, 4)])
+            .unwrap();
+        // The suite covering gone.ts was deleted: keeping its row would report
+        // a test that no longer exists as still passing over the file.
+        store
+            .replace_coverage(repo, &[coverage("a.ts", 10, 9)])
+            .unwrap();
+
+        let stored = store.file_coverage(repo).unwrap();
+        assert_eq!(stored, vec![coverage("a.ts", 10, 9)]);
+    }
 
     #[test]
     fn moved_finding_keeps_identity_when_anchored_to_a_symbol() {

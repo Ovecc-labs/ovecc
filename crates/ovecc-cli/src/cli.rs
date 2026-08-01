@@ -172,6 +172,12 @@ pub enum Command {
         /// Restrict indexing to these glob(s). Repeatable.
         #[arg(long, value_name = "GLOB")]
         include: Vec<String>,
+        /// LCOV tracefile to read line coverage from, relative to the
+        /// repository root. Without it, the conventional locations
+        /// (`coverage/lcov.info`, `lcov.info`, `coverage.lcov`) are tried and
+        /// finding none is not an error.
+        #[arg(long, value_name = "PATH")]
+        coverage: Option<String>,
     },
     /// List every command, metric, rule, severity, exit code, and format Ovecc
     /// supports — the machine-readable contract for AI agents.
@@ -648,6 +654,7 @@ fn run_command(cli: Cli) -> Result<u8> {
             no_git,
             exclude,
             include,
+            coverage,
         } => {
             let root = path.or(cli.repo).unwrap_or_else(|| PathBuf::from("."));
             let paths = ProjectPaths::resolve(root)?;
@@ -655,6 +662,7 @@ fn run_command(cli: Cli) -> Result<u8> {
                 format: format_override.map(Into::into),
                 include: (!include.is_empty()).then_some(include),
                 exclude: (!exclude.is_empty()).then_some(exclude),
+                coverage,
                 ..Default::default()
             };
             let config = OveccConfig::load(&paths.root, &overrides)?;

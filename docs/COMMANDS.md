@@ -45,6 +45,13 @@ Files: 52   Modules: 13   Dependencies: 264   Commits ingested: 99
 Key flags: `--exclude <glob>` (adds to the built-in `node_modules`/`target`/…
 excludes), `--no-git`, `--stats` (phase timings + peak memory).
 
+`--coverage <path>` reads per-file line coverage from an LCOV tracefile (also
+settable as `[index] coverage`). Without it the conventional locations are
+tried — `coverage/lcov.info`, `lcov.info`, `coverage.lcov` — and finding none
+is not an error. A tracefile that *was* named and cannot be used says so and
+leaves the previous run's coverage in place, so a failed read never reads as
+"the tests cover nothing".
+
 ### `ovecc capabilities`
 
 The machine-readable contract: every command, every metric and rule (with a

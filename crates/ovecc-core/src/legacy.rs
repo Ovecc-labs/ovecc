@@ -157,6 +157,9 @@ pub struct IndexReport {
     pub files_with_parse_errors: usize,
     /// Per-file failures that did not abort the run.
     pub parse_failures: Vec<IndexFailure>,
+    /// The coverage tracefile this run read, if any was configured or found.
+    #[serde(default)]
+    pub coverage: Option<crate::coverage::CoverageIngest>,
     /// Per-phase wall-clock breakdown, surfaced by `--stats`.
     #[serde(default)]
     pub timings: crate::report::IndexTimings,

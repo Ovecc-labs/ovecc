@@ -64,6 +64,9 @@ impl OveccConfig {
         if let Some(exclude) = &overrides.exclude {
             config.index.exclude.extend(exclude.iter().cloned());
         }
+        if let Some(coverage) = &overrides.coverage {
+            config.index.coverage = Some(coverage.clone());
+        }
         Ok(config)
     }
 
@@ -84,6 +87,7 @@ pub struct ConfigOverrides {
     pub color: Option<ColorMode>,
     pub include: Option<Vec<String>>,
     pub exclude: Option<Vec<String>>,
+    pub coverage: Option<String>,
     pub no_git: bool,
 }
 
@@ -118,7 +122,17 @@ pub struct IndexConfig {
     /// graph — so the finding is false-positive-prone without framework-aware
     /// resolution. Opt in when those caveats are acceptable.
     pub detect_unused_deps: bool,
+    /// LCOV tracefile to read line coverage from, relative to the repository
+    /// root. Unset looks in the conventional places
+    /// ([`DEFAULT_COVERAGE_PATHS`]); finding nothing there is not an error,
+    /// just a run without coverage.
+    pub coverage: Option<String>,
 }
+
+/// Where an LCOV tracefile is looked for when `[index] coverage` is unset:
+/// where nyc, Jest and Vitest write by default, and the two names the Rust
+/// coverage tools are usually pointed at.
+pub const DEFAULT_COVERAGE_PATHS: [&str; 3] = ["coverage/lcov.info", "lcov.info", "coverage.lcov"];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]

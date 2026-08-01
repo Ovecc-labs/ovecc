@@ -34,6 +34,19 @@ impl FileCoverage {
     }
 }
 
+/// What the coverage step of one index run did, for the index report.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CoverageIngest {
+    /// The tracefile, relative to the repository root.
+    pub path: String,
+    /// Files it carried coverage for.
+    pub files: usize,
+    /// Why the tracefile yielded nothing usable. Kept apart from `files: 0`:
+    /// a tracefile written for another checkout parses cleanly and covers
+    /// nothing, which is a configuration mistake, not a coverage result.
+    pub error: Option<String>,
+}
+
 /// What one `SF ... end_of_record` section accumulates before it is collapsed.
 #[derive(Default)]
 struct Section {

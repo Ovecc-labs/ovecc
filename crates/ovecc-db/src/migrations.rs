@@ -382,6 +382,23 @@ const MIGRATION_V10_CO_CHANGES: &str = r#"
             CREATE INDEX IF NOT EXISTS idx_co_changes_repo ON co_changes (repository_id);
             "#;
 
+/// Per-file line coverage from the last tracefile read, replaced wholesale on
+/// every index that finds one. Keyed by path rather than file id: a tracefile
+/// names files the index may not hold, and dropping those silently would hide
+/// a misconfigured path.
+const MIGRATION_V11_COVERAGE: &str = r#"
+            CREATE TABLE IF NOT EXISTS coverage (
+                id TEXT PRIMARY KEY,
+                repository_id TEXT NOT NULL,
+                file_path TEXT NOT NULL,
+                lines_found INTEGER NOT NULL,
+                lines_hit INTEGER NOT NULL,
+                functions_found INTEGER NOT NULL,
+                functions_hit INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_coverage_repo ON coverage (repository_id);
+            "#;
+
 const SCHEMA_MIGRATIONS: &[SchemaMigration] = &[
     SchemaMigration {
         version: 1,
@@ -432,6 +449,11 @@ const SCHEMA_MIGRATIONS: &[SchemaMigration] = &[
         version: 10,
         name: "co_changes",
         sql: MIGRATION_V10_CO_CHANGES,
+    },
+    SchemaMigration {
+        version: 11,
+        name: "coverage",
+        sql: MIGRATION_V11_COVERAGE,
     },
 ];
 
@@ -513,8 +535,8 @@ mod tests {
 
         let version = store.migrate_to_latest().unwrap();
 
-        assert_eq!(version, 10);
-        assert_eq!(store.schema_version().unwrap(), Some(10));
+        assert_eq!(version, 11);
+        assert_eq!(store.schema_version().unwrap(), Some(11));
         for table in [
             "repositories",
             "files",
@@ -540,6 +562,7 @@ mod tests {
             "snapshot_files",
             "capability_uses",
             "co_changes",
+            "coverage",
         ] {
             assert!(table_exists(&store, table), "missing table {table}");
         }
@@ -551,12 +574,12 @@ mod tests {
         store.migrate_to_latest().unwrap();
         store.migrate_to_latest().unwrap();
 
-        assert_eq!(store.schema_version().unwrap(), Some(10));
+        assert_eq!(store.schema_version().unwrap(), Some(11));
         let applied: i64 = store
             .conn
             .query_row("SELECT count(*) FROM ovecc_schema", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(applied, 10, "each migration must be recorded exactly once");
+        assert_eq!(applied, 11, "each migration must be recorded exactly once");
     }
 
     #[test]
@@ -569,7 +592,7 @@ mod tests {
 
         let version = store.migrate_to_latest().unwrap();
 
-        assert_eq!(version, 10);
+        assert_eq!(version, 11);
         assert!(table_exists(&store, "findings"));
         assert!(table_exists(&store, "packages"));
         assert!(table_exists(&store, "complexity"));
