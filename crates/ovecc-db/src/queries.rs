@@ -605,6 +605,39 @@ impl ArchitectureStore {
         collect_rows(rows)
     }
 
+    /// Days between each file's most recent change and the newest commit in the
+    /// index, oldest first. Measured from the index rather than the clock, like
+    /// [`Self::file_fix_history`], so two runs over the same database agree.
+    ///
+    /// Renames are followed, and a file the history never touched is absent
+    /// rather than zero: a file with no commit is not a file changed today.
+    pub fn file_age_days(&self, repository_id: &str) -> Result<Vec<(String, f64)>> {
+        let mut statement = self.conn.prepare(&format!(
+            "{CANONICAL_PATHS},
+             touched AS (
+                 SELECT canonical.current_path AS file_path,
+                        MAX(epoch(CAST(substr(c.committed_at, 1, 19) AS TIMESTAMP))) AS at
+                 FROM file_changes fc
+                 JOIN commits c ON fc.commit_id = c.id
+                 JOIN canonical ON canonical.path = fc.file_path
+                 WHERE fc.repository_id = ?
+                 GROUP BY 1
+             ),
+             newest AS (
+                 SELECT MAX(epoch(CAST(substr(committed_at, 1, 19) AS TIMESTAMP))) AS at
+                 FROM commits WHERE repository_id = ?
+             )
+             SELECT t.file_path, (n.at - t.at) / 86400.0
+             FROM touched t, newest n
+             ORDER BY 2 DESC, 1"
+        ))?;
+        let rows = statement.query_map(
+            params![repository_id, repository_id, repository_id, repository_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?)),
+        )?;
+        collect_rows(rows)
+    }
+
     /// Total cognitive complexity per file (oxc), for per-component aggregation.
     pub fn file_complexity(&self, repository_id: &str) -> Result<Vec<(String, f64)>> {
         let mut statement = self.conn.prepare(

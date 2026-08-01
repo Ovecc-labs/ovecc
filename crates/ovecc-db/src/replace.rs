@@ -595,6 +595,41 @@ mod tests {
     }
 
     #[test]
+    fn file_age_counts_from_the_newest_indexed_commit() {
+        let (_dir, mut store) = temp_store();
+        store.migrate_to_latest().unwrap();
+        let repo = "repo:test";
+
+        ingest_history(
+            &mut store,
+            repo,
+            &[
+                ("head", 0, false, "fresh.ts", None),
+                ("old", 90, false, "stale.ts", None),
+                ("older", 200, false, "stale.ts", None),
+                ("move", 30, false, "b.ts", Some("a.ts")),
+                ("first", 300, false, "a.ts", None),
+            ],
+        );
+
+        let ages: std::collections::BTreeMap<String, f64> =
+            store.file_age_days(repo).unwrap().into_iter().collect();
+
+        assert_eq!(ages.get("fresh.ts").copied(), Some(0.0));
+        assert_eq!(
+            ages.get("stale.ts").copied(),
+            Some(90.0),
+            "the most recent change, not the first"
+        );
+        assert_eq!(
+            ages.get("b.ts").copied(),
+            Some(30.0),
+            "a moved file is aged under its current name"
+        );
+        assert!(!ages.contains_key("a.ts"), "the old name is gone: {ages:?}");
+    }
+
+    #[test]
     fn fix_classification_round_trips_and_backfills() {
         use ovecc_core::facts::CommitRecord;
         use ovecc_core::id::{CommitId, RepositoryId};
