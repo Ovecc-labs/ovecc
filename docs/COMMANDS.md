@@ -537,6 +537,24 @@ review: FAIL (2 new finding(s) at or above 'any')
   new cycle: src/core/db.ts:3 <-> src/services/billing.ts:2
 ```
 
+Both `review` and `gate` also print the shape of the change: how many files and
+head lines it touches, how many contract components it reaches, how evenly it
+spreads over its files, which ranked hotspots it lands on, its share of the
+repository's age-weighted fix mass, and the mean age of the files it edits.
+
+The file, component, fix-mass and age measurements each carry a percentile
+(`p91`) against the repository's own indexed commits, so a change is read
+against the codebase it lands in rather than against a constant. Lines and
+spread carry none: the index records which files a commit touched, not how many
+lines it moved, so there is no historical distribution to rank them against. The
+percentiles are information, never a verdict: no rank fails the gate.
+
+Under 100 indexed commits, none is reported at all — one commit would move the
+rank by more than a point. An unmeasured axis is absent rather than shown as
+zero: no percentile without the history behind it, no line count when git cannot
+attest the change, and no component count when the repository declares no
+contract. `--format json` carries the same fields under `shape`.
+
 ### `ovecc gate [base] [head]`
 
 The pass/fail CI verdict behind `review`: fails on new cycles, violations, or

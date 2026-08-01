@@ -4,12 +4,13 @@
 use super::findings::{build_security_report, window};
 use super::open_store;
 use super::selfcheck::{SELFCHECK_CAVEAT, load_selfcheck, selfcheck_line};
-use super::summary::{load_hotspots, load_summary};
+use super::summary::{hotspots_with, load_hotspots, load_summary};
 use crate::cli::FailOn;
 use crate::render::{
     emit_json, emit_ndjson_meta, first_evidence, meta_for, ndjson_line, severity_tag,
 };
 use anyhow::Result;
+use ovecc_core::architecture::{ArchitectureContract, assign_components};
 use ovecc_core::config::{OutputFormat, OveccConfig, ProjectPaths};
 use ovecc_core::error::OveccError;
 use ovecc_core::facts::{FindingKind, FindingRecord, Severity};
@@ -40,7 +41,38 @@ pub(crate) struct ReviewReport {
     /// when git attests the lines, else to touched files), so new duplication is
     /// not buried under pre-existing repo-wide clones.
     new_duplications: Vec<graph::dupes::CloneFamily>,
+    /// What the change touches, ranked against the repository's own commits.
+    /// `None` when it touches nothing.
+    shape: Option<ChangeShapeView>,
     changed_files: ChangedFiles,
+}
+
+/// The size and reach of a change, each measurement next to its percentile
+/// among the commits this repository has already made.
+///
+/// Reported beside the verdict and never inside it: "wider than 9 out of 10
+/// commits here" is a reason to read a diff closely, not a defect, so nothing
+/// in here moves `--fail-on`.
+#[derive(serde::Serialize)]
+pub(crate) struct ChangeShapeView {
+    files: usize,
+    /// Head lines touched, `None` when git cannot attest them. The rest is then
+    /// measured over whole files, which stays true, just coarser.
+    lines: Option<u32>,
+    /// How evenly the touched lines spread over the touched files, 0 for one
+    /// file carrying everything and 1 for an even split. `None` under two files.
+    spread: Option<f64>,
+    /// Contract components reached, `None` when the repository declares no
+    /// contract: every change would otherwise reach zero of them and rank at
+    /// the top of a column of zeros.
+    components: Option<usize>,
+    /// Touched modules the hotspot ranking lists, in its order.
+    hotspots: Vec<String>,
+    /// Share of the repository's age-weighted fix mass carried by the touched
+    /// files, `None` when the history holds no fix to take a share of.
+    fix_mass_share: Option<f64>,
+    mean_age_days: Option<f64>,
+    rank: graph::changeshape::ChangeRank,
 }
 
 #[derive(serde::Serialize)]
@@ -111,6 +143,17 @@ pub(crate) fn build_review_report(
         attested_change_ranges(paths, &base_snapshot, &head_snapshot, &changed_files);
     let (new_findings, shifted_findings) =
         scope_to_touched_lines(store, &repository_id, change_ranges.as_ref(), new_findings)?;
+
+    let shape = match changed_files.touched().next() {
+        Some(_) => Some(build_change_shape(
+            paths,
+            store,
+            &repository_id,
+            &changed_files,
+            change_ranges.as_ref(),
+        )?),
+        None => None,
+    };
 
     let head_modules = store.current_modules(&repository_id)?;
     let head_dependencies = store.current_dependencies(&repository_id)?;
@@ -229,8 +272,157 @@ pub(crate) fn build_review_report(
         new_findings,
         new_cycles,
         new_duplications,
+        shape,
         changed_files,
     })
+}
+
+/// Measures the change against the indexed history and ranks it there.
+///
+/// `ranges` are the head lines git attests, or `None` to fall back to whole
+/// files.
+fn build_change_shape(
+    paths: &ProjectPaths,
+    store: &ArchitectureStore,
+    repository_id: &str,
+    changed_files: &ChangedFiles,
+    ranges: Option<&std::collections::BTreeMap<String, Vec<(u32, u32)>>>,
+) -> Result<ChangeShapeView> {
+    let attested = ranges.is_some();
+    // Whole files when git cannot attest the lines: an empty span list holds no
+    // line, so the line count and the spread come back unmeasured while the
+    // file, component, hotspot and age measurements still stand.
+    let ranges: std::collections::BTreeMap<String, Vec<(u32, u32)>> = match ranges {
+        Some(ranges) => ranges.clone(),
+        None => changed_files
+            .touched()
+            .map(|path| (path.clone(), Vec::new()))
+            .collect(),
+    };
+
+    let facts = ChangeFacts::load(paths, store, repository_id)?;
+    let shape = graph::changeshape::change_shape(
+        &ranges,
+        &facts.component_of,
+        &facts.module_of,
+        &facts.hotspots,
+        &facts.fix_mass,
+        &facts.age_days,
+    );
+
+    let total_mass = facts
+        .fix_mass
+        .iter()
+        .map(|(_, mass)| mass)
+        .fold(0.0, |total, mass| total + mass);
+    let mass_of: std::collections::BTreeMap<String, f64> = facts.fix_mass.into_iter().collect();
+    let history: Vec<graph::changeshape::CommitShape> = store
+        .commit_shapes(repository_id)?
+        .iter()
+        .map(|commit| {
+            graph::changeshape::commit_shape(
+                &commit.files,
+                &facts.component_of,
+                &mass_of,
+                total_mass,
+            )
+        })
+        .collect();
+    let declares_components = !facts.component_of.is_empty();
+    let mut rank = graph::changeshape::rank_change(&shape, &history);
+    if !declares_components {
+        rank.components = None;
+    }
+
+    Ok(ChangeShapeView {
+        files: shape.files,
+        lines: attested.then_some(shape.lines),
+        spread: shape.spread,
+        components: declares_components.then_some(shape.components),
+        hotspots: shape.hotspots,
+        fix_mass_share: (total_mass > 0.0).then_some(shape.fix_mass_share),
+        mean_age_days: shape.mean_age_days,
+        rank,
+    })
+}
+
+/// The indexed facts a change is measured against, each keyed by file path.
+struct ChangeFacts {
+    /// Empty when the repository declares no contract.
+    component_of: std::collections::BTreeMap<String, String>,
+    module_of: std::collections::BTreeMap<String, String>,
+    hotspots: Vec<String>,
+    fix_mass: Vec<(String, f64)>,
+    age_days: std::collections::BTreeMap<String, f64>,
+}
+
+impl ChangeFacts {
+    fn load(
+        paths: &ProjectPaths,
+        store: &ArchitectureStore,
+        repository_id: &str,
+    ) -> Result<ChangeFacts> {
+        let component_of = match ArchitectureContract::load(&paths.root)? {
+            Some(contract) => {
+                let files: Vec<String> = store
+                    .current_files(repository_id)?
+                    .into_iter()
+                    .map(|file| file.path)
+                    .collect();
+                assign_components(&contract, &files)?
+            }
+            None => std::collections::BTreeMap::new(),
+        };
+        Ok(ChangeFacts {
+            component_of,
+            module_of: store.file_modules(repository_id)?.into_iter().collect(),
+            // The ten `ovecc hotspots` prints by default, so a module named
+            // beside a change is one the reader can go and look up.
+            hotspots: hotspots_with(store, repository_id, 10)?
+                .hotspots
+                .into_iter()
+                .map(|hotspot| hotspot.module)
+                .collect(),
+            fix_mass: store
+                .file_fix_history(repository_id, ovecc_db::FIX_HALF_LIFE_DAYS)?
+                .into_iter()
+                .map(|file| (file.file_path, file.mass))
+                .collect(),
+            age_days: store.file_age_days(repository_id)?.into_iter().collect(),
+        })
+    }
+}
+
+/// The change shape for a caller that holds only the two refs, `gate` being the
+/// one. `None` when either ref names no snapshot or the comparison moved no
+/// file.
+pub(crate) fn load_change_shape(
+    paths: &ProjectPaths,
+    store: &ArchitectureStore,
+    base: &str,
+    head: &str,
+) -> Result<Option<ChangeShapeView>> {
+    let repository_id = paths.repository_id().0;
+    let (Some(base_snapshot), Some(head_snapshot)) = (
+        store.resolve_snapshot(&repository_id, base)?,
+        store.resolve_snapshot(&repository_id, head)?,
+    ) else {
+        return Ok(None);
+    };
+    let changed_files =
+        store.changed_files(&repository_id, &base_snapshot.id, &head_snapshot.id)?;
+    if changed_files.touched().next().is_none() {
+        return Ok(None);
+    }
+    let ranges = attested_change_ranges(paths, &base_snapshot, &head_snapshot, &changed_files);
+    build_change_shape(
+        paths,
+        store,
+        &repository_id,
+        &changed_files,
+        ranges.as_ref(),
+    )
+    .map(Some)
 }
 
 /// The head lines this change touched, when git can attest them: both snapshots
@@ -526,6 +718,9 @@ pub(crate) fn render_review(report: &ReviewReport, format: OutputFormat) -> Resu
         OutputFormat::Ndjson => {
             emit_ndjson_meta("review", &meta_for("review"))?;
             println!("{}", ndjson_line("review_summary", &report.summary)?);
+            if let Some(shape) = &report.shape {
+                println!("{}", ndjson_line("change_shape", shape)?);
+            }
             for finding in &report.new_findings {
                 println!("{}", ndjson_line("new_finding", finding)?);
             }
@@ -555,9 +750,94 @@ fn review_markdown(report: &ReviewReport) {
     for reason in &report.rationale {
         println!("- {reason}");
     }
+    if let Some(shape) = &report.shape {
+        review_markdown_shape(shape);
+    }
     review_markdown_cycles(report);
     review_markdown_findings(report);
     review_markdown_duplications(report);
+}
+
+/// A measurement carrying its percentile when the history could give one:
+/// `7 files (p91)`.
+fn ranked(measurement: String, percentile: Option<f64>) -> String {
+    match percentile {
+        Some(percentile) => format!("{measurement} (p{:.0})", percentile * 100.0),
+        None => measurement,
+    }
+}
+
+/// The measurements, in the order a reader weighs them: how big, then how far
+/// it reaches, then what it lands on. An axis the index cannot speak to is left
+/// out rather than shown as zero.
+fn shape_cells(shape: &ChangeShapeView) -> Vec<String> {
+    let mut cells = vec![ranked(format!("{} files", shape.files), shape.rank.files)];
+    match shape.lines {
+        Some(lines) => cells.push(format!("{lines} lines")),
+        None => cells.push("lines not attested by git".to_string()),
+    }
+    if let Some(components) = shape.components {
+        cells.push(ranked(
+            format!("{components} components"),
+            shape.rank.components,
+        ));
+    }
+    if let Some(spread) = shape.spread {
+        cells.push(format!("spread {spread:.2}"));
+    }
+    if let Some(share) = shape.fix_mass_share {
+        cells.push(ranked(
+            format!("{:.0}% of the fix mass", share * 100.0),
+            shape.rank.fix_mass_share,
+        ));
+    }
+    if let Some(age) = shape.mean_age_days {
+        cells.push(ranked(
+            format!("mean age {age:.0}d"),
+            shape.rank.mean_age_days,
+        ));
+    }
+    cells
+}
+
+/// The one-line form `gate` prints beside its counts.
+pub(crate) fn shape_summary_line(shape: &ChangeShapeView) -> String {
+    shape_cells(shape).join(", ")
+}
+
+/// What the percentiles are measured against, or why there are none.
+fn shape_basis(shape: &ChangeShapeView) -> String {
+    if shape.rank.commits < graph::changeshape::MIN_RANKED_COMMITS {
+        format!(
+            "no percentiles: {} indexed commit(s), under the {} a rank needs",
+            shape.rank.commits,
+            graph::changeshape::MIN_RANKED_COMMITS
+        )
+    } else {
+        format!("percentiles against {} indexed commits", shape.rank.commits)
+    }
+}
+
+fn review_markdown_shape(shape: &ChangeShapeView) {
+    println!();
+    println!("## Change shape");
+    println!();
+    for cell in shape_cells(shape) {
+        println!("- {cell}");
+    }
+    if !shape.hotspots.is_empty() {
+        println!("- Hotspots touched: {}", quoted(&shape.hotspots));
+    }
+    println!();
+    println!("_{}. These do not affect the verdict._", shape_basis(shape));
+}
+
+fn quoted(names: &[String]) -> String {
+    names
+        .iter()
+        .map(|name| format!("`{name}`"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn review_markdown_cycles(report: &ReviewReport) {
@@ -644,6 +924,13 @@ fn review_text(report: &ReviewReport) {
     );
     for reason in &report.rationale {
         println!("  - {reason}");
+    }
+    if let Some(shape) = &report.shape {
+        println!("Change shape: {}", shape_summary_line(shape));
+        if !shape.hotspots.is_empty() {
+            println!("  hotspots touched: {}", shape.hotspots.join(", "));
+        }
+        println!("  {}", shape_basis(shape));
     }
     review_text_cycles(report);
     review_text_findings(report);
@@ -989,5 +1276,57 @@ mod tests {
         assert!(rationale.iter().any(|r| r.contains("3 new dead-code")));
         assert!(rationale.iter().any(|r| r.contains("4 new code smell")));
         assert!(rationale.iter().any(|r| r.contains("1 new duplication")));
+    }
+
+    #[test]
+    fn a_measured_change_carries_its_percentiles() {
+        let cells = shape_cells(&ChangeShapeView {
+            files: 7,
+            lines: Some(214),
+            spread: Some(0.62),
+            components: Some(3),
+            hotspots: vec!["api".to_string()],
+            fix_mass_share: Some(0.123),
+            mean_age_days: Some(84.0),
+            rank: graph::changeshape::ChangeRank {
+                commits: 1204,
+                files: Some(0.91),
+                components: Some(0.88),
+                fix_mass_share: Some(0.74),
+                mean_age_days: Some(0.6),
+            },
+        });
+
+        assert_eq!(cells[0], "7 files (p91)");
+        assert_eq!(cells[1], "214 lines");
+        assert_eq!(cells[2], "3 components (p88)");
+        assert_eq!(cells[4], "12% of the fix mass (p74)");
+    }
+
+    #[test]
+    fn an_unmeasured_axis_is_left_out_rather_than_shown_as_zero() {
+        let shape = ChangeShapeView {
+            files: 1,
+            lines: None,
+            spread: None,
+            components: None,
+            hotspots: Vec::new(),
+            fix_mass_share: None,
+            mean_age_days: None,
+            rank: graph::changeshape::ChangeRank {
+                commits: 12,
+                ..graph::changeshape::ChangeRank::default()
+            },
+        };
+        let cells = shape_cells(&shape);
+
+        assert_eq!(cells[0], "1 files", "no history to rank one file against");
+        assert_eq!(cells[1], "lines not attested by git");
+        assert_eq!(cells.len(), 2, "nothing else was measured: {cells:?}");
+        assert!(
+            shape_basis(&shape).contains("12 indexed commit(s), under the 100"),
+            "{}",
+            shape_basis(&shape)
+        );
     }
 }

@@ -7,68 +7,54 @@ use ovecc_core::config::{OutputFormat, ProjectPaths};
 use ovecc_core::coverage::CoverageTotals;
 use ovecc_core::facts::FindingKind;
 use ovecc_core::legacy::{HotspotsReport, SummaryReport};
+use ovecc_db::ArchitectureStore;
 use ovecc_graph as graph;
 
 pub(crate) fn load_hotspots(paths: &ProjectPaths, limit: usize) -> Result<HotspotsReport> {
-    use std::collections::HashMap;
     let store = open_store(paths)?;
-    let repository_id = paths.repository_id().0;
+    hotspots_with(&store, &paths.repository_id().0, limit)
+}
 
-    let modules = store.current_modules(&repository_id)?;
-    let dependencies = store.current_dependencies(&repository_id)?;
-    let churn: HashMap<String, f64> = store.module_churn(&repository_id)?.into_iter().collect();
+/// The same ranking over a store the caller already holds: DuckDB permits one
+/// connection per file per process, so a command that opened the store cannot
+/// go through [`load_hotspots`].
+pub(crate) fn hotspots_with(
+    store: &ArchitectureStore,
+    repository_id: &str,
+    limit: usize,
+) -> Result<HotspotsReport> {
+    use std::collections::HashMap;
+    let modules = store.current_modules(repository_id)?;
+    let dependencies = store.current_dependencies(repository_id)?;
+    let churn: HashMap<String, f64> = store.module_churn(repository_id)?.into_iter().collect();
     let file_modules: HashMap<String, String> =
-        store.file_modules(&repository_id)?.into_iter().collect();
-    let ownership_rows = store.ownership_metrics(&repository_id)?;
+        store.file_modules(repository_id)?.into_iter().collect();
+    let fragmentation =
+        ownership_fragmentation(&store.ownership_metrics(repository_id)?, &file_modules);
     // No ingested commits => no git history, so churn and ownership are
     // unavailable ("n/a"), not genuinely zero. `module_churn` can't be the
     // signal: it LEFT JOINs file_changes and returns a 0 row per module even
     // with no history.
-    let has_git_history = store.count_rows("commits", &repository_id)? > 0;
-    // Fragmentation per module: the share of its files with no majority owner
-    // (highest single-author share below 50%).
-    let mut fragmented: HashMap<String, (usize, usize)> = HashMap::new();
-    for ownership in &ownership_rows {
-        if let Some(module) = file_modules.get(&ownership.file_path) {
-            let entry = fragmented.entry(module.clone()).or_insert((0, 0));
-            entry.1 += 1;
-            if ownership.ownership < 0.5 {
-                entry.0 += 1;
-            }
-        }
-    }
-    let fragmentation: HashMap<String, f64> = fragmented
-        .iter()
-        .map(|(module, (low, total))| {
-            (
-                module.clone(),
-                if *total > 0 {
-                    *low as f64 / *total as f64
-                } else {
-                    0.0
-                },
-            )
-        })
-        .collect();
+    let has_git_history = store.count_rows("commits", repository_id)? > 0;
     let mut violations: HashMap<String, usize> = HashMap::new();
-    for finding in store.findings(&repository_id, None)? {
+    for finding in store.findings(repository_id, None)? {
         if let Some(target) = &finding.target {
             *violations.entry(target.id.clone()).or_default() += 1;
         }
     }
     let complexity: HashMap<String, f64> = store
-        .module_complexity(&repository_id)?
+        .module_complexity(repository_id)?
         .into_iter()
         .collect();
     let fixes: HashMap<String, ovecc_core::legacy::FixHistory> = store
-        .module_fix_history(&repository_id, ovecc_db::FIX_HALF_LIFE_DAYS)?
+        .module_fix_history(repository_id, ovecc_db::FIX_HALF_LIFE_DAYS)?
         .into_iter()
         .collect();
     // Coverage arrives per file and the ranking is per module. A file the
     // tracefile covers but the index never saw is dropped: it would add
     // covered lines to a module whose size the ranking measures differently.
     let mut coverage: HashMap<String, CoverageTotals> = HashMap::new();
-    for file in store.file_coverage(&repository_id)? {
+    for file in store.file_coverage(repository_id)? {
         if let Some(module) = file_modules.get(&file.path) {
             coverage.entry(module.clone()).or_default().add(&file);
         }
@@ -88,6 +74,37 @@ pub(crate) fn load_hotspots(paths: &ProjectPaths, limit: usize) -> Result<Hotspo
         ),
         has_git_history,
     })
+}
+
+/// Per module, the share of its files with no majority owner: nobody holds more
+/// than half the commits. A file the index never assigned to a module is left
+/// out, so the share is over the files the ranking actually covers.
+fn ownership_fragmentation(
+    ownership: &[ovecc_db::FileOwnership],
+    file_modules: &std::collections::HashMap<String, String>,
+) -> std::collections::HashMap<String, f64> {
+    let mut fragmented: std::collections::HashMap<String, (usize, usize)> =
+        std::collections::HashMap::new();
+    for file in ownership {
+        if let Some(module) = file_modules.get(&file.file_path) {
+            let entry = fragmented.entry(module.clone()).or_insert((0, 0));
+            entry.1 += 1;
+            if file.ownership < 0.5 {
+                entry.0 += 1;
+            }
+        }
+    }
+    fragmented
+        .into_iter()
+        .map(|(module, (low, total))| {
+            let share = if total > 0 {
+                low as f64 / total as f64
+            } else {
+                0.0
+            };
+            (module, share)
+        })
+        .collect()
 }
 
 /// A module's corrections as text: the count, then the age-weighted mass and

@@ -1,4 +1,5 @@
 use crate::commands::{
+    Comparison,
     architecture::{
         run_architecture_check, run_architecture_diff, run_architecture_init,
         run_architecture_show, run_architecture_suggest, run_architecture_templates,
@@ -707,13 +708,13 @@ fn run_command(cli: Cli) -> Result<u8> {
             head,
             fail_on,
         } => {
-            let paths = ProjectPaths::resolve(cli.repo.unwrap_or_else(|| PathBuf::from(".")))?;
-            let config = load_config(&paths, format_override)?;
-            let store = open_store(&paths)?;
-            let base = resolve_ref(&paths.root, &base);
-            let head = resolve_ref(&paths.root, &head);
-            let report = store.diff(paths.repository_id().as_str(), &base, &head)?;
-            render_diff_report(&report, config.output.default_format)?;
+            let compared = Comparison::resolve(cli.repo, format_override, &base, &head)?;
+            let report = compared.store.diff(
+                compared.paths.repository_id().as_str(),
+                &compared.base,
+                &compared.head,
+            )?;
+            render_diff_report(&report, compared.format())?;
             Ok(if diff_crosses_threshold(&report, fail_on) {
                 1
             } else {
@@ -906,15 +907,16 @@ fn run_command(cli: Cli) -> Result<u8> {
             head,
             fail_on,
         } => {
-            let paths = ProjectPaths::resolve(cli.repo.unwrap_or_else(|| PathBuf::from(".")))?;
-            let config = load_config(&paths, format_override)?;
-            let store = open_store(&paths)?;
-            let base = resolve_ref(&paths.root, &base);
-            let head = resolve_ref(&paths.root, &head);
-            let report =
-                build_gate_report(&store, &paths.repository_id().0, &base, &head, fail_on)?;
+            let compared = Comparison::resolve(cli.repo, format_override, &base, &head)?;
+            let report = build_gate_report(
+                &compared.paths,
+                &compared.store,
+                &compared.base,
+                &compared.head,
+                fail_on,
+            )?;
             let failed = report.verdict == "fail";
-            render_gate(&report, config.output.default_format)?;
+            render_gate(&report, compared.format())?;
             Ok(u8::from(failed))
         }
         Command::Coupling {
@@ -986,14 +988,17 @@ fn run_command(cli: Cli) -> Result<u8> {
             head,
             fail_on,
         } => {
-            let paths = ProjectPaths::resolve(cli.repo.unwrap_or_else(|| PathBuf::from(".")))?;
-            let config = load_config(&paths, format_override)?;
-            let store = open_store(&paths)?;
-            let base = resolve_ref(&paths.root, &base);
-            let head = resolve_ref(&paths.root, &head);
-            let report = build_review_report(&paths, &config, &store, &base, &head, fail_on)?;
+            let compared = Comparison::resolve(cli.repo, format_override, &base, &head)?;
+            let report = build_review_report(
+                &compared.paths,
+                &compared.config,
+                &compared.store,
+                &compared.base,
+                &compared.head,
+                fail_on,
+            )?;
             let failed = report.verdict == "fail";
-            render_review(&report, config.output.default_format)?;
+            render_review(&report, compared.format())?;
             Ok(u8::from(failed))
         }
         Command::Diagnose {

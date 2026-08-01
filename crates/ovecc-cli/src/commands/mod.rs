@@ -4,7 +4,7 @@
 
 use crate::cli::FormatArg;
 use anyhow::Result;
-use ovecc_core::config::{ConfigOverrides, OveccConfig, ProjectPaths};
+use ovecc_core::config::{ConfigOverrides, OutputFormat, OveccConfig, ProjectPaths};
 use ovecc_core::error::OveccError;
 use ovecc_db::ArchitectureStore;
 
@@ -42,6 +42,43 @@ pub(crate) fn load_config(paths: &ProjectPaths, format: Option<FormatArg>) -> Re
         ..Default::default()
     };
     Ok(OveccConfig::load(&paths.root, &overrides)?)
+}
+
+/// What a two-snapshot command needs before it can compare anything: the
+/// resolved project, its config, one open store, and both refs turned into
+/// snapshot selectors. `diff`, `gate` and `review` open exactly this.
+pub(crate) struct Comparison {
+    pub(crate) paths: ProjectPaths,
+    pub(crate) config: OveccConfig,
+    pub(crate) store: ArchitectureStore,
+    pub(crate) base: String,
+    pub(crate) head: String,
+}
+
+impl Comparison {
+    pub(crate) fn resolve(
+        repo: Option<std::path::PathBuf>,
+        format: Option<FormatArg>,
+        base: &str,
+        head: &str,
+    ) -> Result<Self> {
+        let paths = ProjectPaths::resolve(repo.unwrap_or_else(|| std::path::PathBuf::from(".")))?;
+        let config = load_config(&paths, format)?;
+        let store = open_store(&paths)?;
+        let base = resolve_ref(&paths.root, base);
+        let head = resolve_ref(&paths.root, head);
+        Ok(Self {
+            paths,
+            config,
+            store,
+            base,
+            head,
+        })
+    }
+
+    pub(crate) fn format(&self) -> OutputFormat {
+        self.config.output.default_format
+    }
 }
 
 pub(crate) fn open_store(paths: &ProjectPaths) -> Result<ArchitectureStore> {

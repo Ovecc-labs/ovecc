@@ -1,9 +1,10 @@
 //! Snapshot comparison: `diff`, `drift`, and the count-based CI `gate`.
 
+use super::review::{ChangeShapeView, load_change_shape, shape_summary_line};
 use crate::cli::FailOn;
 use crate::render::{emit_json, emit_ndjson_meta, meta_for, ndjson_header, ndjson_line};
 use anyhow::Result;
-use ovecc_core::config::OutputFormat;
+use ovecc_core::config::{OutputFormat, ProjectPaths};
 use ovecc_core::legacy::{DependencyEdge, DiffReport, DriftReport, RiskLevel};
 use ovecc_db::ArchitectureStore;
 
@@ -17,17 +18,21 @@ pub(crate) struct GateReport {
     new_dependencies: usize,
     risk: String,
     signals: Vec<String>,
+    /// How this change compares to the repository's own commits. Beside the
+    /// verdict, not in it: no percentile fails the gate.
+    shape: Option<ChangeShapeView>,
 }
 
 pub(crate) fn build_gate_report(
+    paths: &ProjectPaths,
     store: &ArchitectureStore,
-    repository_id: &str,
     base: &str,
     head: &str,
     fail_on: FailOn,
 ) -> Result<GateReport> {
-    let diff = store.diff(repository_id, base, head)?;
-    let drift = store.drift(repository_id, base, head)?;
+    let repository_id = paths.repository_id().0;
+    let diff = store.diff(&repository_id, base, head)?;
+    let drift = store.drift(&repository_id, base, head)?;
     let new_cycles = i64::from(drift.circular_dependency_delta.max(0) as i32);
     let new_modules = diff.added_modules.len();
     let new_dependencies = diff.added_dependencies.len();
@@ -87,6 +92,7 @@ pub(crate) fn build_gate_report(
         new_dependencies,
         risk: diff.risk_score.as_str().to_string(),
         signals,
+        shape: load_change_shape(paths, store, base, head)?,
     })
 }
 
@@ -103,6 +109,9 @@ pub(crate) fn render_gate(report: &GateReport, format: OutputFormat) -> Result<(
             println!("- Head: `{}`", report.head);
             println!("- New cycles: {}", report.new_cycles);
             println!("- Risk: {}", report.risk);
+            if let Some(shape) = &report.shape {
+                println!("- Change shape: {}", shape_summary_line(shape));
+            }
             if report.signals.is_empty() {
                 println!("- No gating signals.");
             } else {
@@ -123,6 +132,9 @@ pub(crate) fn render_gate(report: &GateReport, format: OutputFormat) -> Result<(
                 "New cycles: {}, new modules: {}, new deps: {}, risk: {}",
                 report.new_cycles, report.new_modules, report.new_dependencies, report.risk
             );
+            if let Some(shape) = &report.shape {
+                println!("Change shape: {}", shape_summary_line(shape));
+            }
             for signal in &report.signals {
                 println!("  - {signal}");
             }
