@@ -1,8 +1,8 @@
 //! Read queries over the current state of the index.
 
 use crate::{
-    ArchitectureStore, FileFixHistory, FileGraphRow, FileOwnership, FindingRow, MetricPoint,
-    SymbolDef, collect_rows,
+    ArchitectureStore, CommitShapeRow, FileFixHistory, FileGraphRow, FileOwnership, FindingRow,
+    MetricPoint, SymbolDef, collect_rows,
 };
 use anyhow::Result;
 use duckdb::{Connection, params};
@@ -636,6 +636,59 @@ impl ArchitectureStore {
             |row| Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?)),
         )?;
         collect_rows(rows)
+    }
+
+    /// Each indexed commit as the files it touched, newest first, with the days
+    /// each file had gone untouched when that commit landed. The first commit
+    /// to reach a file has no previous one, hence the `None`.
+    ///
+    /// The material for ranking a change against the repository's own history.
+    /// Line counts are absent on purpose: `file_changes.additions` is not
+    /// populated, so there is no historical line distribution to rank against.
+    pub fn commit_shapes(&self, repository_id: &str) -> Result<Vec<CommitShapeRow>> {
+        let mut statement = self.conn.prepare(&format!(
+            "{CANONICAL_PATHS},
+             touches AS (
+                 SELECT DISTINCT c.sha AS sha,
+                        canonical.current_path AS file_path,
+                        -- `at` alone is a DuckDB keyword and a bare column of
+                        -- that name is a parser error outside a qualified use.
+                        epoch(CAST(substr(c.committed_at, 1, 19) AS TIMESTAMP)) AS at_epoch
+                 FROM file_changes fc
+                 JOIN commits c ON fc.commit_id = c.id
+                 JOIN canonical ON canonical.path = fc.file_path
+                 WHERE fc.repository_id = ?
+             )
+             SELECT sha, at_epoch, file_path,
+                    (at_epoch - LAG(at_epoch) OVER (PARTITION BY file_path ORDER BY at_epoch))
+                        / 86400.0
+             FROM touches
+             ORDER BY at_epoch DESC, sha, file_path"
+        ))?;
+        let rows = statement.query_map(
+            params![repository_id, repository_id, repository_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, f64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<f64>>(3)?,
+                ))
+            },
+        )?;
+
+        let mut shapes: Vec<CommitShapeRow> = Vec::new();
+        for (sha, at, path, age) in collect_rows(rows)? {
+            match shapes.last_mut() {
+                Some(last) if last.sha == sha => last.files.push((path, age)),
+                _ => shapes.push(CommitShapeRow {
+                    sha,
+                    at,
+                    files: vec![(path, age)],
+                }),
+            }
+        }
+        Ok(shapes)
     }
 
     /// Total cognitive complexity per file (oxc), for per-component aggregation.

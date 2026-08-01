@@ -630,6 +630,64 @@ mod tests {
     }
 
     #[test]
+    fn commit_shapes_carry_how_long_each_file_had_been_untouched() {
+        use ovecc_core::facts::{ChangeKind, CommitRecord};
+        use ovecc_core::id::{CommitId, FileChangeId, RepositoryId};
+
+        let (_dir, mut store) = temp_store();
+        store.migrate_to_latest().unwrap();
+        let repo = "repo:test";
+
+        let commit = |sha: &str, age_days: i64| CommitRecord {
+            id: CommitId::from_parts(&[repo, sha]),
+            repository_id: RepositoryId::from_raw(repo),
+            sha: sha.to_string(),
+            parent_shas: Vec::new(),
+            author_name: None,
+            author_email: None,
+            committed_at: chrono::DateTime::from_timestamp(1_700_000_000 - age_days * 86_400, 0)
+                .unwrap(),
+            message: None,
+            is_fix: false,
+            fix_confidence: 0.0,
+        };
+        let change = |sha: &str, path: &str| FileChangeRecord {
+            id: FileChangeId::from_parts(&[repo, sha, path]),
+            repository_id: RepositoryId::from_raw(repo),
+            commit_id: CommitId::from_parts(&[repo, sha]),
+            file_path: path.to_string(),
+            kind: ChangeKind::Modified,
+            previous_path: None,
+            additions: None,
+            deletions: None,
+        };
+        store
+            .upsert_git_facts(
+                repo,
+                &[commit("first", 100), commit("second", 40)],
+                &[
+                    change("first", "a.ts"),
+                    change("second", "a.ts"),
+                    change("second", "b.ts"),
+                ],
+            )
+            .unwrap();
+
+        let shapes = store.commit_shapes(repo).unwrap();
+        assert_eq!(
+            shapes.iter().map(|s| s.sha.as_str()).collect::<Vec<_>>(),
+            ["second", "first"],
+            "newest first"
+        );
+        assert_eq!(
+            shapes[0].files,
+            [("a.ts".to_string(), Some(60.0)), ("b.ts".to_string(), None)],
+            "a.ts had gone 60 days, b.ts is new to the history"
+        );
+        assert_eq!(shapes[1].files, [("a.ts".to_string(), None)]);
+    }
+
+    #[test]
     fn fix_classification_round_trips_and_backfills() {
         use ovecc_core::facts::CommitRecord;
         use ovecc_core::id::{CommitId, RepositoryId};

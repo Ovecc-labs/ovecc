@@ -98,6 +98,16 @@ pub struct FileFixHistory {
     pub last_fix_at: String,
 }
 
+/// One commit as [`ArchitectureStore::commit_shapes`] reads it: the files it
+/// touched, each with the days it had gone untouched when the commit landed.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CommitShapeRow {
+    pub sha: String,
+    /// Commit time in epoch seconds, for ordering.
+    pub at: f64,
+    pub files: Vec<(String, Option<f64>)>,
+}
+
 /// Differential statistics returned by [`ArchitectureStore::sync_current_index`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SyncStats {
