@@ -35,6 +35,21 @@ pub(crate) const SELFCHECK_CAVEAT: &str = "Association, not proof: findings are 
      happened in the past, and a rule can be right about code nobody has got \
      round to fixing.";
 
+/// One line for `ovecc report`, or `None` when there was nothing to measure —
+/// no git history, or no rule fired on an indexed file. Rules arrive sorted by
+/// lift, so the ends of the list are the range.
+pub(crate) fn selfcheck_line(report: &SelfCheckReport) -> Option<String> {
+    let (best, worst) = (report.rules.first()?, report.rules.last()?);
+    Some(format!(
+        "{} rule(s) measured against this repository's fix history: lift {:.2}-{:.2} over a \
+         base of {:.2} fixes/KB. `ovecc selfcheck` breaks it down per rule.",
+        report.rules.len(),
+        worst.lift,
+        best.lift,
+        report.base_rate,
+    ))
+}
+
 /// The share of the window's corrections that landed outside the index, or
 /// `None` when there were none.
 fn off_index_note(report: &SelfCheckReport) -> Option<String> {

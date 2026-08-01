@@ -3,6 +3,7 @@
 
 use super::findings::{build_security_report, window};
 use super::open_store;
+use super::selfcheck::{SELFCHECK_CAVEAT, load_selfcheck, selfcheck_line};
 use super::summary::{load_hotspots, load_summary};
 use crate::cli::FailOn;
 use crate::render::{
@@ -728,6 +729,7 @@ pub(crate) fn render_full_report(
     // connection per file per process.
     let summary = load_summary(paths)?;
     let hotspots = load_hotspots(paths, 10)?;
+    let selfcheck = load_selfcheck(paths)?;
 
     let store = open_store(paths)?;
     let modules = store.current_modules(&repository_id)?;
@@ -780,6 +782,7 @@ pub(crate) fn render_full_report(
                     "total": security.total,
                 },
                 "hotspots": hotspots,
+                "selfcheck": selfcheck,
                 "note": note,
             });
             emit_json("report", &data, meta_for("report"))?;
@@ -859,6 +862,14 @@ pub(crate) fn render_full_report(
                         "s"
                     }
                 );
+            }
+            if let Some(line) = selfcheck_line(&selfcheck) {
+                println!();
+                println!("## Self-check");
+                println!();
+                println!("- {line}");
+                println!();
+                println!("_{SELFCHECK_CAVEAT}_");
             }
         }
     }

@@ -124,6 +124,58 @@ of dynamic dispatch and inheritance that no static graph resolves for free,
 and it answers empty on 6 to 22% of symbols where the reference sits in
 constructs the extractors do not yet model.
 
+## Self-check: do the findings track the corrections?
+
+A benchmark that only measures speed and coverage never asks whether the
+findings are worth acting on. `ovecc selfcheck` asks: for each rule, does the
+code it flags get corrected more often than the rest of the repository?
+
+Rates are age-weighted fix mass per kilobyte of source (a fix loses half its
+weight every 180 days). A rule's lift is its rate over the repository's base
+rate, so 1.00 means "flags code exactly as fix-prone as the average line", and
+2.00 means twice as fix-prone. Bytes rather than lines because bytes are what
+the index stores; the lift is a ratio, so the unit cancels.
+
+Measured on ovecc's own repository, 145 commits from 12 June to 1 August 2026,
+109 indexed files, 1661 KB, base rate 0.04 fixes/KB.
+
+| Rule | Files flagged | KB flagged | Fix mass | Lift |
+| --- | --- | --- | --- | --- |
+| `architecture/behavioral-coupling` | 7 | 165.8 | 11.70 | 1.63 |
+| `security/command-exec` | 5 | 166.2 | 11.02 | 1.53 |
+| `security/secret` | 5 | 290.7 | 14.51 | 1.15 |
+| `long-parameter-list` | 9 | 346.0 | 14.51 | 0.97 |
+| `data-clumps` | 16 | 498.0 | 20.02 | 0.93 |
+| `complexity` | 43 | 1161.6 | 43.92 | 0.87 |
+| `long-function` | 37 | 1132.5 | 41.29 | 0.84 |
+| `unlisted-dependency` | 4 | 35.2 | 1.00 | 0.66 |
+| `large-class` | 3 | 180.1 | 4.46 | 0.57 |
+| `feature-envy` | 7 | 249.9 | 3.79 | 0.35 |
+| `security/weak-hash` | 1 | 0.1 | 0.00 | 0.00 |
+
+Read plainly: two rules clear the base rate by a margin worth naming, one sits
+on it, and the rest are below. Behavioural coupling ranking first is the result
+we would have predicted and is therefore the one to trust least on a single
+repository. `security/weak-hash` flags one 99-byte test fixture; any rule with a
+flagged surface that small is noise, not a measurement.
+
+What this number does not show:
+
+- **One repository, and the most conflicted one.** Everything above is ovecc
+  measured on ovecc. The five benchmark repositories are indexed with
+  `--no-git`, so they have no fix history and cannot appear here.
+- **Association, not proof.** Findings are computed on today's code while the
+  corrections happened in the past.
+- **It penalises the rules that worked.** A file flagged, fixed, and cleaned up
+  no longer carries the finding, so the rules that got acted on lose exactly the
+  evidence that would have vindicated them.
+- **Fixes that landed outside the index are excluded**, 10% of the mass here:
+  deleted files, documentation, unsupported languages. Folding them in would
+  raise the base rate and depress every lift; leaving them silent would be worse.
+
+There is no published bar to clear here. The protocol is ours, and so is the
+obligation to ship the figure when it is unflattering.
+
 ## Observations
 
 - **Linear and predictable.** Time and memory track repository size; there is no
