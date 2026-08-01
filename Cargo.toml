@@ -27,6 +27,12 @@ ovecc-audit = { path = "crates/ovecc-audit" }
 ovecc-ai = { path = "crates/ovecc-ai" }
 
 # External dependencies
+# Severity colouring on a terminal. `anstream` strips the escapes when stdout is
+# not a terminal and honours NO_COLOR, so a redirected run stays byte-identical.
+# Both are already in the tree transitively through `clap`, so this adds no new
+# third-party code.
+anstream = "1.0"
+anstyle = "1.0"
 anyhow = "1.0"
 chrono = { version = "0.4", features = ["clock", "serde"] }
 clap = { version = "4.5", features = ["derive"] }

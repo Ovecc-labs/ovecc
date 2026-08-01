@@ -5,6 +5,7 @@
 use anyhow::Result;
 use ovecc_core::capabilities;
 use ovecc_core::facts::{FindingRecord, Severity};
+use ovecc_core::legacy::RiskLevel;
 use ovecc_core::report::{Envelope, Meta, ToolInfo};
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -79,6 +80,34 @@ pub(crate) fn report_run_stats(elapsed: std::time::Duration) {
         elapsed.as_millis(),
         crate::PEAK_ALLOC.peak_usage_as_mb()
     );
+}
+
+/// The bracketed severity tag for text output, coloured on a terminal. Callers
+/// must print it through `anstream::println!`, which strips the escapes again
+/// when stdout is a pipe or a file: redirected output carries no styling and
+/// stays comparable byte for byte. Text format only, since markdown and JSON
+/// are documents.
+pub(crate) fn severity_tag(severity: Severity) -> String {
+    let style = match severity {
+        Severity::Critical => anstyle::AnsiColor::Red.on_default() | anstyle::Effects::BOLD,
+        Severity::High => anstyle::AnsiColor::Red.on_default(),
+        Severity::Medium => anstyle::AnsiColor::Yellow.on_default(),
+        Severity::Low => anstyle::AnsiColor::BrightBlack.on_default(),
+    };
+    format!("{style}[{severity:?}]{style:#}")
+}
+
+/// The summary's risk score, on the same scale as [`severity_tag`] except at the
+/// bottom: a Low severity is one item worth little attention, a Low risk is the
+/// verdict on the whole repository, so it reads as good news rather than dim.
+pub(crate) fn risk_tag(risk: RiskLevel) -> String {
+    let style = match risk {
+        RiskLevel::Critical => anstyle::AnsiColor::Red.on_default() | anstyle::Effects::BOLD,
+        RiskLevel::High => anstyle::AnsiColor::Red.on_default(),
+        RiskLevel::Medium => anstyle::AnsiColor::Yellow.on_default(),
+        RiskLevel::Low => anstyle::AnsiColor::Green.on_default(),
+    };
+    format!("{style}{}{style:#}", risk.as_str())
 }
 
 /// Injects each finding's machine-actionable `fix` (derived from its kind) into a

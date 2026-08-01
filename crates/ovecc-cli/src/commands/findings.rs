@@ -6,7 +6,7 @@ use super::open_store;
 use crate::cli::FailOn;
 use crate::render::{
     emit_codeclimate, emit_json, emit_json_with_fix, emit_ndjson_meta, emit_sarif, first_evidence,
-    format_evidence, meta_for, ndjson_line,
+    format_evidence, meta_for, ndjson_line, severity_tag,
 };
 use anyhow::Result;
 use ovecc_core::config::{OutputFormat, ProjectPaths};
@@ -243,7 +243,7 @@ fn violations_text(
     }
     for finding in shown {
         println!();
-        println!("[{:?}] {}", finding.severity, finding.title);
+        anstream::println!("{} {}", severity_tag(finding.severity), finding.title);
         if let Some(rule) = &finding.rule_name {
             println!("  Rule: {rule}");
         }
@@ -350,7 +350,7 @@ pub(crate) fn render_security(report: &SecurityReport, format: OutputFormat) -> 
             );
             for finding in &report.findings {
                 println!();
-                println!("[{:?}] {}", finding.severity, finding.title);
+                anstream::println!("{} {}", severity_tag(finding.severity), finding.title);
                 for evidence in &finding.evidence {
                     println!("  Evidence: {}", format_evidence(evidence));
                 }
@@ -423,7 +423,7 @@ pub(crate) fn render_audit(report: &AuditReport, format: OutputFormat) -> Result
             println!("Vulnerabilities: {}", report.vulnerabilities);
             for finding in &report.findings {
                 println!();
-                println!("[{:?}] {}", finding.severity, finding.title);
+                anstream::println!("{} {}", severity_tag(finding.severity), finding.title);
             }
             if report.advisories_loaded == 0 {
                 println!("  (no OSV database in .ovecc/osv/ — sync advisories to enable matching)");
@@ -564,7 +564,7 @@ pub(crate) fn render_health(report: &HealthReport, format: OutputFormat) -> Resu
             );
             for finding in &report.findings {
                 println!();
-                println!("[{:?}] {}", finding.severity, finding.title);
+                anstream::println!("{} {}", severity_tag(finding.severity), finding.title);
                 for evidence in &finding.evidence {
                     println!("  {}", format_evidence(evidence));
                 }
@@ -708,7 +708,7 @@ pub(crate) fn render_deadcode(report: &DeadcodeReport, format: OutputFormat) -> 
             );
             for finding in &report.findings {
                 println!();
-                println!("[{:?}] {}", finding.severity, finding.title);
+                anstream::println!("{} {}", severity_tag(finding.severity), finding.title);
                 for evidence in &finding.evidence {
                     println!("  {}", format_evidence(evidence));
                 }

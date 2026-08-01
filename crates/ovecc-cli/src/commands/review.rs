@@ -5,7 +5,9 @@ use super::findings::{build_security_report, window};
 use super::open_store;
 use super::summary::{load_hotspots, load_summary};
 use crate::cli::FailOn;
-use crate::render::{emit_json, emit_ndjson_meta, first_evidence, meta_for, ndjson_line};
+use crate::render::{
+    emit_json, emit_ndjson_meta, first_evidence, meta_for, ndjson_line, severity_tag,
+};
 use anyhow::Result;
 use ovecc_core::config::{OutputFormat, OveccConfig, ProjectPaths};
 use ovecc_core::error::OveccError;
@@ -670,9 +672,9 @@ fn review_text_findings(report: &ReviewReport) {
     if !report.new_findings.is_empty() {
         println!("New findings:");
         for finding in &report.new_findings {
-            println!(
-                "  [{:?}] {:?}{} {}",
-                finding.severity,
+            anstream::println!(
+                "  {} {:?}{} {}",
+                severity_tag(finding.severity),
                 finding.kind,
                 first_evidence(finding),
                 finding.title

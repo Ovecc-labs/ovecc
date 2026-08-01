@@ -2732,6 +2732,8 @@ dependencies = [
 name = "ovecc-cli"
 version = "0.2.1"
 dependencies = [
+ "anstream",
+ "anstyle",
  "anyhow",
  "clap",
  "ignore",

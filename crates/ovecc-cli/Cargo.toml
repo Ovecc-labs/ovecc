@@ -19,6 +19,8 @@ ovecc-indexer = { workspace = true }
 ovecc-rules = { workspace = true }
 ovecc-audit = { workspace = true }
 ovecc-ai = { workspace = true }
+anstream = { workspace = true }
+anstyle = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
 ignore = { workspace = true }

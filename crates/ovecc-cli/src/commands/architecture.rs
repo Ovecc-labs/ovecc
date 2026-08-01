@@ -25,7 +25,9 @@ use serde::Serialize;
 use crate::cli::FailOn;
 use crate::commands::findings::findings_exit;
 use crate::commands::open_store;
-use crate::render::{emit_json, emit_ndjson_meta, format_evidence, meta_for, ndjson_line};
+use crate::render::{
+    emit_json, emit_ndjson_meta, format_evidence, meta_for, ndjson_line, severity_tag,
+};
 
 /// The reflexion report `diff` and `check` share: every declared edge with its
 /// observed occurrence count (0 = absence), plus the contract findings.
@@ -340,7 +342,7 @@ fn architecture_text(report: &ArchitectureReport) {
         println!();
         println!("{label} ({}):", group.len());
         for finding in group {
-            println!("  [{:?}] {}", finding.severity, finding.title);
+            anstream::println!("  {} {}", severity_tag(finding.severity), finding.title);
             for evidence in &finding.evidence {
                 println!("    {}", format_evidence(evidence));
             }

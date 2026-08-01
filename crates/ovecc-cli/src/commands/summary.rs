@@ -1,7 +1,7 @@
 //! `ovecc summary` and `ovecc hotspots`: the repository-level overview.
 
 use super::open_store;
-use crate::render::{emit_json, emit_ndjson_meta, meta_for, ndjson_header, ndjson_line};
+use crate::render::{emit_json, emit_ndjson_meta, meta_for, ndjson_header, ndjson_line, risk_tag};
 use anyhow::Result;
 use ovecc_core::config::{OutputFormat, ProjectPaths};
 use ovecc_core::facts::FindingKind;
@@ -276,7 +276,7 @@ pub(crate) fn render_summary_report(report: &SummaryReport, format: OutputFormat
             println!("Circular deps: {}", report.circular_dependencies);
             println!("Boundary violations: {}", report.boundary_violations);
             println!("Coupling density: {:.2}%", report.coupling_density * 100.0);
-            println!("Risk score: {}", report.risk_score.as_str());
+            anstream::println!("Risk score: {}", risk_tag(report.risk_score));
 
             if !report.hotspots.is_empty() {
                 println!();

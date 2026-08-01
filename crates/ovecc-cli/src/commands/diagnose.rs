@@ -6,6 +6,7 @@ use super::open_store;
 use crate::cli::{FailOn, GroupByArg};
 use crate::render::{
     emit_json, emit_ndjson_meta, enrich_findings_with_fix, format_evidence, meta_for, ndjson_line,
+    severity_tag,
 };
 use anyhow::Result;
 use ovecc_core::config::{OutputFormat, OveccConfig, ProjectPaths};
@@ -254,7 +255,7 @@ fn advise_text(
     for finding in findings {
         let fix = finding.kind.fix_spec();
         println!();
-        println!("[{:?}] {}", finding.severity, finding.title);
+        anstream::println!("{} {}", severity_tag(finding.severity), finding.title);
         if let Some(rule) = &finding.rule_name {
             println!("  Rule: {rule}");
         }
@@ -269,9 +270,12 @@ fn advise_text(
     }
     for smell in &smells.findings {
         println!();
-        println!(
-            "[{:?}] {} — {}  (confidence {:.2})",
-            smell.severity, smell.title, smell.target, smell.confidence
+        anstream::println!(
+            "{} {} — {}  (confidence {:.2})",
+            severity_tag(smell.severity),
+            smell.title,
+            smell.target,
+            smell.confidence
         );
         let evidence: Vec<String> = smell.evidence.iter().map(fmt_diag_evidence).collect();
         println!("  Evidence: {}", evidence.join(", "));
@@ -463,9 +467,13 @@ fn diagnose_text(report: &ovecc_graph::diagnose::DiagnoseReport, group_by: Optio
 
 fn diagnose_text_finding(finding: &ovecc_graph::diagnose::Diagnosis) {
     println!();
-    println!(
-        "[{:?}] {} — {} {}  (confidence {:.2})",
-        finding.severity, finding.title, finding.target_kind, finding.target, finding.confidence
+    anstream::println!(
+        "{} {} — {} {}  (confidence {:.2})",
+        severity_tag(finding.severity),
+        finding.title,
+        finding.target_kind,
+        finding.target,
+        finding.confidence
     );
     println!("  Principle: {}", finding.principle);
     let evidence: Vec<String> = finding.evidence.iter().map(fmt_diag_evidence).collect();
