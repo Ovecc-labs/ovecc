@@ -556,7 +556,7 @@ fn audit_findings(
     paths: &ProjectPaths,
     input: &AnalysisInput<'_>,
 ) -> Result<Vec<FindingRecord>> {
-    let packages = ovecc_audit::discover_packages(&paths.root);
+    let packages = ovecc_audit::discover_packages(&paths.root).packages;
     let package_rows: Vec<ovecc_db::PackageRow> = packages
         .iter()
         .map(|package| ovecc_db::PackageRow {

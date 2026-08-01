@@ -367,7 +367,9 @@ formats are planned). Offline by default; `--fetch` first downloads the
 advisories for the discovered packages. This is the **only** ovecc operation that
 ever touches the network, and only with this flag. Severity follows the
 advisory's own label (GHSA `LOW`/`MODERATE`/`HIGH`/`CRITICAL`); unlabeled
-advisories default to High.
+advisories default to High. A scan of 0 packages says which of the three cases
+it is: no lockfile, a lockfile that could not be read, or no advisories on
+disk yet.
 
 ```
 Fetched 27 new advisory(ies) for 1 package(s).

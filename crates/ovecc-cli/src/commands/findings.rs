@@ -370,14 +370,17 @@ pub(crate) struct AuditReport {
     packages_scanned: usize,
     advisories_loaded: usize,
     vulnerabilities: usize,
+    /// Lockfiles present but unreadable. A scan of 0 packages means "nothing
+    /// declares dependencies here" only while this is empty.
+    unreadable_lockfiles: Vec<String>,
     pub(crate) findings: Vec<FindingRecord>,
 }
 
 pub(crate) fn load_audit_report(paths: &ProjectPaths, fetch: bool) -> Result<AuditReport> {
-    let packages = ovecc_audit::discover_packages(&paths.root);
+    let scan = ovecc_audit::discover_packages(&paths.root);
     if fetch {
         let (written, queried) =
-            ovecc_audit::fetch_advisories(&packages, &paths.ovecc_dir.join("osv")).map_err(
+            ovecc_audit::fetch_advisories(&scan.packages, &paths.ovecc_dir.join("osv")).map_err(
                 |error| OveccError::Repository {
                     message: format!("audit --fetch failed: {error:#}"),
                 },
@@ -385,13 +388,41 @@ pub(crate) fn load_audit_report(paths: &ProjectPaths, fetch: bool) -> Result<Aud
         eprintln!("Fetched {written} new advisory(ies) for {queried} package(s).");
     }
     let osv = ovecc_audit::load_osv_dir(&paths.ovecc_dir.join("osv"));
-    let findings = ovecc_audit::audit(&paths.repository_id().0, None, &packages, &osv);
+    let findings = ovecc_audit::audit(&paths.repository_id().0, None, &scan.packages, &osv);
     Ok(AuditReport {
-        packages_scanned: packages.len(),
+        packages_scanned: scan.packages.len(),
         advisories_loaded: osv.len(),
         vulnerabilities: findings.len(),
+        unreadable_lockfiles: scan.unreadable,
         findings,
     })
+}
+
+/// The one line worth adding under an audit that reported nothing. Ordered by
+/// how badly it misleads: a lockfile that could not be read is a broken run, no
+/// lockfile at all is a repository with nothing to audit, and an empty advisory
+/// directory is the one case a single command fixes.
+fn audit_note(report: &AuditReport) -> Option<String> {
+    if let Some(first) = report.unreadable_lockfiles.first() {
+        return Some(format!(
+            "lockfile unreadable, so no dependency was audited — {first}"
+        ));
+    }
+    if report.packages_scanned == 0 {
+        return Some(
+            "no package-lock.json at the repository root, the only lockfile format \
+             audit reads today"
+                .to_string(),
+        );
+    }
+    if report.advisories_loaded == 0 {
+        return Some(
+            "no OSV database in .ovecc/osv/ — run `ovecc audit --fetch` once to download the \
+             advisories for these packages"
+                .to_string(),
+        );
+    }
+    (report.vulnerabilities == 0).then(|| "no known vulnerabilities".to_string())
 }
 
 pub(crate) fn render_audit(report: &AuditReport, format: OutputFormat) -> Result<()> {
@@ -411,6 +442,10 @@ pub(crate) fn render_audit(report: &AuditReport, format: OutputFormat) -> Result
             println!("- Packages scanned: {}", report.packages_scanned);
             println!("- Advisories loaded: {}", report.advisories_loaded);
             println!("- Vulnerabilities: {}", report.vulnerabilities);
+            if let Some(note) = audit_note(report) {
+                println!();
+                println!("> {note}");
+            }
             for finding in &report.findings {
                 println!();
                 println!("## [{:?}] {}", finding.severity, finding.title);
@@ -427,13 +462,8 @@ pub(crate) fn render_audit(report: &AuditReport, format: OutputFormat) -> Result
                 println!();
                 anstream::println!("{} {}", severity_tag(finding.severity), finding.title);
             }
-            if report.advisories_loaded == 0 {
-                println!(
-                    "  (no OSV database in .ovecc/osv/ — run `ovecc audit --fetch` once to \
-                     download the advisories for these packages)"
-                );
-            } else if report.vulnerabilities == 0 {
-                println!("  (no known vulnerabilities)");
+            if let Some(note) = audit_note(report) {
+                println!("  ({note})");
             }
         }
     }

@@ -7,7 +7,9 @@ of a live feed for determinism and privacy; it is reproducible and sends
 nothing out.
 
 `discover_packages` parses lockfiles (currently `package-lock.json`) into a
-package list: ecosystem, name, version, manifest path, direct or transitive.
+package list: ecosystem, name, version, manifest path, direct or transitive. It
+reports a lockfile that exists but cannot be read separately from one that is
+absent, so a scan of nothing is never mistaken for a clean bill of health.
 `load_osv_dir` reads OSV entries from `.ovecc/osv/`, each carrying affected
 version ranges as SEMVER events (introduced/fixed). `audit` evaluates every
 package against those ranges with the `semver` crate and emits one

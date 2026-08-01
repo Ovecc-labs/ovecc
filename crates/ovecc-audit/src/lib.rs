@@ -117,14 +117,27 @@ pub fn parse_npm_lockfile(content: &str, manifest_path: &str) -> Vec<Package> {
     out
 }
 
+/// What a scan of the repository's lockfiles found.
+#[derive(Debug, Default)]
+pub struct LockfileScan {
+    pub packages: Vec<Package>,
+    /// Lockfiles that exist but could not be read, each as `path: reason`. Kept
+    /// apart from an absent lockfile: collapsing the two makes an audit that
+    /// could not run look like an audit that found nothing to worry about.
+    pub unreadable: Vec<String>,
+}
+
 /// Discovers packages from known lockfiles at the repository root. Currently
 /// supports npm's `package-lock.json`.
-pub fn discover_packages(root: &Path) -> Vec<Package> {
-    let lockfile = root.join("package-lock.json");
-    match std::fs::read_to_string(&lockfile) {
-        Ok(content) => parse_npm_lockfile(&content, "package-lock.json"),
-        Err(_) => Vec::new(),
+pub fn discover_packages(root: &Path) -> LockfileScan {
+    let mut scan = LockfileScan::default();
+    let name = "package-lock.json";
+    match std::fs::read_to_string(root.join(name)) {
+        Ok(content) => scan.packages = parse_npm_lockfile(&content, name),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => scan.unreadable.push(format!("{name}: {error}")),
     }
+    scan
 }
 
 /// Downloads the OSV advisories affecting `packages` into `osv_dir` — the
