@@ -26,6 +26,7 @@ use crate::commands::{
     query::{build_context_slice, load_impact, render_blast, render_explanation, run_query},
     resolve_ref,
     review::{build_review_report, render_full_report, render_review},
+    selfcheck::{load_selfcheck, render_selfcheck},
     summary::{load_hotspots, load_summary, render_hotspots, render_summary_report},
 };
 use crate::render::{SUPPRESS_META, emit_json, meta_for, report_run_stats};
@@ -335,6 +336,9 @@ pub enum Command {
         #[arg(long, default_value_t = DEFAULT_FINDING_LIMIT)]
         limit: usize,
     },
+    /// Measure ovecc's own rules against this repository's fix history: does
+    /// the code a rule flags get corrected more than the rest?
+    Selfcheck,
     /// Detect duplicated code (clone families) over a normalized token stream.
     Dupes {
         /// Minimum shared run, in tokens, to report as a clone. The default
@@ -913,6 +917,13 @@ fn run_command(cli: Cli) -> Result<u8> {
             let config = load_config(&paths, format_override)?;
             let report = load_coupling(&paths, min_confidence)?;
             render_coupling(&report, config.output.default_format, limit)?;
+            Ok(0)
+        }
+        Command::Selfcheck => {
+            let paths = ProjectPaths::resolve(cli.repo.unwrap_or_else(|| PathBuf::from(".")))?;
+            let config = load_config(&paths, format_override)?;
+            let report = load_selfcheck(&paths)?;
+            render_selfcheck(&report, config.output.default_format)?;
             Ok(0)
         }
         Command::Dupes {

@@ -454,6 +454,35 @@ fixes touched it, the same count weighted so a fix loses half its weight every
 inside it — what a correction says about a module is a judgment call, so the
 number is there to be argued with, not to hand down a verdict.
 
+### `ovecc selfcheck`
+
+Turns the tool on itself: for each rule, does the code it flags get corrected
+more often than the rest of the repository? Rules are ranked by lift over the
+repository's own base rate, so a quiet codebase and a burning one are each
+judged against themselves.
+
+```
+Base rate: 0.04 fixes/KB over 109 file(s), 1661.2 KB (half-life 180 days)
+
+architecture/behavioral-coupling (lift 1.63)
+  7 file(s), 165.8 KB, fix mass 11.70 -> 0.07 fixes/KB
+```
+
+Rates are per kilobyte, not per file: large files collect more findings *and*
+more corrections, so a per-file rate would flatter every rule that happens to
+fire on large files. Bytes rather than lines because bytes are what the index
+stores, and the lift is a ratio, so the unit cancels.
+
+Fix mass that landed on paths the index does not hold — deleted files, docs,
+unsupported languages — is reported as a share and excluded from both rates.
+Excluding it silently is how a self-check flatters itself: the files a team
+deletes are often the ones it fixed the most.
+
+What the number does not show: findings are computed on today's code while the
+corrections happened in the past, so this is association, not proof, and a rule
+can be right about code nobody has got round to fixing. There is no published
+bar to clear here — the protocol is ours, and the figure ships whatever it says.
+
 ### `ovecc conventions`
 
 Conventions learned from the repository itself (naming roles, dependency

@@ -11,6 +11,7 @@ pub mod conventions;
 pub mod cycles;
 pub mod diagnose;
 pub mod dupes;
+pub mod selfcheck;
 
 use ovecc_core::legacy::{
     DependencyRecord, FixHistory, Hotspot, HotspotEntry, ImpactDirection, ImpactReport, RiskLevel,

@@ -132,6 +132,13 @@ pub const COMMANDS: &[CommandSpec] = &[
         read_only: true,
     },
     CommandSpec {
+        name: "selfcheck",
+        summary: "Measure each rule's findings against the repository's own fix history.",
+        key_params: &[],
+        output: "Per rule: files flagged, fix mass they carry, fixes per KB, and the lift over the repository's base rate; empty without git history.",
+        read_only: true,
+    },
+    CommandSpec {
         name: "dupes",
         summary: "Detect duplicated code (clone families) over a normalized token stream.",
         key_params: &["--min-tokens", "--min-lines", "--include-intra-file"],
