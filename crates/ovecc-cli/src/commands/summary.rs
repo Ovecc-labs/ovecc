@@ -4,6 +4,7 @@ use super::open_store;
 use crate::render::{emit_json, emit_ndjson_meta, meta_for, ndjson_header, ndjson_line, risk_tag};
 use anyhow::Result;
 use ovecc_core::config::{OutputFormat, ProjectPaths};
+use ovecc_core::coverage::CoverageTotals;
 use ovecc_core::facts::FindingKind;
 use ovecc_core::legacy::{HotspotsReport, SummaryReport};
 use ovecc_graph as graph;
@@ -63,6 +64,15 @@ pub(crate) fn load_hotspots(paths: &ProjectPaths, limit: usize) -> Result<Hotspo
         .module_fix_history(&repository_id, ovecc_db::FIX_HALF_LIFE_DAYS)?
         .into_iter()
         .collect();
+    // Coverage arrives per file and the ranking is per module. A file the
+    // tracefile covers but the index never saw is dropped: it would add
+    // covered lines to a module whose size the ranking measures differently.
+    let mut coverage: HashMap<String, CoverageTotals> = HashMap::new();
+    for file in store.file_coverage(&repository_id)? {
+        if let Some(module) = file_modules.get(&file.path) {
+            coverage.entry(module.clone()).or_default().add(&file);
+        }
+    }
 
     Ok(HotspotsReport {
         hotspots: graph::compute_hotspots(
@@ -73,6 +83,7 @@ pub(crate) fn load_hotspots(paths: &ProjectPaths, limit: usize) -> Result<Hotspo
             &violations,
             &complexity,
             &fixes,
+            &coverage,
             limit,
         ),
         has_git_history,
@@ -91,6 +102,44 @@ fn fix_history(history: &ovecc_core::legacy::FixHistory) -> String {
         ),
         None => "0".to_string(),
     }
+}
+
+/// A module's coverage as text, or `None` when no tracefile was indexed.
+fn coverage_cell(hotspot: &ovecc_core::legacy::HotspotEntry) -> Option<String> {
+    let coverage = hotspot.coverage?;
+    Some(format!(
+        "{:.0}% ({} of {} lines uncovered)",
+        coverage.line_rate() * 100.0,
+        coverage.lines_missed(),
+        coverage.lines_found,
+    ))
+}
+
+/// The ranked hotspot the tests reach least. The cross is the whole point:
+/// churn alone ranks the code that keeps moving, coverage alone ranks the code
+/// nobody tests, and only together do they name where a change is most likely
+/// to break something no test would catch. Chosen as the minimum over the list
+/// already on screen rather than against a coverage bar — no published
+/// threshold exists, and inventing one would be a constant to defend instead of
+/// a measurement.
+fn least_covered_hotspot(report: &HotspotsReport) -> Option<String> {
+    let (rank, hotspot) = report
+        .hotspots
+        .iter()
+        .enumerate()
+        .filter(|(_, hotspot)| hotspot.coverage.is_some_and(|c| c.lines_found > 0))
+        .min_by(|(_, a), (_, b)| {
+            a.coverage
+                .unwrap_or_default()
+                .line_rate()
+                .total_cmp(&b.coverage.unwrap_or_default().line_rate())
+        })?;
+    Some(format!(
+        "Least covered of these: {} at {}, ranked {} by score.",
+        hotspot.module,
+        coverage_cell(hotspot)?,
+        rank + 1,
+    ))
 }
 
 pub(crate) fn render_hotspots(report: &HotspotsReport, format: OutputFormat) -> Result<()> {
@@ -112,9 +161,9 @@ pub(crate) fn render_hotspots(report: &HotspotsReport, format: OutputFormat) -> 
                 println!();
             }
             println!(
-                "| # | Module | Score | Churn | Corrections | Coupling | Fan-in | Fan-out | Owner frag. | Violations |"
+                "| # | Module | Score | Churn | Corrections | Coverage | Coupling | Fan-in | Fan-out | Owner frag. | Violations |"
             );
-            println!("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |");
+            println!("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |");
             for (rank, hotspot) in report.hotspots.iter().enumerate() {
                 let churn = if report.has_git_history {
                     format!("{:.0}", hotspot.churn)
@@ -132,18 +181,23 @@ pub(crate) fn render_hotspots(report: &HotspotsReport, format: OutputFormat) -> 
                     "n/a".to_string()
                 };
                 println!(
-                    "| {} | {} | {:.0} | {} | {} | {} | {} | {} | {} | {} |",
+                    "| {} | {} | {:.0} | {} | {} | {} | {} | {} | {} | {} | {} |",
                     rank + 1,
                     hotspot.module,
                     hotspot.score,
                     churn,
                     fixes,
+                    coverage_cell(hotspot).unwrap_or_else(|| "n/a".to_string()),
                     hotspot.coupling,
                     hotspot.fan_in,
                     hotspot.fan_out,
                     owner,
                     hotspot.violations
                 );
+            }
+            if let Some(note) = least_covered_hotspot(report) {
+                println!();
+                println!("> {note}");
             }
         }
         OutputFormat::Text => {
@@ -172,6 +226,13 @@ pub(crate) fn render_hotspots(report: &HotspotsReport, format: OutputFormat) -> 
                 );
                 println!("   Complexity: {:.0} (cognitive)", hotspot.complexity);
                 println!("   Violations: {}", hotspot.violations);
+                if let Some(coverage) = coverage_cell(hotspot) {
+                    println!("   Coverage: {coverage}");
+                }
+            }
+            if let Some(note) = least_covered_hotspot(report) {
+                println!();
+                println!("{note}");
             }
             if report.hotspots.is_empty() {
                 println!("  (none)");

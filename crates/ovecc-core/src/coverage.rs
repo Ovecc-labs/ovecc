@@ -34,6 +34,32 @@ impl FileCoverage {
     }
 }
 
+/// Line coverage rolled up over a set of files.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CoverageTotals {
+    pub lines_found: usize,
+    pub lines_hit: usize,
+}
+
+impl CoverageTotals {
+    pub fn add(&mut self, file: &FileCoverage) {
+        self.lines_found += file.lines_found;
+        self.lines_hit += file.lines_hit;
+    }
+
+    /// Share of executable lines executed at least once, in `[0, 1]`.
+    pub fn line_rate(&self) -> f64 {
+        if self.lines_found == 0 {
+            return 1.0;
+        }
+        self.lines_hit as f64 / self.lines_found as f64
+    }
+
+    pub fn lines_missed(&self) -> usize {
+        self.lines_found.saturating_sub(self.lines_hit)
+    }
+}
+
 /// What the coverage step of one index run did, for the index report.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CoverageIngest {

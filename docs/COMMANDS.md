@@ -461,6 +461,14 @@ fixes touched it, the same count weighted so a fix loses half its weight every
 inside it — what a correction says about a module is a judgment call, so the
 number is there to be argued with, not to hand down a verdict.
 
+When an LCOV tracefile was indexed (see `ovecc index --coverage`), line
+coverage sits on the same row, and a closing line names the least-covered
+module of those ranked. That crossing is the point: churn alone ranks the code
+that keeps moving, coverage alone ranks the code nobody tests, and only
+together do they say where a change is most likely to break something no test
+would catch. Coverage stays out of the score for the same reason the fix
+history does.
+
 ### `ovecc selfcheck`
 
 Turns the tool on itself: for each rule, does the code it flags get corrected

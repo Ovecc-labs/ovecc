@@ -13,6 +13,7 @@ pub mod diagnose;
 pub mod dupes;
 pub mod selfcheck;
 
+use ovecc_core::coverage::CoverageTotals;
 use ovecc_core::legacy::{
     DependencyRecord, FixHistory, Hotspot, HotspotEntry, ImpactDirection, ImpactReport, RiskLevel,
     SummaryReport,
@@ -165,6 +166,7 @@ pub fn compute_hotspots(
     violations: &HashMap<String, usize>,
     complexity: &HashMap<String, f64>,
     fixes: &HashMap<String, FixHistory>,
+    coverage: &HashMap<String, CoverageTotals>,
     limit: usize,
 ) -> Vec<HotspotEntry> {
     let mut fan_in = HashMap::<String, usize>::new();
@@ -232,6 +234,7 @@ pub fn compute_hotspots(
                 violations: *violations.get(module).unwrap_or(&0),
                 complexity: complexity_of(module),
                 fix_history: fixes.get(module).cloned().unwrap_or_default(),
+                coverage: coverage.get(module).copied(),
             }
         })
         .filter(|hotspot| hotspot.score > 0.0)
@@ -483,6 +486,7 @@ mod hotspot_tests {
             &violations,
             &complexity,
             &fixes,
+            &HashMap::new(),
             10,
         );
 
@@ -510,6 +514,7 @@ mod hotspot_tests {
                 &violations,
                 &complexity,
                 &fixes,
+                &HashMap::new(),
                 1
             )
             .len(),

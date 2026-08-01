@@ -247,6 +247,11 @@ pub struct HotspotEntry {
     /// call, and the number is there to be argued with.
     #[serde(default)]
     pub fix_history: FixHistory,
+    /// Line coverage over the module's files, or `None` when no tracefile was
+    /// indexed. Beside the score like [`Self::fix_history`], not inside it: the
+    /// weight coverage deserves against churn is a judgment nobody has measured.
+    #[serde(default)]
+    pub coverage: Option<crate::coverage::CoverageTotals>,
 }
 
 /// The corrections a module (or a file) has accumulated.
