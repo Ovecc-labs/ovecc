@@ -21,12 +21,32 @@ pub(crate) fn load_selfcheck(paths: &ProjectPaths) -> Result<SelfCheckReport> {
         .map(|history| (history.file_path, history.mass))
         .collect();
     let findings = store.findings(&repository_id, None)?;
+    let has_git_history = store.count_rows("commits", &repository_id)? > 0;
     Ok(selfcheck::self_check(
         &files,
         &fix_mass,
         &findings,
         ovecc_db::FIX_HALF_LIFE_DAYS,
+        has_git_history,
     ))
+}
+
+/// Why every lift is 0, when it is 0 for want of data rather than for want of
+/// predictive power. Without this the table reads as a ruleset that predicts
+/// nothing, which is the opposite of what an unmeasurable repository shows.
+fn no_measurement_note(report: &SelfCheckReport) -> Option<String> {
+    if !report.has_git_history {
+        return Some(
+            "No commits in the index, so there is nothing to measure against. The fix \
+             history needs a git repository indexed without --no-git."
+                .to_string(),
+        );
+    }
+    (report.fix_mass + report.fix_mass_off_index == 0.0).then(|| {
+        "No commit in the indexed history is classified as a fix, so there is nothing to \
+         measure against."
+            .to_string()
+    })
 }
 
 /// The caveat that belongs next to every number this command prints. Written
@@ -39,6 +59,9 @@ pub(crate) const SELFCHECK_CAVEAT: &str = "Association, not proof: findings are 
 /// no git history, or no rule fired on an indexed file. Rules arrive sorted by
 /// lift, so the ends of the list are the range.
 pub(crate) fn selfcheck_line(report: &SelfCheckReport) -> Option<String> {
+    if no_measurement_note(report).is_some() {
+        return None;
+    }
     let (best, worst) = (report.rules.first()?, report.rules.last()?);
     Some(format!(
         "{} rule(s) measured against this repository's fix history: lift {:.2}-{:.2} over a \
@@ -78,6 +101,10 @@ pub(crate) fn render_selfcheck(report: &SelfCheckReport, format: OutputFormat) -
         OutputFormat::Markdown => {
             println!("# Self-check against the fix history");
             println!();
+            if let Some(note) = no_measurement_note(report) {
+                println!("> {note}");
+                println!();
+            }
             println!(
                 "- Base rate: {:.2} fixes/KB over {} file(s), {:.1} KB",
                 report.base_rate,
@@ -106,6 +133,9 @@ pub(crate) fn render_selfcheck(report: &SelfCheckReport, format: OutputFormat) -
             println!("> {SELFCHECK_CAVEAT}");
         }
         OutputFormat::Text => {
+            if let Some(note) = no_measurement_note(report) {
+                println!("{note}");
+            }
             println!(
                 "Base rate: {:.2} fixes/KB over {} file(s), {:.1} KB (half-life {:.0} days)",
                 report.base_rate,
@@ -135,4 +165,49 @@ pub(crate) fn render_selfcheck(report: &SelfCheckReport, format: OutputFormat) -
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ovecc_graph::selfcheck::RuleSelfCheck;
+
+    fn report(has_git_history: bool, fix_mass: f64) -> SelfCheckReport {
+        SelfCheckReport {
+            has_git_history,
+            half_life_days: 180.0,
+            files_evaluated: 2,
+            bytes_evaluated: 2048,
+            fix_mass,
+            fix_mass_off_index: 0.0,
+            base_rate: fix_mass / 2.0,
+            rules: vec![RuleSelfCheck {
+                rule: "complexity".to_string(),
+                files_flagged: 1,
+                bytes_flagged: 1024,
+                fix_mass,
+                rate: fix_mass,
+                lift: if fix_mass > 0.0 { 2.0 } else { 0.0 },
+            }],
+        }
+    }
+
+    #[test]
+    fn the_report_line_stays_quiet_when_there_was_nothing_to_measure() {
+        assert!(selfcheck_line(&report(false, 0.0)).is_none(), "no commits");
+        assert!(selfcheck_line(&report(true, 0.0)).is_none(), "no fixes");
+
+        let line = selfcheck_line(&report(true, 4.0)).expect("a measurable repository");
+        assert!(line.contains("lift 2.00-2.00"), "{line}");
+    }
+
+    #[test]
+    fn a_measurable_repository_needs_no_excuse() {
+        assert!(no_measurement_note(&report(true, 4.0)).is_none());
+        assert!(
+            no_measurement_note(&report(false, 4.0))
+                .expect("no commits")
+                .contains("--no-git")
+        );
+    }
 }

@@ -31,6 +31,9 @@ pub struct RuleSelfCheck {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SelfCheckReport {
+    /// False when no git history was indexed. Every lift is then 0 for want of
+    /// data, which reads exactly like a ruleset that predicts nothing.
+    pub has_git_history: bool,
     /// Half-life the fix mass was weighted with, in days.
     pub half_life_days: f64,
     pub files_evaluated: usize,
@@ -68,6 +71,7 @@ pub fn self_check(
     fix_mass: &[(String, f64)],
     findings: &[FindingRecord],
     half_life_days: f64,
+    has_git_history: bool,
 ) -> SelfCheckReport {
     let sizes: BTreeMap<&str, u64> = files
         .iter()
@@ -137,6 +141,7 @@ pub fn self_check(
     });
 
     SelfCheckReport {
+        has_git_history,
         half_life_days,
         files_evaluated: sizes.len(),
         bytes_evaluated,
@@ -186,7 +191,13 @@ mod tests {
     fn a_rule_on_the_repeatedly_fixed_file_lifts_above_the_base() {
         // 4 KB of source carrying 4.0 of fix mass: a base rate of 1.0/KB.
         let fixes = vec![("hot.ts".to_string(), 4.0)];
-        let report = self_check(&files(), &fixes, &[finding("complexity", "hot.ts")], 180.0);
+        let report = self_check(
+            &files(),
+            &fixes,
+            &[finding("complexity", "hot.ts")],
+            180.0,
+            true,
+        );
 
         assert_eq!(report.files_evaluated, 3);
         assert_eq!(report.bytes_evaluated, 4096);
@@ -201,7 +212,13 @@ mod tests {
     #[test]
     fn a_rule_on_untouched_code_lifts_below_one() {
         let fixes = vec![("hot.ts".to_string(), 4.0)];
-        let report = self_check(&files(), &fixes, &[finding("dead-code", "quiet.ts")], 180.0);
+        let report = self_check(
+            &files(),
+            &fixes,
+            &[finding("dead-code", "quiet.ts")],
+            180.0,
+            true,
+        );
 
         assert_eq!(report.rules[0].fix_mass, 0.0);
         assert_eq!(report.rules[0].lift, 0.0);
@@ -218,7 +235,13 @@ mod tests {
             ("deleted.ts".to_string(), 9.0),
             ("README.md".to_string(), 3.0),
         ];
-        let report = self_check(&files(), &fixes, &[finding("complexity", "hot.ts")], 180.0);
+        let report = self_check(
+            &files(),
+            &fixes,
+            &[finding("complexity", "hot.ts")],
+            180.0,
+            true,
+        );
 
         assert_eq!(report.fix_mass, 4.0);
         assert_eq!(report.fix_mass_off_index, 12.0);
@@ -235,7 +258,7 @@ mod tests {
             finding("complexity", "hot.ts"),
             finding("aaa-weak", "calm.ts"),
         ];
-        let report = self_check(&files(), &fixes, &findings, 180.0);
+        let report = self_check(&files(), &fixes, &findings, 180.0, true);
 
         let order: Vec<&str> = report.rules.iter().map(|r| r.rule.as_str()).collect();
         assert_eq!(order, ["complexity", "aaa-weak", "zzz-weak"]);
