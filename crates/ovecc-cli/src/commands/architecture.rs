@@ -14,6 +14,7 @@ use ovecc_core::architecture::{
     load_baseline, recognize, save_baseline,
 };
 use ovecc_core::config::{OutputFormat, ProjectPaths};
+use ovecc_core::coverage::FileCoverage;
 use ovecc_core::error::OveccError;
 use ovecc_core::facts::FindingRecord;
 use ovecc_core::facts::{CapabilityFact, CoChangedPair, FunctionMetricsRow};
@@ -68,6 +69,7 @@ const VERDICTS: &[(&str, &str)] = &[
         "architecture/complexity-budget",
         "Complexity budgets exceeded",
     ),
+    ("architecture/coverage-floor", "Coverage floors missed"),
     ("architecture/unassigned", "Files outside every component"),
     (
         "architecture/absence",
@@ -91,6 +93,7 @@ struct ArchitectureData {
     capability_uses: Vec<(String, CapabilityFact)>,
     functions: Vec<FunctionMetricsRow>,
     co_changes: Vec<CoChangedPair>,
+    coverage: Vec<FileCoverage>,
 }
 
 impl ArchitectureData {
@@ -104,6 +107,7 @@ impl ArchitectureData {
             capability_uses: &self.capability_uses,
             functions: &self.functions,
             co_changes: &self.co_changes,
+            coverage: &self.coverage,
         }
     }
 }
@@ -145,6 +149,15 @@ fn load_architecture_data(paths: &ProjectPaths) -> Result<ArchitectureData> {
     } else {
         Vec::new()
     };
+    let coverage = if contract
+        .components
+        .iter()
+        .any(|component| component.min_coverage.is_some())
+    {
+        store.file_coverage(&repository_id)?
+    } else {
+        Vec::new()
+    };
     // Read from the table the last index wrote: `check` judges the stored
     // graph, and the history behind it is just as stored.
     let co_changes = store.co_changes(&repository_id, 0.0)?;
@@ -158,6 +171,7 @@ fn load_architecture_data(paths: &ProjectPaths) -> Result<ArchitectureData> {
         capability_uses,
         functions,
         co_changes,
+        coverage,
     })
 }
 
@@ -457,6 +471,8 @@ pub(crate) struct ComponentView {
     pub(crate) max_cyclomatic: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) max_cognitive: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) min_coverage: Option<f64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -545,6 +561,7 @@ fn contract_view(contract: &ArchitectureContract, query: &[String]) -> Result<Co
                 .collect(),
             max_cyclomatic: component.max_cyclomatic,
             max_cognitive: component.max_cognitive,
+            min_coverage: component.min_coverage,
         })
         .collect();
     Ok(ContractView {
@@ -677,6 +694,9 @@ fn budget_line(component: &ComponentView) -> Option<String> {
     }
     if let Some(value) = component.max_cognitive {
         parts.push(format!("cognitive <= {value}"));
+    }
+    if let Some(value) = component.min_coverage {
+        parts.push(format!("coverage >= {:.0}%", value * 100.0));
     }
     (!parts.is_empty()).then(|| parts.join(", "))
 }

@@ -610,6 +610,14 @@ pub fn rule_definitions() -> BTreeMap<String, MetaRule> {
             ),
         ),
         (
+            "architecture/coverage-floor".to_string(),
+            rule(
+                "A component's line coverage is under the `min_coverage` it \
+                 declares. Silent when no tracefile was indexed.",
+                "medium",
+            ),
+        ),
+        (
             "architecture/deprecated-use".to_string(),
             rule(
                 "A dependency the contract marks deprecated is still imported.",

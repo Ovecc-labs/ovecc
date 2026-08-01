@@ -171,9 +171,10 @@ with import counts), divergences (imports the contract does not allow),
 slice-isolation breaches (imports between sibling slices of a `slices = true`
 component), interface bypasses (imports that skip a component's declared entry
 files), deprecated dependencies still in use, banned external packages, denied
-capabilities used, complexity budgets exceeded, unassigned files, and absences
-(declared but never implemented). Divergences, slice breaches, and bypasses are
-High; deprecated, banned, capability, and budget are Medium; hygiene is Low.
+capabilities used, complexity budgets exceeded, coverage floors missed,
+unassigned files, and absences (declared but never implemented). Divergences,
+slice breaches, and bypasses are High; deprecated, banned, capability, budget
+and coverage are Medium; hygiene is Low.
 `mode = "warn"` caps everything at Low so nothing gates.
 
 One verdict reads no code at all. **Behavioral coupling** names two components
@@ -193,6 +194,16 @@ clock, randomness), reported with the exact `file:line` and API; and
 `max_cyclomatic` / `max_cognitive` set a per-function complexity budget, an
 architectural fitness function checked against every function the component
 owns.
+
+`min_coverage` is the third fitness function, and the only one that reads a
+file the repository produces rather than a metric ovecc derives: a fraction in
+`(0, 1]`, and a component under it is an `architecture/coverage-floor` verdict
+at Medium. It is checked only when a tracefile was indexed, and only over the
+files that tracefile mentions: with none, the component is unmeasured, and
+calling that 0% would say more than the data does. Unlike every other verdict
+it cannot be baselined: a floor is one aggregate per component, so accepting it
+once accepts the whole condition, which is what deleting the declaration
+already does.
 
 ```
 Architecture contract: 13 components, 25/25 declared dependencies implemented, mode new-violations

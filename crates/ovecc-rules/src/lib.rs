@@ -20,6 +20,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use chrono::Utc;
 use ovecc_core::architecture::ArchitectureContract;
 use ovecc_core::config::RulesConfig;
+use ovecc_core::coverage::FileCoverage;
 use ovecc_core::facts::{
     CapabilityFact, CoChangedPair, EntityRef, Evidence, FindingKind, FindingRecord,
     FunctionMetricsRow, SecurityPatternFact, SecurityPatternKind, Severity,
@@ -69,6 +70,9 @@ pub struct ContractInput<'a> {
     /// File pairs the history keeps changing together, for the behavioral
     /// coupling check. Empty when no git history was ingested.
     pub co_changes: &'a [CoChangedPair],
+    /// Per-file line coverage for the `min_coverage` check. Empty when no
+    /// tracefile was indexed, which means "unknown", not "nothing covered".
+    pub coverage: &'a [FileCoverage],
 }
 
 /// Evaluates every enabled rule family and returns the findings, sorted by ID

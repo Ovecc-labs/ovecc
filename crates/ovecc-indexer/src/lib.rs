@@ -210,6 +210,10 @@ pub fn index_repository(
         })
         .collect();
     let baseline = ovecc_core::architecture::load_baseline(&paths.root)?;
+    // Read before the rules run, not with the other writes: the contract's
+    // `min_coverage` check is one of the rules.
+    let coverage = read_coverage(paths, config);
+    let coverage_files = coverage.as_ref().map_or(&[][..], |(_, files)| files);
     let architecture_input = contract
         .as_ref()
         .map(|contract| ovecc_rules::ContractInput {
@@ -221,6 +225,7 @@ pub fn index_repository(
             capability_uses: &capability_uses,
             functions: &functions,
             co_changes: &co_changes,
+            coverage: coverage_files,
         });
     let (mut findings, security_patterns) =
         evaluate_rules(&input, &config.rules, architecture_input);
@@ -270,7 +275,6 @@ pub fn index_repository(
     )?;
     store.replace_co_changes(&repository_id, &co_changes)?;
     store.replace_findings(&repository_id, &findings)?;
-    let coverage = read_coverage(paths, config);
     // A tracefile that could not be used leaves the previous run's coverage
     // alone: wiping it because today's read failed would report the tests as
     // gone rather than the file as unreadable.

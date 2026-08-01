@@ -15,6 +15,7 @@ use chrono::Utc;
 use ovecc_core::architecture::{
     ArchitectureContract, EnforcementMode, UnassignedPolicy, baseline_entry, x_notation_allows,
 };
+use ovecc_core::coverage::CoverageTotals;
 use ovecc_core::facts::{
     CapabilityKind, CoChangedPair, EntityRef, Evidence, FindingKind, FindingRecord,
     FunctionMetricsRow, Severity,
@@ -47,6 +48,10 @@ type BudgetMap<'a> = BTreeMap<(&'a str, &'a str), Vec<(&'a FunctionMetricsRow, u
 /// (component, component), ordered, -> the coupled file pairs linking them.
 type CouplingMap<'a> = BTreeMap<(&'a str, &'a str), Vec<&'a CoChangedPair>>;
 
+/// component -> (its measured coverage, the floor it declared). Only components
+/// under their floor are entered.
+type CoverageMap<'a> = BTreeMap<&'a str, (CoverageTotals, f64)>;
+
 /// Coupled file pairs two components must share before the deviation is
 /// reported. One pair is an accident: a single shared constant, one commit that
 /// happened to touch both sides. The published precision on this family of
@@ -66,6 +71,7 @@ struct EdgeGroups<'a> {
     capabilities: CapabilityMap<'a>,
     budgets: BudgetMap<'a>,
     coupling: CouplingMap<'a>,
+    coverage: CoverageMap<'a>,
     observed: BTreeSet<(&'a str, &'a str)>,
 }
 
@@ -231,6 +237,10 @@ fn prune_baselined<'a>(groups: EdgeGroups<'a>, baseline: &BTreeSet<String>) -> E
                 (!kept.is_empty()).then_some((pair, kept))
             })
             .collect(),
+        // Not baselineable, unlike everything above. A coverage floor is one
+        // aggregate per component, so accepting it once accepts the whole
+        // condition — which is what deleting the declaration already does.
+        coverage: groups.coverage,
         observed: groups.observed,
     }
 }
@@ -274,6 +284,7 @@ fn classify_edges<'a>(input: &RuleInput<'a>, architecture: ContractInput<'a>) ->
     }
     classify_capability_facts(architecture, &mut groups);
     classify_budgets(architecture, &mut groups);
+    classify_coverage(architecture, &mut groups);
     classify_coupling(architecture, &mut groups);
     groups
 }
@@ -417,6 +428,35 @@ fn classify_budgets<'a>(architecture: ContractInput<'a>, groups: &mut EdgeGroups
                 .entry((component.as_str(), "cognitive"))
                 .or_default()
                 .push((row, budget));
+        }
+    }
+}
+
+/// Components whose measured line coverage sits under the floor they declared.
+///
+/// A component the tracefile does not mention at all is skipped rather than
+/// reported at 0%: the tracefile may predate the component, cover another
+/// language, or not have been produced at all, so what is known is that the
+/// component is unmeasured, not that it is untested.
+fn classify_coverage<'a>(architecture: ContractInput<'a>, groups: &mut EdgeGroups<'a>) {
+    let floors: BTreeMap<&'a str, f64> = architecture
+        .contract
+        .components
+        .iter()
+        .filter_map(|spec| Some((spec.name.as_str(), spec.min_coverage?)))
+        .collect();
+    let mut measured: BTreeMap<&'a str, CoverageTotals> = BTreeMap::new();
+    for file in architecture.coverage {
+        let Some(component) = architecture.component_of.get(&file.path) else {
+            continue;
+        };
+        if let Some((&name, _)) = floors.get_key_value(component.as_str()) {
+            measured.entry(name).or_default().add(file);
+        }
+    }
+    for (name, totals) in measured {
+        if totals.lines_found > 0 && totals.line_rate() < floors[name] {
+            groups.coverage.insert(name, (totals, floors[name]));
         }
     }
 }
@@ -749,6 +789,41 @@ fn pair_findings(input: &RuleInput<'_>, groups: &EdgeGroups<'_>) -> Vec<FindingR
             created_at: Utc::now(),
         });
     }
+    for (&component, (totals, floor)) in &groups.coverage {
+        findings.push(FindingRecord {
+            id: FindingId::from_parts(&[
+                input.repository_id,
+                "architecture",
+                "coverage-floor",
+                component,
+            ]),
+            repository_id: RepositoryId::from_raw(input.repository_id),
+            snapshot_id: input.snapshot_id.map(SnapshotId::from_raw),
+            kind: FindingKind::ArchitectureViolation,
+            severity: Severity::Medium,
+            rule_name: Some("architecture/coverage-floor".to_string()),
+            target: Some(EntityRef {
+                kind: NodeKind::Module,
+                id: component.to_string(),
+            }),
+            title: format!(
+                "{component}: line coverage {:.0}% is under the declared {:.0}%",
+                totals.line_rate() * 100.0,
+                floor * 100.0
+            ),
+            description: format!(
+                "'{component}' declares min_coverage = {floor}, and {} of its \
+                 {} executable line(s) are not reached by any test. Cover them, \
+                 or lower the floor deliberately.",
+                totals.lines_missed(),
+                totals.lines_found
+            ),
+            // The component is the subject; naming one of its files would
+            // point at an arbitrary member of the set.
+            evidence: Vec::new(),
+            created_at: Utc::now(),
+        });
+    }
     findings
 }
 
@@ -902,6 +977,7 @@ mod tests {
     use super::*;
     use ovecc_core::architecture::{ComponentSpec, CouplingPolicy, DependsOn};
     use ovecc_core::config::RulesConfig;
+    use ovecc_core::coverage::FileCoverage;
     use ovecc_core::facts::CapabilityFact;
 
     fn component(name: &str, paths: &[&str]) -> ComponentSpec {
@@ -958,6 +1034,7 @@ mod tests {
         capability_uses: Vec<(String, CapabilityFact)>,
         functions: Vec<FunctionMetricsRow>,
         co_changes: Vec<CoChangedPair>,
+        coverage: Vec<FileCoverage>,
     }
 
     impl Default for Fixture {
@@ -972,6 +1049,7 @@ mod tests {
                 capability_uses: Vec::new(),
                 functions: Vec::new(),
                 co_changes: Vec::new(),
+                coverage: Vec::new(),
             }
         }
     }
@@ -994,6 +1072,7 @@ mod tests {
                 capability_uses: &fixture.capability_uses,
                 functions: &fixture.functions,
                 co_changes: &fixture.co_changes,
+                coverage: &fixture.coverage,
             }),
         };
         contract_rules(&input)
@@ -1017,6 +1096,7 @@ mod tests {
                 capability_uses: &fixture.capability_uses,
                 functions: &fixture.functions,
                 co_changes: &fixture.co_changes,
+                coverage: &fixture.coverage,
             }),
         };
         violation_entries(&input)
@@ -1630,6 +1710,62 @@ mod tests {
             budget.evidence[0].detail.as_deref(),
             Some("cyclomatic 9 > 5")
         );
+    }
+
+    fn covered(path: &str, found: usize, hit: usize) -> FileCoverage {
+        FileCoverage {
+            path: path.to_string(),
+            lines_found: found,
+            lines_hit: hit,
+            functions_found: 0,
+            functions_hit: 0,
+        }
+    }
+
+    fn coverage_floor_findings(coverage: Vec<FileCoverage>) -> Vec<FindingRecord> {
+        let mut core = component("core", &["src/core/**"]);
+        core.min_coverage = Some(0.8);
+        let fixture = Fixture {
+            contract: contract(vec![core]),
+            component_of: assign(&[("src/core/logic.ts", "core"), ("src/core/util.ts", "core")]),
+            coverage,
+            ..Fixture::default()
+        };
+        run(&fixture)
+            .into_iter()
+            .filter(|f| f.rule_name.as_deref() == Some("architecture/coverage-floor"))
+            .collect()
+    }
+
+    #[test]
+    fn a_component_under_its_declared_coverage_is_a_verdict() {
+        // 30 of 50 lines reached: 60%, under the declared 80%.
+        let findings = coverage_floor_findings(vec![
+            covered("src/core/logic.ts", 40, 30),
+            covered("src/core/util.ts", 10, 0),
+        ]);
+
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].severity, Severity::Medium);
+        assert!(findings[0].title.contains("60%"), "{}", findings[0].title);
+        assert!(
+            findings[0].description.contains("20 of"),
+            "{}",
+            findings[0].description
+        );
+    }
+
+    #[test]
+    fn a_component_at_or_over_its_floor_is_silent() {
+        assert!(coverage_floor_findings(vec![covered("src/core/logic.ts", 10, 8)]).is_empty());
+    }
+
+    #[test]
+    fn an_unmeasured_component_is_not_reported_as_untested() {
+        // No tracefile at all, and a tracefile that covers other files only:
+        // both leave the component unmeasured.
+        assert!(coverage_floor_findings(Vec::new()).is_empty());
+        assert!(coverage_floor_findings(vec![covered("src/web/page.ts", 10, 0)]).is_empty());
     }
 
     #[test]

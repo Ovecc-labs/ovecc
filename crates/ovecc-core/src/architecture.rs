@@ -152,6 +152,14 @@ pub struct ComponentSpec {
     pub max_cyclomatic: Option<u32>,
     #[serde(default)]
     pub max_cognitive: Option<u32>,
+    /// Line coverage this component must hold, as a fraction in `(0, 1]`.
+    /// Falling under it is an `architecture/coverage-floor` verdict, on the
+    /// same footing as an exceeded budget. Checked only when a tracefile was
+    /// indexed: with no coverage data the component is not judged, since a
+    /// missing tracefile would otherwise read as a component covered by
+    /// nothing.
+    #[serde(default)]
+    pub min_coverage: Option<f64>,
 }
 
 /// A `depends_on` entry: a bare component name, or a table when the
@@ -412,6 +420,17 @@ impl ComponentSpec {
         if self.max_cyclomatic == Some(0) {
             return Err(contract_error(format!(
                 "component '{}': max_cyclomatic must be at least 1",
+                self.name
+            )));
+        }
+        // A fraction, not a percentage: 80 would silently never be met, and a
+        // floor of 0 is the same as declaring nothing.
+        if self
+            .min_coverage
+            .is_some_and(|floor| !(0.0..=1.0).contains(&floor) || floor == 0.0)
+        {
+            return Err(contract_error(format!(
+                "component '{}': min_coverage is a fraction in (0, 1], e.g. 0.8 for 80%",
                 self.name
             )));
         }
