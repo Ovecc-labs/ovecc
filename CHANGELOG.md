@@ -7,6 +7,8 @@ changes).
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-08-01
+
 ### Added
 
 - Behavioral coupling: the files a repository keeps changing in the same
@@ -23,17 +25,53 @@ changes).
 - `hotspots` and `summary` report each module's fix history: how many bug-fix
   commits touched it, the same count weighted by age (180-day half-life), and
   the date of the last one.
+- `ovecc selfcheck`: ovecc's own findings measured against the repository's fix
+  history, as a lift per rule over the repository's own base rate. It ships in
+  `report` and in `BENCHMARKS.md` with the number as it comes — on this
+  repository two rules of eleven clearly beat the base rate. With no ingested
+  history it says it had nothing to measure instead of printing a table of
+  zeros that reads as a rule set predicting nothing.
+- Line coverage from an LCOV tracefile: `index --coverage <path>`, or the
+  conventional locations (`coverage/lcov.info`, `lcov.info`, `coverage.lcov`)
+  when none is given. Stored per file, reported per module by `hotspots`, and
+  crossed with the ranking to name the hotspot the tests reach least.
+- `min_coverage` per component in `.ovecc/architecture.toml`: a verdict when a
+  component's measured line coverage sits under the floor it declared. A
+  component the tracefile never mentions is skipped rather than reported at 0%,
+  because what is known is that it is unmeasured, not that it is untested.
+- `review` and `gate` report the shape of a change: the files and head lines it
+  touches, the contract components it reaches, how evenly it spreads over its
+  files, the ranked hotspots it lands on, its share of the repository's
+  age-weighted fix mass, and the mean age of the files it edits. The file,
+  component, fix-mass and age measurements each carry a percentile against the
+  repository's own indexed commits, so a change is read against the codebase it
+  lands in rather than against a constant. Information, never a verdict: no rank
+  fails the gate, and under 100 indexed commits none is reported at all.
 
 ### Fixed
 
 - Churn follows renames: a file's history no longer restarts at its new path.
   Tree diffs also stopped counting directories as files.
+- `grep --limit` cuts the definitions returned, not the matches alone, so one
+  symbol with many call sites no longer crowds every other result out of the
+  page.
+- `audit` tells an unreadable lockfile apart from an absent one, instead of
+  reporting both as no dependencies found.
+- `impact` says when it answered for a file's module rather than for the file
+  itself, instead of widening the question in silence.
+- `summary` carries the files the index could not read, so a partial index shows
+  up in the report and not only in the output of the run that produced it.
 
 ### Changed
 
 - The commit index records where a renamed file came from, and the co-change
   pairs get their own table (schema 10). Existing databases migrate on the next
   `index`, which re-ingests the commit history so old renames get linked.
+- Per-file coverage gets its own table (schema 11), migrated on the next
+  `index`.
+- Finding severities are coloured when stdout is a terminal and left plain when
+  it is piped or redirected.
+- The first-run hints name the command that helps instead of describing it.
 
 ## [0.2.1] - 2026-07-31
 
