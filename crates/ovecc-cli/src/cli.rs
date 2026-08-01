@@ -246,10 +246,11 @@ pub enum Command {
         /// Optional paths (files or directories) to scope the text scan.
         #[arg(value_name = "PATH")]
         paths: Vec<String>,
-        /// Matches to print. 0 prints all of them; totals always cover the
-        /// whole set.
-        #[arg(long, default_value_t = crate::commands::search::DEFAULT_GREP_LIMIT)]
-        limit: usize,
+        /// Results to print, applied to the definitions and to the matches
+        /// alike. Defaults to 20 definitions and 50 matches; 0 prints all of
+        /// them. Totals always cover the whole set.
+        #[arg(long)]
+        limit: Option<usize>,
     },
     /// Read one element instead of a whole file: a symbol's source by name, a
     /// `file:start-end` range, a `file:line` anchor (expands to the enclosing

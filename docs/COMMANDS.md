@@ -298,10 +298,11 @@ runtime dependency); the file opens offline.
 Search served from the index: symbol definitions first (name, kind,
 `file:start-end` span), then text matches from an ignore-aware disk scan —
 configs and docs included — in the familiar `path:line: text` form. Matches are
-deduplicated and capped (5 per file, 50 overall by default; totals always cover
-the full set), with test files ranked after source. All-lowercase patterns
-search case-insensitively (smart case). Same coverage as `grep -r`, a fraction
-of the output.
+deduplicated and capped (20 definitions, 5 matches per file, 50 matches
+overall; totals always cover the full set), with test files ranked after
+source. `--limit` raises both caps at once and `--limit 0` lifts them.
+All-lowercase patterns search case-insensitively (smart case). Same coverage as
+`grep -r`, a fraction of the output.
 
 ### `ovecc read <target> [--limit]`
 

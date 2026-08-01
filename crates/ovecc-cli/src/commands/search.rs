@@ -24,7 +24,11 @@ use std::path::Path;
 pub(crate) const DEFAULT_READ_LINES: usize = 200;
 
 /// Matches `grep` renders before truncating. Totals always cover the full set.
-pub(crate) const DEFAULT_GREP_LIMIT: usize = 50;
+const DEFAULT_GREP_LIMIT: usize = 50;
+
+/// Definitions `grep` renders before truncating. Lower than the match budget:
+/// a name rarely has more definitions than that, and each one costs a line.
+const DEFAULT_GREP_DEFS: usize = 20;
 
 /// Text matches shown per file; the rest of a file collapses to a count so one
 /// chatty file cannot spend the whole budget.
@@ -379,7 +383,7 @@ pub(crate) fn run_grep(
     paths: &ProjectPaths,
     pattern: &str,
     scopes: &[String],
-    limit: usize,
+    limit: Option<usize>,
     format: OutputFormat,
 ) -> Result<u8> {
     if pattern.is_empty() {
@@ -396,7 +400,7 @@ pub(crate) fn run_grep(
         .map_err(|err| OveccError::Usage {
             message: format!("invalid regex '{pattern}': {err}"),
         })?;
-    let limit = if limit == 0 { usize::MAX } else { limit };
+    let (def_limit, match_limit) = grep_budgets(limit);
 
     let store = open_store(paths)?;
     let repository_id = paths.repository_id().0;
@@ -411,7 +415,25 @@ pub(crate) fn run_grep(
     let files = scan_files(&paths.root, scopes)?;
     let matches = scan_matches(&paths.root, &files, &regex);
 
-    render_grep(pattern, &definitions, &matches, limit, format)
+    render_grep(
+        pattern,
+        &definitions,
+        &matches,
+        def_limit,
+        match_limit,
+        format,
+    )
+}
+
+/// The definition and match budgets for one `grep`, in that order. An explicit
+/// `--limit` raises both, so neither list can strand the caller with no way past
+/// it; without one, each keeps its own default. 0 means everything.
+fn grep_budgets(limit: Option<usize>) -> (usize, usize) {
+    let uncapped = |n: usize| if n == 0 { usize::MAX } else { n };
+    (
+        uncapped(limit.unwrap_or(DEFAULT_GREP_DEFS)),
+        uncapped(limit.unwrap_or(DEFAULT_GREP_LIMIT)),
+    )
 }
 
 struct GrepMatch {
@@ -539,19 +561,22 @@ fn render_grep(
     pattern: &str,
     definitions: &[SymbolDef],
     matches: &[GrepMatch],
-    limit: usize,
+    def_limit: usize,
+    match_limit: usize,
     format: OutputFormat,
 ) -> Result<u8> {
-    let shown_defs = &definitions[..definitions.len().min(20)];
+    let shown_defs = &definitions[..definitions.len().min(def_limit)];
     let files_matched = {
         let mut files: Vec<&str> = matches.iter().map(|m| m.file.as_str()).collect();
         files.dedup();
         files.len()
     };
-    let (shown, per_file_hidden) = select_matches(matches, limit);
+    let (shown, per_file_hidden) = select_matches(matches, match_limit);
+
+    let truncated = shown.len() < matches.len() || shown_defs.len() < definitions.len();
 
     if matches!(format, OutputFormat::Json | OutputFormat::Ndjson) {
-        let data = serde_json::json!({
+        let mut data = serde_json::json!({
             "pattern": pattern,
             "definitions": shown_defs.iter().map(def_json).collect::<Vec<_>>(),
             "definitions_total": definitions.len(),
@@ -560,8 +585,14 @@ fn render_grep(
             })).collect::<Vec<_>>(),
             "matches_total": matches.len(),
             "files_matched": files_matched,
-            "truncated": shown.len() < matches.len(),
+            "truncated": truncated,
         });
+        if truncated {
+            let full = definitions.len().max(matches.len());
+            data["next_call"] = serde_json::json!(format!(
+                "ovecc grep {pattern:?} --limit {full} for the rest"
+            ));
+        }
         emit_json("grep", &data, meta_for("grep"))?;
         return Ok(0);
     }
@@ -609,7 +640,7 @@ fn render_grep(
     if unseen_files > 0 {
         println!("  … {unseen_matches} more matches in {unseen_files} other files");
     }
-    if shown.len() < matches.len() {
+    if truncated {
         println!("Narrow with a path (ovecc grep PATTERN src/) or raise --limit.");
     }
     if let Some(def) = definitions.first() {
@@ -737,6 +768,18 @@ mod tests {
         assert_eq!(hidden.get("a.py"), Some(&3));
         let (capped, _) = select_matches(&matches, 3);
         assert_eq!(capped.len(), 3);
+    }
+
+    #[test]
+    fn an_explicit_limit_raises_both_grep_budgets() {
+        assert_eq!(
+            grep_budgets(None),
+            (DEFAULT_GREP_DEFS, DEFAULT_GREP_LIMIT),
+            "each list keeps its own default"
+        );
+        // A raised limit has to reach the definitions, not the matches alone.
+        assert_eq!(grep_budgets(Some(40)), (40, 40));
+        assert_eq!(grep_budgets(Some(0)), (usize::MAX, usize::MAX));
     }
 
     #[test]
