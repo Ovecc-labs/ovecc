@@ -681,8 +681,13 @@ fn run_command(cli: Cli) -> Result<u8> {
         } => {
             let paths = ProjectPaths::resolve(cli.repo.unwrap_or_else(|| PathBuf::from(".")))?;
             let config = load_config(&paths, format_override)?;
-            let result = load_impact(&paths, &target, direction.into(), max_depth)?;
-            render_blast(&result, config.output.default_format)?;
+            let (result, redirected_from) =
+                load_impact(&paths, &target, direction.into(), max_depth)?;
+            render_blast(
+                &result,
+                redirected_from.as_deref(),
+                config.output.default_format,
+            )?;
             Ok(0)
         }
         Command::Diff {

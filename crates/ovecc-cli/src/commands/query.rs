@@ -466,7 +466,7 @@ pub(crate) fn load_impact(
     target: &str,
     direction: ImpactDirection,
     max_depth: usize,
-) -> Result<BlastResult> {
+) -> Result<(BlastResult, Option<String>)> {
     let store = open_store(paths)?;
     let (nodes, edges) = load_graph(&store, &paths.repository_id().0)?;
     let Some(node) = blast::resolve_target(target, &nodes) else {
@@ -475,25 +475,34 @@ pub(crate) fn load_impact(
     // A file target carries no architectural edges of its own — dependency edges
     // are module-level — so a raw file node yields an empty (and falsely
     // reassuring "Low risk") blast radius. Redirect it to the module that
-    // `contains` it, so `impact src/foo/bar.ts` answers for module `foo`.
-    let node = if node.kind == "file" {
-        edges
+    // `contains` it, so `impact src/foo/bar.ts` answers for module `foo`, and
+    // hand the caller the file back so the report can admit the substitution.
+    let (node, redirected_from) = match node.kind.as_str() {
+        "file" => edges
             .iter()
             .find(|edge| edge.kind == "contains" && edge.target == node.id)
             .and_then(|edge| nodes.iter().find(|candidate| candidate.id == edge.source))
-            .unwrap_or(node)
-    } else {
-        node
+            .map_or((node, None), |module| (module, Some(node.label.clone()))),
+        _ => (node, None),
     };
-    blast::blast_radius(&nodes, &edges, &node.id, direction, max_depth).ok_or_else(|| {
-        OveccError::Internal {
-            message: format!("resolved target '{target}' vanished from the graph view"),
-        }
-        .into()
-    })
+    let result =
+        blast::blast_radius(&nodes, &edges, &node.id, direction, max_depth).ok_or_else(|| {
+            OveccError::Internal {
+                message: format!("resolved target '{target}' vanished from the graph view"),
+            }
+        })?;
+    Ok((result, redirected_from))
 }
 
-pub(crate) fn render_blast(result: &BlastResult, format: OutputFormat) -> Result<()> {
+pub(crate) fn render_blast(
+    result: &BlastResult,
+    redirected_from: Option<&str>,
+    format: OutputFormat,
+) -> Result<()> {
+    // The prose form for the two human-facing arms; JSON carries the file itself
+    // under `redirected_from`.
+    let redirect = redirected_from
+        .map(|file| format!("{file} has no dependency edges of its own; answering for its module"));
     match format {
         OutputFormat::Json | OutputFormat::Sarif | OutputFormat::Codeclimate => {
             // The per-kind counts already summarize the full radius; the node
@@ -503,6 +512,9 @@ pub(crate) fn render_blast(result: &BlastResult, format: OutputFormat) -> Result
                 | cap_array(&mut data, "paths", 10);
             if truncated {
                 data["truncated"] = serde_json::json!(true);
+            }
+            if let Some(file) = redirected_from {
+                data["redirected_from"] = serde_json::json!(file);
             }
             emit_json("impact", &data, meta_for("impact"))?
         }
@@ -522,6 +534,10 @@ pub(crate) fn render_blast(result: &BlastResult, format: OutputFormat) -> Result
         OutputFormat::Markdown => {
             println!("# Impact: {}", result.target_label);
             println!();
+            if let Some(note) = &redirect {
+                println!("> {note}");
+                println!();
+            }
             println!("- Affected modules: {}", result.impacted_modules);
             println!("- Affected APIs: {}", result.impacted_apis);
             println!("- Affected tables: {}", result.impacted_tables);
@@ -543,6 +559,9 @@ pub(crate) fn render_blast(result: &BlastResult, format: OutputFormat) -> Result
         }
         OutputFormat::Text => {
             println!("Impact: {}", result.target_label);
+            if let Some(note) = &redirect {
+                println!("  ({note})");
+            }
             println!("Affected modules: {}", result.impacted_modules);
             println!("Affected APIs: {}", result.impacted_apis);
             println!("Affected tables: {}", result.impacted_tables);
