@@ -7,6 +7,7 @@
 pub mod architecture;
 pub mod capabilities;
 pub mod config;
+pub mod coverage;
 pub mod error;
 pub mod facts;
 pub mod graph;
