@@ -124,6 +124,59 @@ of dynamic dispatch and inheritance that no static graph resolves for free,
 and it answers empty on 6 to 22% of symbols where the reference sits in
 constructs the extractors do not yet model.
 
+## What one question costs an agent
+
+Accuracy says nothing about what the answer costs to obtain. This section
+prices the same question, "which files reference F", on both paths: one
+`ovecc query "rdeps F"` against the index, versus `rg -w` and then opening the
+files it matched, which is what an agent does with a hit list it cannot trust.
+
+Method:
+
+- **Sample**: the same construction as the accuracy table, uniquely-named
+  functions drawn with a fixed seed, 40 per repository. Unique names again
+  favour the baseline by removing its collision noise.
+- **Baseline**: ripgrep 15.1.0, scoped to the language's extension. Both
+  commands run once to warm the cache before the timed run.
+- **Bytes**: what the tool writes to stdout, and for the baseline also the size
+  of every file it matched. Roughly four bytes to the token.
+- **Checkouts**: django `5f30fd2358`, remeda `465991f`.
+
+| Repository | Files | ovecc median | rg median | ovecc bytes | rg hit lines | rg + reading the files |
+| --- | --- | --- | --- | --- | --- | --- |
+| django | 2 868 | 517 ms | 315 ms | 8 805 | 68 070 (7.7×) | 4 355 185 (**495×**) |
+| remeda | 391 | 138 ms | 91 ms | 9 784 | 77 724 (7.9×) | 954 320 (**98×**) |
+
+Ovecc is not the faster command. It is about 1.6× slower per call than
+ripgrep, because it opens and queries a database where ripgrep streams bytes
+past a matcher, and `ovecc_capabilities` returning in 32 ms over a warm MCP
+session shows that cost is the query, not process startup.
+
+What it removes is reading. Against ripgrep's hit list alone the answer is
+7.7 to 7.9× smaller, which is the floor: it credits the baseline with resolving
+the reference set from `file:line` pairs, which it cannot do, since the truth
+set is a subset of the lines containing the identifier and nothing in the
+output says which. Against the path an agent actually takes, opening the
+matched files to decide, it is 98 to 495× smaller. Half a second of query
+against a 33 kB median read is the trade, and it only pays off because the
+tokens are what the model is slow at, not the tool call.
+
+These are single-question costs, and a whole task compounds them in ways the
+table does not model. One end-to-end run that does compound them, on zod with
+Claude Sonnet 4.6, asking whether importing `scripts/check-semver.js` from
+`packages/zod/src/index.ts` closes an architectural cycle:
+
+| Path | Tokens | Cost | Wall clock |
+| --- | --- | --- | --- |
+| agent + ovecc over MCP | 58 906 | $0.22 | 64 s |
+| agent reading files | 528 865 | $1.63 | 96 s |
+
+Read that as one observation, not a benchmark: a single run, one model, one
+question, and agent runs are not deterministic. It is recorded because it is
+the only measurement here of what the token difference is worth once inference
+is in the loop, and because the ratios land where the table predicts, roughly
+an order of magnitude on tokens and much less than that on time.
+
 ## Self-check: do the findings track the corrections?
 
 A benchmark that only measures speed and coverage never asks whether the
