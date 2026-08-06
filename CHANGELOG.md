@@ -7,6 +7,8 @@ changes).
 
 ## [Unreleased]
 
+## [0.2.3] - 2026-08-07
+
 ### Added
 
 - A macOS arm64 binary in the releases, built on the standard `macos-15` runner
