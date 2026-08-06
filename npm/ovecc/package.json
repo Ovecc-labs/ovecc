@@ -1,0 +1,35 @@
+{
+  "name": "ovecc",
+  "version": "0.0.0",
+  "description": "Deterministic, offline architecture intelligence: dependency graph, impact, dead code, duplication, security findings, and a CI gate",
+  "keywords": [
+    "architecture",
+    "dependency-graph",
+    "static-analysis",
+    "monorepo",
+    "code-quality",
+    "cli",
+    "mcp"
+  ],
+  "homepage": "https://ovecc.dev",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Ovecc-labs/ovecc.git"
+  },
+  "bugs": "https://github.com/Ovecc-labs/ovecc/issues",
+  "license": "Apache-2.0",
+  "bin": {
+    "ovecc": "bin/ovecc.js"
+  },
+  "files": [
+    "bin"
+  ],
+  "optionalDependencies": {
+    "@ovecc/cli-darwin-arm64": "0.0.0",
+    "@ovecc/cli-linux-x64": "0.0.0",
+    "@ovecc/cli-win32-x64": "0.0.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

@@ -15,6 +15,10 @@
 #   and publishes the versioned release — the one `/releases/latest` serves.
 #   Cutting a release is: bump the version in Cargo.toml, move the Unreleased
 #   changelog entries under the new heading, tag `vX.Y.Z`, push the tag.
+# - `publish-npm` runs after it and ships the same binaries to npm: one platform
+#   package per target, whose `os`/`cpu` fields make npm download only the
+#   matching one, plus the `ovecc` launcher. No install script, so `npx ovecc`
+#   works under `--ignore-scripts`. Needs the `NPM_TOKEN` secret.
 #
 # Windows uses the GNU (MinGW-w64) toolchain — the supported path per
 # docs/dev/SETUP.md. We install the gnu host toolchain and MSYS2's gcc so
@@ -281,3 +285,52 @@ jobs:
             --notes-file notes.md \
             --latest \
             dist/*
+
+  publish-npm:
+    name: Publish to npm
+    needs: release-version
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write # npm provenance attestation
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      # The versions committed under npm/ are 0.0.0 placeholders: the tag is the
+      # single source of truth, and release-version has already checked it against
+      # Cargo.toml.
+      - name: Stage the binaries and the version
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          install -Dm755 dist/ovecc-linux-x86_64       npm/cli-linux-x64/bin/ovecc
+          install -Dm755 dist/ovecc-macos-aarch64      npm/cli-darwin-arm64/bin/ovecc
+          install -Dm755 dist/ovecc-windows-x86_64.exe npm/cli-win32-x64/bin/ovecc.exe
+          for p in cli-linux-x64 cli-darwin-arm64 cli-win32-x64 ovecc; do
+            (cd "npm/$p" && npm pkg set version="$version")
+          done
+          (cd npm/ovecc && npm pkg set \
+            "optionalDependencies.@ovecc/cli-linux-x64=$version" \
+            "optionalDependencies.@ovecc/cli-darwin-arm64=$version" \
+            "optionalDependencies.@ovecc/cli-win32-x64=$version")
+
+      # Platform packages first: by the time the launcher is installable, its
+      # optionalDependencies have to already resolve.
+      - name: Publish
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          for p in cli-linux-x64 cli-darwin-arm64 cli-win32-x64 ovecc; do
+            npm publish --provenance --access public "npm/$p"
+          done

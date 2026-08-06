@@ -1,0 +1,23 @@
+{
+  "name": "@ovecc/cli-linux-x64",
+  "version": "0.0.0",
+  "description": "Linux x86_64 binary for ovecc",
+  "homepage": "https://ovecc.dev",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Ovecc-labs/ovecc.git"
+  },
+  "license": "Apache-2.0",
+  "os": [
+    "linux"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "files": [
+    "bin"
+  ],
+  "engines": {
+    "node": ">=18"
+  }
+}

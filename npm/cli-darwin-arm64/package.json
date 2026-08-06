@@ -1,0 +1,23 @@
+{
+  "name": "@ovecc/cli-darwin-arm64",
+  "version": "0.0.0",
+  "description": "macOS arm64 binary for ovecc",
+  "homepage": "https://ovecc.dev",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Ovecc-labs/ovecc.git"
+  },
+  "license": "Apache-2.0",
+  "os": [
+    "darwin"
+  ],
+  "cpu": [
+    "arm64"
+  ],
+  "files": [
+    "bin"
+  ],
+  "engines": {
+    "node": ">=18"
+  }
+}

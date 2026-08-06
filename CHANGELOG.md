@@ -15,6 +15,10 @@ changes).
   alongside the Linux and Windows ones. The GitHub Action picks it up when the
   caller's job runs on macOS. It is unsigned, so the first run needs `xattr -d
   com.apple.quarantine`.
+- `npx ovecc`: the same binaries published to npm, one platform package per
+  target that npm picks by its `os` and `cpu` fields, behind an `ovecc` launcher
+  with no install script (so it works under `--ignore-scripts`). Installing this
+  way also avoids the macOS quarantine flag, which only browsers set.
 
 ## [0.2.2] - 2026-08-01
 
