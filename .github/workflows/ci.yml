@@ -2,14 +2,14 @@
 #
 # - `lint` runs `cargo xtask lint` (fmt + clippy `-D warnings`), the strict
 #   dependency audit, and the suppression report; failures gate everything.
-# - `build-test` runs on every push to `mvp` or `main` and every PR, on Linux +
-#   Windows, compiling and testing in release mode. The heavy dependencies
-#   (DuckDB's bundled C++ build, oxc, tree-sitter) are cached by
-#   Swatinem/rust-cache, so only the first run per OS pays the full ~15-20 min;
-#   later runs are minutes.
+# - `build-test` runs on every push to `mvp` or `main` and every PR, on Linux,
+#   Windows and macOS, compiling and testing in release mode. The heavy
+#   dependencies (DuckDB's bundled C++ build, oxc, tree-sitter) are cached by
+#   Swatinem/rust-cache, so only the first run per OS pays the full ~15-20 min
+#   (longer on the 3-CPU macOS runner); later runs are minutes.
 # - `release` runs only on push to `main` (or manual dispatch from main). It
-#   recreates a rolling "latest" pre-release with both binaries attached, so
-#   the newest Linux and Windows dev builds are always downloadable.
+#   recreates a rolling "latest" pre-release with every binary attached, so
+#   the newest dev build for each platform is always downloadable.
 # - `release-version` runs on `v*` tags. It checks the tag against the
 #   workspace version, takes that version's CHANGELOG section as the notes,
 #   and publishes the versioned release — the one `/releases/latest` serves.
@@ -91,6 +91,14 @@ jobs:
             toolchain: stable-x86_64-pc-windows-gnu
             asset: ovecc-windows-x86_64.exe
             ext: ".exe"
+          # Pinned rather than macos-latest: that label moved to macOS 15 in
+          # August 2025 and will move again, silently raising the minimum macOS
+          # the published binary runs on. Standard arm64 runner, so it stays
+          # free on a public repo.
+          - os: macos-15
+            toolchain: stable
+            asset: ovecc-macos-aarch64
+            ext: ""
     steps:
       - uses: actions/checkout@v7
 
@@ -220,7 +228,7 @@ jobs:
           gh release delete latest --yes --cleanup-tag 2>/dev/null || true
           gh release create latest \
             --title "Rolling build (${GITHUB_SHA::7})" \
-            --notes "Dev build from \`${GITHUB_SHA}\` — Linux + Windows x86_64 binaries. For the supported build, use the newest versioned release." \
+            --notes "Dev build from \`${GITHUB_SHA}\`: Linux and Windows x86_64, macOS arm64. For the supported build, use the newest versioned release." \
             --target "${GITHUB_SHA}" \
             --prerelease \
             dist/*

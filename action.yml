@@ -68,6 +68,7 @@ runs:
         set -euo pipefail
         case "$RUNNER_OS" in
           Windows) asset="ovecc-windows-x86_64.exe"; bin="ovecc.exe" ;;
+          macOS)   asset="ovecc-macos-aarch64";      bin="ovecc" ;;
           *)       asset="ovecc-linux-x86_64";       bin="ovecc" ;;
         esac
         dest="$RUNNER_TEMP/ovecc-bin"

@@ -114,10 +114,17 @@ below](#the-architecture-contract-in-depth).
 ## Install
 
 Grab a prebuilt binary from the [latest release](../../releases/latest) (Linux and
-Windows x86_64), drop it on your `PATH`, and run `ovecc index .`. There is nothing
-else to install: DuckDB is bundled, there is no runtime, and it works fully
-offline. A rolling [dev build](../../releases/tag/latest) ships on every push to
-`main`.
+Windows x86_64, macOS arm64), drop it on your `PATH`, and run `ovecc index .`.
+There is nothing else to install: DuckDB is bundled, there is no runtime, and it
+works fully offline. A rolling [dev build](../../releases/tag/latest) ships on
+every push to `main`.
+
+The macOS binary is unsigned, so Gatekeeper quarantines it on download. Clear the
+flag once and it runs:
+
+```sh
+xattr -d com.apple.quarantine ./ovecc-macos-aarch64
+```
 
 ### Build from source
 

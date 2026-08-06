@@ -7,6 +7,13 @@ changes).
 
 ## [Unreleased]
 
+### Added
+
+- A macOS arm64 binary in the releases, built on the standard `macos-15` runner
+  alongside the Linux and Windows ones. The GitHub Action picks it up when the
+  caller's job runs on macOS. It is unsigned, so the first run needs `xattr -d
+  com.apple.quarantine`.
+
 ## [0.2.2] - 2026-08-01
 
 ### Added
