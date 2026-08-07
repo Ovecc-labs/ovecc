@@ -327,10 +327,13 @@ jobs:
 
       # Platform packages first: by the time the launcher is installable, its
       # optionalDependencies have to already resolve.
+      #
+      # Without ./, npm reads npm/cli-linux-x64 as a github owner/repo shorthand
+      # and tries to clone it.
       - name: Publish
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           for p in cli-linux-x64 cli-darwin-arm64 cli-win32-x64 ovecc; do
-            npm publish --provenance --access public "npm/$p"
+            npm publish --provenance --access public "./npm/$p"
           done
