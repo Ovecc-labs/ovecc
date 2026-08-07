@@ -1,0 +1,14 @@
+# cargo-audit reads Cargo.lock, which lists a crate's optional dependencies
+# whether or not a feature ever activates them.
+#
+# RUSTSEC-2026-0235 is an out-of-bounds read in rkyv's archive validation. rkyv
+# reaches this lockfile only through rust_decimal's optional `rkyv` feature, and
+# duckdb depends on rust_decimal with default features only, so rkyv is never
+# compiled into the binary:
+#
+#   cargo tree -i rkyv -e all   ->   "nothing to print"
+#
+# rust_decimal 1.42.1, its latest release, still requires rkyv ^0.7.46, so there
+# is no version to move to. Drop this entry once it moves to 0.8.
+[advisories]
+ignore = ["RUSTSEC-2026-0235"]
