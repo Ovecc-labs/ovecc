@@ -1324,6 +1324,95 @@ fn architecture_show_states_what_a_component_must_and_must_not_import() {
     );
 }
 
+/// The distinction the whole calibration exists for: two files with zero
+/// dependents, one of which is genuinely unused and one of which is named by an
+/// import the resolver rejected. An agent told "0" for both deletes the second
+/// and breaks the build.
+#[test]
+fn an_empty_answer_says_whether_it_is_absence_or_ignorance() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let root = temp.path();
+    let repo = root.to_str().expect("utf8 path").to_string();
+
+    write_source(
+        root,
+        "src/auth/guard.ts",
+        "export const guard = () => true;\n",
+    );
+    write_source(root, "src/util/orphan.ts", "export const orphan = 1;\n");
+    // `./guard` is the shape a moved file leaves behind: the importer was never
+    // updated, so it names `src/api/guard.ts`, which has never existed.
+    write_source(
+        root,
+        "src/api/legacy.ts",
+        "import { guard } from \"./guard\";\n\
+         import { missing } from \"./nowhere\";\n\
+         export const legacy = [guard, missing];\n",
+    );
+    index_repo(&repo);
+
+    let orphan = json_output(
+        &repo,
+        &["query", "rdeps src/util/orphan.ts", "--format", "json"],
+    );
+    assert_eq!(orphan["data"]["total"], 0);
+    assert_eq!(
+        orphan["data"]["answer"], "none",
+        "nothing imports it and nothing unresolved could have: {orphan}"
+    );
+    assert!(
+        orphan["data"]["unresolved"].is_null(),
+        "a clean answer carries no caveat: {orphan}"
+    );
+
+    let guard = json_output(
+        &repo,
+        &["query", "rdeps src/auth/guard.ts", "--format", "json"],
+    );
+    assert_eq!(
+        guard["data"]["answer"], "could_not_resolve",
+        "an import naming 'guard' resolved to nothing, so 0 is not a fact: {guard}"
+    );
+    let blindspots = guard["data"]["unresolved"]
+        .as_array()
+        .expect("the blind spots are named");
+    assert_eq!(blindspots.len(), 1, "{guard}");
+    assert_eq!(blindspots[0]["file"], "src/api/legacy.ts");
+    assert_eq!(blindspots[0]["specifier"], "./guard");
+
+    // The importing file's own broken import is exact, not a guess: it is on
+    // its own lines.
+    let outgoing = json_output(
+        &repo,
+        &["query", "deps src/api/legacy.ts", "--format", "json"],
+    );
+    let outgoing_spots = outgoing["data"]["unresolved"]
+        .as_array()
+        .expect("its own unresolved imports");
+    assert_eq!(
+        outgoing_spots
+            .iter()
+            .map(|spot| spot["specifier"].as_str().expect("specifier"))
+            .collect::<Vec<_>>(),
+        vec!["./guard", "./nowhere"],
+        "both of its imports resolve to nothing: {outgoing}"
+    );
+
+    let text = ovecc(
+        &repo,
+        &["query", "rdeps src/auth/guard.ts", "--format", "text"],
+    );
+    let rendered = String::from_utf8_lossy(&text.stdout);
+    assert!(
+        rendered.contains("caution: 1 import(s) could not be resolved"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("src/api/legacy.ts:1  ./guard"),
+        "the caveat names the site to go and look at: {rendered}"
+    );
+}
+
 #[test]
 fn unresolved_relative_imports_are_flagged_and_never_counted_as_packages() {
     let temp = tempfile::tempdir().expect("temp dir");

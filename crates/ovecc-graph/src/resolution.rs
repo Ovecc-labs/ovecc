@@ -126,7 +126,7 @@ pub fn calibrate(dependencies: &[DependencyRecord], target_file: Option<&str>) -
             calibration.incoming.push(spot);
         }
     }
-    calibration.outgoing.sort_by(|a, b| a.line.cmp(&b.line));
+    calibration.outgoing.sort_by_key(|spot| spot.line);
     calibration
         .incoming
         .sort_by(|a, b| (&a.file, a.line).cmp(&(&b.file, b.line)));
@@ -254,9 +254,10 @@ mod tests {
             line: 4,
             specifier: "./guard".to_string(),
         };
+        let one = std::slice::from_ref(&spot);
         assert_eq!(Answer::of(0, &[]), Answer::None);
-        assert_eq!(Answer::of(0, &[spot.clone()]), Answer::CouldNotResolve);
-        assert_eq!(Answer::of(3, &[spot]), Answer::Resolved);
+        assert_eq!(Answer::of(0, one), Answer::CouldNotResolve);
+        assert_eq!(Answer::of(3, one), Answer::Resolved);
         assert_eq!(Answer::of(3, &[]), Answer::Resolved);
     }
 }

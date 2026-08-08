@@ -13,6 +13,7 @@ use ovecc_core::query::{Query, TargetSelector};
 use ovecc_core::report::{AnchoredRef, ContextSlice};
 use ovecc_db::ArchitectureStore;
 use ovecc_graph::blast::{self, BlastEdge, BlastNode, BlastResult, ImpactedNode};
+use ovecc_graph::resolution::{self, Answer, Blindspot};
 use std::collections::HashMap;
 
 pub(crate) fn render_explanation(
@@ -139,16 +140,28 @@ pub(crate) fn run_query(
         })
     };
 
+    // Loaded once and only when a direction-bearing query asks: `cycles` and
+    // `hotspots` returned above, and the rest pay nothing for it.
+    let calibrate = |selector: &TargetSelector| -> Result<resolution::Calibration> {
+        let node = resolve(selector)?;
+        Ok(resolution::calibrate(
+            &store.current_dependencies(&paths.repository_id().0)?,
+            target_file(node).as_deref(),
+        ))
+    };
+
     match query {
         Query::Deps(target) => print_query_labels(
             "Dependencies",
             run(target, ImpactDirection::Upstream, direct_depth)?,
             format,
+            &calibrate(target)?.outgoing,
         ),
         Query::ReverseDeps(target) => print_query_labels(
             "Dependents",
             run(target, ImpactDirection::Downstream, direct_depth)?,
             format,
+            &calibrate(target)?.incoming,
         ),
         Query::Module(name) => {
             let selector = TargetSelector::Free(name.clone());
@@ -156,6 +169,7 @@ pub(crate) fn run_query(
                 "Dependencies",
                 run(&selector, ImpactDirection::Upstream, direct_depth)?,
                 format,
+                &calibrate(&selector)?.outgoing,
             )
         }
         Query::Paths(target) => print_query_paths(
@@ -163,6 +177,9 @@ pub(crate) fn run_query(
             &run(target, ImpactDirection::Both, reach_depth)?,
             format,
         ),
+        // `a -> b` answers yes/no, and a "no" the index could not fully see is
+        // the same lie as an empty list — so it carries the caveat in both
+        // directions: an unresolved import at either end could hide the link.
         Query::Relation { source, target } => {
             let result = run(source, ImpactDirection::Upstream, reach_depth)?;
             // Resolving the right-hand side too keeps `a -> b` honest: an
@@ -180,15 +197,25 @@ pub(crate) fn run_query(
                         .is_some_and(|l| l.eq_ignore_ascii_case(&target_node.label))
                 })
                 .cloned();
+            // A "no" the index could not fully see is the same lie as an empty
+            // list. Both ends are asked: an unresolved import written by the
+            // source, or one elsewhere naming the target, could hide the link.
+            let mut blindspots = calibrate(source)?.outgoing;
+            blindspots.extend(calibrate(target)?.incoming);
+            let answer = Answer::of(usize::from(reached), &blindspots);
             match format {
                 OutputFormat::Json | OutputFormat::Ndjson => {
-                    let data = serde_json::json!({
+                    let mut data = serde_json::json!({
                         "query": "relation",
                         "source": result.target_label,
                         "target": target_node.label,
                         "depends_on": reached,
                         "path": path,
+                        "answer": answer.as_str(),
                     });
+                    if !blindspots.is_empty() {
+                        data["unresolved"] = serde_json::json!(blindspots);
+                    }
                     emit_json("query", &data, meta_for("query"))?;
                 }
                 _ => {
@@ -201,12 +228,25 @@ pub(crate) fn run_query(
                     if let Some(path) = path {
                         println!("  {}", path.join(" -> "));
                     }
+                    if !reached {
+                        print_caution(&blindspots);
+                    }
                 }
             }
             Ok(0)
         }
         // Named queries handled above.
         Query::Hotspots | Query::Violations | Query::Cycles => unreachable!(),
+    }
+}
+
+/// The file a target speaks for, for the resolution calibration: a symbol's
+/// defining file, a module's file, or — for a file node — its own label, since
+/// a file has no source-anchor row to carry the path.
+fn target_file(node: &BlastNode) -> Option<String> {
+    match node.kind.as_str() {
+        "file" => Some(node.label.clone()),
+        _ => node.file.clone(),
     }
 }
 
@@ -251,12 +291,22 @@ fn unresolved_target(input: &str, nodes: &[BlastNode], edges: &[BlastEdge]) -> a
 /// uncapped list once cost an agent session more than the grep it replaced.
 const QUERY_ITEM_CAP: usize = 50;
 
+/// Blind spots listed under an answer. The count is the signal; a handful of
+/// sites is enough to go and look, and the JSON carries them all.
+const BLINDSPOT_CAP: usize = 5;
+
 // Echoing the resolved label matters because targets resolve by substring:
 // `deps sinc` lands on `filter_changed_since`, and a count without the
 // resolved name reads as an answer about the literal input.
-fn print_query_labels(label: &str, result: BlastResult, format: OutputFormat) -> Result<u8> {
+fn print_query_labels(
+    label: &str,
+    result: BlastResult,
+    format: OutputFormat,
+    blindspots: &[Blindspot],
+) -> Result<u8> {
     let items = result.impacted;
     let shown = &items[..items.len().min(QUERY_ITEM_CAP)];
+    let answer = Answer::of(items.len(), blindspots);
     match format {
         OutputFormat::Json | OutputFormat::Ndjson => {
             let mut data = serde_json::json!({
@@ -264,9 +314,13 @@ fn print_query_labels(label: &str, result: BlastResult, format: OutputFormat) ->
                 "target": result.target_label,
                 "items": shown,
                 "total": items.len(),
+                "answer": answer.as_str(),
             });
             if shown.len() < items.len() {
                 data["truncated"] = serde_json::json!(true);
+            }
+            if !blindspots.is_empty() {
+                data["unresolved"] = serde_json::json!(blindspots);
             }
             emit_json("query", &data, meta_for("query"))?;
         }
@@ -282,9 +336,29 @@ fn print_query_labels(label: &str, result: BlastResult, format: OutputFormat) ->
                     result.target_label
                 );
             }
+            print_caution(blindspots);
         }
     }
     Ok(0)
+}
+
+/// The caveat under an answer the index could not fully see. Printed even
+/// beside a non-empty list, because "3 dependents, and 2 imports I could not
+/// follow" is a different fact from "3 dependents".
+fn print_caution(blindspots: &[Blindspot]) {
+    if blindspots.is_empty() {
+        return;
+    }
+    println!(
+        "  caution: {} import(s) could not be resolved, so this answer may be incomplete",
+        blindspots.len()
+    );
+    for spot in blindspots.iter().take(BLINDSPOT_CAP) {
+        println!("    {}:{}  {}", spot.file, spot.line, spot.specifier);
+    }
+    if blindspots.len() > BLINDSPOT_CAP {
+        println!("    … and {} more", blindspots.len() - BLINDSPOT_CAP);
+    }
 }
 
 /// Truncates a JSON array field in place, recording the pre-cap length in a

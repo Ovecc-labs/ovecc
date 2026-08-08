@@ -418,6 +418,34 @@ Structured graph queries: `deps X`, `rdeps X`, `paths X`, `module X`,
 `"a -> b"` (reachability with the path), `hotspots`, `violations`, `cycles`
 (elementary module cycles with `file:line` witness edges per hop).
 
+**Answers are ternary.** An empty result means two different things — "nothing
+references this" and "I could not work out what references this" — and a tool
+that returns the same silence for both invites an agent to read the second as
+the first, delete the symbol, and break the build. So `deps`, `rdeps`, `module`
+and `a -> b` carry an `answer` of `resolved`, `none`, or `could_not_resolve`,
+and name the imports behind the doubt:
+
+```
+Dependents of src/auth/guard.ts: 0
+  caution: 1 import(s) could not be resolved, so this answer may be incomplete
+    src/api/legacy.ts:1  ./guard
+```
+
+The two directions differ in what they can promise. On `deps` the blind spots
+are the target file's **own** unresolved imports — exact, they are its own
+lines. On `rdeps` they are unresolved imports elsewhere whose specifier names
+the target (its file stem, or its directory when it is the directory's entry
+point), which is plausible rather than certain. The matching deliberately errs
+toward doubt: a specifier that merely ends in the target's name counts, because
+claiming a certainty we do not have is the failure this exists to prevent.
+
+It is scoped to the target on purpose. A repository-wide "N imports are
+unresolved" would attach a warning to every answer and be tuned out within a
+day; only imports that could have meant *this* target are reported, so a clean
+answer stays clean. Roughly 70% edge recall is where static call graphs sit as
+a field (Helm et al., *Total Recall?*, ISSTA 2024), so the winnable axis is not
+resolving more — it is being honest about the rest.
+
 ### `ovecc impact <target> [--direction] [--max-depth]`
 
 Blast radius of changing a module, symbol, `table:NAME`, or `api:<route>`: the

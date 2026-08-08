@@ -34,6 +34,17 @@ changes).
 
 ### Added
 
+- `query deps`, `rdeps`, `module` and `a -> b` answer ternary: `resolved`,
+  `none`, or `could_not_resolve`. An empty result used to mean both "nothing
+  references this" and "I could not work out what references this", and an agent
+  that cannot tell them apart acts on the second as if it were the first —
+  deletes the symbol, breaks the build, and had no sign the tool was guessing.
+  The answer now names the unresolved imports behind the doubt, with their
+  `file:line`. On `deps` those are the target file's own unresolved imports,
+  which is exact; on `rdeps` they are unresolved imports elsewhere whose
+  specifier names the target, which is plausible and deliberately errs toward
+  doubt. Scoped to the target rather than the repository: a global "N imports
+  are unresolved" would annotate every answer and be ignored within a day.
 - Three constraint forms in `.ovecc/architecture.toml`, closing the gap between
   an allow-list and what an architecture actually needs to say. `depends_on` is
   a strictly positive bipartite set: it can express permission and nothing else.
