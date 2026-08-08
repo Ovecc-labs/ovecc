@@ -73,6 +73,21 @@
               ]
             }
           },
+          "cannot_depend_on": {
+            "description": "Components this one must never depend on. An allow-list already forbids by omission; naming the prohibition reports the edge as a forbidden dependency rather than an undeclared one. Naming the same component here and in depends_on or must_depend_on is a contract error.",
+            "type": "array",
+            "items": { "type": "string", "minLength": 1 }
+          },
+          "consumed_by": {
+            "description": "The only components allowed to depend on this one, declared on the target. An empty list closes the component to everybody - the strangler-fig rule for a module on its way out. Omit to leave it unrestricted. A dependency this list does not admit is a contract error, not a finding.",
+            "type": "array",
+            "items": { "type": "string", "minLength": 1 }
+          },
+          "must_depend_on": {
+            "description": "Components every file of this one must depend on, judged per file. Files that import nothing at all are exempt. Implies permission, so a required dependency is never also a divergence.",
+            "type": "array",
+            "items": { "type": "string", "minLength": 1 }
+          },
           "interface": {
             "description": "Public entry files. When non-empty, other components may import only these paths; anything else is an interface bypass. Virtual: no barrel file required.",
             "type": "array",

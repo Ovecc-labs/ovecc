@@ -57,6 +57,18 @@ pub(crate) struct DeclaredEdge {
 /// contract hygiene last.
 const VERDICTS: &[(&str, &str)] = &[
     ("architecture/divergence", "Divergences"),
+    (
+        "architecture/forbidden-dependency",
+        "Forbidden dependencies",
+    ),
+    (
+        "architecture/restricted-access",
+        "Imports of a component closed to them",
+    ),
+    (
+        "architecture/required-dependency",
+        "Required dependencies missing",
+    ),
     ("architecture/slice-isolation", "Slice isolation breaches"),
     ("architecture/interface-bypass", "Interface bypasses"),
     (
@@ -458,6 +470,16 @@ pub(crate) struct ComponentView {
     pub(crate) role: Option<String>,
     pub(crate) paths: Vec<String>,
     pub(crate) may_import: Vec<AllowedImport>,
+    /// Components this one must never import.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) must_not_import: Vec<String>,
+    /// Components every file of this one must import.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) must_import: Vec<String>,
+    /// The only components allowed to import this one. `Some([])` closes it to
+    /// everyone; `None` leaves it open.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) importable_by: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub(crate) interface: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -551,6 +573,9 @@ fn contract_view(contract: &ArchitectureContract, query: &[String]) -> Result<Co
                         .unwrap_or_default(),
                 })
                 .collect(),
+            must_not_import: component.cannot_depend_on.clone(),
+            must_import: component.must_depend_on.clone(),
+            importable_by: component.consumed_by.clone(),
             interface: component.interface.clone(),
             external_deny: component.external_deny.clone(),
             slices: component.slices,
@@ -604,6 +629,21 @@ fn show_text(view: &ContractView) {
                 .collect();
             println!("  may import: {}", allowed.join(", "));
         }
+        if !component.must_import.is_empty() {
+            println!(
+                "  must import: {} (every file)",
+                component.must_import.join(", ")
+            );
+        }
+        if !component.must_not_import.is_empty() {
+            println!(
+                "  must not import: {}",
+                component.must_not_import.join(", ")
+            );
+        }
+        if let Some(consumers) = &component.importable_by {
+            println!("  importable by: {}", consumer_list(consumers));
+        }
         if !component.interface.is_empty() {
             println!("  interface: {}", component.interface.join(", "));
         }
@@ -653,6 +693,21 @@ fn show_markdown(view: &ContractView) {
             }
             println!("{text}");
         }
+        if !component.must_import.is_empty() {
+            println!(
+                "- every file must import **{}**",
+                component.must_import.join("**, **")
+            );
+        }
+        if !component.must_not_import.is_empty() {
+            println!(
+                "- must not import **{}**",
+                component.must_not_import.join("**, **")
+            );
+        }
+        if let Some(consumers) = &component.importable_by {
+            println!("- importable by {}", consumer_list(consumers));
+        }
         if !component.interface.is_empty() {
             println!("- interface: `{}`", component.interface.join("`, `"));
         }
@@ -682,6 +737,16 @@ fn show_markdown(view: &ContractView) {
             view.unassigned.len(),
             view.unassigned.join("`, `")
         );
+    }
+}
+
+/// The consumers a component admits. An empty list is the whole point of the
+/// form — it must read as a rule, not as a missing value.
+fn consumer_list(consumers: &[String]) -> String {
+    if consumers.is_empty() {
+        "nothing (no component may import it)".to_string()
+    } else {
+        format!("{} only", consumers.join(", "))
     }
 }
 
