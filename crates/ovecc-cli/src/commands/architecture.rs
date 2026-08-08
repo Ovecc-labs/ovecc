@@ -57,6 +57,18 @@ pub(crate) struct DeclaredEdge {
 /// contract hygiene last.
 const VERDICTS: &[(&str, &str)] = &[
     ("architecture/divergence", "Divergences"),
+    (
+        "architecture/forbidden-dependency",
+        "Forbidden dependencies",
+    ),
+    (
+        "architecture/restricted-access",
+        "Imports of a component closed to them",
+    ),
+    (
+        "architecture/required-dependency",
+        "Required dependencies missing",
+    ),
     ("architecture/slice-isolation", "Slice isolation breaches"),
     ("architecture/interface-bypass", "Interface bypasses"),
     (
@@ -458,6 +470,16 @@ pub(crate) struct ComponentView {
     pub(crate) role: Option<String>,
     pub(crate) paths: Vec<String>,
     pub(crate) may_import: Vec<AllowedImport>,
+    /// Components this one must never import.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) must_not_import: Vec<String>,
+    /// Components every file of this one must import.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) must_import: Vec<String>,
+    /// The only components allowed to import this one. `Some([])` closes it to
+    /// everyone; `None` leaves it open.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) importable_by: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub(crate) interface: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -551,6 +573,9 @@ fn contract_view(contract: &ArchitectureContract, query: &[String]) -> Result<Co
                         .unwrap_or_default(),
                 })
                 .collect(),
+            must_not_import: component.cannot_depend_on.clone(),
+            must_import: component.must_depend_on.clone(),
+            importable_by: component.consumed_by.clone(),
             interface: component.interface.clone(),
             external_deny: component.external_deny.clone(),
             slices: component.slices,
@@ -571,6 +596,104 @@ fn contract_view(contract: &ArchitectureContract, query: &[String]) -> Result<Co
     })
 }
 
+/// How a `show` renderer marks up the two kinds of name it prints. Plain text
+/// marks neither; Markdown bolds component names and quotes literals.
+#[derive(Clone, Copy)]
+struct Style {
+    names: &'static str,
+    literals: &'static str,
+}
+
+const PLAIN: Style = Style {
+    names: "",
+    literals: "",
+};
+
+const MARKED: Style = Style {
+    names: "**",
+    literals: "`",
+};
+
+fn marked(items: &[String], mark: &str) -> String {
+    items
+        .iter()
+        .map(|item| format!("{mark}{item}{mark}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Every clause of a component's contract beyond its allow-list, as
+/// `(label, value)`. One list for both renderers, so a form added to the
+/// contract cannot land in one output and be forgotten in the other.
+fn component_clauses(component: &ComponentView, style: Style) -> Vec<(&'static str, String)> {
+    let mut clauses = Vec::new();
+    if !component.must_import.is_empty() {
+        clauses.push((
+            "must import (every file)",
+            marked(&component.must_import, style.names),
+        ));
+    }
+    if !component.must_not_import.is_empty() {
+        clauses.push((
+            "must not import",
+            marked(&component.must_not_import, style.names),
+        ));
+    }
+    if let Some(consumers) = &component.importable_by {
+        // An empty list is the whole point of the form: it must read as a
+        // rule, not as a missing value.
+        let value = if consumers.is_empty() {
+            "nothing (no component may import it)".to_string()
+        } else {
+            format!("{} only", marked(consumers, style.names))
+        };
+        clauses.push(("importable by", value));
+    }
+    if !component.interface.is_empty() {
+        clauses.push(("interface", marked(&component.interface, style.literals)));
+    }
+    if !component.external_deny.is_empty() {
+        clauses.push((
+            "external deny",
+            marked(&component.external_deny, style.literals),
+        ));
+    }
+    if component.slices {
+        clauses.push((
+            "slices",
+            "isolated (no imports between sibling slices)".to_string(),
+        ));
+    }
+    if !component.deny_capabilities.is_empty() {
+        clauses.push((
+            "deny capabilities",
+            marked(&component.deny_capabilities, style.literals),
+        ));
+    }
+    if let Some(budget) = budget_line(component) {
+        clauses.push(("budget", budget));
+    }
+    clauses
+}
+
+/// Each declared dependency as `target (via interface) (deprecated)`.
+fn allowed_imports(component: &ComponentView, style: Style) -> Vec<String> {
+    component
+        .may_import
+        .iter()
+        .map(|entry| {
+            let mut text = format!("{0}{1}{0}", style.names, entry.component);
+            if !entry.via.is_empty() {
+                text.push_str(&format!(" (via {})", marked(&entry.via, style.literals)));
+            }
+            if entry.deprecated {
+                text.push_str(" (deprecated)");
+            }
+            text
+        })
+        .collect()
+}
+
 fn show_text(view: &ContractView) {
     println!(
         "Contract mode {}, {} component(s):",
@@ -585,42 +708,14 @@ fn show_text(view: &ContractView) {
             .map(|role| format!(" [{role}]"))
             .unwrap_or_default();
         println!("{}{role} ({})", component.name, component.paths.join(", "));
-        if component.may_import.is_empty() {
+        let allowed = allowed_imports(component, PLAIN);
+        if allowed.is_empty() {
             println!("  may import: nothing (no depends_on declared)");
         } else {
-            let allowed: Vec<String> = component
-                .may_import
-                .iter()
-                .map(|entry| {
-                    let mut text = entry.component.clone();
-                    if !entry.via.is_empty() {
-                        text.push_str(&format!(" (via {})", entry.via.join(", ")));
-                    }
-                    if entry.deprecated {
-                        text.push_str(" (deprecated)");
-                    }
-                    text
-                })
-                .collect();
             println!("  may import: {}", allowed.join(", "));
         }
-        if !component.interface.is_empty() {
-            println!("  interface: {}", component.interface.join(", "));
-        }
-        if !component.external_deny.is_empty() {
-            println!("  external deny: {}", component.external_deny.join(", "));
-        }
-        if component.slices {
-            println!("  slices: isolated (no imports between sibling slices)");
-        }
-        if !component.deny_capabilities.is_empty() {
-            println!(
-                "  deny capabilities: {}",
-                component.deny_capabilities.join(", ")
-            );
-        }
-        if let Some(budget) = budget_line(component) {
-            println!("  budget: {budget}");
+        for (label, value) in component_clauses(component, PLAIN) {
+            println!("  {label}: {value}");
         }
     }
     if !view.unassigned.is_empty() {
@@ -643,36 +738,11 @@ fn show_markdown(view: &ContractView) {
             println!("- role: {role}");
         }
         println!("- paths: `{}`", component.paths.join("`, `"));
-        for entry in &component.may_import {
-            let mut text = format!("- may import **{}**", entry.component);
-            if !entry.via.is_empty() {
-                text.push_str(&format!(" via `{}`", entry.via.join("`, `")));
-            }
-            if entry.deprecated {
-                text.push_str(" (deprecated)");
-            }
-            println!("{text}");
+        for entry in allowed_imports(component, MARKED) {
+            println!("- may import {entry}");
         }
-        if !component.interface.is_empty() {
-            println!("- interface: `{}`", component.interface.join("`, `"));
-        }
-        if !component.external_deny.is_empty() {
-            println!(
-                "- external deny: `{}`",
-                component.external_deny.join("`, `")
-            );
-        }
-        if component.slices {
-            println!("- slices: isolated (no imports between sibling slices)");
-        }
-        if !component.deny_capabilities.is_empty() {
-            println!(
-                "- deny capabilities: `{}`",
-                component.deny_capabilities.join("`, `")
-            );
-        }
-        if let Some(budget) = budget_line(component) {
-            println!("- budget: {budget}");
+        for (label, value) in component_clauses(component, MARKED) {
+            println!("- {label}: {value}");
         }
     }
     if !view.unassigned.is_empty() {

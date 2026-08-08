@@ -12,6 +12,7 @@ pub mod conventions;
 pub mod cycles;
 pub mod diagnose;
 pub mod dupes;
+pub mod resolution;
 pub mod selfcheck;
 
 use ovecc_core::coverage::CoverageTotals;

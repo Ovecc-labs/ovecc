@@ -13,6 +13,7 @@ use ovecc_core::query::{Query, TargetSelector};
 use ovecc_core::report::{AnchoredRef, ContextSlice};
 use ovecc_db::ArchitectureStore;
 use ovecc_graph::blast::{self, BlastEdge, BlastNode, BlastResult, ImpactedNode};
+use ovecc_graph::resolution::{self, Answer, Blindspot};
 use std::collections::HashMap;
 
 pub(crate) fn render_explanation(
@@ -70,39 +71,7 @@ pub(crate) fn run_query(
             return Ok(0);
         }
         Query::Cycles => {
-            let store = open_store(paths)?;
-            let repository_id = paths.repository_id().0;
-            let modules = store.current_modules(&repository_id)?;
-            let dependencies = store.current_dependencies(&repository_id)?;
-            // Elementary loops shortest-first, each with the file:line import
-            // edges that witness every hop — the same walk `review` uses.
-            let cycles =
-                ovecc_graph::cycles::elementary_cycles_with_witness(&modules, &dependencies);
-            match format {
-                OutputFormat::Json | OutputFormat::Ndjson => {
-                    let data = serde_json::json!({ "query": "cycles", "cycles": cycles });
-                    emit_json("query", &data, meta_for("query"))?;
-                }
-                _ => {
-                    println!("Cycles: {}", cycles.len());
-                    for cycle in &cycles {
-                        let mut closed = cycle.modules.clone();
-                        if let Some(first) = cycle.modules.first().cloned() {
-                            closed.push(first);
-                        }
-                        println!("  {}", closed.join(" -> "));
-                        for edge in &cycle.edges {
-                            println!(
-                                "    {}:{} -> {} ({})",
-                                edge.from_file,
-                                edge.line,
-                                edge.to_file.as_deref().unwrap_or(&edge.to_module),
-                                edge.specifier
-                            );
-                        }
-                    }
-                }
-            }
+            print_cycles(paths, format)?;
             return Ok(0);
         }
         _ => {}
@@ -139,16 +108,29 @@ pub(crate) fn run_query(
         })
     };
 
+    // Read once for the whole query: `a -> b` calibrates both of its ends, and
+    // the named queries returned above without paying for this at all.
+    let dependencies = store.current_dependencies(&paths.repository_id().0)?;
+    let calibrate = |selector: &TargetSelector| -> Result<resolution::Calibration> {
+        let node = resolve(selector)?;
+        Ok(resolution::calibrate(
+            &dependencies,
+            target_file(node).as_deref(),
+        ))
+    };
+
     match query {
         Query::Deps(target) => print_query_labels(
             "Dependencies",
             run(target, ImpactDirection::Upstream, direct_depth)?,
             format,
+            &calibrate(target)?.outgoing,
         ),
         Query::ReverseDeps(target) => print_query_labels(
             "Dependents",
             run(target, ImpactDirection::Downstream, direct_depth)?,
             format,
+            &calibrate(target)?.incoming,
         ),
         Query::Module(name) => {
             let selector = TargetSelector::Free(name.clone());
@@ -156,6 +138,7 @@ pub(crate) fn run_query(
                 "Dependencies",
                 run(&selector, ImpactDirection::Upstream, direct_depth)?,
                 format,
+                &calibrate(&selector)?.outgoing,
             )
         }
         Query::Paths(target) => print_query_paths(
@@ -168,45 +151,108 @@ pub(crate) fn run_query(
             // Resolving the right-hand side too keeps `a -> b` honest: an
             // unknown `b` errors with suggestions instead of a false "no".
             let target_node = resolve(target)?;
-            let reached = result
-                .impacted
-                .iter()
-                .any(|node| node.label.eq_ignore_ascii_case(&target_node.label));
-            let path = result
-                .paths
-                .iter()
-                .find(|p| {
-                    p.last()
-                        .is_some_and(|l| l.eq_ignore_ascii_case(&target_node.label))
-                })
-                .cloned();
-            match format {
-                OutputFormat::Json | OutputFormat::Ndjson => {
-                    let data = serde_json::json!({
-                        "query": "relation",
-                        "source": result.target_label,
-                        "target": target_node.label,
-                        "depends_on": reached,
-                        "path": path,
-                    });
-                    emit_json("query", &data, meta_for("query"))?;
-                }
-                _ => {
-                    println!(
-                        "{} depends on {}: {}",
-                        result.target_label,
-                        target_node.label,
-                        if reached { "yes" } else { "no" }
-                    );
-                    if let Some(path) = path {
-                        println!("  {}", path.join(" -> "));
-                    }
-                }
-            }
-            Ok(0)
+            // A "no" the index could not fully see is the same lie as an empty
+            // list. Both ends are asked: an unresolved import written by the
+            // source, or one elsewhere naming the target, could hide the link.
+            let mut blindspots = calibrate(source)?.outgoing;
+            blindspots.extend(calibrate(target)?.incoming);
+            print_relation(&result, &target_node.label, format, &blindspots)
         }
         // Named queries handled above.
         Query::Hotspots | Query::Violations | Query::Cycles => unreachable!(),
+    }
+}
+
+/// Elementary loops shortest-first, each with the `file:line` import edges that
+/// witness every hop — the same walk `review` uses.
+fn print_cycles(paths: &ProjectPaths, format: OutputFormat) -> Result<()> {
+    let store = open_store(paths)?;
+    let repository_id = paths.repository_id().0;
+    let modules = store.current_modules(&repository_id)?;
+    let dependencies = store.current_dependencies(&repository_id)?;
+    let cycles = ovecc_graph::cycles::elementary_cycles_with_witness(&modules, &dependencies);
+    if matches!(format, OutputFormat::Json | OutputFormat::Ndjson) {
+        let data = serde_json::json!({ "query": "cycles", "cycles": cycles });
+        return emit_json("query", &data, meta_for("query"));
+    }
+    println!("Cycles: {}", cycles.len());
+    for cycle in &cycles {
+        let mut closed = cycle.modules.clone();
+        if let Some(first) = cycle.modules.first().cloned() {
+            closed.push(first);
+        }
+        println!("  {}", closed.join(" -> "));
+        for edge in &cycle.edges {
+            println!(
+                "    {}:{} -> {} ({})",
+                edge.from_file,
+                edge.line,
+                edge.to_file.as_deref().unwrap_or(&edge.to_module),
+                edge.specifier
+            );
+        }
+    }
+    Ok(())
+}
+
+/// `a -> b`: whether the source reaches the target, with the path that proves
+/// it. A "no" the index could not fully see is the same lie as an empty list,
+/// so it carries the same caveat.
+fn print_relation(
+    source: &BlastResult,
+    target_label: &str,
+    format: OutputFormat,
+    blindspots: &[Blindspot],
+) -> Result<u8> {
+    let reached = source
+        .impacted
+        .iter()
+        .any(|node| node.label.eq_ignore_ascii_case(target_label));
+    let path = source
+        .paths
+        .iter()
+        .find(|p| {
+            p.last()
+                .is_some_and(|l| l.eq_ignore_ascii_case(target_label))
+        })
+        .cloned();
+    if matches!(format, OutputFormat::Json | OutputFormat::Ndjson) {
+        let mut data = serde_json::json!({
+            "query": "relation",
+            "source": source.target_label,
+            "target": target_label,
+            "depends_on": reached,
+            "path": path,
+            "answer": Answer::of(usize::from(reached), blindspots).as_str(),
+        });
+        if !blindspots.is_empty() {
+            data["unresolved"] = serde_json::json!(blindspots);
+        }
+        emit_json("query", &data, meta_for("query"))?;
+        return Ok(0);
+    }
+    println!(
+        "{} depends on {}: {}",
+        source.target_label,
+        target_label,
+        if reached { "yes" } else { "no" }
+    );
+    if let Some(path) = path {
+        println!("  {}", path.join(" -> "));
+    }
+    if !reached {
+        print_caution(blindspots);
+    }
+    Ok(0)
+}
+
+/// The file a target speaks for, for the resolution calibration: a symbol's
+/// defining file, a module's file, or — for a file node — its own label, since
+/// a file has no source-anchor row to carry the path.
+fn target_file(node: &BlastNode) -> Option<String> {
+    match node.kind.as_str() {
+        "file" => Some(node.label.clone()),
+        _ => node.file.clone(),
     }
 }
 
@@ -251,12 +297,22 @@ fn unresolved_target(input: &str, nodes: &[BlastNode], edges: &[BlastEdge]) -> a
 /// uncapped list once cost an agent session more than the grep it replaced.
 const QUERY_ITEM_CAP: usize = 50;
 
+/// Blind spots listed under an answer. The count is the signal; a handful of
+/// sites is enough to go and look, and the JSON carries them all.
+const BLINDSPOT_CAP: usize = 5;
+
 // Echoing the resolved label matters because targets resolve by substring:
 // `deps sinc` lands on `filter_changed_since`, and a count without the
 // resolved name reads as an answer about the literal input.
-fn print_query_labels(label: &str, result: BlastResult, format: OutputFormat) -> Result<u8> {
+fn print_query_labels(
+    label: &str,
+    result: BlastResult,
+    format: OutputFormat,
+    blindspots: &[Blindspot],
+) -> Result<u8> {
     let items = result.impacted;
     let shown = &items[..items.len().min(QUERY_ITEM_CAP)];
+    let answer = Answer::of(items.len(), blindspots);
     match format {
         OutputFormat::Json | OutputFormat::Ndjson => {
             let mut data = serde_json::json!({
@@ -264,9 +320,13 @@ fn print_query_labels(label: &str, result: BlastResult, format: OutputFormat) ->
                 "target": result.target_label,
                 "items": shown,
                 "total": items.len(),
+                "answer": answer.as_str(),
             });
             if shown.len() < items.len() {
                 data["truncated"] = serde_json::json!(true);
+            }
+            if !blindspots.is_empty() {
+                data["unresolved"] = serde_json::json!(blindspots);
             }
             emit_json("query", &data, meta_for("query"))?;
         }
@@ -282,9 +342,29 @@ fn print_query_labels(label: &str, result: BlastResult, format: OutputFormat) ->
                     result.target_label
                 );
             }
+            print_caution(blindspots);
         }
     }
     Ok(0)
+}
+
+/// The caveat under an answer the index could not fully see. Printed even
+/// beside a non-empty list, because "3 dependents, and 2 imports I could not
+/// follow" is a different fact from "3 dependents".
+fn print_caution(blindspots: &[Blindspot]) {
+    if blindspots.is_empty() {
+        return;
+    }
+    println!(
+        "  caution: {} import(s) could not be resolved, so this answer may be incomplete",
+        blindspots.len()
+    );
+    for spot in blindspots.iter().take(BLINDSPOT_CAP) {
+        println!("    {}:{}  {}", spot.file, spot.line, spot.specifier);
+    }
+    if blindspots.len() > BLINDSPOT_CAP {
+        println!("    … and {} more", blindspots.len() - BLINDSPOT_CAP);
+    }
 }
 
 /// Truncates a JSON array field in place, recording the pre-cap length in a

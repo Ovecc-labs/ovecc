@@ -42,6 +42,9 @@ struct CapabilityUse<'a> {
 /// (component, capability) -> its denied uses.
 type CapabilityMap<'a> = BTreeMap<(&'a str, &'a str), Vec<CapabilityUse<'a>>>;
 
+/// (component, required target) -> the component's files that reach neither.
+type FileMap<'a> = BTreeMap<(&'a str, &'a str), Vec<&'a str>>;
+
 /// (component, metric name) -> (function row, its budget).
 type BudgetMap<'a> = BTreeMap<(&'a str, &'a str), Vec<(&'a FunctionMetricsRow, u32)>>;
 
@@ -62,6 +65,12 @@ const MIN_COUPLED_FILE_PAIRS: usize = 2;
 #[derive(Default)]
 struct EdgeGroups<'a> {
     divergences: PairMap<'a>,
+    /// Imports of a component whose `consumed_by` does not admit the importer.
+    restricted: PairMap<'a>,
+    /// Imports the source component's `cannot_depend_on` names outright.
+    forbidden: PairMap<'a>,
+    /// Files under a `must_depend_on` that import the target nowhere.
+    required: FileMap<'a>,
     bypasses: PairMap<'a>,
     deprecated: PairMap<'a>,
     banned: PairMap<'a>,
@@ -119,8 +128,10 @@ pub(crate) fn violation_entries(input: &RuleInput<'_>) -> BTreeMap<String, BTree
         return BTreeMap::new();
     }
     let groups = classify_edges(input, architecture);
-    let sections: [(&str, &PairMap<'_>); 5] = [
+    let sections: [(&str, &PairMap<'_>); 7] = [
         ("divergence", &groups.divergences),
+        ("restricted-access", &groups.restricted),
+        ("forbidden-dependency", &groups.forbidden),
         ("interface-bypass", &groups.bypasses),
         ("deprecated-use", &groups.deprecated),
         ("external-deny", &groups.banned),
@@ -147,6 +158,14 @@ pub(crate) fn violation_entries(input: &RuleInput<'_>) -> BTreeMap<String, BTree
                 .entry(component.to_string())
                 .or_default()
                 .insert(baseline_entry("capability", use_.file, use_.api));
+        }
+    }
+    for (&(component, target), files) in &groups.required {
+        for file in files {
+            entries
+                .entry(component.to_string())
+                .or_default()
+                .insert(baseline_entry("required-dependency", file, target));
         }
     }
     for (&(component, _), rows) in &groups.budgets {
@@ -181,6 +200,21 @@ pub(crate) fn violation_entries(input: &RuleInput<'_>) -> BTreeMap<String, BTree
 fn prune_baselined<'a>(groups: EdgeGroups<'a>, baseline: &BTreeSet<String>) -> EdgeGroups<'a> {
     EdgeGroups {
         divergences: without_baselined(groups.divergences, "divergence", baseline),
+        restricted: without_baselined(groups.restricted, "restricted-access", baseline),
+        forbidden: without_baselined(groups.forbidden, "forbidden-dependency", baseline),
+        required: groups
+            .required
+            .into_iter()
+            .filter_map(|(pair, files)| {
+                let kept: Vec<&str> = files
+                    .into_iter()
+                    .filter(|file| {
+                        !baseline.contains(&baseline_entry("required-dependency", file, pair.1))
+                    })
+                    .collect();
+                (!kept.is_empty()).then_some((pair, kept))
+            })
+            .collect(),
         bypasses: without_baselined(groups.bypasses, "interface-bypass", baseline),
         deprecated: without_baselined(groups.deprecated, "deprecated-use", baseline),
         banned: without_baselined(groups.banned, "external-deny", baseline),
@@ -282,6 +316,7 @@ fn classify_edges<'a>(input: &RuleInput<'a>, architecture: ContractInput<'a>) ->
             classify_internal(architecture, &interfaces, source, dependency, &mut groups);
         }
     }
+    classify_required(input, architecture, &mut groups);
     classify_capability_facts(architecture, &mut groups);
     classify_budgets(architecture, &mut groups);
     classify_coverage(architecture, &mut groups);
@@ -498,6 +533,50 @@ fn classify_external<'a>(
     }
 }
 
+/// Which prohibition an edge trips, if either names it. `consumed_by` is
+/// asked first because it is the target's own rule about who may reach it, and
+/// a component closed to the source is closed however the source describes it.
+enum Prohibition {
+    Restricted,
+    Forbidden,
+}
+
+fn prohibition(contract: &ArchitectureContract, pair: (&str, &str)) -> Option<Prohibition> {
+    let closed = contract
+        .component(pair.1)
+        .and_then(|spec| spec.consumed_by.as_deref())
+        .is_some_and(|allowed| !allowed.iter().any(|name| name == pair.0));
+    if closed {
+        return Some(Prohibition::Restricted);
+    }
+    contract
+        .component(pair.0)
+        .is_some_and(|spec| spec.cannot_depend_on.iter().any(|name| name == pair.1))
+        .then_some(Prohibition::Forbidden)
+}
+
+/// Inside one component the only possible verdict is a slice breach: both
+/// files sit in a `slices = true` component, in different slices, and the
+/// target is not an `@x` public API for the source.
+fn classify_slice<'a>(
+    architecture: ContractInput<'a>,
+    dependency: &'a DependencyRecord,
+    target_path: &str,
+    slices: &mut PairMap<'a>,
+) {
+    if let (Some(source_slice), Some(target_slice)) = (
+        architecture.slice_of.get(&dependency.source_file_path),
+        architecture.slice_of.get(target_path),
+    ) && source_slice != target_slice
+        && !x_notation_allows(source_slice, target_path)
+    {
+        slices
+            .entry((source_slice.as_str(), target_slice.as_str()))
+            .or_default()
+            .push(dependency);
+    }
+}
+
 fn classify_internal<'a>(
     architecture: ContractInput<'a>,
     interfaces: &BTreeMap<&str, BTreeSet<String>>,
@@ -513,24 +592,27 @@ fn classify_internal<'a>(
         return;
     };
     if source == target {
-        // Inside one component the only possible verdict is a slice breach:
-        // both files sit in a `slices = true` component, in different
-        // slices, and the target is not an `@x` public API for the source.
-        if let (Some(source_slice), Some(target_slice)) = (
-            architecture.slice_of.get(&dependency.source_file_path),
-            architecture.slice_of.get(target_path),
-        ) && source_slice != target_slice
-            && !x_notation_allows(source_slice, target_path)
-        {
-            groups
-                .slices
-                .entry((source_slice.as_str(), target_slice.as_str()))
-                .or_default()
-                .push(dependency);
-        }
+        classify_slice(architecture, dependency, target_path, &mut groups.slices);
         return;
     }
     let pair = (source.as_str(), target.as_str());
+
+    // A prohibition comes first and answers alone. Each refines what would
+    // otherwise be a divergence into a sharper verdict, and the contract
+    // forbids either form from overlapping a declared dependency, so an edge
+    // still carries exactly one — reporting the interface alongside a
+    // prohibited import would only bury it.
+    if let Some(verdict) = prohibition(architecture.contract, pair) {
+        let group = match verdict {
+            Prohibition::Restricted => &mut groups.restricted,
+            Prohibition::Forbidden => &mut groups.forbidden,
+        };
+        group.entry(pair).or_default().push(dependency);
+        return;
+    }
+    let Some(spec) = architecture.contract.component(pair.0) else {
+        return;
+    };
 
     // The interface holds even for a declared dependency: the pair being
     // legal does not open the target's internals.
@@ -540,19 +622,78 @@ fn classify_internal<'a>(
         groups.bypasses.entry(pair).or_default().push(dependency);
     }
 
-    let Some(spec) = architecture.contract.component(pair.0) else {
-        return;
-    };
     match spec
         .depends_on
         .iter()
         .find(|entry| entry.component() == pair.1)
     {
-        None => groups.divergences.entry(pair).or_default().push(dependency),
         Some(entry) => {
             groups.observed.insert(pair);
             if entry.deprecated() {
                 groups.deprecated.entry(pair).or_default().push(dependency);
+            }
+        }
+        // A required dependency is permitted by being required: reporting the
+        // very import the contract demands as undeclared would be absurd.
+        None if spec.must_depend_on.iter().any(|name| name == pair.1) => {
+            groups.observed.insert(pair);
+        }
+        None => groups.divergences.entry(pair).or_default().push(dependency),
+    }
+}
+
+/// Files of a `must_depend_on` component that import the required target
+/// nowhere.
+///
+/// Judged per file rather than per component, because the component-level
+/// question — does anything here reach the target — is what `depends_on` plus
+/// the absence verdict already answer. "Every route handler must depend on
+/// auth" is a claim about each handler.
+///
+/// Only files that import something are judged. A file with no imports at all
+/// is a leaf — constants, types, a stylesheet the indexer happened to claim —
+/// and holding it to a mandatory dependency would turn the check into a
+/// guess about which files are "real" code.
+fn classify_required<'a>(
+    input: &RuleInput<'a>,
+    architecture: ContractInput<'a>,
+    groups: &mut EdgeGroups<'a>,
+) {
+    let required: BTreeMap<&'a str, &'a [String]> = architecture
+        .contract
+        .components
+        .iter()
+        .filter(|spec| !spec.must_depend_on.is_empty())
+        .map(|spec| (spec.name.as_str(), spec.must_depend_on.as_slice()))
+        .collect();
+    if required.is_empty() {
+        return;
+    }
+    let mut importers: BTreeMap<&'a str, BTreeSet<&'a str>> = BTreeMap::new();
+    for dependency in input.dependencies {
+        let reached = importers
+            .entry(dependency.source_file_path.as_str())
+            .or_default();
+        if let Some(target_path) = &dependency.target_file_path
+            && let Some(component) = architecture.component_of.get(target_path)
+        {
+            reached.insert(component.as_str());
+        }
+    }
+    for (file, component) in architecture.component_of {
+        let Some((&component, targets)) = required.get_key_value(component.as_str()) else {
+            continue;
+        };
+        let Some(reached) = importers.get(file.as_str()) else {
+            continue;
+        };
+        for target in *targets {
+            if !reached.contains(target.as_str()) {
+                groups
+                    .required
+                    .entry((component, target.as_str()))
+                    .or_default()
+                    .push(file.as_str());
             }
         }
     }
@@ -636,6 +777,94 @@ fn pair_findings(input: &RuleInput<'_>, groups: &EdgeGroups<'_>) -> Vec<FindingR
             ),
             edges,
         ));
+    }
+    for (&(source, target), edges) in &groups.restricted {
+        let allowed = input
+            .architecture
+            .and_then(|architecture| architecture.contract.component(target))
+            .and_then(|spec| spec.consumed_by.clone())
+            .unwrap_or_default();
+        findings.push(pair_finding(
+            input,
+            "restricted-access",
+            Severity::High,
+            (source, target),
+            format!("{source} imports {target}, which is closed to it"),
+            format!(
+                "'{source}' imports '{target}' ({} occurrence(s)), but the contract \
+                 says '{target}' is consumed by {}. Reach it through {}, or open \
+                 '{target}' to '{source}' deliberately.",
+                edges.len(),
+                if allowed.is_empty() {
+                    "nothing".to_string()
+                } else {
+                    quoted(&allowed)
+                },
+                if allowed.is_empty() {
+                    "another component".to_string()
+                } else {
+                    quoted(&allowed)
+                }
+            ),
+            edges,
+        ));
+    }
+    for (&(source, target), edges) in &groups.forbidden {
+        findings.push(pair_finding(
+            input,
+            "forbidden-dependency",
+            Severity::High,
+            (source, target),
+            format!("{source} -> {target} is forbidden by the contract"),
+            format!(
+                "'{source}' imports '{target}' ({} occurrence(s)), which its \
+                 cannot_depend_on forbids outright. This is not an undeclared \
+                 dependency: someone wrote down that it must not exist.",
+                edges.len()
+            ),
+            edges,
+        ));
+    }
+    for (&(source, target), files) in &groups.required {
+        findings.push(FindingRecord {
+            id: FindingId::from_parts(&[
+                input.repository_id,
+                "architecture",
+                "required-dependency",
+                source,
+                target,
+            ]),
+            repository_id: RepositoryId::from_raw(input.repository_id),
+            snapshot_id: input.snapshot_id.map(SnapshotId::from_raw),
+            kind: FindingKind::ArchitectureViolation,
+            severity: Severity::High,
+            rule_name: Some("architecture/required-dependency".to_string()),
+            target: Some(EntityRef {
+                kind: NodeKind::Module,
+                id: source.to_string(),
+            }),
+            title: format!(
+                "{} file(s) of {source} never reach the required {target}",
+                files.len()
+            ),
+            description: format!(
+                "The contract requires every file of '{source}' to depend on \
+                 '{target}', and {} file(s) import it nowhere. Add the \
+                 dependency, or drop '{target}' from '{source}'.must_depend_on.",
+                files.len()
+            ),
+            evidence: files
+                .iter()
+                .take(10)
+                .map(|file| Evidence {
+                    file_path: (*file).to_string(),
+                    line: None,
+                    symbol: None,
+                    detail: Some(format!("no import of '{target}'")),
+                })
+                .collect(),
+            created_at: Utc::now(),
+        });
     }
     for (&(source, target), edges) in &groups.bypasses {
         findings.push(pair_finding(
@@ -925,6 +1154,14 @@ fn unassigned_finding(
             .collect(),
         created_at: Utc::now(),
     })
+}
+
+fn quoted(names: &[String]) -> String {
+    names
+        .iter()
+        .map(|name| format!("'{name}'"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn pair_finding(
@@ -1766,6 +2003,236 @@ mod tests {
         // both leave the component unmeasured.
         assert!(coverage_floor_findings(Vec::new()).is_empty());
         assert!(coverage_floor_findings(vec![covered("src/web/page.ts", 10, 0)]).is_empty());
+    }
+
+    /// `api -> db` with `db` closed to everyone but `repository`: the rule the
+    /// allow-list cannot state, because removing `db` from every other
+    /// component's `depends_on` is an edit to every other component.
+    fn restricted_fixture() -> Fixture {
+        let mut db = component("db", &["src/db/**"]);
+        db.consumed_by = Some(vec!["repository".to_string()]);
+        Fixture {
+            contract: contract(vec![
+                component("api", &["src/api/**"]),
+                component("repository", &["src/repository/**"]),
+                db,
+            ]),
+            component_of: assign(&[
+                ("src/api/routes.ts", "api"),
+                ("src/repository/users.ts", "repository"),
+                ("src/db/pool.ts", "db"),
+            ]),
+            dependencies: vec![edge("src/api/routes.ts", "src/db/pool.ts", "../db/pool", 4)],
+            ..Fixture::default()
+        }
+    }
+
+    #[test]
+    fn an_import_the_target_does_not_admit_is_restricted_not_diverging() {
+        let findings = run(&restricted_fixture());
+        assert_eq!(
+            rules_of(&findings),
+            vec!["architecture/restricted-access"],
+            "one verdict per edge: the sharper one, never both"
+        );
+        assert_eq!(findings[0].severity, Severity::High);
+        assert!(
+            findings[0].description.contains("'repository'"),
+            "the description names who may reach it: {}",
+            findings[0].description
+        );
+        assert_eq!(findings[0].evidence[0].file_path, "src/api/routes.ts");
+        assert_eq!(findings[0].evidence[0].line, Some(4));
+    }
+
+    #[test]
+    fn a_component_its_target_admits_is_silent() {
+        let mut fixture = restricted_fixture();
+        fixture.dependencies = vec![edge(
+            "src/repository/users.ts",
+            "src/db/pool.ts",
+            "../db/pool",
+            2,
+        )];
+        // `repository` is admitted by `db` but declares no depends_on, so the
+        // edge falls through to the ordinary allow-list verdict.
+        assert_eq!(rules_of(&run(&fixture)), vec!["architecture/divergence"]);
+
+        fixture.contract.components[1].depends_on = vec![DependsOn::Name("db".to_string())];
+        assert!(run(&fixture).is_empty(), "admitted and declared: legal");
+    }
+
+    /// The strangler-fig rule: `consumed_by = []` says nothing may import the
+    /// component, without naming a single consumer.
+    #[test]
+    fn an_empty_consumed_by_closes_a_component_to_everyone() {
+        let mut legacy = component("legacy", &["src/legacy/**"]);
+        legacy.consumed_by = Some(Vec::new());
+        let fixture = Fixture {
+            contract: contract(vec![component("api", &["src/api/**"]), legacy]),
+            component_of: assign(&[
+                ("src/api/routes.ts", "api"),
+                ("src/legacy/store.ts", "legacy"),
+            ]),
+            dependencies: vec![edge(
+                "src/api/routes.ts",
+                "src/legacy/store.ts",
+                "../legacy/store",
+                7,
+            )],
+            ..Fixture::default()
+        };
+        let findings = run(&fixture);
+        assert_eq!(rules_of(&findings), vec!["architecture/restricted-access"]);
+        assert!(
+            findings[0].description.contains("consumed by nothing"),
+            "{}",
+            findings[0].description
+        );
+    }
+
+    #[test]
+    fn a_forbidden_dependency_reads_as_forbidden_rather_than_undeclared() {
+        let mut api = component("api", &["src/api/**"]);
+        api.cannot_depend_on = vec!["legacy".to_string()];
+        let fixture = Fixture {
+            contract: contract(vec![api, component("legacy", &["src/legacy/**"])]),
+            component_of: assign(&[
+                ("src/api/routes.ts", "api"),
+                ("src/legacy/store.ts", "legacy"),
+            ]),
+            dependencies: vec![edge(
+                "src/api/routes.ts",
+                "src/legacy/store.ts",
+                "../legacy/store",
+                9,
+            )],
+            ..Fixture::default()
+        };
+        let findings = run(&fixture);
+        assert_eq!(
+            rules_of(&findings),
+            vec!["architecture/forbidden-dependency"]
+        );
+        assert_eq!(findings[0].severity, Severity::High);
+        assert_eq!(findings[0].evidence[0].line, Some(9));
+    }
+
+    /// Two handlers, one of which never imports `auth`. Judged per file: the
+    /// component-level question is what `depends_on` and absence already
+    /// answer.
+    fn required_fixture() -> Fixture {
+        let mut api = component("api", &["src/api/**"]);
+        api.must_depend_on = vec!["auth".to_string()];
+        api.depends_on = vec![DependsOn::Name("util".to_string())];
+        Fixture {
+            contract: contract(vec![
+                api,
+                component("auth", &["src/auth/**"]),
+                component("util", &["src/util/**"]),
+            ]),
+            component_of: assign(&[
+                ("src/api/orders.ts", "api"),
+                ("src/api/prices.ts", "api"),
+                ("src/auth/guard.ts", "auth"),
+                ("src/util/log.ts", "util"),
+            ]),
+            dependencies: vec![
+                edge("src/api/orders.ts", "src/auth/guard.ts", "../auth/guard", 1),
+                edge("src/api/prices.ts", "src/util/log.ts", "../util/log", 1),
+            ],
+            ..Fixture::default()
+        }
+    }
+
+    #[test]
+    fn a_file_that_never_reaches_a_required_component_is_reported() {
+        let findings = run(&required_fixture());
+        let required: Vec<&FindingRecord> = findings
+            .iter()
+            .filter(|finding| {
+                finding.rule_name.as_deref() == Some("architecture/required-dependency")
+            })
+            .collect();
+        assert_eq!(required.len(), 1, "one finding per (component, target)");
+        assert_eq!(required[0].severity, Severity::High);
+        assert_eq!(
+            required[0]
+                .evidence
+                .iter()
+                .map(|item| item.file_path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["src/api/prices.ts"],
+            "only the file missing the dependency"
+        );
+    }
+
+    #[test]
+    fn a_required_dependency_is_permitted_by_being_required() {
+        let findings = run(&required_fixture());
+        assert!(
+            !rules_of(&findings).contains(&"architecture/divergence"),
+            "the import must_depend_on demands is never also undeclared: {:?}",
+            rules_of(&findings)
+        );
+        assert!(
+            !rules_of(&findings).contains(&"architecture/absence"),
+            "must_depend_on is not a depends_on entry to go stale"
+        );
+    }
+
+    /// A file that imports nothing is a leaf — constants, types, a stylesheet
+    /// the indexer claimed. Holding it to a mandatory dependency would make the
+    /// check a guess about which files are real code.
+    #[test]
+    fn a_file_with_no_imports_at_all_is_not_held_to_a_required_dependency() {
+        let mut fixture = required_fixture();
+        fixture.dependencies.remove(1);
+        let findings = run(&fixture);
+        assert!(
+            !rules_of(&findings).contains(&"architecture/required-dependency"),
+            "{:?}",
+            rules_of(&findings)
+        );
+    }
+
+    #[test]
+    fn every_new_form_freezes_and_the_baseline_silences_it() {
+        for mut fixture in [restricted_fixture(), required_fixture(), {
+            let mut api = component("api", &["src/api/**"]);
+            api.cannot_depend_on = vec!["legacy".to_string()];
+            Fixture {
+                contract: contract(vec![api, component("legacy", &["src/legacy/**"])]),
+                component_of: assign(&[
+                    ("src/api/routes.ts", "api"),
+                    ("src/legacy/store.ts", "legacy"),
+                ]),
+                dependencies: vec![edge(
+                    "src/api/routes.ts",
+                    "src/legacy/store.ts",
+                    "../legacy/store",
+                    9,
+                )],
+                ..Fixture::default()
+            }
+        }] {
+            let frozen = entries(&fixture);
+            assert!(!frozen.is_empty(), "the violation must be freezable");
+            fixture.baseline = frozen.values().flatten().cloned().collect();
+            let after = run(&fixture);
+            assert!(
+                !rules_of(&after).iter().any(|rule| {
+                    matches!(
+                        *rule,
+                        "architecture/restricted-access"
+                            | "architecture/forbidden-dependency"
+                            | "architecture/required-dependency"
+                    )
+                }),
+                "accepted debt must stop being reported: {:?}",
+                rules_of(&after)
+            );
+        }
     }
 
     #[test]

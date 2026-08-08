@@ -34,6 +34,41 @@ changes).
 
 ### Added
 
+- `query deps`, `rdeps`, `module` and `a -> b` answer ternary: `resolved`,
+  `none`, or `could_not_resolve`. An empty result used to mean both "nothing
+  references this" and "I could not work out what references this", and an agent
+  that cannot tell them apart acts on the second as if it were the first —
+  deletes the symbol, breaks the build, and had no sign the tool was guessing.
+  The answer now names the unresolved imports behind the doubt, with their
+  `file:line`. On `deps` those are the target file's own unresolved imports,
+  which is exact; on `rdeps` they are unresolved imports elsewhere whose
+  specifier names the target, which is plausible and deliberately errs toward
+  doubt. Scoped to the target rather than the repository: a global "N imports
+  are unresolved" would annotate every answer and be ignored within a day.
+- Three constraint forms in `.ovecc/architecture.toml`, closing the gap between
+  an allow-list and what an architecture actually needs to say. `depends_on` is
+  a strictly positive bipartite set: it can express permission and nothing else.
+  Terra & Valente's DCL identifies four forms, and ovecc supported one.
+  - `cannot_depend_on` — a stated prohibition rather than a prohibition by
+    omission. Reported as `architecture/forbidden-dependency` (high).
+  - `consumed_by` — the only components allowed to import this one, declared on
+    the target, where the sentence belongs: "the database is reached only
+    through the repository" is one claim about the database, not an edit to
+    every other component's allow-list. `consumed_by = []` admits nobody — the
+    strangler-fig rule, "no new code may touch this" — without naming a single
+    consumer. Reported as `architecture/restricted-access` (high).
+  - `must_depend_on` — a mandatory dependency, judged per file, since the
+    component-level question is what `depends_on` and the absence verdict
+    already answer. Files that import nothing at all are exempt, and a required
+    dependency implies permission, so it is never also a divergence. Reported as
+    `architecture/required-dependency` (high).
+
+  The two prohibitions *replace* the divergence an edge would otherwise have
+  been rather than adding a second finding, and contradictions between the forms
+  fail at parse time — a target both forbidden and required, or a dependency the
+  target's `consumed_by` does not admit — so every import still carries exactly
+  one verdict. All three freeze into the baseline and shrink with the ratchet
+  like any other violation.
 - `unresolved-import` (medium): an import naming a path inside the repository
   that the resolver rejected outright — a rename or deletion its importers never
   followed. Precision-first: a specifier that reached a real file is a different

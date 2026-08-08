@@ -167,10 +167,11 @@ rather than pushed a template it does not fit. Needs an index.
 The contract resolved, from the contract alone — no index required. Without
 paths, every component; with paths, the components owning them. Each component
 lists what it may import (with the target's interface files as the legal
-doors), its own interface, its external deny-list, whether its slices are
-isolated, the capabilities it denies, and any per-function budget. This is the
-pre-edit question — "I'm editing this file, what am I allowed to import and
-do?" — and what the `ovecc_architecture` MCP tool serves to agents.
+doors), what it must and must not import, who may import it, its own
+interface, its external deny-list, whether its slices are isolated, the
+capabilities it denies, and any per-function budget. This is the pre-edit
+question — "I'm editing this file, what am I allowed to import and do?" — and
+what the `ovecc_architecture` MCP tool serves to agents.
 
 ```
 Contract mode new-violations, 1 component(s):
@@ -184,13 +185,16 @@ cli (crates/ovecc-cli/**)
 The reflexion report between the contract and the stored graph, in the
 Murphy/Notkin/Sullivan vocabulary: convergences (declared and implemented,
 with import counts), divergences (imports the contract does not allow),
-slice-isolation breaches (imports between sibling slices of a `slices = true`
-component), interface bypasses (imports that skip a component's declared entry
-files), deprecated dependencies still in use, banned external packages, denied
-capabilities used, complexity budgets exceeded, coverage floors missed,
-unassigned files, and absences (declared but never implemented). Divergences,
-slice breaches, and bypasses are High; deprecated, banned, capability, budget
-and coverage are Medium; hygiene is Low.
+forbidden dependencies (imports a `cannot_depend_on` names outright), imports
+of a component its `consumed_by` closes to them, required dependencies a file
+never makes, slice-isolation breaches (imports between sibling slices of a
+`slices = true` component), interface bypasses (imports that skip a
+component's declared entry files), deprecated dependencies still in use,
+banned external packages, denied capabilities used, complexity budgets
+exceeded, coverage floors missed, unassigned files, and absences (declared but
+never implemented). Divergences, the three DCL verdicts, slice breaches, and
+bypasses are High; deprecated, banned, capability, budget and coverage are
+Medium; hygiene is Low.
 `mode = "warn"` caps everything at Low so nothing gates.
 
 One verdict reads no code at all. **Behavioral coupling** names two components
@@ -202,6 +206,66 @@ and the honest exception is real (a version field every implementer of a
 protocol must bump). It is Low by default, under every gate's threshold, because
 the deviation is a question for the reader; `coupling = "medium"` (or `"high"`)
 in the contract puts it in the gate, `coupling = "off"` stops reporting it.
+
+### The four constraint forms
+
+`depends_on` is an allow-list, and an allow-list is a strictly positive
+bipartite set: it can say what is permitted and nothing else. Terra & Valente's
+DCL identifies four constraint forms an architecture actually needs, and three
+of them cannot be written as a permission. Each has its own field, and each is
+declared where the rule belongs.
+
+| Form | Field | Reads as |
+| --- | --- | --- |
+| `can` | `depends_on` | "api may import core" |
+| `cannot` | `cannot_depend_on` | "api may never import legacy" |
+| `can only` | `consumed_by` (on the target) | "db is reached only through repository" |
+| `must` | `must_depend_on` | "every route handler imports auth" |
+
+`consumed_by` is declared on the target because that is where the sentence
+lives: *"the database is reached only through the repository"* is one claim
+about the database, not an edit to every other component's allow-list — and
+the allow-list version silently breaks the moment somebody adds a component.
+`consumed_by = []` admits nobody, which is the strangler-fig rule: **no new
+code may touch this module**, without naming a single consumer.
+
+`must_depend_on` is judged per file, because the component-level question —
+does *anything* here reach the target — is what `depends_on` plus the absence
+verdict already answer. A file that imports nothing at all is exempt: it is a
+leaf (constants, types, a stylesheet), and holding it to a mandatory
+dependency would turn the check into a guess about which files are real code.
+A required dependency implies permission, so it is never also a divergence.
+
+Contradictions between the forms are **contract errors, not findings**: a
+component that both forbids and requires the same target, or one that declares
+a dependency the target's `consumed_by` does not admit. They fail at parse
+time, so every import still carries exactly one verdict and no reader is ever
+asked which half of the contract wins. `restricted-access` and
+`forbidden-dependency` are both High, and both *replace* the divergence the
+edge would otherwise have been — a sharper answer, not an extra one.
+
+```toml
+[[component]]
+name = "api"
+paths = ["src/api/**"]
+depends_on = ["repository"]
+must_depend_on = ["auth"]
+cannot_depend_on = ["legacy"]
+
+[[component]]
+name = "db"
+paths = ["src/db/**"]
+consumed_by = ["repository"]
+
+[[component]]
+name = "legacy"
+paths = ["src/legacy/**"]
+consumed_by = []
+```
+
+Because `consumed_by` judges only the files a component claims, a repository
+leaning on it should also set `unassigned = "forbid"`, so a file outside every
+component cannot reach a closed one unnoticed.
 
 Beyond the import graph, two verdicts read the code itself (JS/TS): a
 `deny_capabilities` list forbids a component the ambient capabilities that
@@ -353,6 +417,34 @@ anchors instead of guessing.
 Structured graph queries: `deps X`, `rdeps X`, `paths X`, `module X`,
 `"a -> b"` (reachability with the path), `hotspots`, `violations`, `cycles`
 (elementary module cycles with `file:line` witness edges per hop).
+
+**Answers are ternary.** An empty result means two different things — "nothing
+references this" and "I could not work out what references this" — and a tool
+that returns the same silence for both invites an agent to read the second as
+the first, delete the symbol, and break the build. So `deps`, `rdeps`, `module`
+and `a -> b` carry an `answer` of `resolved`, `none`, or `could_not_resolve`,
+and name the imports behind the doubt:
+
+```
+Dependents of src/auth/guard.ts: 0
+  caution: 1 import(s) could not be resolved, so this answer may be incomplete
+    src/api/legacy.ts:1  ./guard
+```
+
+The two directions differ in what they can promise. On `deps` the blind spots
+are the target file's **own** unresolved imports — exact, they are its own
+lines. On `rdeps` they are unresolved imports elsewhere whose specifier names
+the target (its file stem, or its directory when it is the directory's entry
+point), which is plausible rather than certain. The matching deliberately errs
+toward doubt: a specifier that merely ends in the target's name counts, because
+claiming a certainty we do not have is the failure this exists to prevent.
+
+It is scoped to the target on purpose. A repository-wide "N imports are
+unresolved" would attach a warning to every answer and be tuned out within a
+day; only imports that could have meant *this* target are reported, so a clean
+answer stays clean. Roughly 70% edge recall is where static call graphs sit as
+a field (Helm et al., *Total Recall?*, ISSTA 2024), so the winnable axis is not
+resolving more — it is being honest about the rest.
 
 ### `ovecc impact <target> [--direction] [--max-depth]`
 

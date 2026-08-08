@@ -964,6 +964,455 @@ fn a_type_only_cycle_is_no_cycle_on_any_surface() {
     );
 }
 
+/// A repository holding one of each sentence an allow-list cannot write:
+/// `api` reaches into `db`, which only `repository` may touch; into `legacy`,
+/// which nothing may touch; into `telemetry`, which it is forbidden outright; and
+/// one `api` file never reaches the `auth` every one of them must.
+fn dcl_repo(root: &Path) {
+    write_source(
+        root,
+        "src/auth/guard.ts",
+        "export const guard = () => true;\n",
+    );
+    write_source(
+        root,
+        "src/db/pool.ts",
+        "export const pool = { query: 1 };\n",
+    );
+    write_source(
+        root,
+        "src/legacy/store.ts",
+        "export const legacyStore = { get: 1 };\n",
+    );
+    write_source(
+        root,
+        "src/telemetry/sdk.ts",
+        "export const sdk = { call: 1 };\n",
+    );
+    write_source(
+        root,
+        "src/repository/users.ts",
+        "import { pool } from \"../db/pool\";\nexport const users = pool;\n",
+    );
+    write_source(
+        root,
+        "src/api/orders.ts",
+        "import { guard } from \"../auth/guard\";\n\
+         import { users } from \"../repository/users\";\n\
+         import { pool } from \"../db/pool\";\n\
+         import { sdk } from \"../telemetry/sdk\";\n\
+         export const orders = [guard, users, pool, sdk];\n",
+    );
+    write_source(
+        root,
+        "src/api/prices.ts",
+        "import { users } from \"../repository/users\";\n\
+         import { legacyStore } from \"../legacy/store\";\n\
+         export const prices = [users, legacyStore];\n",
+    );
+}
+
+fn write_contract(root: &Path, body: &str) {
+    let dir = root.join(".ovecc");
+    fs::create_dir_all(&dir).expect("create .ovecc");
+    fs::write(dir.join("architecture.toml"), body).expect("write contract");
+}
+
+const DCL_CONTRACT: &str = r#"
+schema = 1
+mode = "strict"
+unassigned = "ignore"
+
+[[component]]
+name = "api"
+paths = ["src/api/**"]
+depends_on = ["repository"]
+must_depend_on = ["auth"]
+cannot_depend_on = ["telemetry"]
+
+[[component]]
+name = "repository"
+paths = ["src/repository/**"]
+depends_on = ["db"]
+
+[[component]]
+name = "auth"
+paths = ["src/auth/**"]
+
+[[component]]
+name = "telemetry"
+paths = ["src/telemetry/**"]
+
+[[component]]
+name = "db"
+paths = ["src/db/**"]
+consumed_by = ["repository"]
+
+[[component]]
+name = "legacy"
+paths = ["src/legacy/**"]
+consumed_by = []
+"#;
+
+/// Every finding of a rule, as `(title, first evidence path)`. Sorted, because
+/// the report orders by finding id — a hash — and these assertions are about
+/// content, not about an order `summary_json_is_byte_identical_across_runs`
+/// already pins.
+fn findings_of<'a>(report: &'a serde_json::Value, rule: &str) -> Vec<(&'a str, &'a str)> {
+    let mut found: Vec<(&str, &str)> = report["data"]["findings"]
+        .as_array()
+        .expect("findings array")
+        .iter()
+        .filter(|finding| finding["rule_name"] == rule)
+        .map(|finding| {
+            (
+                finding["title"].as_str().expect("title"),
+                finding["evidence"][0]["file_path"].as_str().unwrap_or(""),
+            )
+        })
+        .collect();
+    found.sort_unstable();
+    found
+}
+
+#[test]
+fn the_three_dcl_forms_gate_a_build_and_freeze_into_the_baseline() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let root = temp.path();
+    let repo = root.to_str().expect("utf8 path").to_string();
+    dcl_repo(root);
+    write_contract(root, DCL_CONTRACT);
+    index_repo(&repo);
+
+    let report = json_output(&repo, &["architecture", "diff", "--format", "json"]);
+
+    let restricted = findings_of(&report, "architecture/restricted-access");
+    assert_eq!(
+        restricted,
+        vec![
+            ("api imports db, which is closed to it", "src/api/orders.ts"),
+            (
+                "api imports legacy, which is closed to it",
+                "src/api/prices.ts"
+            ),
+        ],
+        "a component reached only through repository, and one reached by nobody"
+    );
+    assert_eq!(
+        findings_of(&report, "architecture/forbidden-dependency"),
+        vec![(
+            "api -> telemetry is forbidden by the contract",
+            "src/api/orders.ts"
+        )],
+        "{report}"
+    );
+    assert_eq!(
+        findings_of(&report, "architecture/required-dependency"),
+        vec![(
+            "1 file(s) of api never reach the required auth",
+            "src/api/prices.ts"
+        )],
+        "orders.ts imports auth and is silent; prices.ts does not"
+    );
+
+    assert!(
+        findings_of(&report, "architecture/divergence").is_empty(),
+        "a prohibited import is reported once, as prohibited, not also as undeclared: {report}"
+    );
+    assert!(
+        findings_of(&report, "architecture/absence").is_empty(),
+        "must_depend_on is not a depends_on entry that can go stale: {report}"
+    );
+
+    let checked = ovecc(&repo, &["architecture", "check"]);
+    assert_eq!(
+        checked.status.code(),
+        Some(1),
+        "the contract must fail the build: {}",
+        String::from_utf8_lossy(&checked.stdout)
+    );
+
+    // Freezing accepts today's debt; `new-violations` is the mode that hides
+    // it, so the ratchet can shrink it from there.
+    ovecc(&repo, &["architecture", "check", "--freeze"]);
+    fs::write(
+        root.join(".ovecc").join("architecture.toml"),
+        DCL_CONTRACT.replace("mode = \"strict\"", "mode = \"new-violations\""),
+    )
+    .expect("relax the mode");
+    let ratcheted = json_output(&repo, &["architecture", "diff", "--format", "json"]);
+    for rule in [
+        "architecture/restricted-access",
+        "architecture/forbidden-dependency",
+        "architecture/required-dependency",
+    ] {
+        assert!(
+            findings_of(&ratcheted, rule).is_empty(),
+            "{rule} was frozen and must stop being reported: {ratcheted}"
+        );
+    }
+    assert_eq!(
+        ovecc(&repo, &["architecture", "check"]).status.code(),
+        Some(0),
+        "with the debt accepted the build passes again"
+    );
+}
+
+/// `cannot_depend_on` is not `depends_on` by omission: it names the
+/// prohibition, and the verdict says so instead of reporting an undeclared
+/// edge.
+#[test]
+fn a_forbidden_import_is_reported_as_forbidden_not_undeclared() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let root = temp.path();
+    let repo = root.to_str().expect("utf8 path").to_string();
+    dcl_repo(root);
+    write_contract(
+        root,
+        r#"
+schema = 1
+mode = "strict"
+unassigned = "ignore"
+
+[[component]]
+name = "api"
+paths = ["src/api/**"]
+depends_on = ["repository", "auth"]
+cannot_depend_on = ["legacy"]
+
+[[component]]
+name = "repository"
+paths = ["src/repository/**"]
+depends_on = ["db"]
+
+[[component]]
+name = "auth"
+paths = ["src/auth/**"]
+
+[[component]]
+name = "db"
+paths = ["src/db/**"]
+
+[[component]]
+name = "legacy"
+paths = ["src/legacy/**"]
+"#,
+    );
+    index_repo(&repo);
+
+    let report = json_output(&repo, &["architecture", "diff", "--format", "json"]);
+    assert_eq!(
+        findings_of(&report, "architecture/forbidden-dependency"),
+        vec![(
+            "api -> legacy is forbidden by the contract",
+            "src/api/prices.ts"
+        )],
+        "{report}"
+    );
+    assert_eq!(
+        findings_of(&report, "architecture/divergence"),
+        vec![("api -> db is not in the contract", "src/api/orders.ts")],
+        "an ordinary undeclared edge still reads as a divergence: {report}"
+    );
+}
+
+/// A contract that both forbids and allows the same edge has no right answer,
+/// so it is refused at parse time rather than resolved by precedence.
+#[test]
+fn a_self_contradictory_contract_is_refused_before_it_judges_anything() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let root = temp.path();
+    let repo = root.to_str().expect("utf8 path").to_string();
+    dcl_repo(root);
+    index_repo(&repo);
+
+    for (contract, expected) in [
+        (
+            r#"
+schema = 1
+[[component]]
+name = "api"
+paths = ["src/api/**"]
+depends_on = ["db"]
+cannot_depend_on = ["db"]
+[[component]]
+name = "db"
+paths = ["src/db/**"]
+"#,
+            "cannot_depend_on",
+        ),
+        (
+            r#"
+schema = 1
+[[component]]
+name = "api"
+paths = ["src/api/**"]
+depends_on = ["db"]
+[[component]]
+name = "repository"
+paths = ["src/repository/**"]
+[[component]]
+name = "db"
+paths = ["src/db/**"]
+consumed_by = ["repository"]
+"#,
+            "consumed_by",
+        ),
+    ] {
+        write_contract(root, contract);
+        let out = ovecc(&repo, &["architecture", "diff"]);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_ne!(out.status.code(), Some(0), "{stderr}");
+        assert!(
+            stderr.contains(expected),
+            "the error must name the field: {stderr}"
+        );
+    }
+}
+
+/// The pre-edit question an agent asks: the new forms have to be visible in
+/// `architecture show`, or a coding agent cannot honour them.
+#[test]
+fn architecture_show_states_what_a_component_must_and_must_not_import() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let root = temp.path();
+    let repo = root.to_str().expect("utf8 path").to_string();
+    dcl_repo(root);
+    write_contract(root, DCL_CONTRACT);
+
+    let shown = json_output(&repo, &["architecture", "show", "--format", "json"]);
+    let components = shown["data"]["components"]
+        .as_array()
+        .expect("component array");
+    let api = components
+        .iter()
+        .find(|component| component["name"] == "api")
+        .expect("api");
+    assert_eq!(api["must_import"], serde_json::json!(["auth"]));
+    assert_eq!(api["must_not_import"], serde_json::json!(["telemetry"]));
+    let legacy = components
+        .iter()
+        .find(|component| component["name"] == "legacy")
+        .expect("legacy");
+    assert_eq!(
+        legacy["importable_by"],
+        serde_json::json!([]),
+        "closed to everyone must be a value, not a missing field: {legacy}"
+    );
+    assert!(
+        components
+            .iter()
+            .find(|component| component["name"] == "auth")
+            .expect("auth")["importable_by"]
+            .is_null(),
+        "an unrestricted component says nothing"
+    );
+
+    let text = ovecc(&repo, &["architecture", "show"]);
+    let rendered = String::from_utf8_lossy(&text.stdout);
+    assert!(
+        rendered.contains("must import (every file): auth"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("must not import: telemetry"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("importable by: nothing (no component may import it)"),
+        "{rendered}"
+    );
+}
+
+/// The distinction the whole calibration exists for: two files with zero
+/// dependents, one of which is genuinely unused and one of which is named by an
+/// import the resolver rejected. An agent told "0" for both deletes the second
+/// and breaks the build.
+#[test]
+fn an_empty_answer_says_whether_it_is_absence_or_ignorance() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let root = temp.path();
+    let repo = root.to_str().expect("utf8 path").to_string();
+
+    write_source(
+        root,
+        "src/auth/guard.ts",
+        "export const guard = () => true;\n",
+    );
+    write_source(root, "src/util/orphan.ts", "export const orphan = 1;\n");
+    // `./guard` is the shape a moved file leaves behind: the importer was never
+    // updated, so it names `src/api/guard.ts`, which has never existed.
+    write_source(
+        root,
+        "src/api/legacy.ts",
+        "import { guard } from \"./guard\";\n\
+         import { missing } from \"./nowhere\";\n\
+         export const legacy = [guard, missing];\n",
+    );
+    index_repo(&repo);
+
+    let orphan = json_output(
+        &repo,
+        &["query", "rdeps src/util/orphan.ts", "--format", "json"],
+    );
+    assert_eq!(orphan["data"]["total"], 0);
+    assert_eq!(
+        orphan["data"]["answer"], "none",
+        "nothing imports it and nothing unresolved could have: {orphan}"
+    );
+    assert!(
+        orphan["data"]["unresolved"].is_null(),
+        "a clean answer carries no caveat: {orphan}"
+    );
+
+    let guard = json_output(
+        &repo,
+        &["query", "rdeps src/auth/guard.ts", "--format", "json"],
+    );
+    assert_eq!(
+        guard["data"]["answer"], "could_not_resolve",
+        "an import naming 'guard' resolved to nothing, so 0 is not a fact: {guard}"
+    );
+    let blindspots = guard["data"]["unresolved"]
+        .as_array()
+        .expect("the blind spots are named");
+    assert_eq!(blindspots.len(), 1, "{guard}");
+    assert_eq!(blindspots[0]["file"], "src/api/legacy.ts");
+    assert_eq!(blindspots[0]["specifier"], "./guard");
+
+    // The importing file's own broken import is exact, not a guess: it is on
+    // its own lines.
+    let outgoing = json_output(
+        &repo,
+        &["query", "deps src/api/legacy.ts", "--format", "json"],
+    );
+    let outgoing_spots = outgoing["data"]["unresolved"]
+        .as_array()
+        .expect("its own unresolved imports");
+    assert_eq!(
+        outgoing_spots
+            .iter()
+            .map(|spot| spot["specifier"].as_str().expect("specifier"))
+            .collect::<Vec<_>>(),
+        vec!["./guard", "./nowhere"],
+        "both of its imports resolve to nothing: {outgoing}"
+    );
+
+    let text = ovecc(
+        &repo,
+        &["query", "rdeps src/auth/guard.ts", "--format", "text"],
+    );
+    let rendered = String::from_utf8_lossy(&text.stdout);
+    assert!(
+        rendered.contains("caution: 1 import(s) could not be resolved"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("src/api/legacy.ts:1  ./guard"),
+        "the caveat names the site to go and look at: {rendered}"
+    );
+}
+
 #[test]
 fn unresolved_relative_imports_are_flagged_and_never_counted_as_packages() {
     let temp = tempfile::tempdir().expect("temp dir");

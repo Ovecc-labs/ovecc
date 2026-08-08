@@ -590,6 +590,30 @@ pub fn rule_definitions() -> BTreeMap<String, MetaRule> {
             ),
         ),
         (
+            "architecture/restricted-access".to_string(),
+            rule(
+                "A component imports another whose `consumed_by` does not admit \
+                 it. An empty `consumed_by` admits nobody.",
+                "high",
+            ),
+        ),
+        (
+            "architecture/forbidden-dependency".to_string(),
+            rule(
+                "A component imports another its `cannot_depend_on` forbids \
+                 outright — a stated prohibition, not an undeclared edge.",
+                "high",
+            ),
+        ),
+        (
+            "architecture/required-dependency".to_string(),
+            rule(
+                "A file of a component with `must_depend_on` imports the required \
+                 component nowhere. Files that import nothing at all are exempt.",
+                "high",
+            ),
+        ),
+        (
             "architecture/interface-bypass".to_string(),
             rule(
                 "A component imports another component's internals instead of its \
