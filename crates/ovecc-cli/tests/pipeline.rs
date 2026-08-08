@@ -1311,7 +1311,7 @@ fn architecture_show_states_what_a_component_must_and_must_not_import() {
     let text = ovecc(&repo, &["architecture", "show"]);
     let rendered = String::from_utf8_lossy(&text.stdout);
     assert!(
-        rendered.contains("must import: auth (every file)"),
+        rendered.contains("must import (every file): auth"),
         "{rendered}"
     );
     assert!(

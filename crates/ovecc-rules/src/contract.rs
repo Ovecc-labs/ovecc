@@ -533,6 +533,50 @@ fn classify_external<'a>(
     }
 }
 
+/// Which prohibition an edge trips, if either names it. `consumed_by` is
+/// asked first because it is the target's own rule about who may reach it, and
+/// a component closed to the source is closed however the source describes it.
+enum Prohibition {
+    Restricted,
+    Forbidden,
+}
+
+fn prohibition(contract: &ArchitectureContract, pair: (&str, &str)) -> Option<Prohibition> {
+    let closed = contract
+        .component(pair.1)
+        .and_then(|spec| spec.consumed_by.as_deref())
+        .is_some_and(|allowed| !allowed.iter().any(|name| name == pair.0));
+    if closed {
+        return Some(Prohibition::Restricted);
+    }
+    contract
+        .component(pair.0)
+        .is_some_and(|spec| spec.cannot_depend_on.iter().any(|name| name == pair.1))
+        .then_some(Prohibition::Forbidden)
+}
+
+/// Inside one component the only possible verdict is a slice breach: both
+/// files sit in a `slices = true` component, in different slices, and the
+/// target is not an `@x` public API for the source.
+fn classify_slice<'a>(
+    architecture: ContractInput<'a>,
+    dependency: &'a DependencyRecord,
+    target_path: &str,
+    slices: &mut PairMap<'a>,
+) {
+    if let (Some(source_slice), Some(target_slice)) = (
+        architecture.slice_of.get(&dependency.source_file_path),
+        architecture.slice_of.get(target_path),
+    ) && source_slice != target_slice
+        && !x_notation_allows(source_slice, target_path)
+    {
+        slices
+            .entry((source_slice.as_str(), target_slice.as_str()))
+            .or_default()
+            .push(dependency);
+    }
+}
+
 fn classify_internal<'a>(
     architecture: ContractInput<'a>,
     interfaces: &BTreeMap<&str, BTreeSet<String>>,
@@ -548,46 +592,27 @@ fn classify_internal<'a>(
         return;
     };
     if source == target {
-        // Inside one component the only possible verdict is a slice breach:
-        // both files sit in a `slices = true` component, in different
-        // slices, and the target is not an `@x` public API for the source.
-        if let (Some(source_slice), Some(target_slice)) = (
-            architecture.slice_of.get(&dependency.source_file_path),
-            architecture.slice_of.get(target_path),
-        ) && source_slice != target_slice
-            && !x_notation_allows(source_slice, target_path)
-        {
-            groups
-                .slices
-                .entry((source_slice.as_str(), target_slice.as_str()))
-                .or_default()
-                .push(dependency);
-        }
+        classify_slice(architecture, dependency, target_path, &mut groups.slices);
         return;
     }
     let pair = (source.as_str(), target.as_str());
 
-    // The two prohibitions come first and answer alone. Each one refines what
-    // would otherwise be a divergence into a sharper verdict — the contract
-    // forbids either form from overlapping a declared dependency — so an edge
-    // still carries exactly one, and reporting the interface alongside a
+    // A prohibition comes first and answers alone. Each refines what would
+    // otherwise be a divergence into a sharper verdict, and the contract
+    // forbids either form from overlapping a declared dependency, so an edge
+    // still carries exactly one — reporting the interface alongside a
     // prohibited import would only bury it.
-    if architecture
-        .contract
-        .component(pair.1)
-        .and_then(|spec| spec.consumed_by.as_deref())
-        .is_some_and(|allowed| !allowed.iter().any(|name| name == pair.0))
-    {
-        groups.restricted.entry(pair).or_default().push(dependency);
+    if let Some(verdict) = prohibition(architecture.contract, pair) {
+        let group = match verdict {
+            Prohibition::Restricted => &mut groups.restricted,
+            Prohibition::Forbidden => &mut groups.forbidden,
+        };
+        group.entry(pair).or_default().push(dependency);
         return;
     }
     let Some(spec) = architecture.contract.component(pair.0) else {
         return;
     };
-    if spec.cannot_depend_on.iter().any(|name| name == pair.1) {
-        groups.forbidden.entry(pair).or_default().push(dependency);
-        return;
-    }
 
     // The interface holds even for a declared dependency: the pair being
     // legal does not open the target's internals.
