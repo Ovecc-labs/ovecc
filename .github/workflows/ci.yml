@@ -38,9 +38,15 @@ on:
 permissions:
   contents: read
 
-# Supersede in-flight runs on the same ref so pushes don't race on the release.
+# Supersede in-flight runs for the same branch so pushes don't race on the
+# release. Keyed on the *source branch*, not on `github.ref`: a push to `mvp`
+# is `refs/heads/mvp` while its pull request is `refs/pull/N/merge`, so keying
+# on the ref put them in different groups and ran the whole matrix twice, in
+# parallel, for one change. `head_ref` is set only on pull_request events and
+# names the branch the PR comes from, so both events land on `ci-mvp` and the
+# newer run — the pull request's — cancels the push's.
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.head_ref || github.ref_name }}
   cancel-in-progress: true
 
 jobs:
