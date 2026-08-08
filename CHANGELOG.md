@@ -7,6 +7,19 @@ changes).
 
 ## [Unreleased]
 
+### Added
+
+- A `server.json`, and the matching `mcpName` in the npm manifest, so a tagged
+  release also publishes to the official MCP registry as
+  `io.github.Ovecc-labs/ovecc`. Directories that mirror the registry then carry
+  the real version and launch command rather than guessing them from this repo.
+
+### Changed
+
+- The MCP client snippet in the README registers `npx -y ovecc mcp`, which needs
+  nothing installed first. The bare binary still works and is documented next to
+  it.
+
 ## [0.2.3] - 2026-08-07
 
 ### Added

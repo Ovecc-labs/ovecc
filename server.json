@@ -1,0 +1,23 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.Ovecc-labs/ovecc",
+  "title": "ovecc",
+  "description": "Architecture guardrails for AI-written code: dependency graph, impact, dead code, CI gate",
+  "version": "0.0.0",
+  "websiteUrl": "https://ovecc.dev",
+  "repository": {
+    "url": "https://github.com/Ovecc-labs/ovecc",
+    "source": "github"
+  },
+  "packages": [
+    {
+      "registryType": "npm",
+      "identifier": "ovecc",
+      "version": "0.0.0",
+      "transport": { "type": "stdio" },
+      "packageArguments": [
+        { "type": "positional", "value": "mcp", "isRequired": true }
+      ]
+    }
+  ]
+}

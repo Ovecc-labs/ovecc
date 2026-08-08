@@ -337,3 +337,38 @@ jobs:
           for p in cli-linux-x64 cli-darwin-arm64 cli-win32-x64 ovecc; do
             npm publish --provenance --access public "./npm/$p"
           done
+
+  publish-registry:
+    name: Publish to the MCP registry
+    needs: publish-npm
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write # OIDC stands in for a registry token
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install mcp-publisher
+        run: |
+          curl -fsSL "https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_$(uname -s | tr '[:upper:]' '[:lower:]')_$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/').tar.gz" | tar xz mcp-publisher
+
+      # server.json carries the same 0.0.0 placeholders as the npm manifests, and
+      # for the same reason: the tag is the version.
+      - name: Stage the version
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          jq --arg v "$version" '.version = $v | .packages[].version = $v' server.json > server.json.tmp
+          mv server.json.tmp server.json
+
+      # Ownership is proved by reading mcpName out of the package on
+      # registry.npmjs.org, which lags the publish above by up to a minute.
+      - name: Publish
+        run: |
+          ./mcp-publisher login github-oidc
+          for attempt in 1 2 3; do
+            ./mcp-publisher publish && exit 0
+            echo "attempt ${attempt} failed, waiting for npm to serve the new version" >&2
+            sleep 30
+          done
+          exit 1

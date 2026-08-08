@@ -1,6 +1,7 @@
 {
   "name": "ovecc",
   "version": "0.0.0",
+  "mcpName": "io.github.Ovecc-labs/ovecc",
   "description": "Deterministic, offline architecture intelligence: dependency graph, impact, dead code, duplication, security findings, and a CI gate",
   "keywords": [
     "architecture",

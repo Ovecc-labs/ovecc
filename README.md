@@ -259,8 +259,11 @@ this PR break the architecture contract?" and get the same deterministic answer.
 Register it with any MCP client:
 
 ```json
-{ "mcpServers": { "ovecc": { "command": "ovecc", "args": ["mcp"] } } }
+{ "mcpServers": { "ovecc": { "command": "npx", "args": ["-y", "ovecc", "mcp"] } } }
 ```
+
+With the binary already on `PATH`, `"command": "ovecc"` and `"args": ["mcp"]` start it
+without the npm lookup.
 
 Start with `ovecc capabilities --format json`: it returns every command, the
 metrics and rules they emit (each with a definition), the severity vocabulary,
