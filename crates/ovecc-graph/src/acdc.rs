@@ -21,10 +21,23 @@
 //! Type-only imports participate. Clustering measures coupling, and a type
 //! dependency is coupling even though it can never form a runtime cycle.
 //!
+//! **What this cannot tell you.** The dominator pattern groups everything
+//! reachable only through one node, so a feature with a single entry point
+//! becomes a single subsystem however many slices it is written as — including
+//! when those slices import each other in a cycle. Recovered subsystems are
+//! therefore a view *beside* the directory-derived modules, never a replacement
+//! for them: a cycle between two sibling slices is visible to `diagnose` at
+//! directory granularity and to `module_depth`, and is invisible here by
+//! construction — pinned by the test
+//! `a_feature_behind_one_entry_point_clusters_whole`.
+//!
 //! Reference: Tzerpos & Holt, *ACDC: An Algorithm for Comprehension-Driven
 //! Clustering*, WCRE 2000. Empirical standing: Lutellier et al., *Comparing
 //! Software Architecture Recovery Techniques Using Accurate Dependencies*,
-//! ICSE 2015.
+//! ICSE 2015 — best MoJoFM of the deterministic techniques on 3 of 5 subjects
+//! and an order of magnitude more scalable, but note §III-D, where a Chromium
+//! developer told the authors most ACDC clusters "did not make sense" and to
+//! use the module organisation instead.
 
 use crate::diagnose::FileDep;
 use petgraph::algo::dominators::simple_fast;
@@ -637,6 +650,41 @@ mod tests {
         );
         assert_eq!(alpha.name, "src/feature/alpha/index.ts");
         assert_eq!(beta.name, "src/feature/beta/scoring.ts");
+    }
+
+    #[test]
+    fn a_feature_behind_one_entry_point_clusters_whole() {
+        // The lab/demo-crash shape, this time with the cycle it actually has:
+        // nothing outside imports the feature, so alpha/index is a graph source
+        // that reaches every file, dominates all of them, and the pattern makes
+        // them one subsystem. Measured against the fixture's ground truth — two
+        // slices — this is the wrong answer, and it is the *right* behaviour for
+        // the pattern: a unit reachable only through one door is one unit.
+        // Pinned so nobody later mistakes `components` for a fix to that bug.
+        let paths = files(&[
+            "src/feature/alpha/index.ts",
+            "src/feature/alpha/types.ts",
+            "src/feature/beta/scoring.ts",
+        ]);
+        let deps = vec![
+            edge("src/feature/alpha/index.ts", "src/feature/alpha/types.ts"),
+            edge("src/feature/alpha/index.ts", "src/feature/beta/scoring.ts"),
+            edge("src/feature/beta/scoring.ts", "src/feature/alpha/types.ts"),
+        ];
+
+        let clustering = cluster(&paths, &deps, &AcdcConfig::default());
+
+        let alpha = clustering
+            .subsystem_of("src/feature/alpha/types.ts")
+            .unwrap();
+        let beta = clustering
+            .subsystem_of("src/feature/beta/scoring.ts")
+            .unwrap();
+        assert_eq!(
+            alpha.name, beta.name,
+            "one entry point, one subsystem — the slices are not separated"
+        );
+        assert_eq!(alpha.files.len(), 3);
     }
 
     #[test]

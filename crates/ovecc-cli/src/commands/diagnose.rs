@@ -35,15 +35,16 @@ pub(crate) fn diagnose_config_for(
     diagnose
 }
 
-fn load_diagnose_inputs(paths: &ProjectPaths) -> Result<DiagnoseInputs> {
+/// Each indexed file with the module the directory heuristic named for it, and
+/// the in-repository file→file import edges.
+pub(crate) type ComponentInputs = (Vec<(String, String)>, Vec<ovecc_graph::diagnose::FileDep>);
+
+/// The dependency graph every component-granularity view starts from.
+pub(crate) fn load_component_inputs(paths: &ProjectPaths) -> Result<ComponentInputs> {
     let store = open_store(paths)?;
     let repository_id = paths.repository_id().0;
     // Every indexed file, so components with no edges still count toward size.
-    let files: Vec<String> = store
-        .file_modules(&repository_id)?
-        .into_iter()
-        .map(|(path, _module)| path)
-        .collect();
+    let file_modules = store.file_modules(&repository_id)?;
     let file_deps: Vec<ovecc_graph::diagnose::FileDep> = store
         .current_dependencies(&repository_id)?
         .into_iter()
@@ -60,6 +61,14 @@ fn load_diagnose_inputs(paths: &ProjectPaths) -> Result<DiagnoseInputs> {
                 })
         })
         .collect();
+    Ok((file_modules, file_deps))
+}
+
+fn load_diagnose_inputs(paths: &ProjectPaths) -> Result<DiagnoseInputs> {
+    let (file_modules, file_deps) = load_component_inputs(paths)?;
+    let files: Vec<String> = file_modules.into_iter().map(|(path, _)| path).collect();
+    let store = open_store(paths)?;
+    let repository_id = paths.repository_id().0;
     let churn: std::collections::HashMap<String, f64> =
         store.file_churn(&repository_id)?.into_iter().collect();
     let complexity: std::collections::HashMap<String, f64> =

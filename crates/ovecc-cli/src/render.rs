@@ -4,6 +4,7 @@
 
 use anyhow::Result;
 use ovecc_core::capabilities;
+use ovecc_core::config::OutputFormat;
 use ovecc_core::facts::{FindingRecord, Severity};
 use ovecc_core::legacy::RiskLevel;
 use ovecc_core::report::{Envelope, Meta, ToolInfo};
@@ -39,6 +40,32 @@ pub(crate) fn emit_ndjson_meta(command: &str, meta: &Meta) -> Result<()> {
         "meta": meta,
     });
     println!("{}", serde_json::to_string(&header)?);
+    Ok(())
+}
+
+/// The four-format dispatch a report-shaped command repeats: one JSON envelope
+/// (SARIF and Code Climate degrade to it, since a report is not a finding feed),
+/// an NDJSON header followed by the command's own typed rows, and a renderer
+/// each for markdown and text.
+pub(crate) fn render_report<T: serde::Serialize + ?Sized>(
+    command: &'static str,
+    data: &T,
+    format: OutputFormat,
+    rows: impl FnOnce() -> Result<()>,
+    markdown: impl FnOnce(),
+    text: impl FnOnce(),
+) -> Result<()> {
+    match format {
+        OutputFormat::Json | OutputFormat::Sarif | OutputFormat::Codeclimate => {
+            emit_json(command, data, meta_for(command))?
+        }
+        OutputFormat::Ndjson => {
+            emit_ndjson_meta(command, &meta_for(command))?;
+            rows()?;
+        }
+        OutputFormat::Markdown => markdown(),
+        OutputFormat::Text => text(),
+    }
     Ok(())
 }
 

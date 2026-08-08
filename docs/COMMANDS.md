@@ -361,6 +361,44 @@ Per-component Martin metrics: fan-in/out, coupling, instability *I*,
 abstractness *A*, distance from the main sequence *D = |A + I − 1|*, churn,
 plus repo-wide coupling density. The trendable numbers behind `diagnose`.
 
+### `ovecc components [--target] [--max-size N] [--support-in-degree N]`
+
+Recovers subsystems from the dependency graph with ACDC's two-phase clustering
+(Tzerpos & Holt, WCRE 2000), as a **second view beside** the directory-derived
+modules — not a replacement for them.
+
+Phase one applies subsystem patterns: the body-header pattern folds `x.c`/`x.h`
+into one unit, the support-library pattern lifts out files whose in-degree
+exceeds `--support-in-degree` (they are used by everything and dominated by
+nothing), and the subgraph-dominator pattern claims, for each file, everything
+reachable only through it. Phase two adopts the leftovers into whichever
+subsystem they are most connected to. The output is a containment tree, and
+`split_modules` names every module the two views disagree about.
+
+The published algorithm leaves tie-breaking unspecified — the ICSE 2015
+comparison had to run it five times per subject and report the best score. Here
+ties break on connectivity, then cardinality, then name, so one index always
+yields one clustering.
+
+**What it will not tell you.** Dominance groups everything behind a single
+entry point, so a feature with one barrel index is one subsystem however many
+slices it contains — even when those slices import each other in a cycle. Use
+`diagnose` (directory granularity) or raise `[architecture] module_depth` for
+that question; the two commands answer different ones.
+
+```
+Components: 2 subsystem(s) recovered, 4 module(s) named by directory
+  6 file(s) claimed by a pattern, 0 adopted
+
+Modules the layout collapses (1):
+  app -> 2 subsystems: src/app/main.ts, src/app/router.ts
+
+src/app/main.ts    [subgraph dominator]  3 file(s), modules: app, store, util
+  contains: src/app/router.ts
+src/app/router.ts  [subgraph dominator]  3 file(s), modules: app, handlers
+  inside: src/app/main.ts
+```
+
 ### `ovecc explain <target>`
 
 A deterministic, offline explanation of an element's role: coupling

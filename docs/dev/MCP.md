@@ -123,7 +123,7 @@ printf '%s\n' \
 You should get an `initialize` result (serverInfo `ovecc`) followed by a `tools/list`
 result enumerating the **agent profile** (11 tools by default — see
 [Tool profiles](#tool-profiles)). Set `OVECC_MCP_PROFILE=full` in the server's
-environment to list all 31. To exercise a real analysis tool against an indexed repo:
+environment to list all 32. To exercise a real analysis tool against an indexed repo:
 
 ```sh
 printf '%s\n' \
@@ -159,7 +159,7 @@ profile only controls what the agent *discovers*.
 
 ## Tool catalog
 
-The full surface — 31 tools (every one takes an optional `repo`; `*` marks required
+The full surface — 32 tools (every one takes an optional `repo`; `*` marks required
 arguments). The eleven in the agent profile are listed under
 [Tool profiles](#tool-profiles) above.
 
@@ -191,6 +191,7 @@ arguments). The eleven in the agent profile are listed under
 | `ovecc_diagnose` | `diagnose` | `target`, `severity` (architectural smells + remediation) |
 | `ovecc_advise` | `advise` | `target*` (findings touching one file/component + the fix) |
 | `ovecc_metrics` | `metrics` | `target` (per-component fan-in/out, instability, abstractness, distance) |
+| `ovecc_components` | `components` | `target` (subsystems recovered by dominance, and the modules the two views disagree about) |
 | `ovecc_gate` | `gate` | `base`, `head`, `fail_on` |
 | `ovecc_diff` | `diff` | `base`, `head`, `fail_on` |
 | `ovecc_explain` | `explain` | `target*` |

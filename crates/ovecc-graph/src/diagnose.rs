@@ -26,10 +26,11 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 pub use ovecc_core::config::DiagnoseConfig;
 use ovecc_core::facts::FixSpec;
 
-/// Whether a file path is excluded from diagnosis. A token containing `.`
-/// matches the filename as a substring; otherwise it matches a whole path
-/// segment. All case-insensitive.
-fn is_excluded(path: &str, exclude: &[String]) -> bool {
+/// Whether a file path is excluded from component-granularity analysis. A token
+/// containing `.` matches the filename as a substring; otherwise it matches a
+/// whole path segment. All case-insensitive. Shared with [`crate::acdc`]'s
+/// callers so both views of a component answer for the same set of files.
+pub fn is_excluded(path: &str, exclude: &[String]) -> bool {
     let norm = path.replace('\\', "/").to_ascii_lowercase();
     let segments: Vec<&str> = norm.split('/').filter(|s| !s.is_empty()).collect();
     let file = segments.last().copied().unwrap_or("");

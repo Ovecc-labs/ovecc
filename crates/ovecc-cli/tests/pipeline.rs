@@ -1960,3 +1960,228 @@ fn coupling_reports_files_that_keep_changing_together() {
         "each meeting is witnessed by its commit: {pair}"
     );
 }
+
+/// A layered spine the folder tree does not state: `main` is the only way in,
+/// it reaches `router`, and `router` is the only way to the handlers. The
+/// directory heuristic names four flat modules for that; dominance recovers the
+/// nesting, and disagrees with the layout about `app`.
+fn layered_repo(root: &Path) {
+    write_source(
+        root,
+        "src/util/fmt.ts",
+        "export const fmt = (value: string) => value.trim();\n",
+    );
+    write_source(
+        root,
+        "src/store/db.ts",
+        "import { fmt } from \"../util/fmt\";\nexport const db = { read: fmt };\n",
+    );
+    write_source(
+        root,
+        "src/handlers/orders.ts",
+        "import { fmt } from \"../util/fmt\";\nexport const orders = () => fmt(\"o\");\n",
+    );
+    write_source(
+        root,
+        "src/handlers/users.ts",
+        "import { fmt } from \"../util/fmt\";\nexport const users = () => fmt(\"u\");\n",
+    );
+    write_source(
+        root,
+        "src/app/router.ts",
+        "import { orders } from \"../handlers/orders\";\n\
+         import { users } from \"../handlers/users\";\n\
+         export const route = () => [orders(), users()];\n",
+    );
+    write_source(
+        root,
+        "src/app/main.ts",
+        "import { route } from \"./router\";\n\
+         import { db } from \"../store/db\";\n\
+         export const main = () => route().concat(db.read(\"x\"));\n",
+    );
+}
+
+fn subsystem<'a>(report: &'a serde_json::Value, name: &str) -> &'a serde_json::Value {
+    report["data"]["subsystems"]
+        .as_array()
+        .expect("subsystems array")
+        .iter()
+        .find(|entry| entry["name"] == name)
+        .unwrap_or_else(|| panic!("no subsystem {name} in {report}"))
+}
+
+#[test]
+fn components_recover_the_nesting_the_directories_do_not_state() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let root = temp.path();
+    let repo = root.to_str().expect("utf8 path").to_string();
+    layered_repo(root);
+    index_repo(&repo);
+
+    let report = json_output(&repo, &["components", "--format", "json"]);
+    let names: Vec<&str> = report["data"]["subsystems"]
+        .as_array()
+        .expect("subsystems")
+        .iter()
+        .map(|entry| entry["name"].as_str().expect("name"))
+        .collect();
+    assert_eq!(
+        names,
+        vec!["src/app/main.ts", "src/app/router.ts"],
+        "two dominators, named for the file each one guards: {report}"
+    );
+
+    // The containment tree: router sits inside main, which the flat module list
+    // cannot express at all.
+    let main = subsystem(&report, "src/app/main.ts");
+    let router = subsystem(&report, "src/app/router.ts");
+    assert_eq!(main["pattern"], "subgraph_dominator");
+    assert!(main["parent"].is_null(), "main is a root: {main}");
+    assert_eq!(main["children"][0], "src/app/router.ts");
+    assert_eq!(router["parent"], "src/app/main.ts");
+    assert_eq!(
+        router["files"],
+        serde_json::json!([
+            "src/app/router.ts",
+            "src/handlers/orders.ts",
+            "src/handlers/users.ts"
+        ]),
+        "everything reachable only through router: {router}"
+    );
+
+    // Where the two views part company: one `app` module, two subsystems.
+    assert_eq!(
+        report["data"]["split_modules"],
+        serde_json::json!([{
+            "module": "app",
+            "subsystems": ["src/app/main.ts", "src/app/router.ts"],
+        }]),
+        "{report}"
+    );
+
+    // Every indexed file lands in exactly one subsystem, and the counts add up.
+    let mut placed: Vec<&str> = report["data"]["subsystems"]
+        .as_array()
+        .expect("subsystems")
+        .iter()
+        .flat_map(|entry| entry["files"].as_array().expect("files"))
+        .map(|file| file.as_str().expect("path"))
+        .collect();
+    placed.sort_unstable();
+    assert_eq!(
+        placed,
+        vec![
+            "src/app/main.ts",
+            "src/app/router.ts",
+            "src/handlers/orders.ts",
+            "src/handlers/users.ts",
+            "src/store/db.ts",
+            "src/util/fmt.ts"
+        ],
+        "a partition, nothing lost or doubled: {report}"
+    );
+    assert_eq!(report["data"]["skeleton_files"], 6);
+    assert_eq!(report["data"]["adopted_files"], 0);
+
+    // Scoping keeps the whole-repository module count, so a slice still says
+    // what it is a slice of.
+    let scoped = json_output(
+        &repo,
+        &["components", "--format", "json", "--target", "handlers"],
+    );
+    assert_eq!(
+        scoped["data"]["subsystems"]
+            .as_array()
+            .expect("subsystems")
+            .len(),
+        1,
+        "{scoped}"
+    );
+    assert_eq!(scoped["data"]["modules"], report["data"]["modules"]);
+
+    // Same index, same clustering, byte for byte.
+    let again = ovecc(&repo, &["components", "--format", "json"]);
+    assert_eq!(
+        String::from_utf8_lossy(&again.stdout),
+        String::from_utf8_lossy(&ovecc(&repo, &["components", "--format", "json"]).stdout)
+    );
+}
+
+/// The honest boundary, end to end, on the `lab/demo-crash` shape: a barrel
+/// index imports both slices directly and nothing outside enters the feature,
+/// so the index dominates every file and the whole feature is one subsystem —
+/// the `alpha`/`beta` split the fixture's ground truth calls for is not
+/// recovered. `diagnose` still reports the cycle at directory granularity; the
+/// two commands answer different questions, and this pins which.
+#[test]
+fn a_feature_behind_one_barrel_is_one_subsystem_however_many_slices_it_has() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let root = temp.path();
+    let repo = root.to_str().expect("utf8 path").to_string();
+    write_source(
+        root,
+        "src/feature/alpha/types.ts",
+        "export enum Kind { A, B }\n",
+    );
+    write_source(
+        root,
+        "src/feature/alpha/policy.ts",
+        "export const resolvePolicy = () => 1;\n",
+    );
+    write_source(
+        root,
+        "src/feature/beta/formatting.ts",
+        "export const renderRollup = () => \"r\";\n",
+    );
+    // The back edge that closes the alpha <-> beta cycle.
+    write_source(
+        root,
+        "src/feature/beta/scoring.ts",
+        "import { Kind } from \"../alpha/types\";\nexport const score = () => Kind.A;\n",
+    );
+    write_source(
+        root,
+        "src/feature/alpha/index.ts",
+        "import { Kind } from \"./types\";\n\
+         import { resolvePolicy } from \"./policy\";\n\
+         import { score } from \"../beta/scoring\";\n\
+         import { renderRollup } from \"../beta/formatting\";\n\
+         export const run = () => [Kind.A, resolvePolicy(), score(), renderRollup()];\n",
+    );
+    index_repo(&repo);
+
+    let report = json_output(&repo, &["components", "--format", "json"]);
+    let subsystems = report["data"]["subsystems"].as_array().expect("subsystems");
+    assert_eq!(
+        subsystems.len(),
+        1,
+        "the whole feature clusters as one: {report}"
+    );
+    assert_eq!(subsystems[0]["name"], "src/feature/alpha/index.ts");
+    assert_eq!(
+        subsystems[0]["files"].as_array().expect("files").len(),
+        5,
+        "both slices, one subsystem: {report}"
+    );
+    assert_eq!(
+        report["data"]["split_modules"],
+        serde_json::json!([]),
+        "so the module view is not contradicted here — nothing to report: {report}"
+    );
+
+    // The cycle is real and `diagnose` names it, at directory granularity.
+    let diagnosed = json_output(&repo, &["diagnose", "--format", "json"]);
+    let cyclic: Vec<&str> = diagnosed["data"]["findings"]
+        .as_array()
+        .expect("findings")
+        .iter()
+        .filter(|finding| finding["detector"] == "cyclic_dependency")
+        .map(|finding| finding["target"].as_str().expect("target"))
+        .collect();
+    assert_eq!(
+        cyclic,
+        vec!["src/feature/alpha <-> src/feature/beta"],
+        "clustering does not see it; diagnosis does: {diagnosed}"
+    );
+}

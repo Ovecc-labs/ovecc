@@ -401,6 +401,10 @@ fn argv_findings(name: &str, args: &Value) -> Argv {
             argv.push("metrics".into());
             push_opt(&mut argv, args, "target", "--target");
         }
+        "ovecc_components" => {
+            argv.push("components".into());
+            push_opt(&mut argv, args, "target", "--target");
+        }
         _ => return Err(ArgvError::UnknownTool),
     }
     Ok(argv)
@@ -569,7 +573,8 @@ fn tool_specs() -> Value {
         {"name": "ovecc_diagnose", "description": "Deterministic architectural diagnosis: cycles, hub-like (crossing), unstable and god components, dense structure, and hotspots — each with evidence, the design principle it breaks, and an established remediation. Components are directories; no design patterns are invented.", "inputSchema": obj(json!({"repo": repo, "target": {"type": "string", "description": "Scope to findings touching this file or component (substring)."}, "severity": severity}), json!([]))},
         {"name": "ovecc_advise", "description": "Findings touching one file, module, or component, with the established fix for each. Call before editing that area so the change does not reintroduce a known problem. Example: {\"target\": \"src/billing\"}.", "inputSchema": obj(json!({"repo": repo, "target": {"type": "string", "description": "File, module, or component to advise on."}}), json!(["target"]))},
         {"name": "ovecc_architecture", "description": "The architecture contract, resolved: which components own the given paths, what each may import (and through which interface files), what every one of its files must import, what it must never import, and which components may import it. Call before editing a file so the change lands inside the contract; violations surface in ovecc_violations and the gate. Example: {\"paths\": [\"src/api/routes.ts\"]}.", "inputSchema": obj(json!({"repo": repo, "paths": {"type": "array", "items": {"type": "string"}, "description": "Paths to look up. Omit for the whole contract."}}), json!([]))},
-        {"name": "ovecc_metrics", "description": "Per-component architecture metrics: fan-in/out, coupling, Martin instability, aggregate complexity, churn, and repository coupling density.", "inputSchema": obj(json!({"repo": repo, "target": {"type": "string", "description": "Scope to a single component (substring)."}}), json!([]))}
+        {"name": "ovecc_metrics", "description": "Per-component architecture metrics: fan-in/out, coupling, Martin instability, aggregate complexity, churn, and repository coupling density.", "inputSchema": obj(json!({"repo": repo, "target": {"type": "string", "description": "Scope to a single component (substring)."}}), json!([]))},
+        {"name": "ovecc_components", "description": "Subsystems recovered from the dependency graph by ACDC dominance clustering, as a second view beside the directory-derived modules: each subsystem's pattern, containment parent/children, files, and the modules it spans, plus every module the two views disagree about. Groups everything reachable through one entry point, so it does not separate slices sharing one.", "inputSchema": obj(json!({"repo": repo, "target": {"type": "string", "description": "Scope to subsystems mentioning this file, module, or name."}}), json!([]))}
     ])
 }
 
