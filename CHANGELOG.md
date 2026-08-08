@@ -7,6 +7,8 @@ changes).
 
 ## [Unreleased]
 
+## [0.2.4] - 2026-08-08
+
 ### Added
 
 - A `server.json`, and the matching `mcpName` in the npm manifest, so a tagged
