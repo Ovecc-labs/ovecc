@@ -471,6 +471,7 @@ pub enum FindingKind {
     /// An imported package missing from every `package.json` (a phantom
     /// dependency that only works via hoisting or a transitive install).
     UnlistedDependency,
+    UnresolvedImport,
     HighComplexity,
     /// A function long enough (source lines) to be a maintainability risk.
     LongFunction,
@@ -540,6 +541,12 @@ impl FindingKind {
                 "Declare the package in the nearest manifest's dependencies, pinning the \
                  version the lockfile already resolves (it currently works only via \
                  hoisting or a transitive install).",
+            ),
+            FindingKind::UnresolvedImport => FixSpec::new(
+                "repoint_unresolved_import",
+                false,
+                "Point the import at a path that exists, or delete it: nothing in the \
+                 repository resolves this specifier, so the module it names is gone.",
             ),
             FindingKind::HighComplexity => FixSpec::new(
                 "reduce_complexity",

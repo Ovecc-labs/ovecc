@@ -436,7 +436,10 @@ pub fn metric_definitions() -> BTreeMap<String, MetaMetric> {
         (
             "circular_dependencies".to_string(),
             metric(
-                "Number of strongly-connected (cyclic) module components.",
+                "Strongly-connected (cyclic) module components, over runtime imports \
+                 only — `import type` is erased before load and never witnesses a \
+                 cycle. One component can hold several elementary loops, so this sits \
+                 at or below the loop count `query cycles` lists.",
                 "[0, inf)",
                 "lower is better",
             ),
@@ -567,6 +570,15 @@ pub fn rule_definitions() -> BTreeMap<String, MetaRule> {
             rule(
                 "An import matches a banned specifier pattern declared in [[rules.banned_imports]].",
                 "configurable",
+            ),
+        ),
+        (
+            "unresolved-import".to_string(),
+            rule(
+                "An import names a path inside the repository that resolves to no \
+                 file. Asset and loader-query specifiers are excluded: a bundler \
+                 rule, not ovecc, resolves those.",
+                "medium",
             ),
         ),
         (

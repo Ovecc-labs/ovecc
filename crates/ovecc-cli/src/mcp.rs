@@ -206,8 +206,12 @@ fn truncate(s: &str, max: usize) -> String {
 }
 
 fn run_tool(name: &str, arguments: &Value, exe: &Path, default_repo: &str) -> Value {
-    let Some(sub_argv) = build_argv(name, arguments) else {
-        return error_result(format!("unknown tool or missing required argument: {name}"));
+    let sub_argv = match build_argv(name, arguments) {
+        Ok(argv) => argv,
+        Err(ArgvError::UnknownTool) => return error_result(format!("unknown tool: {name}")),
+        Err(ArgvError::MissingArgument(argument)) => {
+            return error_result(format!("missing required argument '{argument}' for {name}"));
+        }
     };
     let repo = arguments
         .get("repo")
@@ -261,20 +265,34 @@ fn error_result(message: String) -> Value {
     json!({"content": [{"type": "text", "text": message}], "isError": true})
 }
 
-/// Builds the CLI sub-argv for a tool, or `None` if the tool is unknown or a
-/// required argument is absent. The global `--repo`/`--format` flags are added
-/// by the caller. The tools are grouped so each builder stays small; names are
-/// disjoint, so the first group that recognizes `name` produces the argv.
-fn build_argv(name: &str, args: &Value) -> Option<Vec<String>> {
-    argv_setup(name, args)
-        .or_else(|| argv_findings(name, args))
-        .or_else(|| argv_navigation(name, args))
-        .or_else(|| argv_change(name, args))
-        .or_else(|| argv_lsp_alias(name, args))
+#[derive(Debug)]
+enum ArgvError {
+    UnknownTool,
+    MissingArgument(&'static str),
+}
+
+type Argv = Result<Vec<String>, ArgvError>;
+
+/// Builds the CLI sub-argv for a tool. The global `--repo`/`--format` flags are
+/// added by the caller. The tools are grouped so each builder stays small;
+/// names are disjoint, so the first group that recognizes `name` produces the
+/// argv and the rest report [`ArgvError::UnknownTool`].
+fn build_argv(name: &str, args: &Value) -> Argv {
+    let mut built = argv_setup(name, args);
+    for next in [argv_findings, argv_navigation, argv_change, argv_lsp_alias] {
+        if matches!(built, Err(ArgvError::UnknownTool)) {
+            built = next(name, args);
+        }
+    }
+    built
 }
 
 fn arg_str<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
     args.get(key).and_then(Value::as_str)
+}
+
+fn required_str<'a>(args: &'a Value, key: &'static str) -> Result<&'a str, ArgvError> {
+    arg_str(args, key).ok_or(ArgvError::MissingArgument(key))
 }
 
 fn arg_u64(args: &Value, key: &str) -> Option<u64> {
@@ -302,7 +320,7 @@ fn push_opt_u64(argv: &mut Vec<String>, args: &Value, key: &str, flag: &str) {
 }
 
 /// index, init, history, and the no-argument status reports.
-fn argv_setup(name: &str, args: &Value) -> Option<Vec<String>> {
+fn argv_setup(name: &str, args: &Value) -> Argv {
     let mut argv = Vec::new();
     match name {
         "ovecc_index" => {
@@ -329,13 +347,13 @@ fn argv_setup(name: &str, args: &Value) -> Option<Vec<String>> {
         "ovecc_report" => argv.push("report".into()),
         "ovecc_health" => argv.push("health".into()),
         "ovecc_conventions" => argv.push("conventions".into()),
-        _ => return None,
+        _ => return Err(ArgvError::UnknownTool),
     }
-    Some(argv)
+    Ok(argv)
 }
 
 /// The finding-bearing commands: their severity/baseline/changed-since filters.
-fn argv_findings(name: &str, args: &Value) -> Option<Vec<String>> {
+fn argv_findings(name: &str, args: &Value) -> Argv {
     let mut argv = Vec::new();
     match name {
         "ovecc_deadcode" => {
@@ -383,29 +401,29 @@ fn argv_findings(name: &str, args: &Value) -> Option<Vec<String>> {
             argv.push("metrics".into());
             push_opt(&mut argv, args, "target", "--target");
         }
-        _ => return None,
+        _ => return Err(ArgvError::UnknownTool),
     }
-    Some(argv)
+    Ok(argv)
 }
 
 /// The element-scoped navigation commands; each needs a target/query.
-fn argv_navigation(name: &str, args: &Value) -> Option<Vec<String>> {
+fn argv_navigation(name: &str, args: &Value) -> Argv {
     let mut argv = Vec::new();
     match name {
         "ovecc_impact" => {
             argv.push("impact".into());
-            argv.push(arg_str(args, "target")?.into());
+            argv.push(required_str(args, "target")?.into());
             push_opt(&mut argv, args, "direction", "--direction");
             push_opt_u64(&mut argv, args, "max_depth", "--max-depth");
         }
         "ovecc_query" => {
             argv.push("query".into());
-            argv.push(arg_str(args, "query")?.into());
+            argv.push(required_str(args, "query")?.into());
             push_opt_u64(&mut argv, args, "depth", "--depth");
         }
         "ovecc_grep" => {
             argv.push("grep".into());
-            argv.push(arg_str(args, "pattern")?.into());
+            argv.push(required_str(args, "pattern")?.into());
             if let Some(path) = arg_str(args, "path") {
                 argv.push(path.into());
             }
@@ -413,25 +431,23 @@ fn argv_navigation(name: &str, args: &Value) -> Option<Vec<String>> {
         }
         "ovecc_read" => {
             argv.push("read".into());
-            argv.push(arg_str(args, "target")?.into());
+            argv.push(required_str(args, "target")?.into());
             push_opt_u64(&mut argv, args, "limit", "--limit");
         }
         "ovecc_explain" => {
             argv.push("explain".into());
-            argv.push(arg_str(args, "target")?.into());
+            argv.push(required_str(args, "target")?.into());
         }
         "ovecc_context" => {
             argv.push("export".into());
             argv.push("context".into());
-            argv.push(arg_str(args, "target")?.into());
+            argv.push(required_str(args, "target")?.into());
         }
         "ovecc_architecture" => {
             argv.push("architecture".into());
             argv.push("show".into());
             if let Some(paths) = args.get("paths").and_then(Value::as_array) {
-                for path in paths {
-                    argv.push(path.as_str()?.into());
-                }
+                argv.extend(paths.iter().filter_map(Value::as_str).map(str::to_string));
             }
         }
         "ovecc_export_graph" => {
@@ -439,13 +455,13 @@ fn argv_navigation(name: &str, args: &Value) -> Option<Vec<String>> {
             argv.push("graph".into());
             push_opt(&mut argv, args, "html", "--html");
         }
-        _ => return None,
+        _ => return Err(ArgvError::UnknownTool),
     }
-    Some(argv)
+    Ok(argv)
 }
 
 /// The change-comparison commands (drift/gate/diff/review) and diagnose/advise.
-fn argv_change(name: &str, args: &Value) -> Option<Vec<String>> {
+fn argv_change(name: &str, args: &Value) -> Argv {
     let base_head_fail = |verb: &str| {
         let mut argv = vec![verb.to_string()];
         push_base_head(&mut argv, arg_str(args, "base"), arg_str(args, "head"));
@@ -458,9 +474,9 @@ fn argv_change(name: &str, args: &Value) -> Option<Vec<String>> {
             argv.push("drift".into());
             push_opt(&mut argv, args, "since", "--since");
         }
-        "ovecc_gate" => return Some(base_head_fail("gate")),
-        "ovecc_diff" => return Some(base_head_fail("diff")),
-        "ovecc_review" => return Some(base_head_fail("review")),
+        "ovecc_gate" => return Ok(base_head_fail("gate")),
+        "ovecc_diff" => return Ok(base_head_fail("diff")),
+        "ovecc_review" => return Ok(base_head_fail("review")),
         "ovecc_diagnose" => {
             argv.push("diagnose".into());
             push_opt(&mut argv, args, "target", "--target");
@@ -468,34 +484,34 @@ fn argv_change(name: &str, args: &Value) -> Option<Vec<String>> {
         }
         "ovecc_advise" => {
             argv.push("advise".into());
-            argv.push(arg_str(args, "target")?.into());
+            argv.push(required_str(args, "target")?.into());
         }
-        _ => return None,
+        _ => return Err(ArgvError::UnknownTool),
     }
-    Some(argv)
+    Ok(argv)
 }
 
 /// LSP-vocabulary aliases (opt-in, see `lsp_aliases_enabled`). Each is a thin
 /// renaming of an existing verb, not new analysis.
-fn argv_lsp_alias(name: &str, args: &Value) -> Option<Vec<String>> {
+fn argv_lsp_alias(name: &str, args: &Value) -> Argv {
     let mut argv = Vec::new();
     match name {
         "find_references" => {
             argv.push("query".into());
-            argv.push(format!("rdeps {}", arg_str(args, "symbol")?));
+            argv.push(format!("rdeps {}", required_str(args, "symbol")?));
         }
         "get_call_hierarchy" => {
             argv.push("impact".into());
-            argv.push(arg_str(args, "symbol")?.into());
+            argv.push(required_str(args, "symbol")?.into());
             push_opt(&mut argv, args, "direction", "--direction");
         }
         "workspace_symbol" => {
             argv.push("explain".into());
-            argv.push(arg_str(args, "query")?.into());
+            argv.push(required_str(args, "query")?.into());
         }
-        _ => return None,
+        _ => return Err(ArgvError::UnknownTool),
     }
-    Some(argv)
+    Ok(argv)
 }
 
 /// Appends the positional `base`/`head` ref arguments shared by `gate` and
@@ -696,10 +712,46 @@ mod tests {
     }
 
     #[test]
-    fn missing_required_argument_or_unknown_tool_yields_none() {
-        assert!(build_argv("ovecc_impact", &json!({})).is_none());
-        assert!(build_argv("ovecc_query", &json!({})).is_none());
-        assert!(build_argv("ovecc_nope", &json!({})).is_none());
+    fn a_missing_argument_is_told_apart_from_an_unknown_tool() {
+        assert!(matches!(
+            build_argv("ovecc_impact", &json!({})),
+            Err(ArgvError::MissingArgument("target"))
+        ));
+        assert!(matches!(
+            build_argv("ovecc_query", &json!({})),
+            Err(ArgvError::MissingArgument("query"))
+        ));
+        assert!(matches!(
+            build_argv("ovecc_grep", &json!({})),
+            Err(ArgvError::MissingArgument("pattern"))
+        ));
+        assert!(matches!(
+            build_argv("ovecc_nope", &json!({})),
+            Err(ArgvError::UnknownTool)
+        ));
+
+        let exe = std::path::PathBuf::from("ovecc");
+        let missing = run_tool("ovecc_impact", &json!({}), &exe, ".");
+        let text = missing
+            .pointer("/content/0/text")
+            .unwrap()
+            .as_str()
+            .unwrap();
+        assert_eq!(missing["isError"], true);
+        assert!(
+            text.contains("missing required argument 'target'"),
+            "{text}"
+        );
+        assert!(!text.contains("unknown tool"), "{text}");
+
+        let unknown = run_tool("ovecc_nope", &json!({}), &exe, ".");
+        let text = unknown
+            .pointer("/content/0/text")
+            .unwrap()
+            .as_str()
+            .unwrap();
+        assert_eq!(unknown["isError"], true);
+        assert_eq!(text, "unknown tool: ovecc_nope");
     }
 
     #[test]
@@ -721,7 +773,10 @@ mod tests {
             vec!["explain", "Billing"]
         );
         // The aliases are off by default, so they must not shadow a required arg.
-        assert!(build_argv("find_references", &json!({})).is_none());
+        assert!(matches!(
+            build_argv("find_references", &json!({})),
+            Err(ArgvError::MissingArgument("symbol"))
+        ));
     }
 
     #[test]
@@ -787,5 +842,39 @@ mod tests {
     fn unknown_method_is_a_jsonrpc_error() {
         let exe = std::path::PathBuf::from("ovecc");
         assert!(handle("frobnicate", None, &exe, ".").is_err());
+    }
+
+    #[test]
+    fn the_mcp_guide_documents_every_tool_and_the_real_counts() {
+        const GUIDE: &str = include_str!("../../../docs/dev/MCP.md");
+        let registry = tool_specs();
+        let names: Vec<&str> = registry
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tool| tool["name"].as_str().unwrap())
+            .collect();
+
+        for name in &names {
+            assert!(
+                GUIDE.contains(&format!("`{name}`")),
+                "docs/dev/MCP.md does not mention {name}"
+            );
+        }
+        assert!(
+            GUIDE.contains(&format!("({} tools by default", AGENT_PROFILE.len())),
+            "the agent-profile count in docs/dev/MCP.md is stale (it is {})",
+            AGENT_PROFILE.len()
+        );
+        assert!(
+            GUIDE.contains(&format!("list all {}", names.len())),
+            "the full-profile count in docs/dev/MCP.md is stale (it is {})",
+            names.len()
+        );
+        assert!(
+            GUIDE.contains(&format!("The full surface — {} tools", names.len())),
+            "the tool-catalog count in docs/dev/MCP.md is stale (it is {})",
+            names.len()
+        );
     }
 }

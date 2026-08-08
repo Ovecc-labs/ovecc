@@ -69,6 +69,9 @@ pub fn build(repository: String, files: &[FileGraphRow], deps: &[DependencyRecor
         if !known_files.contains(dep.source_file_path.as_str()) {
             continue; // stale row; never emit an edge with a dangling endpoint
         }
+        if dep.is_unresolved() || dep.is_unindexed() {
+            continue;
+        }
         if dep.is_external {
             let ext_id = format!("external:{}", dep.target_module);
             file_edges.insert((dep.source_file_path.clone(), ext_id.clone(), "external"));

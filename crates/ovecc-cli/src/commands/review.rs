@@ -1084,13 +1084,13 @@ pub(crate) fn render_full_report(
                 summary.files, summary.modules, summary.dependencies, summary.external_dependencies
             );
             println!(
-                "- Circular dependencies: {} · Coupling density: {:.2}% · Risk: **{}**",
+                "- Cyclic module components: {} · Coupling density: {:.2}% · Risk: **{}**",
                 summary.circular_dependencies,
                 summary.coupling_density * 100.0,
                 summary.risk_score.as_str()
             );
             println!();
-            println!("## Circular dependencies ({})", cycles.len());
+            println!("## Dependency cycles ({} elementary loops)", cycles.len());
             println!();
             if cycles.is_empty() {
                 println!("_None._");

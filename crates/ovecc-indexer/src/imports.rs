@@ -4,10 +4,19 @@
 
 use crate::manifests::{find_cargo_crate_roots, find_package_manifests};
 use ovecc_core::config::ProjectPaths;
-use ovecc_core::legacy::{DependencyRecord, FileRecord, ImportFact, SourceLanguage};
+use ovecc_core::legacy::{
+    DependencyRecord, FileRecord, ImportFact, SourceLanguage, external_module_name,
+    is_path_specifier, unindexed_module_name, unresolved_module_name,
+};
 use ovecc_core::util::stable_id;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+
+enum ImportTarget {
+    Indexed(FileRecord),
+    Unindexed,
+    Unresolved,
+}
 
 pub(crate) fn resolve_dependencies(
     paths: &ProjectPaths,
@@ -60,27 +69,33 @@ pub(crate) fn resolve_dependencies(
                 SourceLanguage::JavaScript
                 | SourceLanguage::Jsx
                 | SourceLanguage::TypeScript
-                | SourceLanguage::Tsx => resolve_js_ts_import(
-                    &js_resolver,
-                    &paths.root,
-                    file,
-                    &import.specifier,
-                    file_by_path,
-                )
-                .or_else(|| {
-                    resolve_workspace_package_import(
+                | SourceLanguage::Tsx => {
+                    let primary = resolve_js_ts_import(
                         &js_resolver,
                         &paths.root,
-                        &npm_workspace,
+                        file,
                         &import.specifier,
                         file_by_path,
-                    )
-                }),
+                    );
+                    if matches!(primary, ImportTarget::Indexed(_)) {
+                        primary
+                    } else {
+                        resolve_workspace_package_import(
+                            &js_resolver,
+                            &paths.root,
+                            &npm_workspace,
+                            &import.specifier,
+                            file_by_path,
+                        )
+                        .map_or(primary, ImportTarget::Indexed)
+                    }
+                }
                 SourceLanguage::Python => resolve_suffix_unique(
                     &python_import_candidates(&file.path, &import.specifier),
                     &suffix_index,
                     file_by_path,
-                ),
+                )
+                .map_or(ImportTarget::Unresolved, ImportTarget::Indexed),
                 SourceLanguage::Rust => {
                     resolve_rust_workspace_import(&cargo_crates, &import.specifier, file_by_path)
                         .or_else(|| {
@@ -90,37 +105,41 @@ pub(crate) fn resolve_dependencies(
                                 file_by_path,
                             )
                         })
+                        .map_or(ImportTarget::Unresolved, ImportTarget::Indexed)
                 }
                 SourceLanguage::Cpp => resolve_suffix_unique(
                     &cpp_import_candidates(&file.path, &import.specifier),
                     &suffix_index,
                     file_by_path,
-                ),
+                )
+                .map_or(ImportTarget::Unresolved, ImportTarget::Indexed),
                 SourceLanguage::Go => resolve_go_package(
                     &go_import_candidates(&import.specifier),
                     &dir_index,
                     file_by_path,
-                ),
+                )
+                .map_or(ImportTarget::Unresolved, ImportTarget::Indexed),
             };
 
             let (target_file_id, target_file_path, target_module_id, target_module, is_external) =
-                if let Some(target_file) = resolved {
-                    (
+                match resolved {
+                    ImportTarget::Indexed(target_file) => (
                         Some(target_file.id.clone()),
                         Some(target_file.path.clone()),
                         target_file.module_id.clone(),
                         target_file.module_name.clone(),
                         false,
-                    )
-                } else {
-                    let external_name = external_module_name(&import.specifier);
-                    (
-                        None,
-                        None,
-                        stable_id("external", &[repository_id, &external_name]),
-                        external_name,
-                        true,
-                    )
+                    ),
+                    other => {
+                        let name = unresolved_target_name(&import.specifier, &other);
+                        (
+                            None,
+                            None,
+                            stable_id("external", &[repository_id, &name]),
+                            name,
+                            true,
+                        )
+                    }
                 };
 
             dependencies.push(DependencyRecord {
@@ -176,10 +195,14 @@ pub(crate) fn resolve_dependencies(
 // confined to this resolution seam — no oxc type crosses into the fact model.
 
 /// JS/TS extensions to probe, TS family first so a `.ts` shadowing a built `.js`
-/// wins (fallow `specifier.rs:34`).
+/// wins (fallow `specifier.rs:34`). The declaration extensions trail their
+/// implementation counterparts: `./x` prefers `x.ts` over `x.d.ts`, but a
+/// specifier backed only by a declaration file still resolves instead of
+/// reading as a broken import.
 fn js_resolver_extensions() -> Vec<String> {
     [
-        ".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs", ".json",
+        ".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs", ".json", ".d.ts", ".d.mts",
+        ".d.cts",
     ]
     .iter()
     .map(|extension| (*extension).to_string())
@@ -241,17 +264,19 @@ fn is_tsconfig_error(error: &oxc_resolver::ResolveError) -> bool {
 }
 
 /// Resolves one JS/TS import specifier — relative, bare/package, OR
-/// tsconfig-aliased — to an indexed [`FileRecord`], or `None` when it resolves
-/// outside the indexed set (`node_modules`, `dist`, …) or cannot be resolved.
-/// `None` makes the caller record it as external, exactly as before. Strictly
-/// widens resolution over the old relative-only path (fallow `specifier.rs:99-135`).
+/// tsconfig-aliased — distinguishing three outcomes: an indexed
+/// [`FileRecord`], a real file the index does not hold (`node_modules`, an
+/// asset, a declaration file), or nothing at all. Only the third is a broken
+/// import; the second is a genuine dependency ovecc simply does not model.
+/// Strictly widens resolution over the old relative-only path (fallow
+/// `specifier.rs:99-135`).
 fn resolve_js_ts_import(
     resolver: &oxc_resolver::Resolver,
     root: &Path,
     file: &FileRecord,
     specifier: &str,
     file_by_path: &HashMap<String, FileRecord>,
-) -> Option<FileRecord> {
+) -> ImportTarget {
     // oxc_resolver wants a plain absolute path; strip the Windows verbatim
     // prefix that `std::fs::canonicalize` adds (oxc uses dunce-style paths),
     // or every resolve fails and falls through to external.
@@ -261,14 +286,22 @@ fn resolve_js_ts_import(
         // A broken tsconfig: retry dir-based so relative/bare still resolve.
         Err(error) if is_tsconfig_error(&error) => {
             let dir = from_file.parent().unwrap_or(&from_file);
-            resolver.resolve(dir, specifier).ok()?.path().to_path_buf()
+            match resolver.resolve(dir, specifier) {
+                Ok(resolution) => resolution.path().to_path_buf(),
+                Err(_) => return ImportTarget::Unresolved,
+            }
         }
-        Err(_) => return None,
+        Err(_) => return ImportTarget::Unresolved,
     };
     // Map the absolute resolution back to a repo-relative '/'-path and into the
-    // indexed set; outside root or a miss (node_modules) => external.
-    let relative = repo_relative_path(root, &resolved_abs)?;
-    file_by_path.get(&relative).cloned()
+    // indexed set; outside root or a miss (node_modules) is still a real file.
+    let Some(relative) = repo_relative_path(root, &resolved_abs) else {
+        return ImportTarget::Unindexed;
+    };
+    match file_by_path.get(&relative) {
+        Some(target) => ImportTarget::Indexed(target.clone()),
+        None => ImportTarget::Unindexed,
+    }
 }
 
 /// Resolves a bare import naming a *workspace package* (`pkg-a`, `zod/v4`)
@@ -722,14 +755,14 @@ fn normalize_rel(path: &str) -> String {
     out.join("/")
 }
 
-fn external_module_name(specifier: &str) -> String {
-    let parts = specifier.split('/').collect::<Vec<_>>();
-    let package = if specifier.starts_with('@') && parts.len() >= 2 {
-        format!("{}/{}", parts[0], parts[1])
-    } else {
-        parts.first().copied().unwrap_or(specifier).to_string()
-    };
-    format!("external:{package}")
+fn unresolved_target_name(specifier: &str, target: &ImportTarget) -> String {
+    if !is_path_specifier(specifier) {
+        return external_module_name(specifier);
+    }
+    match target {
+        ImportTarget::Unindexed => unindexed_module_name(specifier),
+        _ => unresolved_module_name(specifier),
+    }
 }
 
 #[cfg(test)]
@@ -854,6 +887,34 @@ mod tests {
             "external:@scope/pkg"
         );
         assert_eq!(external_module_name("react/jsx-runtime"), "external:react");
+    }
+
+    #[test]
+    fn a_path_specifier_never_becomes_an_external_package() {
+        let name =
+            |specifier: &str, target: ImportTarget| unresolved_target_name(specifier, &target);
+
+        assert_eq!(
+            name("./missing", ImportTarget::Unresolved),
+            "unresolved:./missing"
+        );
+        assert_eq!(
+            name("../nowhere/deleted.ts", ImportTarget::Unresolved),
+            "unresolved:../nowhere/deleted.ts"
+        );
+        assert_ne!(
+            name("./missing", ImportTarget::Unresolved),
+            name("./other", ImportTarget::Unresolved)
+        );
+        assert_eq!(
+            name("./theme.css", ImportTarget::Unindexed),
+            "unindexed:./theme.css"
+        );
+        assert_eq!(
+            name("lodash/fp", ImportTarget::Unresolved),
+            "external:lodash"
+        );
+        assert_eq!(name("lodash", ImportTarget::Unindexed), "external:lodash");
     }
 
     #[test]

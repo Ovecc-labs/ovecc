@@ -1,0 +1,27 @@
+command = "violations"
+
+[[require]]
+rule = "unresolved-import"
+path = "src/broken.ts"
+title = "./missing"
+
+[[require]]
+rule = "unresolved-import"
+path = "src/broken.ts"
+title = "../nowhere/deleted.ts"
+
+[[deny]]
+rule = "unresolved-import"
+title = "theme.css"
+
+[[deny]]
+rule = "unresolved-import"
+title = "icon.svg"
+
+[[deny]]
+rule = "unresolved-import"
+title = "./ambient"
+
+[[deny]]
+rule = "unresolved-import"
+title = "./helpers"

@@ -317,6 +317,19 @@ fn incomplete_index_note(report: &SummaryReport) -> Option<String> {
     })
 }
 
+fn intra_module_cycles_note(report: &SummaryReport) -> Option<String> {
+    (report.intra_module_cycles > 0).then(|| {
+        format!(
+            "{} further cycle(s) run between sibling directories inside a single \
+             module, which the module-level count above cannot represent. \
+             `ovecc diagnose` lists them with file:line witnesses; raising \
+             `[architecture] module_depth` makes those directories modules in \
+             their own right and brings them into the count.",
+            report.intra_module_cycles
+        )
+    })
+}
+
 /// Warns when no component imports another. Every relational metric is then 0
 /// for want of edges, not for want of problems, and the summary reads as a clean
 /// bill of health. A directory holding several unrelated projects lands here.
@@ -359,13 +372,20 @@ pub(crate) fn render_summary_report(report: &SummaryReport, format: OutputFormat
             println!("- Modules: {}", report.modules);
             println!("- Dependencies: {}", report.dependencies);
             println!("- External dependencies: {}", report.external_dependencies);
-            println!("- Circular dependencies: {}", report.circular_dependencies);
+            println!(
+                "- Cyclic module components: {}",
+                report.circular_dependencies
+            );
             println!("- Boundary violations: {}", report.boundary_violations);
             println!(
                 "- Coupling density: {:.2}%",
                 report.coupling_density * 100.0
             );
             println!("- Risk score: **{}**", report.risk_score.as_str());
+            if let Some(note) = intra_module_cycles_note(report) {
+                println!();
+                println!("> {note}");
+            }
             if let Some(note) = isolated_components_note(report) {
                 println!();
                 println!("> {note}");
@@ -400,7 +420,10 @@ pub(crate) fn render_summary_report(report: &SummaryReport, format: OutputFormat
             println!("Modules: {}", report.modules);
             println!("Dependencies: {}", report.dependencies);
             println!("External dependencies: {}", report.external_dependencies);
-            println!("Circular deps: {}", report.circular_dependencies);
+            println!("Cyclic module components: {}", report.circular_dependencies);
+            if let Some(note) = intra_module_cycles_note(report) {
+                println!("  ({note})");
+            }
             println!("Boundary violations: {}", report.boundary_violations);
             println!("Coupling density: {:.2}%", report.coupling_density * 100.0);
             anstream::println!("Risk score: {}", risk_tag(report.risk_score));
@@ -442,6 +465,7 @@ mod tests {
             dependencies: 0,
             external_dependencies: 0,
             circular_dependencies: 0,
+            intra_module_cycles: 0,
             boundary_violations: 0,
             coupling_density: density,
             hotspots: Vec::new(),
@@ -454,6 +478,18 @@ mod tests {
         assert!(incomplete_index_note(&report(36, 0, 4, 0.2)).is_none());
         let note = incomplete_index_note(&report(1, 35, 1, 0.0)).expect("35 files missing");
         assert!(note.starts_with("35 of 36 files"), "{note}");
+    }
+
+    #[test]
+    fn a_cycle_the_module_view_cannot_show_is_stated_not_swallowed() {
+        assert!(intra_module_cycles_note(&report(9, 0, 4, 0.2)).is_none());
+
+        let mut hidden = report(9, 0, 4, 0.2);
+        hidden.intra_module_cycles = 2;
+        let note = intra_module_cycles_note(&hidden).expect("qualifies the count");
+        assert!(note.starts_with("2 further cycle(s)"), "{note}");
+        assert!(note.contains("ovecc diagnose"), "{note}");
+        assert!(note.contains("module_depth"), "{note}");
     }
 
     #[test]

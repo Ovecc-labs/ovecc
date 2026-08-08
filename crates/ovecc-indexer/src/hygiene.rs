@@ -268,7 +268,7 @@ pub(crate) fn detect_unlisted_dependencies(
     let mut first_use: std::collections::BTreeMap<String, (String, usize)> =
         std::collections::BTreeMap::new();
     for dependency in dependencies {
-        if !dependency.is_external {
+        if !dependency.is_external_package() {
             continue;
         }
         let Some(package_root) = external_package_root(&dependency.specifier) else {

@@ -27,6 +27,7 @@ use ovecc_core::facts::{
 };
 use ovecc_core::graph::NodeKind;
 use ovecc_core::id::{FindingId, RepositoryId, SnapshotId};
+use ovecc_core::lang::SourceLanguage;
 use ovecc_core::legacy::DependencyRecord;
 
 /// Read-only inputs a rule evaluation needs.
@@ -82,6 +83,7 @@ pub fn evaluate(input: &RuleInput<'_>) -> Vec<FindingRecord> {
     findings.extend(boundary_rules(input));
     findings.extend(banned_import_rules(input));
     findings.extend(circular_dependency_rule(input));
+    findings.extend(unresolved_import_rule(input));
     findings.extend(security_rules(input));
     findings.extend(contract::contract_rules(input));
     findings.sort_by(|a, b| a.id.0.cmp(&b.id.0));
@@ -422,10 +424,85 @@ fn circular_dependency_rule(input: &RuleInput<'_>) -> Vec<FindingRecord> {
         .collect()
 }
 
+fn unresolved_import_rule(input: &RuleInput<'_>) -> Vec<FindingRecord> {
+    let mut by_site: BTreeMap<(&str, &str), &DependencyRecord> = BTreeMap::new();
+    for dependency in input.dependencies {
+        if !dependency.is_unresolved()
+            || !judged_source(&dependency.source_file_path)
+            || !judged_specifier(&dependency.specifier)
+        {
+            continue;
+        }
+        by_site
+            .entry((
+                dependency.source_file_path.as_str(),
+                dependency.specifier.as_str(),
+            ))
+            .and_modify(|first| {
+                if dependency.evidence_line < first.evidence_line {
+                    *first = dependency;
+                }
+            })
+            .or_insert(dependency);
+    }
+    by_site
+        .into_values()
+        .map(|dependency| FindingRecord {
+            id: FindingId::from_parts(&[
+                input.repository_id,
+                "unresolved-import",
+                &dependency.source_file_path,
+                &dependency.specifier,
+            ]),
+            repository_id: RepositoryId::from_raw(input.repository_id),
+            snapshot_id: input.snapshot_id.map(SnapshotId::from_raw),
+            kind: FindingKind::UnresolvedImport,
+            severity: Severity::Medium,
+            rule_name: Some("unresolved-import".to_string()),
+            target: Some(EntityRef {
+                kind: NodeKind::File,
+                id: dependency.source_file_path.clone(),
+            }),
+            title: format!("Unresolved import: {}", dependency.specifier),
+            description: format!(
+                "'{}' resolves to no file in the repository. The target was renamed or \
+                 deleted and this import was not followed; it breaks the build, or the \
+                 code path is already dead.",
+                dependency.specifier
+            ),
+            evidence: vec![Evidence {
+                file_path: dependency.source_file_path.clone(),
+                line: Some(dependency.evidence_line as u32),
+                symbol: None,
+                detail: Some(dependency.specifier.clone()),
+            }],
+            created_at: Utc::now(),
+        })
+        .collect()
+}
+
+fn judged_specifier(specifier: &str) -> bool {
+    let path = specifier.split('?').next().unwrap_or(specifier);
+    let name = path.rsplit('/').next().unwrap_or(path);
+    match name.rsplit_once('.') {
+        Some((stem, extension)) if !stem.is_empty() => {
+            SourceLanguage::from_extension(extension).is_some()
+        }
+        _ => true,
+    }
+}
+
+fn judged_source(path: &str) -> bool {
+    path.rsplit_once('.')
+        .and_then(|(_, extension)| SourceLanguage::from_extension(extension))
+        .is_some_and(SourceLanguage::is_js_family)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use ovecc_core::config::{BannedImportRule, BoundaryRuleConfig};
+    use ovecc_core::legacy::{unindexed_module_name, unresolved_module_name};
 
     fn dependency(source: &str, target: &str, path: &str, line: usize) -> DependencyRecord {
         DependencyRecord {
@@ -489,6 +566,83 @@ mod tests {
         assert_eq!(boundary.len(), 1, "one finding per forbidden edge");
         assert_eq!(boundary[0].severity, Severity::High);
         assert_eq!(boundary[0].evidence.len(), 2, "both billing->user imports");
+    }
+
+    #[test]
+    fn only_broken_relative_specifiers_are_flagged_as_unresolved() {
+        let unresolved = |specifier: &str, line: usize| {
+            let mut dependency = dependency("broken", "x", "src/broken.ts", line);
+            dependency.specifier = specifier.to_string();
+            dependency.target_module = unresolved_module_name(specifier);
+            dependency.target_module_id = dependency.target_module.clone();
+            dependency.is_external = true;
+            dependency
+        };
+        let mut asset_but_real = unresolved("./theme.css", 9);
+        asset_but_real.target_module = unindexed_module_name("./theme.css");
+
+        let deps = vec![
+            unresolved("./missing", 6),
+            unresolved("../nowhere/deleted.ts", 7),
+            asset_but_real,
+            unresolved("./icon.svg?url", 11),
+            dependency("broken", "helpers", "src/broken.ts", 12),
+        ];
+        let config = RulesConfig::default();
+        let input = RuleInput {
+            repository_id: "repo:test",
+            snapshot_id: Some("snap"),
+            modules: &["broken".to_string()],
+            dependencies: &deps,
+            config: &config,
+            security_patterns: &[],
+            architecture: None,
+        };
+
+        let findings = evaluate(&input);
+        let flagged: Vec<String> = findings
+            .iter()
+            .filter(|finding| finding.kind == FindingKind::UnresolvedImport)
+            .flat_map(|finding| finding.evidence.iter())
+            .filter_map(|evidence| evidence.detail.clone())
+            .collect();
+        assert_eq!(flagged.len(), 2, "{flagged:?}");
+        assert!(flagged.contains(&"./missing".to_string()), "{flagged:?}");
+        assert!(
+            flagged.contains(&"../nowhere/deleted.ts".to_string()),
+            "{flagged:?}"
+        );
+        assert!(
+            findings
+                .iter()
+                .all(|finding| finding.severity == Severity::Medium
+                    || finding.kind != FindingKind::UnresolvedImport)
+        );
+    }
+
+    #[test]
+    fn asset_and_loader_specifiers_are_not_ovecc_to_judge() {
+        assert!(judged_specifier("./missing"));
+        assert!(judged_specifier("../nowhere/deleted.ts"));
+        assert!(judged_specifier("./widget/index"));
+        assert!(!judged_specifier("./theme.css"));
+        assert!(!judged_specifier("./icon.svg?url"));
+        assert!(!judged_specifier("./data.json"));
+        assert!(!judged_specifier("./logo.png?raw"));
+    }
+
+    #[test]
+    fn only_js_family_sources_are_judged_for_unresolved_imports() {
+        assert!(judged_source("src/broken.ts"));
+        assert!(judged_source("src/app.tsx"));
+        assert!(judged_source("src/legacy.js"));
+        // `from . import x` is legal with no file to find in a namespace
+        // package, and the suffix resolvers also return nothing when a
+        // candidate is merely ambiguous.
+        assert!(!judged_source("src/service.py"));
+        assert!(!judged_source("src/main.rs"));
+        assert!(!judged_source("src/session.cpp"));
+        assert!(!judged_source("Makefile"));
     }
 
     #[test]

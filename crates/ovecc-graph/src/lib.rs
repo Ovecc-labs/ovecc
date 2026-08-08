@@ -35,7 +35,7 @@ pub fn summarize(
     let analysis = analyze_modules(&modules, dependencies);
     let external_dependencies = dependencies
         .iter()
-        .filter(|dependency| dependency.is_external)
+        .filter(|dependency| dependency.is_external_package())
         .count();
     let risk_score = summary_risk(
         analysis.cycle_count,
@@ -52,6 +52,7 @@ pub fn summarize(
         dependencies: dependencies.len(),
         external_dependencies,
         circular_dependencies: analysis.cycle_count,
+        intra_module_cycles: cycles::intra_module_cycle_count(dependencies),
         boundary_violations,
         coupling_density: analysis.coupling_density,
         hotspots: analysis.hotspots,
@@ -251,7 +252,8 @@ pub fn compute_hotspots(
 }
 
 /// Members of each strongly-connected component of size > 1 — the modules
-/// caught in a dependency cycle. Each component's members are sorted,
+/// caught in a *runtime* dependency cycle (type-only imports are erased before
+/// load, so they never witness one). Each component's members are sorted,
 /// and the components themselves are sorted, for deterministic findings.
 pub fn strongly_connected_modules(
     modules: &[String],
@@ -265,7 +267,10 @@ pub fn strongly_connected_modules(
     }
     let mut seen = BTreeSet::<(String, String)>::new();
     for dependency in dependencies {
-        if dependency.is_external || dependency.source_module == dependency.target_module {
+        if dependency.is_external
+            || dependency.source_module == dependency.target_module
+            || !cycles::is_runtime_edge(dependency)
+        {
             continue;
         }
         if !seen.insert((
@@ -316,26 +321,30 @@ fn analyze_modules(modules: &[String], dependencies: &[DependencyRecord]) -> Mod
     let mut fan_in = HashMap::<String, usize>::new();
     let mut fan_out = HashMap::<String, usize>::new();
     let mut local_edges = BTreeSet::<(String, String)>::new();
+    let mut runtime_edges = BTreeSet::<(String, String)>::new();
 
     for dependency in dependencies {
         if dependency.is_external || dependency.source_module == dependency.target_module {
             continue;
         }
-        if !local_edges.insert((
+        let edge = (
             dependency.source_module.clone(),
             dependency.target_module.clone(),
-        )) {
+        );
+        if cycles::is_runtime_edge(dependency)
+            && runtime_edges.insert(edge.clone())
+            && let (Some(source), Some(target)) = (
+                node_by_module.get(&dependency.source_module),
+                node_by_module.get(&dependency.target_module),
+            )
+        {
+            graph.add_edge(*source, *target, ());
+        }
+        if !local_edges.insert(edge) {
             continue;
         }
         *fan_out.entry(dependency.source_module.clone()).or_default() += 1;
         *fan_in.entry(dependency.target_module.clone()).or_default() += 1;
-
-        if let (Some(source), Some(target)) = (
-            node_by_module.get(&dependency.source_module),
-            node_by_module.get(&dependency.target_module),
-        ) {
-            graph.add_edge(*source, *target, ());
-        }
     }
 
     let cycle_count = kosaraju_scc(&graph)
@@ -574,6 +583,12 @@ mod analysis_tests {
         );
     }
 
+    fn type_dep(source: &str, target: &str) -> DependencyRecord {
+        let mut dependency = dep(source, target);
+        dependency.dependency_kind = "type_import".to_string();
+        dependency
+    }
+
     #[test]
     fn scc_detects_cycles_and_ignores_acyclic_graphs() {
         let modules = vec!["a".to_string(), "b".to_string(), "c".to_string()];
@@ -586,6 +601,45 @@ mod analysis_tests {
 
         let acyclic = vec![dep("a", "b"), dep("b", "c")];
         assert!(strongly_connected_modules(&modules, &acyclic).is_empty());
+    }
+
+    #[test]
+    fn a_type_only_cycle_counts_as_coupling_but_never_as_a_cycle() {
+        let modules = vec!["p".to_string(), "q".to_string()];
+        let deps = vec![type_dep("p", "q"), type_dep("q", "p")];
+
+        let report = summarize("/repo".to_string(), None, 2, modules.clone(), &deps, 0, 0);
+        assert_eq!(report.circular_dependencies, 0, "type-only, so no cycle");
+        assert!(
+            (report.coupling_density - 1.0).abs() < 1e-9,
+            "a type dependency is still coupling: {}",
+            report.coupling_density
+        );
+        let p = report
+            .hotspots
+            .iter()
+            .find(|hotspot| hotspot.module == "p")
+            .expect("p is coupled, so it is a hotspot candidate");
+        assert_eq!((p.fan_in, p.fan_out), (1, 1));
+
+        assert!(strongly_connected_modules(&modules, &deps).is_empty());
+        assert_eq!(cycle_count(&modules, &deps), 0);
+    }
+
+    #[test]
+    fn a_value_import_alongside_a_type_import_still_witnesses_a_cycle() {
+        let modules = vec!["j".to_string(), "k".to_string()];
+        let orders = [
+            vec![type_dep("j", "k"), dep("j", "k"), dep("k", "j")],
+            vec![dep("j", "k"), type_dep("j", "k"), dep("k", "j")],
+        ];
+        for deps in orders {
+            assert_eq!(cycle_count(&modules, &deps), 1, "{deps:?}");
+            assert_eq!(
+                strongly_connected_modules(&modules, &deps),
+                vec![vec!["j".to_string(), "k".to_string()]]
+            );
+        }
     }
 
     #[test]
