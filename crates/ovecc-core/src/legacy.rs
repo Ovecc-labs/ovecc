@@ -130,6 +130,48 @@ pub struct DependencyRecord {
     pub evidence_line: usize,
 }
 
+pub const EXTERNAL_MODULE_PREFIX: &str = "external:";
+
+pub const UNRESOLVED_MODULE_PREFIX: &str = "unresolved:";
+
+pub const UNINDEXED_MODULE_PREFIX: &str = "unindexed:";
+
+pub fn is_path_specifier(specifier: &str) -> bool {
+    specifier.starts_with('.') || specifier.starts_with('/')
+}
+
+pub fn external_module_name(specifier: &str) -> String {
+    let parts = specifier.split('/').collect::<Vec<_>>();
+    let package = if specifier.starts_with('@') && parts.len() >= 2 {
+        format!("{}/{}", parts[0], parts[1])
+    } else {
+        parts.first().copied().unwrap_or(specifier).to_string()
+    };
+    format!("{EXTERNAL_MODULE_PREFIX}{package}")
+}
+
+pub fn unresolved_module_name(specifier: &str) -> String {
+    format!("{UNRESOLVED_MODULE_PREFIX}{specifier}")
+}
+
+pub fn unindexed_module_name(specifier: &str) -> String {
+    format!("{UNINDEXED_MODULE_PREFIX}{specifier}")
+}
+
+impl DependencyRecord {
+    pub fn is_unresolved(&self) -> bool {
+        self.target_module.starts_with(UNRESOLVED_MODULE_PREFIX)
+    }
+
+    pub fn is_unindexed(&self) -> bool {
+        self.target_module.starts_with(UNINDEXED_MODULE_PREFIX)
+    }
+
+    pub fn is_external_package(&self) -> bool {
+        self.is_external && !self.is_unresolved() && !self.is_unindexed()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IndexReport {
     pub repository_root: String,
@@ -190,6 +232,8 @@ pub struct SummaryReport {
     pub dependencies: usize,
     pub external_dependencies: usize,
     pub circular_dependencies: usize,
+    #[serde(default)]
+    pub intra_module_cycles: usize,
     pub boundary_violations: usize,
     pub coupling_density: f64,
     pub hotspots: Vec<Hotspot>,

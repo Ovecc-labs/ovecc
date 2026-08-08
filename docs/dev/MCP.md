@@ -121,9 +121,9 @@ printf '%s\n' \
 ```
 
 You should get an `initialize` result (serverInfo `ovecc`) followed by a `tools/list`
-result enumerating the **agent profile** (8 tools by default — see
+result enumerating the **agent profile** (11 tools by default — see
 [Tool profiles](#tool-profiles)). Set `OVECC_MCP_PROFILE=full` in the server's
-environment to list all 27. To exercise a real analysis tool against an indexed repo:
+environment to list all 31. To exercise a real analysis tool against an indexed repo:
 
 ```sh
 printf '%s\n' \
@@ -159,7 +159,7 @@ profile only controls what the agent *discovers*.
 
 ## Tool catalog
 
-The full surface — 30 tools (every one takes an optional `repo`; `*` marks required
+The full surface — 31 tools (every one takes an optional `repo`; `*` marks required
 arguments). The eleven in the agent profile are listed under
 [Tool profiles](#tool-profiles) above.
 
@@ -181,6 +181,7 @@ arguments). The eleven in the agent profile are listed under
 | `ovecc_health` | `health` | — |
 | `ovecc_deadcode` | `deadcode` | — |
 | `ovecc_fix` | `fix` | `apply` (write; default dry-run), `rule`: mechanical fixes for auto-fixable findings |
+| `ovecc_coupling` | `coupling` | `limit`: file pairs the history keeps changing together (support, Jaccard, lift, confidences) |
 | `ovecc_dupes` | `dupes` | `min_tokens` |
 | `ovecc_hotspots` | `hotspots` | `limit` |
 | `ovecc_conventions` | `conventions` | — |

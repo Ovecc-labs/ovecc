@@ -1,0 +1,4 @@
+command = "violations"
+
+[[deny]]
+rule = "circular-dependency"

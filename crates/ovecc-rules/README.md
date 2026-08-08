@@ -13,7 +13,13 @@ pair) so it can be defended in review.
   finding with the offending imports as evidence. Layer rules
   (`[[rules.layers]]`) work the same way ("controllers cannot access
   tables").
-- Circular dependencies surface module cycles from the graph.
+- Circular dependencies surface module cycles from the graph. Runtime imports
+  only: `import type` is erased before load, so it cannot form a loop.
+- Unresolved imports flag a specifier naming a path the resolver rejected
+  outright. A specifier that reached a real file the index does not hold is a
+  different state and says nothing; asset extensions and loader queries belong
+  to a bundler rule; and only JS/TS sources are judged, where "unresolved"
+  cannot also mean "ambiguous" or "legal with no file at all".
 - Dead code (`deadcode`) runs entry-point reachability over the import
   graph: unused exports, unreachable files, and re-export chains.
 - Code smells (`smells`) computes the classic-catalog detectors from the

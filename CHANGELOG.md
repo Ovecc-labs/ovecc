@@ -7,6 +7,62 @@ changes).
 
 ## [Unreleased]
 
+### Fixed
+
+- `import type` no longer inflates the persisted `circular_dependencies` metric.
+  The type-only filter landed in `cycles.rs` but never reached the SCC pass in
+  `analyze_modules`, so `gate`, `diff`, `drift`, `history` and the repository
+  risk score all carried phantom cycles while `violations`, `query cycles` and
+  `review` — which go through `cycles.rs` — were right. A PR adding a single
+  `import type` could fail the gate with a cycle the review comment beside it
+  said did not exist. `is_runtime_edge` is now the one definition both paths
+  call. Coupling density and fan-in/out still count type edges, deliberately: a
+  type dependency is coupling, it just cannot form a load-order loop. The two
+  edge sets are deduplicated separately, so a `type_import` row arriving before
+  the value import for the same pair can no longer hide it.
+- Unresolved relative imports are no longer reported as external *packages*.
+  A specifier naming a path that resolves to nothing became `external:.` (or
+  `external:..`), which collapsed every unresolved `./x` in a file onto one
+  node, lost the specifier, and inflated `external_dependencies` — on any
+  repository with a broken import, an unmodelled bundler alias, or an unusual
+  resolution scheme. Such a target is now `unresolved:<specifier>`, a specifier
+  that reached a real but unindexed file (an asset, a declaration file, a
+  package in `node_modules`) is `unindexed:<specifier>`, and neither is counted
+  as an external dependency or fabricated as a package node in `export graph`.
+- `import { x } from "./y"` backed only by a `y.d.ts` now resolves to that
+  declaration file instead of reading as a broken import.
+
+### Added
+
+- `unresolved-import` (medium): an import naming a path inside the repository
+  that the resolver rejected outright — a rename or deletion its importers never
+  followed. Precision-first: a specifier that reached a real file is a different
+  state and says nothing; asset extensions and loader queries (`./a.css`,
+  `./b.svg?url`) are left alone because a bundler rule, not ovecc, resolves
+  those; and only JS/TS sources are judged, since there a specifier is a path
+  the resolver walked the filesystem for. Elsewhere "unresolved" can also mean
+  ambiguous, or legal with no file to find at all — a Python namespace package
+  has no `__init__.py` — and reporting those would be guessing.
+- `summary` states the cycles its own count cannot represent. Two sibling
+  directories of one module importing each other collapse into a self-edge the
+  module graph drops, so the count read `0` while `diagnose`, which works at
+  directory granularity, reported the loop with full confidence — the two
+  commands contradicted each other on the same repository. The new
+  `intra_module_cycles` figure qualifies the count and points at `diagnose` and
+  at `[architecture] module_depth`, which promotes those directories to modules
+  in their own right.
+
+### Changed
+
+- The cycle count is labelled "Cyclic module components" in `summary` and
+  `report`, and its metric description says so: it counts strongly-connected
+  components, while `query cycles` lists *elementary* loops, and one component
+  can hold several. The two numbers differing is correct, and the old wording
+  made it read as an inconsistency.
+- MCP tells "unknown tool" and "missing required argument" apart, naming the
+  argument (`missing required argument 'target' for ovecc_impact`). One message
+  for both left an agent unable to tell a typo from an omission.
+
 ## [0.2.4] - 2026-08-08
 
 ### Added

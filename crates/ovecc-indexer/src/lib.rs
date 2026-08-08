@@ -247,7 +247,7 @@ pub fn index_repository(
 
     let external_dependencies = dependencies
         .iter()
-        .filter(|dependency| dependency.is_external)
+        .filter(|dependency| dependency.is_external_package())
         .count();
     let (schema_edges, complexity_records, export_records, capability_records) =
         build_code_records(&input);
@@ -1689,7 +1689,7 @@ fn compute_snapshot_metrics(
     };
     let external_dependencies = dependencies
         .iter()
-        .filter(|dependency| dependency.is_external)
+        .filter(|dependency| dependency.is_external_package())
         .count();
 
     vec![

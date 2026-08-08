@@ -60,16 +60,32 @@ calls this first and needs nothing else to drive the tool.
 
 ### `ovecc summary`
 
-One-screen health: files, modules, dependency counts, circular deps, coupling
-density, risk score. Files the last index found but could not read or parse are
-counted here too, since every other figure covers only the rest.
+One-screen health: files, modules, dependency counts, cyclic module components,
+coupling density, risk score. Files the last index found but could not read or
+parse are counted here too, since every other figure covers only the rest.
 
 ```
-Files: 52          Modules: 13
-Dependencies: 264  External dependencies: 137
-Circular deps: 0   Coupling density: 11.54%
+Files: 52                     Modules: 13
+Dependencies: 264             External dependencies: 137
+Cyclic module components: 0   Coupling density: 11.54%
 Risk score: Low
 ```
+
+"Cyclic module components" counts *strongly-connected components* over runtime
+imports. Two things follow, and both are intended:
+
+- `query cycles` can report more, because it lists the *elementary* loops and
+  one component can hold several (`g -> h -> g` and `g -> h -> i -> g` are two
+  loops in one component).
+- `import type` never counts. It is erased before the module graph is loaded, so
+  it cannot form a load-order loop — though it does count toward coupling
+  density and fan-in/out, because a type dependency is still coupling.
+
+A cycle running between two sibling directories *inside* one module is invisible
+here: at module granularity both sides are the same node, so the loop is a
+self-edge the graph drops. `summary` says so under the count when it happens;
+`ovecc diagnose` lists those with `file:line` witnesses, and raising
+`[architecture] module_depth` makes the directories modules in their own right.
 
 ### `ovecc report`
 
@@ -356,10 +372,10 @@ the file it started from (`redirected_from` in JSON).
 ### `ovecc violations`
 
 Every architecture + rule finding: boundary violations, banned imports,
-circular dependencies, security patterns, complexity, dead code, unit size,
-code smells (feature envy, large classes, data clumps), with `file:line`
-evidence and a machine `fix` per finding. The CI artifact (`--format sarif`
-for GitHub code scanning, `codeclimate` for GitLab).
+circular dependencies, unresolved imports, security patterns, complexity, dead
+code, unit size, code smells (feature envy, large classes, data clumps), with
+`file:line` evidence and a machine `fix` per finding. The CI artifact
+(`--format sarif` for GitHub code scanning, `codeclimate` for GitLab).
 
 Key flags: `--severity`, `--fail-on`, `--write-baseline` / `--baseline`
 (ratchet: only new findings fail).

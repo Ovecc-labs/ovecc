@@ -871,6 +871,187 @@ fn architecture_suggest_recognizes_a_feature_sliced_repo() {
     assert_eq!(fsd["divergent_edges"], 0);
 }
 
+fn write_source(root: &Path, rel: &str, body: &str) {
+    let path = root.join(rel);
+    fs::create_dir_all(path.parent().expect("has a parent")).expect("mkdir");
+    fs::write(path, body).expect("write source");
+}
+
+fn json_output(repo: &str, args: &[&str]) -> serde_json::Value {
+    let out = ovecc(repo, args);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{args:?} failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    serde_json::from_slice(&out.stdout).expect("json envelope")
+}
+
+#[test]
+fn a_type_only_cycle_is_no_cycle_on_any_surface() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let root = temp.path();
+    let repo = root.to_str().expect("utf8 path").to_string();
+
+    write_source(
+        root,
+        "src/p/x.ts",
+        "export interface PShape { id: string }\nexport const p = 1;\n",
+    );
+    write_source(
+        root,
+        "src/q/x.ts",
+        "import { p } from \"../p/x\";\nexport const q = p + 1;\n",
+    );
+    let indexed = ovecc(&repo, &["index", "--no-git"]);
+    assert!(
+        indexed.status.success(),
+        "index failed: {}",
+        String::from_utf8_lossy(&indexed.stderr)
+    );
+    let baseline = json_output(&repo, &["summary", "--format", "json"]);
+    assert_eq!(baseline["data"]["circular_dependencies"], 0, "{baseline}");
+
+    write_source(
+        root,
+        "src/p/x.ts",
+        "import type { QShape } from \"../q/x\";\n\
+         export interface PShape { id: string }\n\
+         export const p: number = 1;\n\
+         export type Echo = QShape;\n",
+    );
+    write_source(
+        root,
+        "src/q/x.ts",
+        "import { p } from \"../p/x\";\n\
+         export interface QShape { total: number }\n\
+         export const q = p + 1;\n",
+    );
+    let reindexed = ovecc(&repo, &["index", "--no-git"]);
+    assert!(
+        reindexed.status.success(),
+        "re-index failed: {}",
+        String::from_utf8_lossy(&reindexed.stderr)
+    );
+
+    let summary = json_output(&repo, &["summary", "--format", "json"]);
+    assert_eq!(
+        summary["data"]["circular_dependencies"], 0,
+        "the persisted metric must not see a type-only loop: {summary}"
+    );
+    let cycles = json_output(&repo, &["query", "cycles", "--format", "json"]);
+    assert_eq!(
+        cycles["data"]["cycles"].as_array().map(Vec::len),
+        Some(0),
+        "{cycles}"
+    );
+    let violations = json_output(&repo, &["violations", "--format", "json"]);
+    assert!(
+        violations["data"]["findings"]
+            .as_array()
+            .expect("findings array")
+            .iter()
+            .all(|finding| finding["rule_name"] != "circular-dependency"),
+        "{violations}"
+    );
+
+    let gate = ovecc(&repo, &["gate", "--format", "json"]);
+    let verdict: serde_json::Value = serde_json::from_slice(&gate.stdout).expect("gate json");
+    assert_eq!(
+        verdict["data"]["new_cycles"], 0,
+        "a type-only edge is not a new cycle: {verdict}"
+    );
+}
+
+#[test]
+fn unresolved_relative_imports_are_flagged_and_never_counted_as_packages() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let root = temp.path();
+    let repo = root.to_str().expect("utf8 path").to_string();
+
+    fs::write(
+        root.join("package.json"),
+        "{ \"name\": \"broken-demo\", \"dependencies\": { \"lodash\": \"^4.17.21\" } }",
+    )
+    .expect("manifest");
+    write_source(root, "src/helpers.ts", "export const help = 1;\n");
+    write_source(root, "src/theme.css", ".a { color: red }\n");
+    write_source(
+        root,
+        "src/ambient.d.ts",
+        "export declare const ambient: number;\n",
+    );
+    write_source(
+        root,
+        "src/broken.ts",
+        "import { gone } from \"./missing\";\n\
+         import { alsoGone } from \"../nowhere/deleted.ts\";\n\
+         import styles from \"./theme.css\";\n\
+         import iconUrl from \"./icon.svg?url\";\n\
+         import { ambient } from \"./ambient\";\n\
+         import { help } from \"./helpers\";\n\
+         import { chunk } from \"lodash\";\n\
+         export const all = [gone, alsoGone, styles, iconUrl, ambient, help, chunk];\n",
+    );
+
+    let indexed = ovecc(&repo, &["index", "--no-git"]);
+    assert!(
+        indexed.status.success(),
+        "index failed: {}",
+        String::from_utf8_lossy(&indexed.stderr)
+    );
+
+    let violations = json_output(&repo, &["violations", "--format", "json"]);
+    let unresolved: Vec<String> = violations["data"]["findings"]
+        .as_array()
+        .expect("findings array")
+        .iter()
+        .filter(|finding| finding["rule_name"] == "unresolved-import")
+        .map(|finding| finding["evidence"][0]["detail"].to_string())
+        .collect();
+    assert_eq!(
+        unresolved.len(),
+        2,
+        "exactly the two dangling specifiers: {unresolved:?} in {violations}"
+    );
+    assert!(unresolved.iter().any(|d| d.contains("./missing")));
+    assert!(
+        unresolved
+            .iter()
+            .any(|d| d.contains("../nowhere/deleted.ts"))
+    );
+    for suppressed in ["theme.css", "icon.svg", "./ambient", "./helpers", "lodash"] {
+        assert!(
+            !unresolved.iter().any(|d| d.contains(suppressed)),
+            "{suppressed} must not be flagged: {unresolved:?}"
+        );
+    }
+
+    let summary = json_output(&repo, &["summary", "--format", "json"]);
+    assert_eq!(
+        summary["data"]["external_dependencies"], 1,
+        "lodash is the only real external package: {summary}"
+    );
+
+    let graph = json_output(&repo, &["export", "graph", "--format", "json"]);
+    for level in ["modules", "files"] {
+        let nodes = graph["data"][level]["nodes"]
+            .as_array()
+            .expect("node array");
+        let externals: Vec<&str> = nodes
+            .iter()
+            .filter(|node| node["kind"] == "external")
+            .map(|node| node["label"].as_str().expect("label"))
+            .collect();
+        assert_eq!(
+            externals,
+            ["external:lodash"],
+            "{level} nodes: {externals:?}"
+        );
+    }
+}
+
 #[test]
 fn ci_output_formats_parse_as_valid_json() {
     let staged = staged_fixture("small-service");

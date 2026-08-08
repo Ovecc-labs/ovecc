@@ -19,7 +19,7 @@
 //! MIT (c) 2026 Bart Waardenburg. See THIRD-PARTY-NOTICES.md.
 
 use ovecc_core::legacy::DependencyRecord;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 /// Maximum number of elementary cycles enumerated per strongly-connected
 /// component. Dense components have factorially many cycles; the shortest are
@@ -44,7 +44,7 @@ struct ModuleAdjacency {
 /// imports (`import type`) are erased at compile time — they contribute
 /// coupling and reachability, but never a load-order loop, so cycle detection
 /// (and its witnesses) must exclude them.
-fn is_runtime_edge(dependency: &DependencyRecord) -> bool {
+pub(crate) fn is_runtime_edge(dependency: &DependencyRecord) -> bool {
     dependency.dependency_kind != "type_import"
 }
 
@@ -301,6 +301,43 @@ fn cycles_from_adjacency(adjacency: &ModuleAdjacency) -> Vec<Vec<String>> {
         .collect()
 }
 
+pub fn intra_module_cycle_count(dependencies: &[DependencyRecord]) -> usize {
+    let mut directories = BTreeSet::<String>::new();
+    let mut edges = BTreeSet::<(String, String)>::new();
+    for dependency in dependencies {
+        if dependency.is_external
+            || !is_runtime_edge(dependency)
+            || dependency.source_module != dependency.target_module
+        {
+            continue;
+        }
+        let Some(target_file) = dependency.target_file_path.as_deref() else {
+            continue;
+        };
+        let source = parent_directory(&dependency.source_file_path);
+        let target = parent_directory(target_file);
+        if source == target || nests(source, target) || nests(target, source) {
+            continue;
+        }
+        directories.insert(source.to_string());
+        directories.insert(target.to_string());
+        edges.insert((source.to_string(), target.to_string()));
+    }
+    let names: Vec<String> = directories.into_iter().collect();
+    strongly_connected(&ModuleAdjacency::from_module_edges(&names, edges)).len()
+}
+
+fn parent_directory(path: &str) -> &str {
+    path.rsplit_once('/').map_or("", |(directory, _)| directory)
+}
+
+fn nests(outer: &str, inner: &str) -> bool {
+    if outer.is_empty() {
+        return !inner.is_empty();
+    }
+    inner.len() > outer.len() && inner.starts_with(outer) && inner.as_bytes()[outer.len()] == b'/'
+}
+
 /// Iterative Tarjan SCC. Returns components of size >= 2 (the cyclic ones).
 fn strongly_connected(adjacency: &ModuleAdjacency) -> Vec<Vec<usize>> {
     let mut tarjan = Tarjan::new(adjacency);
@@ -518,11 +555,48 @@ mod tests {
         names.iter().map(|n| n.to_string()).collect()
     }
 
+    fn intra(module: &str, from: &str, to: &str) -> DependencyRecord {
+        let mut dependency = dep(module, module);
+        dependency.source_file_path = format!("src/{module}/{from}");
+        dependency.target_file_path = Some(format!("src/{module}/{to}"));
+        dependency
+    }
+
     #[test]
     fn no_cycle_in_a_dag() {
         let mods = modules(&["a", "b", "c"]);
         let deps = vec![dep("a", "b"), dep("b", "c")];
         assert!(elementary_cycles(&mods, &deps).is_empty());
+    }
+
+    #[test]
+    fn a_cycle_between_sibling_directories_of_one_module_is_counted() {
+        let deps = vec![
+            intra("feature", "alpha/index.ts", "beta/scoring.ts"),
+            intra("feature", "beta/scoring.ts", "alpha/types.ts"),
+        ];
+        assert_eq!(intra_module_cycle_count(&deps), 1);
+        assert!(elementary_cycles(&modules(&["feature"]), &deps).is_empty());
+    }
+
+    #[test]
+    fn intra_module_counting_ignores_parent_child_loops_and_type_imports() {
+        let barrel = vec![
+            intra("feature", "index.ts", "alpha/api.ts"),
+            intra("feature", "alpha/api.ts", "index.ts"),
+        ];
+        assert_eq!(intra_module_cycle_count(&barrel), 0);
+
+        let acyclic = vec![intra("feature", "alpha/x.ts", "beta/y.ts")];
+        assert_eq!(intra_module_cycle_count(&acyclic), 0);
+
+        let mut type_back = intra("feature", "beta/y.ts", "alpha/x.ts");
+        type_back.dependency_kind = "type_import".to_string();
+        let type_only = vec![intra("feature", "alpha/x.ts", "beta/y.ts"), type_back];
+        assert_eq!(intra_module_cycle_count(&type_only), 0);
+
+        let cross = vec![dep("a", "b"), dep("b", "a")];
+        assert_eq!(intra_module_cycle_count(&cross), 0);
     }
 
     #[test]
