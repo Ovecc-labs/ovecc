@@ -1,0 +1,33 @@
+schema = 1
+mode = "strict"
+unassigned = "ignore"
+
+[[component]]
+name = "api"
+paths = ["src/api/**"]
+depends_on = ["repository"]
+must_depend_on = ["auth"]
+cannot_depend_on = ["telemetry"]
+
+[[component]]
+name = "repository"
+paths = ["src/repository/**"]
+depends_on = ["db"]
+
+[[component]]
+name = "auth"
+paths = ["src/auth/**"]
+
+[[component]]
+name = "telemetry"
+paths = ["src/telemetry/**"]
+
+[[component]]
+name = "db"
+paths = ["src/db/**"]
+consumed_by = ["repository"]
+
+[[component]]
+name = "legacy"
+paths = ["src/legacy/**"]
+consumed_by = []

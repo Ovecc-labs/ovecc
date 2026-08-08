@@ -1,0 +1,35 @@
+command = "violations"
+
+[[require]]
+rule = "architecture/restricted-access"
+path = "src/api/orders.ts"
+title = "api imports db"
+
+[[require]]
+rule = "architecture/restricted-access"
+path = "src/api/prices.ts"
+title = "api imports legacy"
+
+[[require]]
+rule = "architecture/forbidden-dependency"
+path = "src/api/orders.ts"
+title = "api -> telemetry is forbidden"
+
+[[require]]
+rule = "architecture/required-dependency"
+path = "src/api/prices.ts"
+title = "never reach the required auth"
+
+[[deny]]
+rule = "architecture/divergence"
+
+[[deny]]
+rule = "architecture/restricted-access"
+path = "src/repository/users.ts"
+
+[[deny]]
+rule = "architecture/required-dependency"
+path = "src/api/orders.ts"
+
+[[deny]]
+rule = "architecture/absence"
