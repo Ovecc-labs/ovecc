@@ -123,6 +123,31 @@ pub struct ComponentSpec {
     /// divergences; declared-but-unobserved entries are absences.
     #[serde(default)]
     pub depends_on: Vec<DependsOn>,
+    /// Components this one must never depend on (DCL's `cannot-access`). An
+    /// allow-list already forbids by omission; naming the prohibition states
+    /// it, survives a careless widening of `depends_on` — the two together
+    /// are a contract error — and reports the edge as a forbidden dependency
+    /// rather than an undeclared one.
+    #[serde(default)]
+    pub cannot_depend_on: Vec<String>,
+    /// The only components allowed to depend on *this* one (DCL's `only X
+    /// can-access Y`), declared on the target because that is where the rule
+    /// belongs: "the database is reached only through the repository" is one
+    /// sentence about the database, not an edit to every other component.
+    /// `consumed_by = []` is the degenerate, and most useful, case — nothing
+    /// may import it, the strangler-fig rule for a module on its way out.
+    /// Absent means unrestricted; only files a component claims are judged,
+    /// so a repository leaning on this wants `unassigned = "forbid"`.
+    #[serde(default)]
+    pub consumed_by: Option<Vec<String>>,
+    /// Components every file of this one must depend on (DCL's
+    /// `must-access`): a mandatory dependency an allow-list cannot express.
+    /// Judged per file, and only on files that import something at all — a
+    /// file with no imports is a leaf, not a route handler that forgot its
+    /// auth. Implies permission, so a required dependency is never also a
+    /// divergence.
+    #[serde(default)]
+    pub must_depend_on: Vec<String>,
     /// Public entry files. When non-empty, other components may import only
     /// these — enforced on the observed edges, no physical barrel required.
     #[serde(default)]
@@ -244,6 +269,45 @@ impl ArchitectureContract {
             component.validate_paths()?;
             component.validate_dependencies(&names)?;
             component.validate_budgets()?;
+        }
+        self.validate_access()?;
+        Ok(())
+    }
+
+    /// A rule one component states about its consumers, contradicted by a
+    /// rule another states about its dependencies. Caught here so no edge can
+    /// ever match two forms at once: at check time each import has exactly one
+    /// verdict, and the reader is never asked which half of the contract wins.
+    fn validate_access(&self) -> Result<()> {
+        for target in &self.components {
+            let Some(allowed) = &target.consumed_by else {
+                continue;
+            };
+            for source in &self.components {
+                if source.name == target.name || allowed.contains(&source.name) {
+                    continue;
+                }
+                let claims = source
+                    .depends_on
+                    .iter()
+                    .any(|entry| entry.component() == target.name)
+                    || source.must_depend_on.contains(&target.name);
+                if claims {
+                    return Err(contract_error(format!(
+                        "component '{}' declares a dependency on '{}', which is \
+                         consumed_by {}; add '{}' to that list or drop the \
+                         dependency",
+                        source.name,
+                        target.name,
+                        if allowed.is_empty() {
+                            "nothing".to_string()
+                        } else {
+                            format!("only {}", quoted_names(allowed))
+                        },
+                        source.name
+                    )));
+                }
+            }
         }
         Ok(())
     }
@@ -395,21 +459,57 @@ impl ComponentSpec {
     }
 
     fn validate_dependencies(&self, names: &BTreeSet<&str>) -> Result<()> {
-        for dependency in &self.depends_on {
-            let target = dependency.component();
+        let declared = self.depends_on.iter().map(DependsOn::component);
+        for (field, target) in declared
+            .map(|target| ("depends_on", target))
+            .chain(
+                self.cannot_depend_on
+                    .iter()
+                    .map(|target| ("cannot_depend_on", target.as_str())),
+            )
+            .chain(
+                self.must_depend_on
+                    .iter()
+                    .map(|target| ("must_depend_on", target.as_str())),
+            )
+            .chain(
+                self.consumed_by
+                    .iter()
+                    .flatten()
+                    .map(|source| ("consumed_by", source.as_str())),
+            )
+        {
             if target == self.name {
                 return Err(contract_error(format!(
-                    "component '{}' declares itself in depends_on; a component \
-                     always depends on itself",
+                    "component '{}' names itself in {field}; a component always \
+                     depends on itself",
                     self.name
                 )));
             }
             if !names.contains(target) {
                 return Err(contract_error(format!(
-                    "component '{}' depends on unknown component '{target}'",
+                    "component '{}' names unknown component '{target}' in {field}",
                     self.name
                 )));
             }
+        }
+        for forbidden in &self.cannot_depend_on {
+            let also = if self
+                .depends_on
+                .iter()
+                .any(|entry| entry.component() == forbidden)
+            {
+                "depends_on"
+            } else if self.must_depend_on.contains(forbidden) {
+                "must_depend_on"
+            } else {
+                continue;
+            };
+            return Err(contract_error(format!(
+                "component '{}' both forbids and requires '{forbidden}': it is in \
+                 cannot_depend_on and in {also}",
+                self.name
+            )));
         }
         Ok(())
     }
@@ -436,6 +536,14 @@ impl ComponentSpec {
         }
         Ok(())
     }
+}
+
+fn quoted_names(names: &[String]) -> String {
+    names
+        .iter()
+        .map(|name| format!("'{name}'"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn contract_error(message: String) -> OveccError {
@@ -950,6 +1058,159 @@ mod tests {
         "#,
         );
         assert!(result.is_err(), "'interfaces' is not a field");
+    }
+
+    const DCL: &str = r#"
+        schema = 1
+
+        [[component]]
+        name = "api"
+        paths = ["src/api/**"]
+        depends_on = ["repository"]
+        must_depend_on = ["auth"]
+        cannot_depend_on = ["legacy"]
+
+        [[component]]
+        name = "repository"
+        paths = ["src/repository/**"]
+        depends_on = ["db"]
+
+        [[component]]
+        name = "auth"
+        paths = ["src/auth/**"]
+
+        [[component]]
+        name = "db"
+        paths = ["src/db/**"]
+        consumed_by = ["repository"]
+
+        [[component]]
+        name = "legacy"
+        paths = ["src/legacy/**"]
+        consumed_by = []
+    "#;
+
+    #[test]
+    fn parses_the_three_dcl_forms() {
+        let contract = contract(DCL);
+        contract.validate().expect("valid");
+        let api = contract.component("api").expect("api exists");
+        assert_eq!(api.must_depend_on, vec!["auth".to_string()]);
+        assert_eq!(api.cannot_depend_on, vec!["legacy".to_string()]);
+        assert_eq!(
+            contract.component("db").unwrap().consumed_by.as_deref(),
+            Some(["repository".to_string()].as_slice())
+        );
+        assert_eq!(
+            contract.component("legacy").unwrap().consumed_by.as_deref(),
+            Some([].as_slice()),
+            "an empty list is a declaration that nothing may import it"
+        );
+        assert_eq!(
+            contract.component("auth").unwrap().consumed_by,
+            None,
+            "an undeclared list leaves the component unrestricted"
+        );
+    }
+
+    #[test]
+    fn rejects_a_dependency_the_target_does_not_admit() {
+        let contradiction = contract(&DCL.replace(
+            r#"name = "api"
+        paths = ["src/api/**"]
+        depends_on = ["repository"]"#,
+            r#"name = "api"
+        paths = ["src/api/**"]
+        depends_on = ["repository", "db"]"#,
+        ));
+        let message = contradiction
+            .validate()
+            .expect_err("api is not in db.consumed_by")
+            .to_string();
+        assert!(
+            message.contains("'api'") && message.contains("'db'"),
+            "{message}"
+        );
+
+        let required = contract(&DCL.replace(
+            r#"must_depend_on = ["auth"]"#,
+            r#"must_depend_on = ["auth", "legacy"]"#,
+        ));
+        assert!(
+            required.validate().is_err(),
+            "requiring a dependency on a component that admits nobody"
+        );
+    }
+
+    #[test]
+    fn rejects_a_component_that_both_forbids_and_allows_a_target() {
+        let both = contract(
+            r#"
+            schema = 1
+            [[component]]
+            name = "api"
+            paths = ["src/api/**"]
+            depends_on = ["db"]
+            cannot_depend_on = ["db"]
+            [[component]]
+            name = "db"
+            paths = ["src/db/**"]
+        "#,
+        );
+        let message = both.validate().expect_err("contradiction").to_string();
+        assert!(message.contains("cannot_depend_on"), "{message}");
+
+        let required_and_forbidden = contract(
+            r#"
+            schema = 1
+            [[component]]
+            name = "api"
+            paths = ["src/api/**"]
+            must_depend_on = ["db"]
+            cannot_depend_on = ["db"]
+            [[component]]
+            name = "db"
+            paths = ["src/db/**"]
+        "#,
+        );
+        assert!(required_and_forbidden.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_unknown_and_self_named_components_in_every_form() {
+        for field in ["cannot_depend_on", "must_depend_on", "consumed_by"] {
+            let unknown = contract(&format!(
+                r#"
+                schema = 1
+                [[component]]
+                name = "api"
+                paths = ["src/api/**"]
+                {field} = ["ghost"]
+            "#
+            ));
+            let message = unknown
+                .validate()
+                .expect_err("{field} names a component that does not exist")
+                .to_string();
+            assert!(
+                message.contains(field) && message.contains("ghost"),
+                "{message}"
+            );
+
+            let itself = contract(&format!(
+                r#"
+                schema = 1
+                [[component]]
+                name = "api"
+                paths = ["src/api/**"]
+                {field} = ["api"]
+            "#
+            ));
+            assert!(
+                itself.validate().is_err(),
+                "{field} names its own component"
+            );
+        }
     }
 
     #[test]
