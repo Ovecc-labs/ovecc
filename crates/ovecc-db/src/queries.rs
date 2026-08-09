@@ -440,6 +440,9 @@ impl ArchitectureStore {
         // plain timestamp and both its lexical and chronological order agree.
         // Casting to TIMESTAMPTZ instead aborts the process: the bundled DuckDB
         // ships without ICU.
+        // The decay terms are summed as DECIMAL: DuckDB aggregates in parallel
+        // and float addition is not associative, so a DOUBLE sum lands on a
+        // different last bit per run and the output stops being byte-identical.
         let mut statement = self.conn.prepare(&format!(
             "{CANONICAL_PATHS},
              fixes AS (
@@ -458,7 +461,7 @@ impl ArchitectureStore {
              )
              SELECT f.file_path,
                     COUNT(*)::BIGINT,
-                    SUM(POWER(0.5, (n.at - f.at) / CAST(? AS DOUBLE))),
+                    SUM(CAST(POWER(0.5, (n.at - f.at) / CAST(? AS DOUBLE)) AS DECIMAL(18,9)))::DOUBLE,
                     MAX(f.committed_at)
              FROM fixes f, newest n
              GROUP BY f.file_path
@@ -578,7 +581,7 @@ impl ArchitectureStore {
              )
              SELECT f.module_name,
                     COUNT(*)::BIGINT,
-                    SUM(POWER(0.5, (n.at - f.at) / CAST(? AS DOUBLE))),
+                    SUM(CAST(POWER(0.5, (n.at - f.at) / CAST(? AS DOUBLE)) AS DECIMAL(18,9)))::DOUBLE,
                     MAX(f.committed_at)
              FROM fixes f, newest n
              GROUP BY f.module_name"

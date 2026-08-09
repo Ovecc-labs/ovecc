@@ -40,6 +40,11 @@ changes).
   what a change breaks got a falsely reassuring zero. The fallback now applies
   only when the file really has no edge to follow in the direction asked for, so
   `impact --max-depth 1` and `query rdeps` agree.
+- The age-weighted fix mass is summed as `DECIMAL`. DuckDB aggregates in
+  parallel and float addition is not associative, so the sum landed on a
+  different last bit per run: `hotspots` produced six distinct JSON outputs over
+  six runs against one unchanged database, against a byte-identical guarantee.
+  Ranking never moved, the bytes did.
 
 ### Added
 
