@@ -38,6 +38,12 @@ changes).
   script command lines, matching a token against the index exactly or by a
   `dir/file` suffix, since a step with a `working-directory` writes the path
   relative to it. Unused files on hono fell from 5 to 2.
+- `fix` no longer deletes files unless asked, behind `--delete-files`. The two
+  hono files above survive the widened entry points, but a path passed as a
+  string (`unstable_dev('./runtime-tests/workerd/index.ts')`) still has no edge
+  to find, so the detector cannot be complete. Its other fixes edit a line and
+  read it back against the index; a deletion cannot be verified that way. The
+  MCP surface does not expose the flag at all.
 - `review` no longer invents new dependency cycles, which made the gate fail a
   change that introduced nothing. A loop counted as new when it was absent from
   the base's *enumerated* cycle set, and that enumeration is capped at

@@ -161,8 +161,8 @@ pub const COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         name: "fix",
-        summary: "Apply the mechanical fixes for auto-fixable findings: delete unused files, drop the export keyword on unused exports, remove unused manifest dependencies. Dry-run by default; every edit re-verifies the file against the index and skips stale entries.",
-        key_params: &["--apply", "--rule <rule>"],
+        summary: "Apply the mechanical fixes for auto-fixable findings: drop the export keyword on unused exports, remove unused manifest dependencies, and with --delete-files also delete the files nothing reaches. Dry-run by default; every edit re-verifies the file against the index and skips stale entries.",
+        key_params: &["--apply", "--rule <rule>", "--delete-files"],
         output: "Per-action plan/result: fix kind, file:line, change preview or skip reason, and applied/skipped counts.",
         read_only: false,
     },

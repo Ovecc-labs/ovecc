@@ -1698,6 +1698,73 @@ fn advise_reports_without_opening_the_database_twice() {
 /// A finding's identity is keyed on its file path, so moving a file renames
 /// every finding in it and the snapshot diff reports pre-existing defects as
 #[test]
+fn a_file_only_a_command_runs_is_not_dead_and_fix_never_deletes_by_default() {
+    let staged = staged_fixture("small-service");
+    let root = staged.path();
+    let repo = root.to_str().expect("utf8 path").to_string();
+
+    // Two scripts nothing imports: one named by a package.json script, one by a
+    // workflow step. Both are run, neither is reachable over import edges.
+    std::fs::create_dir_all(root.join("tools")).expect("tools dir");
+    std::fs::write(
+        root.join("tools").join("build.ts"),
+        "export const build = 1;\n",
+    )
+    .expect("write build.ts");
+    std::fs::write(
+        root.join("tools").join("release.ts"),
+        "export const release = 2;\n",
+    )
+    .expect("write release.ts");
+    std::fs::write(
+        root.join("package.json"),
+        "{\n  \"name\": \"small-service\",\n  \"scripts\": {\n    \"build\": \"tsx tools/build.ts\"\n  }\n}\n",
+    )
+    .expect("write package.json");
+    let workflows = root.join(".github").join("workflows");
+    std::fs::create_dir_all(&workflows).expect("workflows dir");
+    std::fs::write(
+        workflows.join("ci.yml"),
+        "jobs:\n  release:\n    steps:\n      - run: tsx tools/release.ts\n",
+    )
+    .expect("write ci.yml");
+    index_repo(&repo);
+
+    let dead = ovecc(&repo, &["deadcode"]);
+    let stdout = String::from_utf8_lossy(&dead.stdout);
+    assert!(
+        !stdout.contains("tools/build.ts"),
+        "a package.json script names this file: {stdout}"
+    );
+    assert!(
+        !stdout.contains("tools/release.ts"),
+        "a workflow step runs this file: {stdout}"
+    );
+
+    // An unreachable file that no command names is still reported, but `fix`
+    // does not remove it without being asked.
+    std::fs::write(
+        root.join("tools").join("orphan.ts"),
+        "export const orphan = 3;\n",
+    )
+    .expect("write orphan.ts");
+    index_repo(&repo);
+    let applied = ovecc(&repo, &["fix", "--apply"]);
+    assert!(
+        root.join("tools").join("orphan.ts").is_file(),
+        "fix --apply must not delete a file on its own: {}",
+        String::from_utf8_lossy(&applied.stdout)
+    );
+
+    let opted_in = ovecc(&repo, &["fix", "--apply", "--delete-files"]);
+    assert!(
+        !root.join("tools").join("orphan.ts").is_file(),
+        "--delete-files must still delete: {}",
+        String::from_utf8_lossy(&opted_in.stdout)
+    );
+}
+
+#[test]
 fn review_reports_a_cycle_once_and_names_the_import_that_closed_it() {
     let staged = staged_fixture("small-service");
     let repo = staged.path().to_str().expect("utf8 path").to_string();
