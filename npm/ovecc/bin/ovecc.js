@@ -7,6 +7,7 @@ const { spawnSync } = require('node:child_process')
 
 const PACKAGES = {
   'darwin arm64': '@ovecc/cli-darwin-arm64',
+  'linux arm64': '@ovecc/cli-linux-arm64',
   'linux x64': '@ovecc/cli-linux-x64',
   'win32 x64': '@ovecc/cli-win32-x64',
 }

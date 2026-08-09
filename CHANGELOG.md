@@ -86,6 +86,10 @@ changes).
   `intra_module_cycles` figure qualifies the count and points at `diagnose` and
   at `[architecture] module_depth`, which promotes those directories to modules
   in their own right.
+- A Linux aarch64 binary, on the release page and as `@ovecc/cli-linux-arm64` on
+  npm. `npx ovecc` used to fail outright on arm64 Linux, which is what a
+  container built on an Apple Silicon Mac runs by default. The GitHub Action
+  picks it up too, so arm64 runners no longer download an x86_64 binary.
 
 ### Changed
 
