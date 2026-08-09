@@ -165,32 +165,74 @@ pub struct GroupFileEdge {
 /// imports the target but isn't on the live path). `edges` must be sorted
 /// deterministically per group pair before calling (see [`group_candidates`]).
 pub fn witness_walk(cycle: &[String], candidates: &GroupCandidates<'_>) -> Vec<WitnessEdge> {
+    witness_walk_preferring(cycle, candidates, &HashSet::new())
+}
+
+/// [`witness_walk`], with the walk anchored on a hop whose importing file is in
+/// `preferred`.
+///
+/// The walk chains each hop off the file the previous one arrived at, so its
+/// whole shape follows from where it starts — and it started at hop 0, taking
+/// that pair's canonical representative. For `review` that is the wrong end of
+/// the loop: it would name three pre-existing imports and omit the one the
+/// change added, which is the only edge the author can remove. Anchoring on a
+/// changed file puts that import in the report and lets the rest of the loop
+/// chain off it as before. The anchor is the lowest such hop, and its edge the
+/// first preferred candidate in an already-sorted list, so the choice is
+/// deterministic; an empty `preferred` starts at hop 0 and reproduces
+/// [`witness_walk`] exactly.
+pub fn witness_walk_preferring(
+    cycle: &[String],
+    candidates: &GroupCandidates<'_>,
+    preferred: &HashSet<&str>,
+) -> Vec<WitnessEdge> {
     let len = cycle.len();
-    let mut edges: Vec<WitnessEdge> = Vec::with_capacity(len);
+    let hop = |i: usize| (cycle[i].as_str(), cycle[(i + 1) % len].as_str());
+    let start = (0..len)
+        .find(|&i| {
+            candidates.get(&hop(i)).is_some_and(|choices| {
+                choices
+                    .iter()
+                    .any(|edge| preferred.contains(edge.from_file.as_str()))
+            })
+        })
+        .unwrap_or(0);
+
+    // Filled by hop index, so the report still reads around the loop in order
+    // however far into it the walk started.
+    let mut picked: Vec<Option<WitnessEdge>> = vec![None; len];
     let mut arrived_at: Option<String> = None;
-    for i in 0..len {
-        let from = &cycle[i];
-        let to = &cycle[(i + 1) % len];
-        let Some(choices) = candidates.get(&(from.as_str(), to.as_str())) else {
+    for step in 0..len {
+        let index = (start + step) % len;
+        let (from, to) = hop(index);
+        let Some(choices) = candidates.get(&(from, to)) else {
             arrived_at = None;
             continue;
         };
-        let chosen = arrived_at
-            .as_deref()
-            .and_then(|file| choices.iter().find(|edge| edge.from_file == file))
-            .copied()
-            .unwrap_or(choices[0]);
+        let chosen = if step == 0 {
+            choices
+                .iter()
+                .find(|edge| preferred.contains(edge.from_file.as_str()))
+                .copied()
+                .unwrap_or(choices[0])
+        } else {
+            arrived_at
+                .as_deref()
+                .and_then(|file| choices.iter().find(|edge| edge.from_file == file))
+                .copied()
+                .unwrap_or(choices[0])
+        };
         arrived_at = chosen.to_file.clone();
-        edges.push(WitnessEdge {
-            from_module: from.clone(),
-            to_module: to.clone(),
+        picked[index] = Some(WitnessEdge {
+            from_module: from.to_string(),
+            to_module: to.to_string(),
             from_file: chosen.from_file.clone(),
             to_file: chosen.to_file.clone(),
             specifier: chosen.specifier.clone(),
             line: chosen.line,
         });
     }
-    edges
+    picked.into_iter().flatten().collect()
 }
 
 /// Candidate file edges per `(from_group, to_group)` pair, sorted for
@@ -231,6 +273,17 @@ pub fn elementary_cycles_with_witness(
     modules: &[String],
     dependencies: &[DependencyRecord],
 ) -> Vec<CycleWitness> {
+    elementary_cycles_with_witness_preferring(modules, dependencies, &HashSet::new())
+}
+
+/// [`elementary_cycles_with_witness`], drawing each witness from `preferred`
+/// where the loop passes through one (see [`witness_walk_preferring`]). Cycle
+/// membership is untouched: only which import is cited as evidence changes.
+pub fn elementary_cycles_with_witness_preferring(
+    modules: &[String],
+    dependencies: &[DependencyRecord],
+    preferred: &HashSet<&str>,
+) -> Vec<CycleWitness> {
     let group_edges: Vec<GroupFileEdge> = dependencies
         .iter()
         .filter(|dependency| {
@@ -251,7 +304,7 @@ pub fn elementary_cycles_with_witness(
     elementary_cycles(modules, dependencies)
         .into_iter()
         .map(|cycle| {
-            let edges = witness_walk(&cycle, &candidates);
+            let edges = witness_walk_preferring(&cycle, &candidates, preferred);
             CycleWitness {
                 modules: cycle,
                 edges,

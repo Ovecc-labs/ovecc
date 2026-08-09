@@ -42,6 +42,14 @@ changes).
   tested edge by edge, which needs no enumeration of the base at all. On hono,
   indexing twice with no change between reported three new cycles and exited 1;
   it now passes.
+- A cycle witness cites the import the change added. The walk chains each hop
+  off the file the previous one arrived at, so its shape follows from where it
+  starts, and it always started at hop 0 with that pair's canonical
+  representative. `review` therefore named pre-existing imports and omitted the
+  one edge the author could remove. The walk now anchors on a hop whose
+  importing file the change touched, and chains the rest of the loop off it as
+  before; `query cycles`, `diagnose` and the rules pass nothing to prefer and
+  are byte-identical.
 - `impact <file>` answers for the file. The index writes file→file `depends_on`
   edges so the blast radius can be computed at file granularity, but the target
   was redirected to its containing module unconditionally, and the note beside
