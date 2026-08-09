@@ -31,6 +31,17 @@ changes).
   as an external dependency or fabricated as a package node in `export graph`.
 - `import { x } from "./y"` backed only by a `y.d.ts` now resolves to that
   declaration file instead of reading as a broken import.
+- `review` no longer invents new dependency cycles, which made the gate fail a
+  change that introduced nothing. A loop counted as new when it was absent from
+  the base's *enumerated* cycle set, and that enumeration is capped at
+  `MAX_CYCLES_PER_SCC`: a component over the cap yields a different truncation
+  of the same loops on either side, so untouched cycles surfaced as new. The two
+  sides were not even reading one graph, since a snapshot records no
+  `dependency_kind` and its edges cannot drop `import type` the way the head
+  graph does. A cycle is now new when one of its edges is absent from the base,
+  tested edge by edge, which needs no enumeration of the base at all. On hono,
+  indexing twice with no change between reported three new cycles and exited 1;
+  it now passes.
 - `impact <file>` answers for the file. The index writes file→file `depends_on`
   edges so the blast radius can be computed at file granularity, but the target
   was redirected to its containing module unconditionally, and the note beside

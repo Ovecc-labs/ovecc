@@ -1697,6 +1697,55 @@ fn advise_reports_without_opening_the_database_twice() {
 
 /// A finding's identity is keyed on its file path, so moving a file renames
 /// every finding in it and the snapshot diff reports pre-existing defects as
+#[test]
+fn review_reports_a_cycle_once_and_names_the_import_that_closed_it() {
+    let staged = staged_fixture("small-service");
+    let repo = staged.path().to_str().expect("utf8 path").to_string();
+    index_repo(&repo);
+
+    // billing/service.ts already imports user/model, so importing billing from
+    // user closes a two-module loop.
+    let model = staged.path().join("src").join("user").join("model.ts");
+    let original = std::fs::read_to_string(&model).expect("read model.ts");
+    std::fs::write(
+        &model,
+        format!(
+            "import {{ createInvoice }} from \"../billing/service\";\n\
+             export const rebill = createInvoice;\n{original}"
+        ),
+    )
+    .expect("write model.ts");
+    index_repo(&repo);
+
+    let introduced = ovecc(&repo, &["review"]);
+    let stdout = String::from_utf8_lossy(&introduced.stdout);
+    assert!(
+        stdout.contains("new dependency cycle"),
+        "closing the loop must be reported: {stdout}"
+    );
+    assert!(
+        stdout.contains("src/user/model.ts"),
+        "the witness must name the import the change added: {stdout}"
+    );
+
+    // Same tree, indexed again: the loop is no longer new. Differencing the
+    // enumerated cycle sets re-reported it, because the enumeration is capped
+    // per component and the two sides truncate differently.
+    index_repo(&repo);
+    let unchanged = ovecc(&repo, &["review"]);
+    let stdout = String::from_utf8_lossy(&unchanged.stdout);
+    assert!(
+        !stdout.contains("new dependency cycle"),
+        "a cycle every edge of which is in the base is not new: {stdout}"
+    );
+    assert_eq!(
+        unchanged.status.code(),
+        Some(0),
+        "an unchanged tree must pass the gate, stderr: {}",
+        String::from_utf8_lossy(&unchanged.stderr)
+    );
+}
+
 /// new — the gate then fails a refactor that introduced nothing. With both
 /// snapshots on commits, review consults the rename-aware git diff and only
 /// charges a lexical finding to the change if its lines were actually touched.
