@@ -31,6 +31,13 @@ changes).
   as an external dependency or fabricated as a package node in `export graph`.
 - `import { x } from "./y"` backed only by a `y.d.ts` now resolves to that
   declaration file instead of reading as a broken import.
+- A file a command runs is no longer dead code. Reachability follows import
+  edges, and `bun tools/check-size.ts` in a CI step or a `package.json` script
+  leaves none, so the file read as an orphan: on hono, `ovecc fix --apply`
+  deleted two scripts a workflow executes. Entry points are now also seeded from
+  script command lines, matching a token against the index exactly or by a
+  `dir/file` suffix, since a step with a `working-directory` writes the path
+  relative to it. Unused files on hono fell from 5 to 2.
 - `review` no longer invents new dependency cycles, which made the gate fail a
   change that introduced nothing. A loop counted as new when it was absent from
   the base's *enumerated* cycle set, and that enumeration is capped at
