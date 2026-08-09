@@ -31,6 +31,15 @@ changes).
   as an external dependency or fabricated as a package node in `export graph`.
 - `import { x } from "./y"` backed only by a `y.d.ts` now resolves to that
   declaration file instead of reading as a broken import.
+- `impact <file>` answers for the file. The index writes file→file `depends_on`
+  edges so the blast radius can be computed at file granularity, but the target
+  was redirected to its containing module unconditionally, and the note beside
+  the answer ("has no dependency edges of its own") stated a condition the code
+  never evaluated. Every file reported `Affected files: 0` while `query rdeps`
+  listed its dependents from the same database, and through MCP an agent asking
+  what a change breaks got a falsely reassuring zero. The fallback now applies
+  only when the file really has no edge to follow in the direction asked for, so
+  `impact --max-depth 1` and `query rdeps` agree.
 
 ### Added
 

@@ -541,6 +541,22 @@ fn load_graph(
     Ok((nodes, edges))
 }
 
+/// Whether the traversal has anywhere to go from `node_id`. `Downstream` walks
+/// dependents, so it needs an incoming edge; `Upstream` walks dependencies, so
+/// it needs an outgoing one. Only the kinds `blast_radius` follows count: a
+/// `contains` edge is structure, and reaching a file through it would report the
+/// module's radius under the file's name.
+fn has_traversable_edge(edges: &[BlastEdge], node_id: &str, direction: ImpactDirection) -> bool {
+    edges.iter().any(|edge| {
+        blast::IMPACT_EDGE_KINDS.contains(&edge.kind.as_str())
+            && match direction {
+                ImpactDirection::Downstream => edge.target == node_id,
+                ImpactDirection::Upstream => edge.source == node_id,
+                ImpactDirection::Both => edge.source == node_id || edge.target == node_id,
+            }
+    })
+}
+
 pub(crate) fn load_impact(
     paths: &ProjectPaths,
     target: &str,
@@ -552,13 +568,14 @@ pub(crate) fn load_impact(
     let Some(node) = blast::resolve_target(target, &nodes) else {
         return Err(unresolved_target(target, &nodes, &edges));
     };
-    // A file target carries no architectural edges of its own — dependency edges
-    // are module-level — so a raw file node yields an empty (and falsely
-    // reassuring "Low risk") blast radius. Redirect it to the module that
-    // `contains` it, so `impact src/foo/bar.ts` answers for module `foo`, and
-    // hand the caller the file back so the report can admit the substitution.
+    // The index writes file→file `depends_on` edges precisely so impact can
+    // answer at file granularity, so a file target is traversed as itself. Only
+    // when it carries no traversable edge in the direction asked for would the
+    // walk return an empty (and falsely reassuring "Low risk") radius; that file
+    // falls back to the module that `contains` it, and the caller gets the file
+    // back so the report can admit the substitution.
     let (node, redirected_from) = match node.kind.as_str() {
-        "file" => edges
+        "file" if !has_traversable_edge(&edges, &node.id, direction) => edges
             .iter()
             .find(|edge| edge.kind == "contains" && edge.target == node.id)
             .and_then(|edge| nodes.iter().find(|candidate| candidate.id == edge.source))

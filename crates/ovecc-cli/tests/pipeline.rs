@@ -507,6 +507,37 @@ fn impact_distinguishes_unknown_target_from_no_impact() {
 }
 
 #[test]
+fn impact_answers_for_a_file_that_carries_its_own_edges() {
+    let staged = staged_fixture("small-service");
+    let repo = staged.path().to_str().expect("utf8 path").to_string();
+    index_repo(&repo);
+
+    // `src/user/model.ts` is imported by billing/service.ts and user/service.ts
+    // and imports nothing, so it exercises both arms: dependents reach it, and
+    // walking outward from it has nowhere to go.
+    let downstream = ovecc(&repo, &["impact", "src/user/model.ts", "--max-depth", "1"]);
+    let stdout = String::from_utf8_lossy(&downstream.stdout);
+    assert!(
+        stdout.contains("Impact: src/user/model.ts"),
+        "a file with dependents must be reported as itself: {stdout}"
+    );
+    assert!(
+        stdout.contains("Affected files: 2"),
+        "both direct dependents must be counted: {stdout}"
+    );
+
+    let upstream = ovecc(
+        &repo,
+        &["impact", "src/user/model.ts", "--direction", "upstream"],
+    );
+    let stdout = String::from_utf8_lossy(&upstream.stdout);
+    assert!(
+        stdout.contains("has no dependency edges of its own"),
+        "a direction with no edge to follow still falls back to the module: {stdout}"
+    );
+}
+
+#[test]
 fn exit_codes_follow_the_documented_contract() {
     let staged = staged_fixture("small-service");
     let repo = staged.path().to_str().expect("utf8 path").to_string();
