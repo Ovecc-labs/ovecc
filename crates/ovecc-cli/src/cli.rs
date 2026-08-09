@@ -5,6 +5,7 @@ use crate::commands::{
         run_architecture_show, run_architecture_suggest, run_architecture_templates,
     },
     capabilities::render_capabilities,
+    components::{load_components_report, render_components},
     conventions::{load_conventions_report, render_conventions},
     coupling::{load_coupling, render_coupling},
     diagnose::{
@@ -434,6 +435,20 @@ pub enum Command {
         /// Scope to a single file or module (substring match).
         #[arg(long)]
         target: Option<String>,
+    },
+    /// Recover subsystems from the dependency graph with ACDC's dominance-based
+    /// clustering, as a second view beside the directory-derived modules, and
+    /// name every module the two views disagree about.
+    Components {
+        /// Scope to subsystems mentioning this file, module, or name.
+        #[arg(long)]
+        target: Option<String>,
+        /// Largest file count a dominator subsystem may claim.
+        #[arg(long, default_value_t = 20)]
+        max_size: usize,
+        /// In-degree above which a file counts as a support library.
+        #[arg(long, default_value_t = 20)]
+        support_in_degree: usize,
     },
     /// Trend one snapshot metric over time: per-index values with deltas and a
     /// sparkline ("is the codebase getting worse?"). Without a metric, lists
@@ -1033,6 +1048,23 @@ fn run_command(cli: Cli) -> Result<u8> {
             let diagnose_config = diagnose_config_for(&paths, &config);
             let report = load_metrics_report(&paths, &diagnose_config, target.as_deref())?;
             render_metrics(&report, config.output.default_format)?;
+            Ok(0)
+        }
+        Command::Components {
+            target,
+            max_size,
+            support_in_degree,
+        } => {
+            let paths = ProjectPaths::resolve(cli.repo.unwrap_or_else(|| PathBuf::from(".")))?;
+            let config = load_config(&paths, format_override)?;
+            let acdc = ovecc_graph::acdc::AcdcConfig {
+                max_subsystem_size: max_size,
+                support_in_degree,
+            };
+            let diagnose_config = diagnose_config_for(&paths, &config);
+            let report =
+                load_components_report(&paths, &acdc, &diagnose_config, target.as_deref())?;
+            render_components(&report, config.output.default_format)?;
             Ok(0)
         }
         Command::Architecture { what } => {

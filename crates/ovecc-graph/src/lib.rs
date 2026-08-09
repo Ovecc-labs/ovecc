@@ -5,6 +5,7 @@
 //! Note: `drift_trend` lives in `ovecc_core::legacy` so that `ovecc-db` can
 //! classify drift without depending on this crate.
 
+pub mod acdc;
 pub mod blast;
 pub mod changeshape;
 pub mod cochange;

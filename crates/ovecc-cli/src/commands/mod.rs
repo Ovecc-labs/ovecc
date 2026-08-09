@@ -11,6 +11,7 @@ use ovecc_db::ArchitectureStore;
 pub(crate) mod agent;
 pub(crate) mod architecture;
 pub(crate) mod capabilities;
+pub(crate) mod components;
 pub(crate) mod conventions;
 pub(crate) mod coupling;
 pub(crate) mod diagnose;

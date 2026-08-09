@@ -188,6 +188,13 @@ pub const COMMANDS: &[CommandSpec] = &[
         read_only: true,
     },
     CommandSpec {
+        name: "components",
+        summary: "Recover subsystems from the dependency graph with ACDC's two-phase clustering (subgraph-dominator, support-library and body-header patterns, then orphan adoption), as a second view beside the directory-derived modules. Deterministic: ties break on connectivity, then cardinality, then name. Groups everything reachable through one entry point, so it does not separate slices that share one.",
+        key_params: &["--target", "--max-size <n>", "--support-in-degree <n>"],
+        output: "Subsystems with their pattern, containment parent/children, files, and the modules they span; plus every module the directory layout collapses into one.",
+        read_only: true,
+    },
+    CommandSpec {
         name: "conventions",
         summary: "Learn dominant repository conventions and detect deviations.",
         key_params: &[],
