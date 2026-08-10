@@ -507,6 +507,37 @@ fn impact_distinguishes_unknown_target_from_no_impact() {
 }
 
 #[test]
+fn impact_answers_for_a_file_that_carries_its_own_edges() {
+    let staged = staged_fixture("small-service");
+    let repo = staged.path().to_str().expect("utf8 path").to_string();
+    index_repo(&repo);
+
+    // `src/user/model.ts` is imported by billing/service.ts and user/service.ts
+    // and imports nothing, so it exercises both arms: dependents reach it, and
+    // walking outward from it has nowhere to go.
+    let downstream = ovecc(&repo, &["impact", "src/user/model.ts", "--max-depth", "1"]);
+    let stdout = String::from_utf8_lossy(&downstream.stdout);
+    assert!(
+        stdout.contains("Impact: src/user/model.ts"),
+        "a file with dependents must be reported as itself: {stdout}"
+    );
+    assert!(
+        stdout.contains("Affected files: 2"),
+        "both direct dependents must be counted: {stdout}"
+    );
+
+    let upstream = ovecc(
+        &repo,
+        &["impact", "src/user/model.ts", "--direction", "upstream"],
+    );
+    let stdout = String::from_utf8_lossy(&upstream.stdout);
+    assert!(
+        stdout.contains("has no dependency edges of its own"),
+        "a direction with no edge to follow still falls back to the module: {stdout}"
+    );
+}
+
+#[test]
 fn exit_codes_follow_the_documented_contract() {
     let staged = staged_fixture("small-service");
     let repo = staged.path().to_str().expect("utf8 path").to_string();
@@ -1666,6 +1697,122 @@ fn advise_reports_without_opening_the_database_twice() {
 
 /// A finding's identity is keyed on its file path, so moving a file renames
 /// every finding in it and the snapshot diff reports pre-existing defects as
+#[test]
+fn a_file_only_a_command_runs_is_not_dead_and_fix_never_deletes_by_default() {
+    let staged = staged_fixture("small-service");
+    let root = staged.path();
+    let repo = root.to_str().expect("utf8 path").to_string();
+
+    // Two scripts nothing imports: one named by a package.json script, one by a
+    // workflow step. Both are run, neither is reachable over import edges.
+    std::fs::create_dir_all(root.join("tools")).expect("tools dir");
+    std::fs::write(
+        root.join("tools").join("build.ts"),
+        "export const build = 1;\n",
+    )
+    .expect("write build.ts");
+    std::fs::write(
+        root.join("tools").join("release.ts"),
+        "export const release = 2;\n",
+    )
+    .expect("write release.ts");
+    std::fs::write(
+        root.join("package.json"),
+        "{\n  \"name\": \"small-service\",\n  \"scripts\": {\n    \"build\": \"tsx tools/build.ts\"\n  }\n}\n",
+    )
+    .expect("write package.json");
+    let workflows = root.join(".github").join("workflows");
+    std::fs::create_dir_all(&workflows).expect("workflows dir");
+    std::fs::write(
+        workflows.join("ci.yml"),
+        "jobs:\n  release:\n    steps:\n      - run: tsx tools/release.ts\n",
+    )
+    .expect("write ci.yml");
+    index_repo(&repo);
+
+    let dead = ovecc(&repo, &["deadcode"]);
+    let stdout = String::from_utf8_lossy(&dead.stdout);
+    assert!(
+        !stdout.contains("tools/build.ts"),
+        "a package.json script names this file: {stdout}"
+    );
+    assert!(
+        !stdout.contains("tools/release.ts"),
+        "a workflow step runs this file: {stdout}"
+    );
+
+    // An unreachable file that no command names is still reported, but `fix`
+    // does not remove it without being asked.
+    std::fs::write(
+        root.join("tools").join("orphan.ts"),
+        "export const orphan = 3;\n",
+    )
+    .expect("write orphan.ts");
+    index_repo(&repo);
+    let applied = ovecc(&repo, &["fix", "--apply"]);
+    assert!(
+        root.join("tools").join("orphan.ts").is_file(),
+        "fix --apply must not delete a file on its own: {}",
+        String::from_utf8_lossy(&applied.stdout)
+    );
+
+    let opted_in = ovecc(&repo, &["fix", "--apply", "--delete-files"]);
+    assert!(
+        !root.join("tools").join("orphan.ts").is_file(),
+        "--delete-files must still delete: {}",
+        String::from_utf8_lossy(&opted_in.stdout)
+    );
+}
+
+#[test]
+fn review_reports_a_cycle_once_and_names_the_import_that_closed_it() {
+    let staged = staged_fixture("small-service");
+    let repo = staged.path().to_str().expect("utf8 path").to_string();
+    index_repo(&repo);
+
+    // billing/service.ts already imports user/model, so importing billing from
+    // user closes a two-module loop.
+    let model = staged.path().join("src").join("user").join("model.ts");
+    let original = std::fs::read_to_string(&model).expect("read model.ts");
+    std::fs::write(
+        &model,
+        format!(
+            "import {{ createInvoice }} from \"../billing/service\";\n\
+             export const rebill = createInvoice;\n{original}"
+        ),
+    )
+    .expect("write model.ts");
+    index_repo(&repo);
+
+    let introduced = ovecc(&repo, &["review"]);
+    let stdout = String::from_utf8_lossy(&introduced.stdout);
+    assert!(
+        stdout.contains("new dependency cycle"),
+        "closing the loop must be reported: {stdout}"
+    );
+    assert!(
+        stdout.contains("src/user/model.ts"),
+        "the witness must name the import the change added: {stdout}"
+    );
+
+    // Same tree, indexed again: the loop is no longer new. Differencing the
+    // enumerated cycle sets re-reported it, because the enumeration is capped
+    // per component and the two sides truncate differently.
+    index_repo(&repo);
+    let unchanged = ovecc(&repo, &["review"]);
+    let stdout = String::from_utf8_lossy(&unchanged.stdout);
+    assert!(
+        !stdout.contains("new dependency cycle"),
+        "a cycle every edge of which is in the base is not new: {stdout}"
+    );
+    assert_eq!(
+        unchanged.status.code(),
+        Some(0),
+        "an unchanged tree must pass the gate, stderr: {}",
+        String::from_utf8_lossy(&unchanged.stderr)
+    );
+}
+
 /// new — the gate then fails a refactor that introduced nothing. With both
 /// snapshots on commits, review consults the rename-aware git diff and only
 /// charges a lexical finding to the change if its lines were actually touched.

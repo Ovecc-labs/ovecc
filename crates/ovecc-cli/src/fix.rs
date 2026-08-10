@@ -41,7 +41,7 @@ pub struct FixAction {
 /// Plans (and with `apply`, performs) the mechanical fixes for `findings`.
 /// Only auto-fixable kinds are considered; callers pre-filter, but the run
 /// re-checks so a mixed list can never trigger a non-mechanical change.
-pub fn run(root: &Path, findings: &[FindingRecord], apply: bool) -> FixReport {
+pub fn run(root: &Path, findings: &[FindingRecord], apply: bool, delete_files: bool) -> FixReport {
     let mut actions: Vec<FixAction> = Vec::new();
 
     // Group line edits per file so they apply bottom-up in one write, keeping
@@ -61,7 +61,13 @@ pub fn run(root: &Path, findings: &[FindingRecord], apply: bool) -> FixReport {
         };
         match finding.kind {
             FindingKind::UnusedFile => {
-                actions.push(fix_unused_file(root, finding, &evidence.file_path, apply));
+                actions.push(fix_unused_file(
+                    root,
+                    finding,
+                    &evidence.file_path,
+                    apply,
+                    delete_files,
+                ));
             }
             FindingKind::UnusedExport => {
                 exports_by_file
@@ -139,7 +145,27 @@ fn done(apply: bool) -> &'static str {
 
 // --- unused file -------------------------------------------------------------
 
-fn fix_unused_file(root: &Path, finding: &FindingRecord, file: &str, apply: bool) -> FixAction {
+fn fix_unused_file(
+    root: &Path,
+    finding: &FindingRecord,
+    file: &str,
+    apply: bool,
+    delete_files: bool,
+) -> FixAction {
+    // Reachability proves nothing imports the file, which is not the same as
+    // nothing running it: a CI step, a task runner, or a path passed as a string
+    // all leave the graph empty. Every other fix here edits a line and is read
+    // back against the index; a deletion cannot be verified that way, so it is
+    // reported and left for `--delete-files`.
+    if !delete_files {
+        return action(
+            finding,
+            "remove_unused_file",
+            file,
+            "skipped",
+            "delete file (no entry point reaches it) — pass --delete-files to write".to_string(),
+        );
+    }
     let absolute = root.join(file);
     if !absolute.is_file() {
         return action(

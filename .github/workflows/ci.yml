@@ -97,6 +97,14 @@ jobs:
             toolchain: stable
             asset: ovecc-linux-x86_64
             ext: ""
+          # Native arm64 runner rather than a cross build: DuckDB's bundled C++
+          # is the expensive part to cross-compile. GitHub publishes no
+          # `-latest` alias for the arm labels, so the Ubuntu version is part of
+          # the label itself and moves only when we bump it.
+          - os: ubuntu-24.04-arm
+            toolchain: stable
+            asset: ovecc-linux-aarch64
+            ext: ""
           - os: windows-latest
             toolchain: stable-x86_64-pc-windows-gnu
             asset: ovecc-windows-x86_64.exe
@@ -238,7 +246,7 @@ jobs:
           gh release delete latest --yes --cleanup-tag 2>/dev/null || true
           gh release create latest \
             --title "Rolling build (${GITHUB_SHA::7})" \
-            --notes "Dev build from \`${GITHUB_SHA}\`: Linux and Windows x86_64, macOS arm64. For the supported build, use the newest versioned release." \
+            --notes "Dev build from \`${GITHUB_SHA}\`: Linux x86_64 and arm64, Windows x86_64, macOS arm64. For the supported build, use the newest versioned release." \
             --target "${GITHUB_SHA}" \
             --prerelease \
             dist/*
@@ -321,13 +329,15 @@ jobs:
         run: |
           version="${GITHUB_REF_NAME#v}"
           install -Dm755 dist/ovecc-linux-x86_64       npm/cli-linux-x64/bin/ovecc
+          install -Dm755 dist/ovecc-linux-aarch64      npm/cli-linux-arm64/bin/ovecc
           install -Dm755 dist/ovecc-macos-aarch64      npm/cli-darwin-arm64/bin/ovecc
           install -Dm755 dist/ovecc-windows-x86_64.exe npm/cli-win32-x64/bin/ovecc.exe
-          for p in cli-linux-x64 cli-darwin-arm64 cli-win32-x64 ovecc; do
+          for p in cli-linux-x64 cli-linux-arm64 cli-darwin-arm64 cli-win32-x64 ovecc; do
             (cd "npm/$p" && npm pkg set version="$version")
           done
           (cd npm/ovecc && npm pkg set \
             "optionalDependencies.@ovecc/cli-linux-x64=$version" \
+            "optionalDependencies.@ovecc/cli-linux-arm64=$version" \
             "optionalDependencies.@ovecc/cli-darwin-arm64=$version" \
             "optionalDependencies.@ovecc/cli-win32-x64=$version")
 
@@ -340,7 +350,7 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
-          for p in cli-linux-x64 cli-darwin-arm64 cli-win32-x64 ovecc; do
+          for p in cli-linux-x64 cli-linux-arm64 cli-darwin-arm64 cli-win32-x64 ovecc; do
             npm publish --provenance --access public "./npm/$p"
           done
 

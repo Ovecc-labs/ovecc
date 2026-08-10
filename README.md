@@ -121,9 +121,9 @@ npm pulls only the binary for your platform. `npm i -g ovecc` keeps it on your
 `PATH`.
 
 Prebuilt binaries are also on the [latest release](../../releases/latest): Linux
-and Windows x86_64, macOS arm64. There is nothing else to install: DuckDB is
-bundled, there is no runtime, and it works fully offline. A rolling [dev
-build](../../releases/tag/latest) ships on every push to `main`.
+x86_64 and aarch64, Windows x86_64, macOS arm64. There is nothing else to
+install: DuckDB is bundled, there is no runtime, and it works fully offline. A
+rolling [dev build](../../releases/tag/latest) ships on every push to `main`.
 
 The macOS binary is unsigned, so Gatekeeper quarantines it when a browser
 downloads it. Clear the flag once and it runs:

@@ -391,6 +391,10 @@ pub enum Command {
         /// Only fix findings from this rule (e.g. unused-export, unused-file).
         #[arg(long)]
         rule: Option<String>,
+        /// Also delete the files nothing reaches. Off by default: a file run by
+        /// a command or named in a string is live with no import to prove it.
+        #[arg(long)]
+        delete_files: bool,
     },
     /// Review what a change introduced: the NAMED new defects between a base and
     /// a head snapshot — new findings (security / dead code / complexity), new
@@ -981,7 +985,11 @@ fn run_command(cli: Cli) -> Result<u8> {
             render_deadcode(&report, config.output.default_format)?;
             Ok(findings_exit(&report.findings, fail_on))
         }
-        Command::Fix { apply, rule } => {
+        Command::Fix {
+            apply,
+            rule,
+            delete_files,
+        } => {
             let paths = ProjectPaths::resolve(cli.repo.unwrap_or_else(|| PathBuf::from(".")))?;
             let config = load_config(&paths, format_override)?;
             let store = open_store(&paths)?;
@@ -994,7 +1002,7 @@ fn run_command(cli: Cli) -> Result<u8> {
                         .is_none_or(|wanted| finding.rule_name.as_deref() == Some(wanted))
                 })
                 .collect();
-            let report = crate::fix::run(&paths.root, &findings, apply);
+            let report = crate::fix::run(&paths.root, &findings, apply, delete_files);
             render_fix(&report, config.output.default_format)?;
             Ok(0)
         }

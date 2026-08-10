@@ -21,9 +21,9 @@ npm install --save-dev ovecc
 ```
 
 This package is a thin launcher. The binary itself ships in a platform package
-(`@ovecc/cli-darwin-arm64`, `@ovecc/cli-linux-x64`, `@ovecc/cli-win32-x64`) that
-npm picks by `os` and `cpu`, so only one is downloaded and there is no install
-script to run.
+(`@ovecc/cli-darwin-arm64`, `@ovecc/cli-linux-x64`, `@ovecc/cli-linux-arm64`,
+`@ovecc/cli-win32-x64`) that npm picks by `os` and `cpu`, so only one is
+downloaded and there is no install script to run.
 
 Full documentation, the architecture contract format, and the CI gate are in the
 [repository](https://github.com/Ovecc-labs/ovecc). Apache-2.0.

@@ -31,6 +31,52 @@ changes).
   as an external dependency or fabricated as a package node in `export graph`.
 - `import { x } from "./y"` backed only by a `y.d.ts` now resolves to that
   declaration file instead of reading as a broken import.
+- A file a command runs is no longer dead code. Reachability follows import
+  edges, and `bun tools/check-size.ts` in a CI step or a `package.json` script
+  leaves none, so the file read as an orphan: on hono, `ovecc fix --apply`
+  deleted two scripts a workflow executes. Entry points are now also seeded from
+  script command lines, matching a token against the index exactly or by a
+  `dir/file` suffix, since a step with a `working-directory` writes the path
+  relative to it. Unused files on hono fell from 5 to 2.
+- `fix` no longer deletes files unless asked, behind `--delete-files`. The two
+  hono files above survive the widened entry points, but a path passed as a
+  string (`unstable_dev('./runtime-tests/workerd/index.ts')`) still has no edge
+  to find, so the detector cannot be complete. Its other fixes edit a line and
+  read it back against the index; a deletion cannot be verified that way. The
+  MCP surface does not expose the flag at all.
+- `review` no longer invents new dependency cycles, which made the gate fail a
+  change that introduced nothing. A loop counted as new when it was absent from
+  the base's *enumerated* cycle set, and that enumeration is capped at
+  `MAX_CYCLES_PER_SCC`: a component over the cap yields a different truncation
+  of the same loops on either side, so untouched cycles surfaced as new. The two
+  sides were not even reading one graph, since a snapshot records no
+  `dependency_kind` and its edges cannot drop `import type` the way the head
+  graph does. A cycle is now new when one of its edges is absent from the base,
+  tested edge by edge, which needs no enumeration of the base at all. On hono,
+  indexing twice with no change between reported three new cycles and exited 1;
+  it now passes.
+- A cycle witness cites the import the change added. The walk chains each hop
+  off the file the previous one arrived at, so its shape follows from where it
+  starts, and it always started at hop 0 with that pair's canonical
+  representative. `review` therefore named pre-existing imports and omitted the
+  one edge the author could remove. The walk now anchors on a hop whose
+  importing file the change touched, and chains the rest of the loop off it as
+  before; `query cycles`, `diagnose` and the rules pass nothing to prefer and
+  are byte-identical.
+- `impact <file>` answers for the file. The index writes file→file `depends_on`
+  edges so the blast radius can be computed at file granularity, but the target
+  was redirected to its containing module unconditionally, and the note beside
+  the answer ("has no dependency edges of its own") stated a condition the code
+  never evaluated. Every file reported `Affected files: 0` while `query rdeps`
+  listed its dependents from the same database, and through MCP an agent asking
+  what a change breaks got a falsely reassuring zero. The fallback now applies
+  only when the file really has no edge to follow in the direction asked for, so
+  `impact --max-depth 1` and `query rdeps` agree.
+- The age-weighted fix mass is summed as `DECIMAL`. DuckDB aggregates in
+  parallel and float addition is not associative, so the sum landed on a
+  different last bit per run: `hotspots` produced six distinct JSON outputs over
+  six runs against one unchanged database, against a byte-identical guarantee.
+  Ranking never moved, the bytes did.
 
 ### Added
 
@@ -86,6 +132,10 @@ changes).
   `intra_module_cycles` figure qualifies the count and points at `diagnose` and
   at `[architecture] module_depth`, which promotes those directories to modules
   in their own right.
+- A Linux aarch64 binary, on the release page and as `@ovecc/cli-linux-arm64` on
+  npm. `npx ovecc` used to fail outright on arm64 Linux, which is what a
+  container built on an Apple Silicon Mac runs by default. The GitHub Action
+  picks it up too, so arm64 runners no longer download an x86_64 binary.
 
 ### Changed
 

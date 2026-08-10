@@ -567,16 +567,22 @@ language-agnostic).
 Dead code: 47 unused export(s), 46 unused file(s), 0 unused dependency(ies), 0 unlisted dependency(ies)
 ```
 
-### `ovecc fix [--apply] [--rule <rule>]`
+### `ovecc fix [--apply] [--rule <rule>] [--delete-files]`
 
-Applies the mechanical fixes for auto-fixable findings: deletes unreachable
-files, drops the `export` keyword on unused exports (and prunes names from
-re-export lists), removes unused manifest dependencies, **declares** phantom
-dependencies with the version the lockfile already resolves, and deletes stale
-`ovecc-ignore` comments. All format-preserving and JSON-validated. **Dry-run
-by default**; every edit re-verifies the file against the index and skips
-stale entries with a reason. Anything needing judgement (default exports,
-architectural smells) is never touched.
+Applies the mechanical fixes for auto-fixable findings: drops the `export`
+keyword on unused exports (and prunes names from re-export lists), removes
+unused manifest dependencies, **declares** phantom dependencies with the version
+the lockfile already resolves, and deletes stale `ovecc-ignore` comments. All
+format-preserving and JSON-validated. **Dry-run by default**; every edit
+re-verifies the file against the index and skips stale entries with a reason.
+Anything needing judgement (default exports, architectural smells) is never
+touched.
+
+Unreachable files are reported but not removed unless `--delete-files` is
+passed. Reachability sees import edges, and a file a CI step runs, a task runner
+invokes, or another file names in a string has none: on hono, `--apply` used to
+delete two scripts a workflow executes. Every other fix edits a line and is read
+back against the index; a deletion cannot be checked that way, so it asks.
 
 ```
 Fix plan: 5 change(s), 0 skipped — dry-run (pass --apply to write)

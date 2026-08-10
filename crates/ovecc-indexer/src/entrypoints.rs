@@ -2,6 +2,7 @@
 //! conventions, Cargo targets, and test/standalone files.
 
 use crate::manifests::{find_cargo_crate_roots, find_package_manifests};
+use ignore::WalkBuilder;
 use ovecc_core::legacy::FileRecord;
 use std::collections::HashSet;
 use std::path::Path;
@@ -16,6 +17,9 @@ use std::path::Path;
 ///   `bin` to indexed source — each relative to its own package directory;
 /// - **framework entry files** the runtime loads rather than `import`s (Next.js
 ///   `app`/`pages` routes, `middleware`);
+/// - **files a command line runs** — `package.json` scripts and the `.github`
+///   workflows and composite actions, where a script is named by path and
+///   nothing ever imports it;
 /// - **Cargo crate roots** — every crate's `src/main.rs`, `src/bin/*.rs`,
 ///   `build.rs` (invoked by Cargo, nothing imports them) and `src/lib.rs`:
 ///   cross-crate `use` edges resolve *through* the crate root straight to the
@@ -32,6 +36,7 @@ pub(crate) fn detect_entry_points(root: &Path, files: &[FileRecord]) -> HashSet<
     let file_paths: HashSet<&str> = files.iter().map(|file| file.path.as_str()).collect();
 
     collect_manifest_entries(root, &file_paths, &mut entries);
+    collect_command_entries(root, &file_paths, &mut entries);
     collect_cargo_entries(root, files, &file_paths, &mut entries);
     for file in files {
         if is_default_entry(&file.path)
@@ -58,6 +63,85 @@ fn collect_manifest_entries(
             }
         }
     }
+}
+
+/// Files a command line runs: `package.json` scripts, and the workflows and
+/// composite actions under `.github`. `bun perf/scripts/check-size.ts` leaves no
+/// import edge and no manifest entry, so reachability sees an orphan and `fix
+/// --apply` deletes a file CI executes. A command names its script by path, so
+/// the tokens that look like one are resolved against the index: exactly, then
+/// by a `dir/file` suffix, since a step with a `working-directory` writes the
+/// path relative to it. Requiring a directory component keeps a bare `index.ts`
+/// in a command from crediting every `index.ts` in the tree.
+fn collect_command_entries(root: &Path, file_paths: &HashSet<&str>, entries: &mut HashSet<String>) {
+    let mut commands: Vec<String> = Vec::new();
+    for (_, manifest) in find_package_manifests(root) {
+        if let Some(scripts) = manifest
+            .get("scripts")
+            .and_then(serde_json::Value::as_object)
+        {
+            commands.extend(
+                scripts
+                    .values()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(str::to_string),
+            );
+        }
+    }
+    for directory in [".github/workflows", ".github/actions"] {
+        collect_yaml_text(&root.join(directory), &mut commands);
+    }
+
+    for command in &commands {
+        for token in command.split(|c: char| c.is_whitespace() || "\"'`(),;:=".contains(c)) {
+            let token = token.trim_start_matches("./");
+            if token.len() < 3 || !has_source_extension(token) {
+                continue;
+            }
+            if let Some(path) = file_paths.get(token) {
+                entries.insert((*path).to_string());
+                continue;
+            }
+            if let Some(&path) = file_paths
+                .iter()
+                .find(|path| path.ends_with(token) && token.contains('/'))
+            {
+                entries.insert(path.to_string());
+            }
+        }
+    }
+}
+
+/// Every YAML file under `directory`, read as raw text: a workflow's `run:`
+/// blocks are what we are after, and parsing the schema to reach them would buy
+/// nothing a token scan does not already give.
+fn collect_yaml_text(directory: &Path, out: &mut Vec<String>) {
+    let mut builder = WalkBuilder::new(directory);
+    builder.hidden(false).git_ignore(false).max_depth(Some(4));
+    for entry in builder.build().flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        if !matches!(
+            path.extension().and_then(|e| e.to_str()),
+            Some("yml") | Some("yaml")
+        ) {
+            continue;
+        }
+        if let Ok(text) = std::fs::read_to_string(path) {
+            out.push(text);
+        }
+    }
+}
+
+fn has_source_extension(token: &str) -> bool {
+    matches!(
+        token.rsplit_once('.').map(|(_, ext)| ext),
+        Some(
+            "ts" | "tsx" | "js" | "jsx" | "mjs" | "cjs" | "mts" | "cts" | "py" | "rb" | "go" | "rs"
+        )
+    )
 }
 
 /// Cargo crate roots: `main.rs`/`lib.rs`, a `build.rs`, and every `src/bin/*.rs`.

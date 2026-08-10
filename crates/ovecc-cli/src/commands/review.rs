@@ -157,17 +157,41 @@ pub(crate) fn build_review_report(
 
     let head_modules = store.current_modules(&repository_id)?;
     let head_dependencies = store.current_dependencies(&repository_id)?;
-    let base_cycles: std::collections::HashSet<Vec<String>> = graph::cycles::module_cycles(
-        &store.snapshot_module_names(&base_snapshot.id)?,
-        &store.snapshot_module_edges(&base_snapshot.id)?,
-    )
-    .into_iter()
-    .collect();
+    // A loop is new when the change added one of its edges, tested edge by edge
+    // against the base. Differencing the enumerated cycle *sets* cannot answer
+    // that: enumeration is capped at `MAX_CYCLES_PER_SCC`, so a component over
+    // the cap yields a different truncation of the same loops on either side and
+    // untouched cycles read as new — enough to fail the gate on a change that
+    // added nothing. It also sidesteps the base being unfilterable: snapshots
+    // record no `dependency_kind`, so their edges cannot drop `import type` the
+    // way the head graph does, and the two enumerations never saw one graph.
+    let base_edges: std::collections::HashSet<(String, String)> = store
+        .snapshot_module_edges(&base_snapshot.id)?
+        .into_iter()
+        .collect();
+    let touched: std::collections::HashSet<&str> =
+        changed_files.touched().map(String::as_str).collect();
+    // Witnesses are drawn through a touched file where the loop passes one: the
+    // author can only delete the import their change added, and a report citing
+    // three untouched files leaves them nothing to act on.
     let new_cycles: Vec<graph::cycles::CycleWitness> =
-        graph::cycles::elementary_cycles_with_witness(&head_modules, &head_dependencies)
-            .into_iter()
-            .filter(|cycle| !base_cycles.contains(&cycle.modules))
-            .collect();
+        graph::cycles::elementary_cycles_with_witness_preferring(
+            &head_modules,
+            &head_dependencies,
+            &touched,
+        )
+        .into_iter()
+        .filter(|cycle| {
+            let len = cycle.modules.len();
+            (0..len).any(|i| {
+                let edge = (
+                    cycle.modules[i].clone(),
+                    cycle.modules[(i + 1) % len].clone(),
+                );
+                !base_edges.contains(&edge)
+            })
+        })
+        .collect();
 
     // Duplication is scanned repo-wide (that is how a new block is matched
     // against an existing utility) but only families the change plausibly
@@ -175,8 +199,6 @@ pub(crate) fn build_review_report(
     // touched when git attests the lines, or merely sit in a touched file when
     // it cannot. So pre-existing clones elsewhere in an edited file do not
     // drown out what THIS change added.
-    let touched: std::collections::HashSet<&str> =
-        changed_files.touched().map(String::as_str).collect();
     let new_duplications: Vec<graph::dupes::CloneFamily> = if touched.is_empty() {
         Vec::new()
     } else {
