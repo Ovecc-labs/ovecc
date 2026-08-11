@@ -7,6 +7,8 @@ changes).
 
 ## [Unreleased]
 
+## [0.2.5] - 2026-08-12
+
 ### Fixed
 
 - `import type` no longer inflates the persisted `circular_dependencies` metric.
