@@ -81,16 +81,18 @@ fn case_findings(case: &Path, spec: &CaseSpec) -> (tempfile::TempDir, Vec<serde_
     let indexed = ovecc(&repo, &["index"]);
     assert!(
         indexed.status.success(),
-        "index failed for {}: {}",
+        "index failed for {} ({}): {}",
         case.display(),
+        indexed.status,
         String::from_utf8_lossy(&indexed.stderr)
     );
     let out = ovecc(&repo, &[spec.command.as_str(), "--format", "json"]);
     assert!(
         out.status.success(),
-        "{} failed for {}: {}",
+        "{} failed for {} ({}): {}",
         spec.command,
         case.display(),
+        out.status,
         String::from_utf8_lossy(&out.stderr)
     );
     let envelope: serde_json::Value =
