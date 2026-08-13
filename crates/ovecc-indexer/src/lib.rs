@@ -287,6 +287,14 @@ pub fn index_repository(
     phase(&mut timings.persist_ms);
     timings.total_ms = run_start.elapsed().as_millis() as u64;
 
+    let mut parse_error_paths: Vec<String> = parsed
+        .file_facts
+        .iter()
+        .filter(|(_, facts)| facts.parse_errors)
+        .map(|(path, _)| path.clone())
+        .collect();
+    parse_error_paths.sort();
+
     Ok(IndexReport {
         repository_root: paths.root_display(),
         database_path: ovecc_core::util::normalize_path(&paths.db_path),
@@ -303,11 +311,11 @@ pub fn index_repository(
         apis: resolved.apis.len(),
         tables: resolved.schema_objects.len(),
         commits_ingested,
-        files_with_parse_errors: parsed
-            .file_facts
-            .values()
-            .filter(|facts| facts.parse_errors)
-            .count(),
+        files_with_parse_errors: parse_error_paths.len(),
+        parse_error_files: parse_error_paths
+            .into_iter()
+            .take(ovecc_core::legacy::MAX_LISTED_PARSE_ERROR_FILES)
+            .collect(),
         parse_failures: parsed.parse_failures,
         coverage: coverage.map(|(ingest, _)| ingest),
         timings,
