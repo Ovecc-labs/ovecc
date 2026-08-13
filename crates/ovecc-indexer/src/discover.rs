@@ -208,6 +208,65 @@ pub(crate) fn language_for_path(path: &Path) -> Option<SourceLanguage> {
 /// `src/billing/...` is `billing`, not `src`.
 const MODULE_CONTAINERS: &[&str] = &["src", "app", "packages", "apps", "services", "crates"];
 
+/// The module depth this layout needs, when the default of 1 would collapse it.
+///
+/// Depth 1 names a module after the first directory below the repository root,
+/// which is right for `src/billing/...` and wrong for `backend/` + `frontend/`:
+/// there, every file lands in one of two modules, no module imports another,
+/// and cycles, boundary violations and coupling density all read 0 for want of
+/// edges. The signal for that layout is two or more top-level directories that
+/// hold source and are not themselves module containers. Returns `None` when
+/// depth 1 already separates the code.
+pub fn suggest_module_depth(root: &Path) -> Option<usize> {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return None;
+    };
+    let mut source_dirs = 0usize;
+    for entry in entries.flatten() {
+        if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.starts_with('.') || is_excluded_component(&name) {
+            continue;
+        }
+        if MODULE_CONTAINERS.contains(&name.as_str()) {
+            // `src/`, `packages/` and friends are already stepped over when a
+            // module is named, so depth 1 reaches the right level under them.
+            return None;
+        }
+        if contains_source(&entry.path(), 3) {
+            source_dirs += 1;
+        }
+    }
+    (source_dirs >= 2).then_some(2)
+}
+
+/// Whether a directory holds any source file within `depth` levels. Bounded so
+/// the check stays a handful of `read_dir` calls on a large repository.
+fn contains_source(dir: &Path, depth: usize) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    let mut subdirectories = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().to_string();
+        if is_excluded_component(&name) {
+            continue;
+        }
+        match entry.file_type() {
+            Ok(kind) if kind.is_dir() => subdirectories.push(path),
+            Ok(_) if language_for_path(&path).is_some() => return true,
+            _ => {}
+        }
+    }
+    depth > 1
+        && subdirectories
+            .iter()
+            .any(|child| contains_source(child, depth - 1))
+}
+
 /// The explicit `[[architecture.modules]]` mapping that governs `relative`, when
 /// the `configured`/`hybrid` strategy is active. The longest matching
 /// `path_prefix` wins so the most specific rule applies; ties break on name for

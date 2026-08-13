@@ -30,6 +30,14 @@ const INIT_CONFIG_TEMPLATE: &str = r#"# ovecc configuration - every key is optio
 # config-only usages cause false positives).
 # detect_unused_deps = true
 
+[architecture]
+# How many directory levels below the repository root name a module. 1 makes
+# `backend/services/pay.js` part of `backend`; 2 makes it `backend/services`.
+# Too shallow and every file lands in a handful of modules that never import
+# each other, so cycles, boundary violations and coupling density all read 0 for
+# want of edges. `ovecc summary` says so when it detects that shape.
+# module_depth = 1
+
 # --- governance: declarative architecture rules, enforced at index time ---
 # [[rules.boundaries]]
 # name = "billing must not depend on user"
@@ -49,6 +57,17 @@ const INIT_CONFIG_TEMPLATE: &str = r#"# ovecc configuration - every key is optio
 # min_confidence = 0.5
 "#;
 
+/// The template, with `module_depth` uncommented at the detected value when the
+/// repository's layout needs one other than the default.
+fn config_template(module_depth: Option<usize>) -> String {
+    match module_depth {
+        None => INIT_CONFIG_TEMPLATE.to_string(),
+        Some(depth) => {
+            INIT_CONFIG_TEMPLATE.replace("# module_depth = 1", &format!("module_depth = {depth}"))
+        }
+    }
+}
+
 pub(crate) fn run_init(paths: &ProjectPaths, force: bool) -> Result<u8> {
     let config_path = paths.ovecc_dir.join("config.toml");
     if config_path.exists() && !force {
@@ -58,8 +77,16 @@ pub(crate) fn run_init(paths: &ProjectPaths, force: bool) -> Result<u8> {
         );
     } else {
         std::fs::create_dir_all(&paths.ovecc_dir)?;
-        std::fs::write(&config_path, INIT_CONFIG_TEMPLATE)?;
+        let depth = ovecc_indexer::suggest_module_depth(&paths.root);
+        std::fs::write(&config_path, config_template(depth))?;
         println!("Wrote {}", config_path.display());
+        if let Some(depth) = depth {
+            println!(
+                "Set module_depth = {depth}: the code sits under several top-level \
+                 directories, and the default of 1 would make each of them a single \
+                 module with no dependencies between them."
+            );
+        }
     }
 
     match wire_gitignore(&paths.root)? {
@@ -161,6 +188,22 @@ pub(crate) fn wire_gitignore_for_index(paths: &ProjectPaths) -> Result<Option<&'
         return Ok(None);
     }
     Ok(wire_gitignore(&paths.root)?.change())
+}
+
+/// Warns when the default module depth collapses this layout, for the user who
+/// went straight to `ovecc index` and so has no config file to read the option
+/// off. Silent once a config exists: the value is then a choice, not a default.
+pub(crate) fn module_depth_hint(paths: &ProjectPaths, configured_depth: usize) -> Option<String> {
+    if configured_depth != 1 || paths.ovecc_dir.join("config.toml").exists() {
+        return None;
+    }
+    let depth = ovecc_indexer::suggest_module_depth(&paths.root)?;
+    Some(format!(
+        "The code sits under several top-level directories, so at the default depth each \
+         of them is one module and no module imports another: cycles, boundary violations \
+         and coupling density will read 0. Run `ovecc init` to write a config with \
+         module_depth = {depth}, or set it by hand under [architecture]."
+    ))
 }
 
 /// What the coverage step did, or `None` when no tracefile was configured and

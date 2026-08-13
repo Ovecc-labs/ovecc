@@ -25,6 +25,12 @@ Sets up a repository: writes a fully commented `.ovecc/config.toml` (every
 value shown is the default), adds `.ovecc/` to `.gitignore`, and prints the
 first commands to run. Idempotent; `--force` overwrites the config.
 
+When the code sits under several top-level directories (`backend/` +
+`frontend/` rather than a single `src/`), `init` writes `module_depth = 2`
+instead of the default and says why: at depth 1 each of those directories is
+one module, no module imports another, and cycles, boundary violations and
+coupling density all read 0 for want of edges.
+
 `--agent` also wires the repository's coding agent (Claude Code hooks in
 `.claude/settings.json`) to query the graph before a broad text search: the
 block fails open the moment ovecc cannot answer, so the agent is never
@@ -43,7 +49,8 @@ Files: 52   Modules: 13   Dependencies: 264   Commits ingested: 99
 ```
 
 Running `index` on a repository that was never `init`ed writes the `.ovecc/`
-ignore rule itself, so the database cannot be committed by accident.
+ignore rule itself, so the database cannot be committed by accident, and warns
+when the default module depth would collapse the layout.
 
 Key flags: `--exclude <glob>` (adds to the built-in `node_modules`/`target`/…
 excludes), `--no-git`, `--stats` (phase timings + peak memory).
