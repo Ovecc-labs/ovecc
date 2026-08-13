@@ -147,6 +147,24 @@ jobs:
       - name: Build (release)
         run: cargo build --release --bin ovecc
 
+      # A `cargo:rustc-link-lib=dylib=stdc++` from a build script lands after
+      # rustc's own -Wl,-Bdynamic, so it wins over the static linking in
+      # .cargo/config.toml and the exe starts importing libstdc++-6.dll. Every
+      # machine that can build this has the DLL, so the build and the tests stay
+      # green and only a user without MSYS2 finds out, with no error message
+      # because the loader fails before main. libduckdb-sys 1.10505.0 shipped
+      # exactly that.
+      - name: Check the binary is self-contained (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          imports=$(objdump -p target/release/ovecc.exe | grep "DLL Name" | sort -u)
+          echo "$imports"
+          if echo "$imports" | grep -qiE "libstdc\+\+|libgcc_s|libwinpthread"; then
+            echo "::error::ovecc.exe imports a MinGW runtime DLL and will not start without MSYS2"
+            exit 1
+          fi
+
       - name: Test (release)
         run: cargo xtask test --release
 
