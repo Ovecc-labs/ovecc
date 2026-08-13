@@ -42,6 +42,9 @@ differential sync). Everything below reads this model.
 Files: 52   Modules: 13   Dependencies: 264   Commits ingested: 99
 ```
 
+Running `index` on a repository that was never `init`ed writes the `.ovecc/`
+ignore rule itself, so the database cannot be committed by accident.
+
 Key flags: `--exclude <glob>` (adds to the built-in `node_modules`/`target`/…
 excludes), `--no-git`, `--stats` (phase timings + peak memory).
 

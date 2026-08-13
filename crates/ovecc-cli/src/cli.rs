@@ -686,8 +686,14 @@ fn run_command(cli: Cli) -> Result<u8> {
                 ..Default::default()
             };
             let config = OveccConfig::load(&paths.root, &overrides)?;
+            let ignore_wired = crate::commands::index::wire_gitignore_for_index(&paths)?;
             let report = index_repository(&paths, &config, no_git)?;
             render_index_report(&report, config.output.default_format)?;
+            if config.output.default_format == OutputFormat::Text
+                && let Some(message) = ignore_wired
+            {
+                println!("{message}");
+            }
             if stats {
                 render_index_timings(&report.timings);
             }

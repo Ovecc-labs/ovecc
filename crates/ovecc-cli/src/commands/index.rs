@@ -62,7 +62,14 @@ pub(crate) fn run_init(paths: &ProjectPaths, force: bool) -> Result<u8> {
         println!("Wrote {}", config_path.display());
     }
 
-    wire_gitignore(&paths.root)?;
+    match wire_gitignore(&paths.root)? {
+        GitignoreOutcome::AlreadyCovered => println!(".gitignore already covers .ovecc/"),
+        other => {
+            if let Some(message) = other.change() {
+                println!("{message}");
+            }
+        }
+    }
 
     println!();
     println!("Next steps:");
@@ -84,18 +91,42 @@ const OVECC_IGNORE_BLOCK: &str = "# ovecc local state (database + parse cache); 
      !.ovecc/architecture.toml\n\
      !.ovecc/architecture/\n";
 
+/// What [`wire_gitignore`] did, so `init` can confirm a no-op while `index`
+/// stays quiet about one.
+pub(crate) enum GitignoreOutcome {
+    NotAGitRepository,
+    AlreadyCovered,
+    Upgraded,
+    Added,
+}
+
+impl GitignoreOutcome {
+    /// The line to print, or `None` when nothing changed.
+    fn change(&self) -> Option<&'static str> {
+        match self {
+            Self::NotAGitRepository | Self::AlreadyCovered => None,
+            Self::Upgraded => Some(
+                "Upgraded the .ovecc/ ignore to keep .ovecc/architecture.toml and its \
+                 baseline trackable",
+            ),
+            Self::Added => {
+                Some("Added .ovecc/* to .gitignore (contract and baseline stay trackable)")
+            }
+        }
+    }
+}
+
 /// Git-ignores the local `.ovecc/` state while keeping the architecture
 /// contract trackable. An ovecc-written blanket `.ovecc/` line from an
 /// earlier version is upgraded in place; a granular block is left alone.
-pub(crate) fn wire_gitignore(root: &Path) -> Result<u8> {
+pub(crate) fn wire_gitignore(root: &Path) -> Result<GitignoreOutcome> {
     if !root.join(".git").exists() {
-        return Ok(0);
+        return Ok(GitignoreOutcome::NotAGitRepository);
     }
     let gitignore = root.join(".gitignore");
     let current = std::fs::read_to_string(&gitignore).unwrap_or_default();
     if current.lines().any(|line| line.trim() == ".ovecc/*") {
-        println!(".gitignore already covers .ovecc/");
-        return Ok(0);
+        return Ok(GitignoreOutcome::AlreadyCovered);
     }
     let blanket = |line: &str| matches!(line.trim(), ".ovecc" | ".ovecc/" | "/.ovecc" | "/.ovecc/");
     if current.lines().any(blanket) {
@@ -110,11 +141,7 @@ pub(crate) fn wire_gitignore(root: &Path) -> Result<u8> {
             })
             .collect();
         std::fs::write(&gitignore, updated.join("\n") + "\n")?;
-        println!(
-            "Upgraded the .ovecc/ ignore to keep .ovecc/architecture.toml and its \
-             baseline trackable"
-        );
-        return Ok(0);
+        return Ok(GitignoreOutcome::Upgraded);
     }
     let mut updated = current;
     if !updated.is_empty() && !updated.ends_with('\n') {
@@ -122,8 +149,18 @@ pub(crate) fn wire_gitignore(root: &Path) -> Result<u8> {
     }
     updated.push_str(OVECC_IGNORE_BLOCK);
     std::fs::write(&gitignore, updated)?;
-    println!("Added .ovecc/* to .gitignore (contract and baseline stay trackable)");
-    Ok(0)
+    Ok(GitignoreOutcome::Added)
+}
+
+/// `ovecc index` on a repository that was never `init`ed used to leave a
+/// multi-megabyte `.ovecc/` untracked in someone else's `git status`, with
+/// nothing to stop it being committed. Indexing writes the ignore rule itself
+/// when it is the one creating the directory.
+pub(crate) fn wire_gitignore_for_index(paths: &ProjectPaths) -> Result<Option<&'static str>> {
+    if paths.ovecc_dir.exists() {
+        return Ok(None);
+    }
+    Ok(wire_gitignore(&paths.root)?.change())
 }
 
 /// What the coverage step did, or `None` when no tracefile was configured and
