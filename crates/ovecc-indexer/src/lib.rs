@@ -8,6 +8,7 @@ mod hygiene;
 mod imports;
 mod manifests;
 pub mod resolve;
+mod tracked_secrets;
 
 pub use discover::{is_excluded_component, suggest_module_depth};
 pub use manifests::manifest_component_roots;
@@ -240,6 +241,10 @@ pub fn index_repository(
         &mut metrics,
     ));
     findings.extend(smell_findings(&input, &mut metrics));
+    let tracked_scan =
+        tracked_secrets::scan(&paths.root, &repository_id, &snapshot_id, &indexed_paths);
+    let tracked_files_scanned = tracked_scan.files_scanned;
+    findings.extend(tracked_scan.findings);
     downrank_test_security(&mut findings, &security_patterns);
     downrank_test_complexity(&mut findings);
     apply_suppressions(&mut findings, &input, &mut metrics);
@@ -316,6 +321,7 @@ pub fn index_repository(
             .into_iter()
             .take(ovecc_core::legacy::MAX_LISTED_PARSE_ERROR_FILES)
             .collect(),
+        tracked_files_scanned,
         parse_failures: parsed.parse_failures,
         coverage: coverage.map(|(ingest, _)| ingest),
         timings,

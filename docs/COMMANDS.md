@@ -530,6 +530,14 @@ inline arrow handlers, with `file:line` evidence for the sink and the route).
 Deterministic, offline, no LLM. Findings in test code (test dirs *and* Rust
 inline `#[cfg(test)]`) are down-ranked to Low, not hidden.
 
+Secrets are scanned over a wider set than the rest of ovecc: the indexed
+sources **plus every file Git tracks**. The source walk respects `.gitignore`,
+which is right for architecture and wrong for credentials, because the usual
+way a secret reaches a whole team is a `.env` committed before someone added it
+to `.gitignore` — it stays in every clone while every ignore-aware scanner skips
+it. Documentation and example paths are excluded from that second pass: they
+exist to show what a credential looks like.
+
 ```
 Security findings: 15    secrets 8, insecure 7, tainted-flows 0
 [Low] Hardcoded secret: AWS access key — crates/ovecc-parser/src/security.rs:302

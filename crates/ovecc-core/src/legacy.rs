@@ -201,6 +201,11 @@ pub struct IndexReport {
     /// [`MAX_LISTED_PARSE_ERROR_FILES`]; the count above stays exact.
     #[serde(default)]
     pub parse_error_files: Vec<String>,
+    /// Git-tracked files outside the source walk that were read for secrets:
+    /// a `.env` committed before it was git-ignored is invisible to every
+    /// ignore-aware scan, and is where a leaked credential usually lives.
+    #[serde(default)]
+    pub tracked_files_scanned: usize,
     /// Per-file failures that did not abort the run.
     pub parse_failures: Vec<IndexFailure>,
     /// The coverage tracefile this run read, if any was configured or found.

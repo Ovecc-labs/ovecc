@@ -398,6 +398,26 @@ fn changed_files(
         .collect()
 }
 
+/// Every path in the Git index, repository-relative with forward slashes.
+///
+/// This is the set a `.gitignore`-aware walk cannot see on its own: a file
+/// committed before someone added it to `.gitignore` stays tracked and keeps
+/// shipping to everyone who clones, while every ignore-respecting tool skips
+/// it. Returns an empty list outside a Git working tree.
+pub fn tracked_files(root: &std::path::Path) -> Vec<String> {
+    let Ok(repo) = gix::discover(root) else {
+        return Vec::new();
+    };
+    let Ok(index) = repo.index_or_empty() else {
+        return Vec::new();
+    };
+    index
+        .entries()
+        .iter()
+        .map(|entry| entry.path(&index).to_string())
+        .collect()
+}
+
 fn now_seconds() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

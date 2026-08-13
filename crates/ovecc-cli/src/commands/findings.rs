@@ -339,7 +339,7 @@ pub(crate) fn render_security(report: &SecurityReport, format: OutputFormat) -> 
         }
         OutputFormat::Text => {
             println!(
-                "Security findings: {} (scanned the indexed repository)",
+                "Security findings: {} (indexed sources plus every file Git tracks)",
                 report.total
             );
             println!(

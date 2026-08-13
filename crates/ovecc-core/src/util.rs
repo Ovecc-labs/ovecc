@@ -48,14 +48,18 @@ pub fn relative_path(root: &Path, path: &Path) -> Result<String> {
 /// True for paths under a conventional test directory or with a test-file
 /// naming pattern (`.test.`, `.spec.`, `_test.go`, `test_*.py`, …).
 pub fn is_test_path(path: &str) -> bool {
-    const TEST_DIRS: [&str; 7] = [
+    // `testdata/` is the Go convention and the Go toolchain itself skips it;
+    // `__fixtures__/` is the JS sibling of `__tests__/` and `__mocks__/`.
+    const TEST_DIRS: [&str; 9] = [
         "__tests__/",
         "__mocks__/",
+        "__fixtures__/",
         "test-d/",
         "type-tests/",
         "type-test/",
         "tests/",
         "test/",
+        "testdata/",
     ];
     if TEST_DIRS
         .iter()
