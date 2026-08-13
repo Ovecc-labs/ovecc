@@ -219,6 +219,120 @@ fn coverage_line(report: &IndexReport) -> Option<String> {
     })
 }
 
+/// The syntax-error paths, plus a tail line when the count exceeds what the
+/// report carries. A bare count is not actionable: the answer to "which file?"
+/// has to be in the same output.
+fn parse_error_file_lines(report: &IndexReport) -> Vec<String> {
+    let mut lines: Vec<String> = report.parse_error_files.clone();
+    let remaining = report
+        .files_with_parse_errors
+        .saturating_sub(report.parse_error_files.len());
+    if remaining > 0 {
+        lines.push(format!("... and {remaining} more"));
+    }
+    lines
+}
+
+/// The counters shared by the text and markdown renderings, in print order.
+fn counters(report: &IndexReport) -> Vec<(&'static str, String)> {
+    let mut rows = vec![
+        ("Files scanned", report.files_scanned.to_string()),
+        ("Files indexed", report.files_indexed.to_string()),
+        ("Files parsed", report.files_parsed.to_string()),
+        ("Files from cache", report.files_from_cache.to_string()),
+        ("Modules", report.modules.to_string()),
+        ("Dependencies", report.dependencies.to_string()),
+        (
+            "External dependencies",
+            report.external_dependencies.to_string(),
+        ),
+        ("Symbols", report.symbols.to_string()),
+        ("Calls", report.calls.to_string()),
+        ("APIs", report.apis.to_string()),
+        ("Tables", report.tables.to_string()),
+        ("Commits ingested", report.commits_ingested.to_string()),
+    ];
+    if report.tracked_files_scanned > 0 {
+        rows.push((
+            "Tracked non-source files scanned for secrets",
+            report.tracked_files_scanned.to_string(),
+        ));
+    }
+    rows
+}
+
+fn render_markdown(report: &IndexReport) {
+    println!("# Ovecc index");
+    println!();
+    println!("- Repository: `{}`", report.repository_root);
+    println!("- Snapshot: `{}`", report.snapshot_id);
+    for (label, value) in counters(report) {
+        println!("- {label}: {value}");
+    }
+    if let Some(line) = coverage_line(report) {
+        println!("- {line}");
+    }
+    if report.files_with_parse_errors > 0 {
+        println!(
+            "- Files with syntax errors: {} (facts may be partial)",
+            report.files_with_parse_errors
+        );
+        for line in parse_error_file_lines(report) {
+            println!("  - {line}");
+        }
+    }
+    if !report.parse_failures.is_empty() {
+        println!();
+        println!("## Parse failures");
+        println!();
+        for failure in &report.parse_failures {
+            println!("- `{}`: {}", failure.path, failure.message);
+        }
+    }
+}
+
+fn render_text(report: &IndexReport) {
+    // A clean run from cache changed nothing worth fifteen lines: one
+    // line says "stop re-indexing" to a human and an agent alike.
+    if report.files_parsed == 0 && report.parse_failures.is_empty() {
+        println!(
+            "Index up to date: {} files ({} from cache), snapshot {}.",
+            report.files_indexed, report.files_from_cache, report.snapshot_id
+        );
+        // Coverage is read on every run, unchanged tree or not, so a
+        // tracefile that broke since last time has to say so here too.
+        if let Some(line) = coverage_line(report) {
+            println!("{line}");
+        }
+        return;
+    }
+    println!("Indexed repository: {}", report.repository_root);
+    println!("Database: {}", report.database_path);
+    println!("Snapshot: {}", report.snapshot_id);
+    for (label, value) in counters(report) {
+        println!("{label}: {value}");
+    }
+    if let Some(line) = coverage_line(report) {
+        println!("{line}");
+    }
+    if report.files_with_parse_errors > 0 {
+        println!(
+            "Files with syntax errors: {} (facts may be partial)",
+            report.files_with_parse_errors
+        );
+        for line in parse_error_file_lines(report) {
+            println!("  {line}");
+        }
+    }
+    if !report.parse_failures.is_empty() {
+        println!();
+        println!("Parse failures: {}", report.parse_failures.len());
+        for failure in &report.parse_failures {
+            println!("  {}: {}", failure.path, failure.message);
+        }
+    }
+}
+
 pub(crate) fn render_index_report(report: &IndexReport, format: OutputFormat) -> Result<()> {
     match format {
         OutputFormat::Json | OutputFormat::Sarif | OutputFormat::Codeclimate => {
@@ -228,88 +342,8 @@ pub(crate) fn render_index_report(report: &IndexReport, format: OutputFormat) ->
             emit_ndjson_meta("index", &meta_for("index"))?;
             println!("{}", ndjson_line("index", report)?);
         }
-        OutputFormat::Markdown => {
-            println!("# Ovecc index");
-            println!();
-            println!("- Repository: `{}`", report.repository_root);
-            println!("- Snapshot: `{}`", report.snapshot_id);
-            println!("- Files scanned: {}", report.files_scanned);
-            println!("- Files indexed: {}", report.files_indexed);
-            println!("- Files parsed: {}", report.files_parsed);
-            println!("- Files from cache: {}", report.files_from_cache);
-            println!("- Modules: {}", report.modules);
-            println!("- Dependencies: {}", report.dependencies);
-            println!("- External dependencies: {}", report.external_dependencies);
-            println!("- Symbols: {}", report.symbols);
-            println!("- Calls: {}", report.calls);
-            println!("- APIs: {}", report.apis);
-            println!("- Tables: {}", report.tables);
-            println!("- Commits ingested: {}", report.commits_ingested);
-            if let Some(line) = coverage_line(report) {
-                println!("- {line}");
-            }
-            if report.files_with_parse_errors > 0 {
-                println!(
-                    "- Files with syntax errors: {} (facts may be partial)",
-                    report.files_with_parse_errors
-                );
-            }
-            if !report.parse_failures.is_empty() {
-                println!();
-                println!("## Parse failures");
-                println!();
-                for failure in &report.parse_failures {
-                    println!("- `{}`: {}", failure.path, failure.message);
-                }
-            }
-        }
-        OutputFormat::Text => {
-            // A clean run from cache changed nothing worth fifteen lines: one
-            // line says "stop re-indexing" to a human and an agent alike.
-            if report.files_parsed == 0 && report.parse_failures.is_empty() {
-                println!(
-                    "Index up to date: {} files ({} from cache), snapshot {}.",
-                    report.files_indexed, report.files_from_cache, report.snapshot_id
-                );
-                // Coverage is read on every run, unchanged tree or not, so a
-                // tracefile that broke since last time has to say so here too.
-                if let Some(line) = coverage_line(report) {
-                    println!("{line}");
-                }
-                return Ok(());
-            }
-            println!("Indexed repository: {}", report.repository_root);
-            println!("Database: {}", report.database_path);
-            println!("Snapshot: {}", report.snapshot_id);
-            println!("Files scanned: {}", report.files_scanned);
-            println!("Files indexed: {}", report.files_indexed);
-            println!("Files parsed: {}", report.files_parsed);
-            println!("Files from cache: {}", report.files_from_cache);
-            println!("Modules: {}", report.modules);
-            println!("Dependencies: {}", report.dependencies);
-            println!("External dependencies: {}", report.external_dependencies);
-            println!("Symbols: {}", report.symbols);
-            println!("Calls: {}", report.calls);
-            println!("APIs: {}", report.apis);
-            println!("Tables: {}", report.tables);
-            println!("Commits ingested: {}", report.commits_ingested);
-            if let Some(line) = coverage_line(report) {
-                println!("{line}");
-            }
-            if report.files_with_parse_errors > 0 {
-                println!(
-                    "Files with syntax errors: {} (facts may be partial)",
-                    report.files_with_parse_errors
-                );
-            }
-            if !report.parse_failures.is_empty() {
-                println!();
-                println!("Parse failures: {}", report.parse_failures.len());
-                for failure in &report.parse_failures {
-                    println!("  {}: {}", failure.path, failure.message);
-                }
-            }
-        }
+        OutputFormat::Markdown => render_markdown(report),
+        OutputFormat::Text => render_text(report),
     }
     Ok(())
 }
