@@ -261,26 +261,32 @@ fn counters(report: &IndexReport) -> Vec<(&'static str, String)> {
     rows
 }
 
+/// The counter block both renderers print. They differ only in how a line
+/// opens, so markdown passes its bullet and text passes nothing.
+fn render_counters(report: &IndexReport, bullet: &str) {
+    for (label, value) in counters(report) {
+        println!("{bullet}{label}: {value}");
+    }
+    if let Some(line) = coverage_line(report) {
+        println!("{bullet}{line}");
+    }
+    if report.files_with_parse_errors > 0 {
+        println!(
+            "{bullet}Files with syntax errors: {} (facts may be partial)",
+            report.files_with_parse_errors
+        );
+        for line in parse_error_file_lines(report) {
+            println!("  {bullet}{line}");
+        }
+    }
+}
+
 fn render_markdown(report: &IndexReport) {
     println!("# Ovecc index");
     println!();
     println!("- Repository: `{}`", report.repository_root);
     println!("- Snapshot: `{}`", report.snapshot_id);
-    for (label, value) in counters(report) {
-        println!("- {label}: {value}");
-    }
-    if let Some(line) = coverage_line(report) {
-        println!("- {line}");
-    }
-    if report.files_with_parse_errors > 0 {
-        println!(
-            "- Files with syntax errors: {} (facts may be partial)",
-            report.files_with_parse_errors
-        );
-        for line in parse_error_file_lines(report) {
-            println!("  - {line}");
-        }
-    }
+    render_counters(report, "- ");
     if !report.parse_failures.is_empty() {
         println!();
         println!("## Parse failures");
@@ -309,21 +315,7 @@ fn render_text(report: &IndexReport) {
     println!("Indexed repository: {}", report.repository_root);
     println!("Database: {}", report.database_path);
     println!("Snapshot: {}", report.snapshot_id);
-    for (label, value) in counters(report) {
-        println!("{label}: {value}");
-    }
-    if let Some(line) = coverage_line(report) {
-        println!("{line}");
-    }
-    if report.files_with_parse_errors > 0 {
-        println!(
-            "Files with syntax errors: {} (facts may be partial)",
-            report.files_with_parse_errors
-        );
-        for line in parse_error_file_lines(report) {
-            println!("  {line}");
-        }
-    }
+    render_counters(report, "");
     if !report.parse_failures.is_empty() {
         println!();
         println!("Parse failures: {}", report.parse_failures.len());
