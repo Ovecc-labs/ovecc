@@ -467,6 +467,33 @@ mod tests {
     }
 
     #[test]
+    fn no_single_depth_describes_a_grouped_monorepo() {
+        // A `packages/` that mixes flat packages with scoped grouping
+        // directories has no right depth. Depth 1 folds a whole scope into one
+        // module, so every package under it shares a name. Depth 2 splits the
+        // flat packages instead, since their own next segment is `src`. That is
+        // why `suggest_module_depth` stays silent once a container sits at the
+        // root.
+        let depth1 = ArchitectureConfig::default();
+        let depth2 = ArchitectureConfig {
+            module_depth: 2,
+            ..Default::default()
+        };
+        assert_eq!(
+            infer_module_name("packages/@scope/config/src/index.ts", &depth1),
+            "scope"
+        );
+        assert_eq!(
+            infer_module_name("packages/@scope/api-types/src/index.ts", &depth1),
+            "scope"
+        );
+        assert_eq!(
+            infer_module_name("packages/cli/src/commands/start.ts", &depth2),
+            "cli/src"
+        );
+    }
+
+    #[test]
     fn explicit_module_mapping_overrides_inference() {
         let arch = ArchitectureConfig {
             module_strategy: ModuleStrategy::Hybrid,
