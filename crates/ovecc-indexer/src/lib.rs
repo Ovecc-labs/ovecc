@@ -214,6 +214,9 @@ pub fn index_repository(
     // `min_coverage` check is one of the rules.
     let coverage = read_coverage(paths, config);
     let coverage_files = coverage.as_ref().map_or(&[][..], |(_, files)| files);
+    // Evidence a previous `runtime import` left behind. Empty when none ran,
+    // which the runtime rule reads as "nobody looked", never as "nothing ran".
+    let runtime_edges = store.runtime_edges(&repository_id)?;
     let architecture_input = contract
         .as_ref()
         .map(|contract| ovecc_rules::ContractInput {
@@ -226,6 +229,7 @@ pub fn index_repository(
             functions: &functions,
             co_changes: &co_changes,
             coverage: coverage_files,
+            runtime_edges: &runtime_edges,
         });
     let (mut findings, security_patterns) =
         evaluate_rules(&input, &config.rules, architecture_input);

@@ -399,6 +399,90 @@ const MIGRATION_V11_COVERAGE: &str = r#"
             CREATE INDEX IF NOT EXISTS idx_coverage_repo ON coverage (repository_id);
             "#;
 
+/// Runtime evidence from the last `runtime import`, replaced wholesale on
+/// every import that carries different bytes. One window at a time: a snapshot
+/// is a sampled, time-bounded observation, and keeping several would invite
+/// comparisons across windows nobody asked to compare.
+///
+/// Rows are inserted pre-sorted on the columns every read scans by, so the
+/// ordering determinism requires pays for itself as row-group skipping. The
+/// secondary index mirrors `idx_coverage_repo`: one deliberate index on the
+/// column pair every query filters on, and no more.
+const MIGRATION_V12_RUNTIME: &str = r#"
+            CREATE TABLE IF NOT EXISTS runtime_snapshots (
+                id TEXT PRIMARY KEY,
+                repository_id TEXT NOT NULL,
+                source_digest TEXT NOT NULL,
+                witness_mode TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                format TEXT NOT NULL,
+                query TEXT,
+                window_start_unix_nano BIGINT,
+                window_end_unix_nano BIGINT,
+                observations BIGINT NOT NULL,
+                attributed BIGINT NOT NULL,
+                attributed_by_path TEXT NOT NULL,
+                route_joins_exact BIGINT NOT NULL,
+                route_joins_mount_suffix BIGINT NOT NULL,
+                sampling_known BIGINT NOT NULL,
+                sampling_unknown BIGINT NOT NULL,
+                sampling_distinct_rates BIGINT NOT NULL,
+                sampling_modal_adjusted_count BIGINT,
+                imported_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_runtime_snapshots_repo
+                ON runtime_snapshots (repository_id);
+
+            CREATE TABLE IF NOT EXISTS runtime_points (
+                id TEXT PRIMARY KEY,
+                repository_id TEXT NOT NULL,
+                snapshot_id TEXT NOT NULL,
+                file_path TEXT NOT NULL,
+                symbol TEXT,
+                line INTEGER,
+                attribution_path TEXT NOT NULL,
+                calls BIGINT NOT NULL,
+                errors BIGINT NOT NULL,
+                estimated_calls BIGINT,
+                latency_p50_ns BIGINT,
+                latency_p95_ns BIGINT,
+                latency_p99_ns BIGINT
+            );
+            CREATE INDEX IF NOT EXISTS idx_runtime_points_repo
+                ON runtime_points (repository_id, snapshot_id);
+
+            CREATE TABLE IF NOT EXISTS runtime_edges (
+                id TEXT PRIMARY KEY,
+                repository_id TEXT NOT NULL,
+                snapshot_id TEXT NOT NULL,
+                from_kind TEXT NOT NULL,
+                from_name TEXT NOT NULL,
+                to_kind TEXT NOT NULL,
+                to_name TEXT NOT NULL,
+                edge_kind TEXT NOT NULL,
+                attribution_path TEXT NOT NULL,
+                calls BIGINT NOT NULL,
+                errors BIGINT NOT NULL,
+                estimated_calls BIGINT,
+                witnesses TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_runtime_edges_repo
+                ON runtime_edges (repository_id, snapshot_id);
+
+            CREATE TABLE IF NOT EXISTS runtime_unattributed (
+                id TEXT PRIMARY KEY,
+                repository_id TEXT NOT NULL,
+                snapshot_id TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                service TEXT,
+                route TEXT,
+                attribute_keys TEXT NOT NULL,
+                observations BIGINT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_runtime_unattributed_repo
+                ON runtime_unattributed (repository_id, snapshot_id);
+            "#;
+
 const SCHEMA_MIGRATIONS: &[SchemaMigration] = &[
     SchemaMigration {
         version: 1,
@@ -455,7 +539,17 @@ const SCHEMA_MIGRATIONS: &[SchemaMigration] = &[
         name: "coverage",
         sql: MIGRATION_V11_COVERAGE,
     },
+    SchemaMigration {
+        version: 12,
+        name: "runtime_evidence",
+        sql: MIGRATION_V12_RUNTIME,
+    },
 ];
+
+/// The version [`ArchitectureStore::migrate_to_latest`] reaches. Derived from
+/// the table so adding a migration updates one place, not every assertion that
+/// mentions the number.
+pub const LATEST_SCHEMA_VERSION: i64 = SCHEMA_MIGRATIONS[SCHEMA_MIGRATIONS.len() - 1].version;
 
 impl ArchitectureStore {
     /// Current schema version, or `None` for a database that predates the
@@ -535,8 +629,8 @@ mod tests {
 
         let version = store.migrate_to_latest().unwrap();
 
-        assert_eq!(version, 11);
-        assert_eq!(store.schema_version().unwrap(), Some(11));
+        assert_eq!(version, LATEST_SCHEMA_VERSION);
+        assert_eq!(store.schema_version().unwrap(), Some(LATEST_SCHEMA_VERSION));
         for table in [
             "repositories",
             "files",
@@ -563,6 +657,10 @@ mod tests {
             "capability_uses",
             "co_changes",
             "coverage",
+            "runtime_snapshots",
+            "runtime_points",
+            "runtime_edges",
+            "runtime_unattributed",
         ] {
             assert!(table_exists(&store, table), "missing table {table}");
         }
@@ -574,12 +672,15 @@ mod tests {
         store.migrate_to_latest().unwrap();
         store.migrate_to_latest().unwrap();
 
-        assert_eq!(store.schema_version().unwrap(), Some(11));
+        assert_eq!(store.schema_version().unwrap(), Some(LATEST_SCHEMA_VERSION));
         let applied: i64 = store
             .conn
             .query_row("SELECT count(*) FROM ovecc_schema", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(applied, 11, "each migration must be recorded exactly once");
+        assert_eq!(
+            applied, LATEST_SCHEMA_VERSION,
+            "each migration must be recorded exactly once"
+        );
     }
 
     #[test]
@@ -592,7 +693,7 @@ mod tests {
 
         let version = store.migrate_to_latest().unwrap();
 
-        assert_eq!(version, 11);
+        assert_eq!(version, LATEST_SCHEMA_VERSION);
         assert!(table_exists(&store, "findings"));
         assert!(table_exists(&store, "packages"));
         assert!(table_exists(&store, "complexity"));

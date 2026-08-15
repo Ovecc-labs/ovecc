@@ -347,6 +347,13 @@ fn argv_setup(name: &str, args: &Value) -> Argv {
         "ovecc_report" => argv.push("report".into()),
         "ovecc_health" => argv.push("health".into()),
         "ovecc_conventions" => argv.push("conventions".into()),
+        "ovecc_runtime" => {
+            argv.push("runtime".into());
+            if arg_flag(args, "unattributed") {
+                argv.push("--unattributed".into());
+            }
+            push_opt_u64(&mut argv, args, "limit", "--limit");
+        }
         _ => return Err(ArgvError::UnknownTool),
     }
     Ok(argv)
@@ -561,6 +568,7 @@ fn tool_specs() -> Value {
         {"name": "ovecc_dupes", "description": "Duplicated code (clone families) over a normalized token stream.", "inputSchema": obj(json!({"repo": repo, "min_tokens": {"type": "integer", "description": "Minimum shared token run to report (default 100, PMD CPD's)."}}), json!([]))},
         {"name": "ovecc_hotspots", "description": "Technical-debt hotspot ranking: churn x coupling x ownership, with each module's bug-fix history beside its score.", "inputSchema": obj(json!({"repo": repo, "limit": {"type": "integer", "description": "Number of hotspots to return (default 10)."}}), json!([]))},
         {"name": "ovecc_conventions", "description": "Learned repository conventions and their deviations.", "inputSchema": obj(json!({"repo": repo}), json!([]))},
+        {"name": "ovecc_runtime", "description": "The imported runtime evidence: the window it covers, how much of it attribution joined to the index and by which path, the busiest anchors, the calls observed between components, and the contract verdicts over them. Read it as one sampled, time-bounded window — it proves calls happened, never how many there are in general. Empty means nobody imported an export, not that nothing ran.", "inputSchema": obj(json!({"repo": repo, "unattributed": {"type": "boolean", "description": "Also list the span shapes attribution could not place, with the reason for each."}, "limit": {"type": "integer", "description": "Rows per section (default 20, 0 for all)."}}), json!([]))},
         {"name": "ovecc_drift", "description": "Architecture drift over time versus a previous snapshot or Git ref.", "inputSchema": obj(json!({"repo": repo, "since": {"type": "string", "description": "Git ref or snapshot to compare against, e.g. main or v1.0.0."}}), json!([]))},
         {"name": "ovecc_history", "description": "Trend one snapshot metric across every index run (values, deltas, sparkline). Without a metric, lists everything trendable.", "inputSchema": obj(json!({"repo": repo, "metric": {"type": "string", "description": "Metric to trend, e.g. coupling_density, high_complexity_functions."}, "limit": {"type": "integer", "description": "Most recent N snapshots to keep (default 20)."}}), json!([]))},
         {"name": "ovecc_init", "description": "Set up ovecc in a repository: write a commented .ovecc/config.toml, git-ignore the local state, and return the suggested first commands.", "inputSchema": obj(json!({"repo": repo, "force": {"type": "boolean", "description": "Overwrite an existing config."}}), json!([]))},

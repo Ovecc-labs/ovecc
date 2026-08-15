@@ -24,7 +24,7 @@ use ovecc_core::graph::NodeKind;
 use ovecc_core::id::{FindingId, RepositoryId, SnapshotId};
 use ovecc_core::legacy::DependencyRecord;
 
-use crate::{ContractInput, RuleInput, specifier_matches};
+use crate::{ContractInput, RuleInput, runtime, specifier_matches};
 
 // Grouped like boundary rules: one finding per offending pair, every
 // occurrence as evidence, so a hot edge does not flood the report.
@@ -94,15 +94,20 @@ pub(crate) fn contract_rules(input: &RuleInput<'_>) -> Vec<FindingRecord> {
     }
 
     let mut groups = classify_edges(input, architecture);
+    let mut observed_runtime = runtime::classify(architecture);
     // The baseline is accepted debt, not a verdict change: entries vanish
     // from the report in new-violations mode and only there — strict means
     // the whole debt gates again.
     if contract.mode == EnforcementMode::NewViolations && !architecture.baseline.is_empty() {
         groups = prune_baselined(groups, architecture.baseline);
+        observed_runtime = runtime::prune_baselined(observed_runtime, architecture.baseline);
     }
     let mut findings = pair_findings(input, &groups);
     if let Some(severity) = contract.coupling.severity() {
         findings.extend(coupling_findings(input, &groups, severity));
+    }
+    if let Some(severity) = contract.runtime.severity() {
+        findings.extend(runtime::findings(input, &observed_runtime, severity));
     }
     findings.extend(absence_findings(input, contract, &groups.observed));
     findings.extend(unassigned_finding(input, architecture));
@@ -179,6 +184,9 @@ pub(crate) fn violation_entries(input: &RuleInput<'_>) -> BTreeMap<String, BTree
                     &row.qualified_name,
                 ));
         }
+    }
+    for (component, observed) in runtime::baseline_entries(&runtime::classify(architecture)) {
+        entries.entry(component).or_default().extend(observed);
     }
     // Owned by the first component of the ordered pair, so the entry lands in
     // one file whichever side the reader looks from.
@@ -1272,6 +1280,7 @@ mod tests {
         functions: Vec<FunctionMetricsRow>,
         co_changes: Vec<CoChangedPair>,
         coverage: Vec<FileCoverage>,
+        runtime_edges: Vec<ovecc_core::runtime::EdgeFact>,
     }
 
     impl Default for Fixture {
@@ -1287,6 +1296,7 @@ mod tests {
                 functions: Vec::new(),
                 co_changes: Vec::new(),
                 coverage: Vec::new(),
+                runtime_edges: Vec::new(),
             }
         }
     }
@@ -1310,6 +1320,7 @@ mod tests {
                 functions: &fixture.functions,
                 co_changes: &fixture.co_changes,
                 coverage: &fixture.coverage,
+                runtime_edges: &fixture.runtime_edges,
             }),
         };
         contract_rules(&input)
@@ -1334,6 +1345,7 @@ mod tests {
                 functions: &fixture.functions,
                 co_changes: &fixture.co_changes,
                 coverage: &fixture.coverage,
+                runtime_edges: &fixture.runtime_edges,
             }),
         };
         violation_entries(&input)

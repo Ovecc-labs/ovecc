@@ -19,6 +19,7 @@ use ovecc_core::error::OveccError;
 use ovecc_core::facts::FindingRecord;
 use ovecc_core::facts::{CapabilityFact, CoChangedPair, FunctionMetricsRow};
 use ovecc_core::legacy::DependencyRecord;
+use ovecc_core::runtime::EdgeFact;
 use ovecc_db::FileGraphRow;
 use ovecc_rules::ContractInput;
 use serde::Serialize;
@@ -91,6 +92,10 @@ const VERDICTS: &[(&str, &str)] = &[
         "architecture/behavioral-coupling",
         "Components that change together without depending on each other",
     ),
+    (
+        RUNTIME_DIVERGENCE_RULE,
+        "Calls production made that the contract does not allow",
+    ),
 ];
 
 /// Everything `diff` and `check` need, loaded once: the contract plus the
@@ -106,6 +111,7 @@ struct ArchitectureData {
     functions: Vec<FunctionMetricsRow>,
     co_changes: Vec<CoChangedPair>,
     coverage: Vec<FileCoverage>,
+    runtime_edges: Vec<EdgeFact>,
 }
 
 impl ArchitectureData {
@@ -120,9 +126,32 @@ impl ArchitectureData {
             functions: &self.functions,
             co_changes: &self.co_changes,
             coverage: &self.coverage,
+            runtime_edges: &self.runtime_edges,
         }
     }
 }
+
+/// The runtime verdicts alone, recomputed from the contract and the stored
+/// evidence on every call — `runtime` re-reads the contract for the same reason
+/// `architecture diff` does. An absent contract is no verdicts, not an error:
+/// runtime evidence is worth reporting before anyone has written one.
+pub(crate) fn runtime_divergences(paths: &ProjectPaths) -> Result<Vec<FindingRecord>> {
+    if ArchitectureContract::load(&paths.root)?.is_none() {
+        return Ok(Vec::new());
+    }
+    let data = load_architecture_data(paths)?;
+    let baseline = ovecc_core::architecture::load_baseline(&paths.root)?;
+    Ok(ovecc_rules::contract_findings(
+        &data.repository_id,
+        &data.dependencies,
+        data.input(&baseline),
+    )
+    .into_iter()
+    .filter(|finding| finding.rule_name.as_deref() == Some(RUNTIME_DIVERGENCE_RULE))
+    .collect())
+}
+
+pub(crate) const RUNTIME_DIVERGENCE_RULE: &str = "architecture/runtime-divergence";
 
 fn load_architecture_data(paths: &ProjectPaths) -> Result<ArchitectureData> {
     let contract = ArchitectureContract::load(&paths.root)?.ok_or_else(|| OveccError::Usage {
@@ -173,6 +202,11 @@ fn load_architecture_data(paths: &ProjectPaths) -> Result<ArchitectureData> {
     // Read from the table the last index wrote: `check` judges the stored
     // graph, and the history behind it is just as stored.
     let co_changes = store.co_changes(&repository_id, 0.0)?;
+    let runtime_edges = if contract.runtime.severity().is_some() {
+        store.runtime_edges(&repository_id)?
+    } else {
+        Vec::new()
+    };
     Ok(ArchitectureData {
         repository_id,
         contract,
@@ -184,6 +218,7 @@ fn load_architecture_data(paths: &ProjectPaths) -> Result<ArchitectureData> {
         functions,
         co_changes,
         coverage,
+        runtime_edges,
     })
 }
 

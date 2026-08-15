@@ -94,6 +94,7 @@ pub(crate) fn meta_for(command: &str) -> Meta {
             | "deadcode"
             | "review"
             | "architecture"
+            | "runtime"
     ) {
         meta.rules = capabilities::rule_definitions();
     }

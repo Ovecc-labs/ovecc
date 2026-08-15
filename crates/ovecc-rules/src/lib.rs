@@ -13,6 +13,7 @@
 
 mod contract;
 pub mod deadcode;
+mod runtime;
 pub mod smells;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -29,6 +30,7 @@ use ovecc_core::graph::NodeKind;
 use ovecc_core::id::{FindingId, RepositoryId, SnapshotId};
 use ovecc_core::lang::SourceLanguage;
 use ovecc_core::legacy::DependencyRecord;
+use ovecc_core::runtime::EdgeFact;
 
 /// Read-only inputs a rule evaluation needs.
 pub struct RuleInput<'a> {
@@ -74,6 +76,10 @@ pub struct ContractInput<'a> {
     /// Per-file line coverage for the `min_coverage` check. Empty when no
     /// tracefile was indexed, which means "unknown", not "nothing covered".
     pub coverage: &'a [FileCoverage],
+    /// Calls observed between endpoints in the imported runtime evidence.
+    /// Empty when no telemetry was imported, which means "nobody looked", not
+    /// "nothing ran".
+    pub runtime_edges: &'a [EdgeFact],
 }
 
 /// Evaluates every enabled rule family and returns the findings, sorted by ID

@@ -265,6 +265,25 @@ pub const COMMANDS: &[CommandSpec] = &[
         read_only: true,
     },
     CommandSpec {
+        name: "runtime import",
+        summary: "Import an OpenTelemetry trace export as runtime evidence and join it to the index. Reads a file or stdin, so any backend that can export spans is supported. Never opens a socket: the bytes come from the caller.",
+        key_params: &[
+            "source (path or -)",
+            "--input-format <id>",
+            "--witnesses",
+            "--provider <name>",
+        ],
+        output: "Import result: observations decoded, attribution rate per path, exact vs mounted route joins, sampling coverage, and whether the evidence replaced or matched what was stored.",
+        read_only: false,
+    },
+    CommandSpec {
+        name: "runtime",
+        summary: "Report the imported runtime evidence: the window it covers, what attribution joined and by which path, the busiest anchors, the observed cross-component calls, and the contract verdicts over them.",
+        key_params: &["--unattributed", "--limit <n>"],
+        output: "Snapshot provenance (window, provider, digest, sampling), per-path attribution counts, point and edge facts, and with --unattributed the span shapes that did not join and why.",
+        read_only: true,
+    },
+    CommandSpec {
         name: "architecture init",
         summary: "Draft .ovecc/architecture.toml from the observed graph: every depends_on entry mirrors an existing import, so the contract starts with zero violations. With --template, write a built-in reference architecture instead (needs no index); the diff then reports the migration gap.",
         key_params: &["--force", "--template <name>"],
@@ -689,6 +708,17 @@ pub fn rule_definitions() -> BTreeMap<String, MetaRule> {
                  connects, that the history keeps changing in the same commits. \
                  Advisory: the evidence is the commits, the call is the reader's. \
                  Raise or silence it with `coupling` in the contract.",
+                "low",
+            ),
+        ),
+        (
+            "architecture/runtime-divergence".to_string(),
+            rule(
+                "Imported runtime evidence records calls between two components \
+                 the contract does not allow to talk. Advisory: the evidence is \
+                 one sampled, time-bounded window, so it proves the calls \
+                 happened, never how many there are in general. Raise or silence \
+                 it with `runtime` in the contract.",
                 "low",
             ),
         ),

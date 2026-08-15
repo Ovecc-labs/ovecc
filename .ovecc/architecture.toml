@@ -41,6 +41,15 @@ name = "audit"
 paths = ["crates/ovecc-audit/**"]
 depends_on = ["core"]
 
+# The offline guarantee, machine-checked. Runtime evidence arrives as bytes the
+# caller supplies; nothing in this component may acquire the ability to fetch
+# them itself.
+[[component]]
+name = "runtime"
+paths = ["crates/ovecc-runtime/**"]
+depends_on = ["core"]
+external_deny = ["reqwest*", "hyper*", "ureq*", "tokio*", "isahc*", "curl*"]
+
 [[component]]
 name = "ai"
 paths = ["crates/ovecc-ai/**"]
@@ -54,7 +63,7 @@ depends_on = ["core", "db", "parser", "rules", "graph", "git", "audit", "dataflo
 [[component]]
 name = "cli"
 paths = ["crates/ovecc-cli/**"]
-depends_on = ["core", "db", "graph", "git", "audit", "ai", "indexer", "rules"]
+depends_on = ["core", "db", "graph", "git", "audit", "ai", "indexer", "rules", "runtime"]
 
 [[component]]
 name = "xtask"

@@ -669,6 +669,113 @@ below the evidence thresholds.
 
 ---
 
+## Runtime evidence
+
+State, not change. These commands describe **the deployed system**, so they sit
+beside `violations` and `architecture diff` rather than in the PR loop below.
+A runtime finding is deliberately excluded from `review` and `gate`: traffic a
+deployment made is not something a pull request introduced, and blaming the
+next commit for it would be false.
+
+### `ovecc runtime import <path|->`
+
+Reads an OpenTelemetry trace export and joins it to the index. **Never opens a
+socket** — the bytes come from a file or from stdin, which is what makes every
+backend supported on day one:
+
+```sh
+curl -H "$AUTH" 'https://api.vendor/spans?...' | ovecc runtime import -
+```
+
+The format is recognized from the payload's content, not its extension. Today
+that is `otlp-json` (a single `TracesData` object, a JSON array of them, or one
+per line as the Collector's file exporter writes). Both the specified camelCase
+keys and the snake_case ones real exporters emit are accepted, 64-bit fields
+decode from a JSON number as readily as from the string the spec asks for, and
+unknown fields at any nesting level are ignored.
+
+```text
+Runtime import: stored (otlp-json via file)
+  window        2026-08-14T10:00:00Z .. 2026-08-14T11:00:00Z (3600s)
+  observations  12481
+  attributed    9204 (73.7%)
+     route          8110
+     schema         994
+     code_attribute 100
+  route joins   7402 exact, 708 through a router mount prefix
+  sampling      8204 span(s) carried a rate (modal 1 in 4), 4277 did not
+  facts         214 anchors, 39 edges
+  unattributed  3277 observation(s) — run `ovecc runtime --unattributed` for the shapes
+  index offered 231 route(s), 48 table(s), 1204 file(s)
+  witnesses     hashed trace ids
+  digest        c59bb256...
+```
+
+**What reaches the database.** Only a closed allow-list of span attributes is
+ever read out of a span — route templates, methods, status codes, collection
+names, code locations, service names. Everything else is dropped in the decoder,
+before a fact exists. `db.query.text` is not on the list and never will be:
+storing query *shape* by regex is the kind of thing that works on fixtures and
+leaks on real traffic, and `.ovecc/` gets committed. Trace ids are hashed unless
+`--witnesses` asks for the raw ones; the witness mode is part of the snapshot's
+identity, so the same export imported both ways is not mistaken for a re-import.
+
+**Idempotent.** Re-importing evidence that would write the same rows reports
+`unchanged` and touches nothing. A different export replaces the previous one
+wholesale: a snapshot is one sampled window, and merging two would produce
+counts describing no period anybody chose.
+
+### `ovecc runtime`
+
+What the stored evidence says. Re-reads the contract on every run, so editing
+`.ovecc/architecture.toml` never requires re-importing.
+
+```text
+Observed calls:
+  src/web/routes.ts -> service:db-api  40000 http call(s) (~160000 sampled), 12 error(s)
+  src/web/routes.ts -> table:orders    18204 db call(s), 0 error(s)
+
+Contract verdicts over this evidence:
+  [Low] web called db 40000 time(s) in production, and the contract does not allow it
+```
+
+`--unattributed` lists the span shapes attribution could not place, with the
+reason for each. It ships from day one on purpose: a runtime report that hides
+what it dropped is worse than no report. A shape names attribute *keys*, never
+their values.
+
+Absence is not a zero. With no import, the report says so in those words — the
+answer is "nobody looked", not "nothing ran".
+
+### What this cannot tell you
+
+- **The window is the window.** Counts prove calls happened; they are not a
+  rate. Every finding says so.
+- **Sampling is read per span**, from the W3C `tracestate` `ot=th:` threshold,
+  and extrapolated per observation rather than with one global multiplier. A
+  span that carries no threshold makes the estimate *unknown*, never 1.0 — so
+  the observed count is reported as a floor instead of being inflated.
+- **Only edges whose two endpoints resolve to components are judged.** An
+  endpoint resolves through a file the contract claims, or a `service.name` a
+  component declares in `services = [...]`. Traffic to an unmapped service, and
+  every edge into a database table, is carried as evidence and never as a
+  verdict.
+- **Router mount prefixes are compensated, not resolved.** The index stores the
+  route literal as written; the tracer reports the mounted path. A suffix match
+  bridges them, and the two counts are reported separately so you can see how
+  much of the join leaned on it.
+
+### Gating
+
+`runtime` in the contract sets the severity, exactly as `coupling` does:
+`off`, `low` (the default), `medium`, `high`. At the default it is advisory and
+crosses no gate. Raising it makes `architecture check` fail on divergence — the
+same state-scoped gate that already fails on a pre-existing undeclared import,
+with the same `--freeze` baseline and ratchet to absorb what you have decided to
+live with. It still never reaches `review` or `gate`.
+
+---
+
 ## Change scope (PR loop)
 
 ### `ovecc review [base] [head]`

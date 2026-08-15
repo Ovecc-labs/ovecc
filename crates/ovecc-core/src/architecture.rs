@@ -20,6 +20,7 @@ use serde::Deserialize;
 
 use crate::error::{OveccError, Result};
 use crate::facts::{CapabilityKind, Severity};
+use crate::runtime::RuntimePolicy;
 
 /// Contract schema version this build reads. Bumped on breaking changes so
 /// yesterday's contract fails loudly instead of being misread.
@@ -42,6 +43,11 @@ pub struct ArchitectureContract {
     /// How loudly behavioral coupling is reported.
     #[serde(default)]
     pub coupling: CouplingPolicy,
+    /// How loudly runtime divergence is reported. Its own knob for the same
+    /// reason `coupling` has one: the evidence is a sampled, time-bounded
+    /// export rather than the source tree, so it ships advisory-first.
+    #[serde(default)]
+    pub runtime: RuntimePolicy,
     #[serde(default, rename = "component")]
     pub components: Vec<ComponentSpec>,
 }
@@ -55,6 +61,7 @@ impl Default for ArchitectureContract {
             mode: EnforcementMode::default(),
             unassigned: UnassignedPolicy::default(),
             coupling: CouplingPolicy::default(),
+            runtime: RuntimePolicy::default(),
             components: Vec::new(),
         }
     }
@@ -177,6 +184,12 @@ pub struct ComponentSpec {
     pub max_cyclomatic: Option<u32>,
     #[serde(default)]
     pub max_cognitive: Option<u32>,
+    /// Deployed service names (OpenTelemetry `service.name`) this component
+    /// runs as. Declared here rather than in a second file so the contract
+    /// stays the single place intent is written down: a runtime edge between
+    /// two services is judged by the same `depends_on` the imports are.
+    #[serde(default)]
+    pub services: Vec<String>,
     /// Line coverage this component must hold, as a fraction in `(0, 1]`.
     /// Falling under it is an `architecture/coverage-floor` verdict, on the
     /// same footing as an exceeded budget. Checked only when a tracefile was
@@ -271,7 +284,48 @@ impl ArchitectureContract {
             component.validate_budgets()?;
         }
         self.validate_access()?;
+        self.validate_services()?;
         Ok(())
+    }
+
+    /// One deployed service belongs to one component. Two components claiming
+    /// the same `service.name` would make every runtime edge touching it
+    /// arbitrary, which is the same reason two components may not claim one
+    /// file with equal specificity.
+    fn validate_services(&self) -> Result<()> {
+        let mut owner: BTreeMap<&str, &str> = BTreeMap::new();
+        for component in &self.components {
+            for service in &component.services {
+                if service.trim().is_empty() {
+                    return Err(contract_error(format!(
+                        "component '{}' declares an empty service name",
+                        component.name
+                    )));
+                }
+                if let Some(previous) = owner.insert(service.as_str(), component.name.as_str()) {
+                    return Err(contract_error(format!(
+                        "service '{service}' is claimed by component '{previous}' and component \
+                         '{}'; a deployed service belongs to one component",
+                        component.name
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Deployed service name -> owning component, for judging runtime edges
+    /// whose endpoints are services rather than files.
+    pub fn service_components(&self) -> BTreeMap<String, String> {
+        self.components
+            .iter()
+            .flat_map(|component| {
+                component
+                    .services
+                    .iter()
+                    .map(|service| (service.clone(), component.name.clone()))
+            })
+            .collect()
     }
 
     /// A rule one component states about its consumers, contradicted by a

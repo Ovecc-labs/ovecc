@@ -25,6 +25,7 @@ ovecc-rules = { path = "crates/ovecc-rules" }
 ovecc-dataflow = { path = "crates/ovecc-dataflow" }
 ovecc-audit = { path = "crates/ovecc-audit" }
 ovecc-ai = { path = "crates/ovecc-ai" }
+ovecc-runtime = { path = "crates/ovecc-runtime" }
 
 # External dependencies
 # Severity colouring on a terminal. `anstream` strips the escapes when stdout is

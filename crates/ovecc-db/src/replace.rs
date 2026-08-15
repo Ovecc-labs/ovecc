@@ -248,6 +248,12 @@ impl ArchitectureStore {
                 let Some(snapshot_id) = finding.snapshot_id.as_ref() else {
                     continue;
                 };
+                // Evidence about the deployed system, not about this change.
+                // Retaining it here would make `review` and `gate` report it as
+                // introduced by whichever commit indexed after the import.
+                if !finding.kind.is_change_scoped() {
+                    continue;
+                }
                 let base_identity = finding_identity(finding, 0);
                 let seen = identity_counts.entry(base_identity.clone()).or_insert(0);
                 let identity = if *seen == 0 {
@@ -350,6 +356,59 @@ mod tests {
 
         let stored = store.file_coverage(repo).unwrap();
         assert_eq!(stored, vec![coverage("a.ts", 10, 9)]);
+    }
+
+    /// `review` and `gate` diff the retained per-snapshot findings. Runtime
+    /// evidence describes the deployed system, so letting it in would make the
+    /// first change after an import answer for traffic it never caused.
+    #[test]
+    fn runtime_evidence_is_stored_but_never_retained_for_a_change_diff() {
+        use ovecc_core::facts::{FindingKind, Severity};
+
+        let (_dir, mut store) = temp_store();
+        store.migrate_to_latest().unwrap();
+        let repo = "repo:test";
+
+        let findings = [
+            sample_finding(
+                "snap",
+                FindingKind::RuntimeDivergence,
+                "src/web/routes.ts",
+                1,
+                "web",
+                Severity::High,
+            ),
+            sample_finding(
+                "snap",
+                FindingKind::ArchitectureViolation,
+                "src/web/routes.ts",
+                2,
+                "web-imports-db",
+                Severity::High,
+            ),
+        ];
+        store.replace_findings(repo, &findings).unwrap();
+
+        assert_eq!(
+            count(&store, "SELECT count(*) FROM findings"),
+            2,
+            "both reach violations, architecture check, and SARIF"
+        );
+        assert_eq!(
+            count(
+                &store,
+                "SELECT count(*) FROM snapshot_findings WHERE finding_kind = 'runtime_divergence'"
+            ),
+            0,
+            "no change diff can attribute deployed traffic to a commit"
+        );
+        assert_eq!(
+            count(
+                &store,
+                "SELECT count(*) FROM snapshot_findings WHERE finding_kind = 'architecture_violation'"
+            ),
+            1
+        );
     }
 
     #[test]

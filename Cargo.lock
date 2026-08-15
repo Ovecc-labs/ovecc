@@ -2745,6 +2745,7 @@ dependencies = [
  "ovecc-graph",
  "ovecc-indexer",
  "ovecc-rules",
+ "ovecc-runtime",
  "peak_alloc",
  "rayon",
  "regex",
@@ -2858,6 +2859,16 @@ dependencies = [
  "chrono",
  "ovecc-core",
  "ovecc-graph",
+]
+
+[[package]]
+name = "ovecc-runtime"
+version = "0.2.5"
+dependencies = [
+ "anyhow",
+ "ovecc-core",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

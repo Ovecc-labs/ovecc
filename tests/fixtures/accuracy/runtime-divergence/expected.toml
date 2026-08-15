@@ -1,0 +1,30 @@
+command = "violations"
+
+# Runtime evidence reaches the ordinary findings surface only after the index
+# that follows the import, which is what makes baselines, SARIF, and --fail-on
+# work with no runtime-specific code.
+setup = [
+  ["runtime", "import", "spans.json"],
+  ["index"],
+]
+
+[[require]]
+rule = "architecture/runtime-divergence"
+path = "src/web/routes.ts"
+title = "web called db"
+
+# Nothing in the source connects the two components, so the static reflexion
+# report must stay silent: the runtime verdict is the only witness there is.
+[[deny]]
+rule = "architecture/divergence"
+
+# Traffic flowed one way. Reporting the reverse would be an invented edge.
+[[deny]]
+rule = "architecture/runtime-divergence"
+path = "src/db/client.ts"
+
+# The database call in the export names a table the index knows; a table is not
+# a component and must never be judged as one.
+[[deny]]
+rule = "architecture/runtime-divergence"
+title = "table"

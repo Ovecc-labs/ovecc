@@ -9,6 +9,12 @@ struct CaseSpec {
     command: String,
     #[serde(default)]
     config: Option<String>,
+    /// Commands run in order after the first index and before the assertion
+    /// command. A detector whose evidence comes from outside the source tree —
+    /// an imported trace export, a re-index that picks it up — needs the case
+    /// to say so rather than being left out of the corpus.
+    #[serde(default)]
+    setup: Vec<Vec<String>>,
     #[serde(default)]
     require: Vec<FindingSpec>,
     #[serde(default)]
@@ -85,6 +91,16 @@ fn case_findings(case: &Path, spec: &CaseSpec) -> (tempfile::TempDir, Vec<serde_
         case.display(),
         String::from_utf8_lossy(&indexed.stderr)
     );
+    for step in &spec.setup {
+        let args: Vec<&str> = step.iter().map(String::as_str).collect();
+        let ran = ovecc(&repo, &args);
+        assert!(
+            ran.status.success(),
+            "setup {args:?} failed for {}: {}",
+            case.display(),
+            String::from_utf8_lossy(&ran.stderr)
+        );
+    }
     let out = ovecc(&repo, &[spec.command.as_str(), "--format", "json"]);
     assert!(
         out.status.success(),

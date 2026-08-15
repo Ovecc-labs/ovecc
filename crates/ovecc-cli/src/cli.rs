@@ -28,6 +28,7 @@ use crate::commands::{
     query::{build_context_slice, load_impact, render_blast, render_explanation, run_query},
     resolve_ref,
     review::{build_review_report, render_full_report, render_review},
+    runtime::run as run_runtime,
     selfcheck::{load_selfcheck, render_selfcheck},
     summary::{load_hotspots, load_summary, render_hotspots, render_summary_report},
 };
@@ -472,9 +473,52 @@ pub enum Command {
         #[command(subcommand)]
         what: ArchitectureCommand,
     },
+    /// Report the imported runtime evidence: what it covers, what attribution
+    /// joined and by which path, the busiest anchors, the calls observed
+    /// between components, and the contract verdicts over them. Re-reads the
+    /// contract on every run, so editing it never requires re-importing.
+    Runtime {
+        #[command(subcommand)]
+        what: Option<RuntimeCommand>,
+        /// Also list the span shapes attribution could not place, with the
+        /// reason for each. Honest coverage: a runtime report that hides what
+        /// it dropped is worse than no report.
+        #[arg(long)]
+        unattributed: bool,
+        /// Rows to print per section. 0 prints all of them; the counts always
+        /// cover the whole set.
+        #[arg(long, default_value_t = DEFAULT_FINDING_LIMIT)]
+        limit: usize,
+    },
     /// Run an MCP (Model Context Protocol) server over stdio, exposing Ovecc's
     /// commands as tools for coding agents. Reads/writes JSON-RPC on stdin/stdout.
     Mcp,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum RuntimeCommand {
+    /// Import an OpenTelemetry trace export as runtime evidence and join it to
+    /// the index. Never opens a socket — the bytes come from a file or stdin,
+    /// which is what makes every backend supported on day one:
+    /// `curl -H "$AUTH" 'https://api.vendor/spans?...' | ovecc runtime import -`.
+    Import {
+        /// Path to the export, or `-` to read stdin.
+        #[arg(value_name = "PATH")]
+        source: String,
+        /// Telemetry format of the export. Sniffed from its content when
+        /// omitted, so a piped payload needs no extension and no flag.
+        #[arg(long, value_name = "ID")]
+        input_format: Option<String>,
+        /// Label recorded on the snapshot for where the evidence came from.
+        #[arg(long, value_name = "NAME")]
+        provider: Option<String>,
+        /// Store raw trace ids as witnesses instead of hashing them. Off by
+        /// default: `.ovecc/` gets committed, and a raw id is a pivot into the
+        /// tracing backend. Turn it on when you want to paste a witness back
+        /// into your own tooling.
+        #[arg(long)]
+        witnesses: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -1102,6 +1146,16 @@ fn run_command(cli: Cli) -> Result<u8> {
                     run_architecture_check(&paths, config.output.default_format, fail_on, freeze)
                 }
             }
+        }
+        Command::Runtime {
+            what,
+            unattributed,
+            limit,
+        } => {
+            let paths = ProjectPaths::resolve(cli.repo.unwrap_or_else(|| PathBuf::from(".")))?;
+            let config = load_config(&paths, format_override)?;
+            let format = config.output.default_format;
+            run_runtime(&paths, format, what, unattributed, limit)
         }
         Command::Mcp => {
             let default_repo = cli

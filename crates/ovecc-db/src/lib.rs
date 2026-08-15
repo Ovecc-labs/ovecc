@@ -10,10 +10,13 @@ mod code_facts;
 mod migrations;
 mod queries;
 mod replace;
+mod runtime;
 mod snapshots;
 mod sync;
 
+pub use migrations::LATEST_SCHEMA_VERSION;
 pub use replace::finding_group_key;
+pub use runtime::RouteRow;
 
 use anyhow::{Context, Result};
 use chrono::Utc;
@@ -202,6 +205,9 @@ pub struct ArchitectureStore {
 }
 
 impl ArchitectureStore {
+    /// Opens the database. DuckDB admits one writer per file per process, so a
+    /// second open while another [`ArchitectureStore`] is alive fails here
+    /// rather than deadlocking later — drop the first, or thread it through.
     pub fn open(path: &Path) -> Result<Self> {
         Ok(Self {
             conn: Connection::open(path)

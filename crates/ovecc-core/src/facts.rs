@@ -493,6 +493,10 @@ pub enum FindingKind {
     /// Two components the contract declares independent, and no import
     /// connects, that the history keeps changing in the same commits.
     BehavioralCoupling,
+    /// Imported runtime evidence records calls between two components the
+    /// contract does not allow to talk. Sampled and time-bounded: it proves
+    /// the calls happened, never how many there are in general.
+    RuntimeDivergence,
 }
 
 /// A fix descriptor attached to a finding so an agent can act without
@@ -517,6 +521,21 @@ impl FixSpec {
 }
 
 impl FindingKind {
+    /// Whether the finding describes the change under review, or a standing
+    /// property of the running system that no diff can attribute to a commit.
+    ///
+    /// Only change-scoped findings are retained per snapshot, so `review` and
+    /// `gate` — which report what a change *introduced* — can never blame a
+    /// pull request for traffic a deployment made. Runtime evidence arrives
+    /// from outside the source tree and would otherwise read as "new" on the
+    /// first index after an import, whichever change happened to run next.
+    /// It still reaches `violations`, `architecture diff`/`check`, SARIF, and
+    /// the baseline, which describe the state of the architecture rather than
+    /// one commit's contribution to it.
+    pub fn is_change_scoped(self) -> bool {
+        !matches!(self, FindingKind::RuntimeDivergence)
+    }
+
     /// Only the mechanical dead-code removals are `auto_fixable`.
     pub fn fix_spec(&self) -> FixSpec {
         match self {
@@ -601,6 +620,14 @@ impl FindingKind {
                  belongs in one place, or the dependency is real and belongs in \
                  .ovecc/architecture.toml. A shared version field every \
                  implementer must bump is the honest exception.",
+            ),
+            FindingKind::RuntimeDivergence => FixSpec::new(
+                "reconcile_runtime_with_contract",
+                false,
+                "Production made this call; the contract does not allow it. Follow the trace \
+                 witnesses to the caller, then either declare the dependency in \
+                 .ovecc/architecture.toml or remove the call. Check the window and sampling \
+                 rate on the finding before treating the count as a rate.",
             ),
             FindingKind::HardcodedSecret => FixSpec::new(
                 "rotate_and_externalize_secret",
@@ -1111,6 +1138,24 @@ mod tests {
         assert!(OwnershipSource::ServiceMetadata.is_explicit());
         assert!(!OwnershipSource::GitHistory.is_explicit());
         assert!(!OwnershipSource::PathConvention.is_explicit());
+    }
+
+    #[test]
+    fn only_evidence_from_the_deployed_system_is_kept_out_of_a_change_review() {
+        assert!(!FindingKind::RuntimeDivergence.is_change_scoped());
+        for kind in [
+            FindingKind::ArchitectureViolation,
+            FindingKind::BehavioralCoupling,
+            FindingKind::HardcodedSecret,
+            FindingKind::UnusedExport,
+            FindingKind::HighComplexity,
+            FindingKind::CircularDependency,
+        ] {
+            assert!(
+                kind.is_change_scoped(),
+                "{kind:?} is derived from the tree and the history, both of which a commit moves"
+            );
+        }
     }
 
     #[test]

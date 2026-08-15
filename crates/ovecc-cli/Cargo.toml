@@ -17,6 +17,7 @@ ovecc-git = { workspace = true }
 ovecc-graph = { workspace = true }
 ovecc-indexer = { workspace = true }
 ovecc-rules = { workspace = true }
+ovecc-runtime = { workspace = true }
 ovecc-audit = { workspace = true }
 ovecc-ai = { workspace = true }
 anstream = { workspace = true }

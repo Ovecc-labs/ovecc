@@ -16,6 +16,7 @@ pub mod lang;
 pub mod legacy;
 pub mod query;
 pub mod report;
+pub mod runtime;
 pub mod traits;
 pub mod util;
 

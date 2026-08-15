@@ -1,0 +1,14 @@
+schema = 1
+mode = "strict"
+unassigned = "ignore"
+runtime = "high"
+
+[[component]]
+name = "web"
+paths = ["src/web/**"]
+services = ["web-api"]
+
+[[component]]
+name = "db"
+paths = ["src/db/**"]
+services = ["db-api"]

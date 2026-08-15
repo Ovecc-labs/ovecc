@@ -22,6 +22,7 @@ pub(crate) mod history;
 pub(crate) mod index;
 pub(crate) mod query;
 pub(crate) mod review;
+pub(crate) mod runtime;
 pub(crate) mod search;
 pub(crate) mod selfcheck;
 pub(crate) mod summary;

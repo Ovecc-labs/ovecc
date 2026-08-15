@@ -123,7 +123,7 @@ printf '%s\n' \
 You should get an `initialize` result (serverInfo `ovecc`) followed by a `tools/list`
 result enumerating the **agent profile** (11 tools by default — see
 [Tool profiles](#tool-profiles)). Set `OVECC_MCP_PROFILE=full` in the server's
-environment to list all 32. To exercise a real analysis tool against an indexed repo:
+environment to list all 33. To exercise a real analysis tool against an indexed repo:
 
 ```sh
 printf '%s\n' \
@@ -159,7 +159,7 @@ profile only controls what the agent *discovers*.
 
 ## Tool catalog
 
-The full surface — 32 tools (every one takes an optional `repo`; `*` marks required
+The full surface — 33 tools (every one takes an optional `repo`; `*` marks required
 arguments). The eleven in the agent profile are listed under
 [Tool profiles](#tool-profiles) above.
 
@@ -185,6 +185,7 @@ arguments). The eleven in the agent profile are listed under
 | `ovecc_dupes` | `dupes` | `min_tokens` |
 | `ovecc_hotspots` | `hotspots` | `limit` |
 | `ovecc_conventions` | `conventions` | — |
+| `ovecc_runtime` | `runtime` | `unattributed`, `limit`: the imported runtime evidence — attribution rate per path, observed calls between components, and the contract verdicts over them. One sampled window; empty means nobody imported an export, not that nothing ran |
 | `ovecc_drift` | `drift` | `since` (git ref / snapshot) |
 | `ovecc_history` | `history` | `metric`, `limit`: trend one snapshot metric (values, deltas, sparkline) |
 | `ovecc_review` | `review` | `base`, `head`, `fail_on` (lead with this for PR review) |

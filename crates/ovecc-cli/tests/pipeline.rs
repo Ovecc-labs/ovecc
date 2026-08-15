@@ -2332,3 +2332,443 @@ fn a_feature_behind_one_barrel_is_one_subsystem_however_many_slices_it_has() {
         "clustering does not see it; diagnosis does: {diagnosed}"
     );
 }
+
+/// Two components deployed as two services, neither declaring a dependency on
+/// the other. Production calls one from the other; nothing in the source does.
+fn runtime_repo(root: &Path) {
+    write_source(
+        root,
+        "src/web/routes.ts",
+        "const app = { get: (path, handler) => handler };\n\
+         export function getOrder(req, res) { return res.json({}); }\n\
+         app.get(\"/orders/:id\", getOrder);\n",
+    );
+    write_source(
+        root,
+        "src/db/client.ts",
+        "export const client = { query: (sql) => sql };\n\
+         export function findOrders() { return client.query(\"SELECT id FROM orders\"); }\n",
+    );
+    write_contract(root, RUNTIME_CONTRACT);
+}
+
+const RUNTIME_CONTRACT: &str = r#"
+schema = 1
+mode = "strict"
+unassigned = "ignore"
+runtime = "high"
+
+[[component]]
+name = "web"
+paths = ["src/web/**"]
+services = ["web-api"]
+
+[[component]]
+name = "db"
+paths = ["src/db/**"]
+services = ["db-api"]
+"#;
+
+/// One OTLP/JSON export exercising every encoding rule the specification
+/// allows a real exporter to pick: camelCase and snake_case keys, 64-bit
+/// integers as strings and as numbers, uppercase hex ids, an integer span
+/// kind, unknown fields at every level, and an attribute carrying a bound
+/// parameter that must never reach storage.
+const OTLP_EXPORT: &str = r#"{
+  "resourceSpans": [
+    {
+      "schemaUrl": "https://opentelemetry.io/schemas/1.44.0",
+      "resource": { "attributes": [
+        { "key": "service.name", "value": { "stringValue": "web-api" } }
+      ] },
+      "scopeSpans": [ { "scope": { "name": "express" }, "spans": [
+        {
+          "traceId": "4BF92F3577B34DA6A3CE929D0E0E4736",
+          "spanId": "00f067aa0ba902b7",
+          "name": "GET /api/orders/:id",
+          "kind": 2,
+          "traceState": "ot=th:c",
+          "startTimeUnixNano": "1700000000000000000",
+          "endTimeUnixNano": "1700000000041000000",
+          "attributes": [
+            { "key": "http.route", "value": { "stringValue": "/api/orders/{id}" } },
+            { "key": "http.request.method", "value": { "stringValue": "GET" } },
+            { "key": "http.response.status_code", "value": { "intValue": "200" } }
+          ]
+        },
+        {
+          "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736",
+          "span_id": "1111111111111111",
+          "parent_span_id": "00f067aa0ba902b7",
+          "kind": 3,
+          "trace_state": "ot=th:c",
+          "start_time_unix_nano": 1700000000010000000,
+          "end_time_unix_nano": 1700000000030000000,
+          "droppedAttributesCount": 0,
+          "attributes": [
+            { "key": "server.address", "value": { "string_value": "db-api" } },
+            { "key": "http.request.method", "value": { "stringValue": "POST" } }
+          ]
+        },
+        {
+          "traceId": "4bf92f3577b34da6a3ce929d0e0e4736",
+          "spanId": "2222222222222222",
+          "parentSpanId": "00f067aa0ba902b7",
+          "kind": 3,
+          "startTimeUnixNano": "1700000000012000000",
+          "endTimeUnixNano": "1700000000013000000",
+          "attributes": [
+            { "key": "db.collection.name", "value": { "stringValue": "orders" } },
+            { "key": "db.query.text",
+              "value": { "stringValue": "SELECT * FROM orders WHERE email = 'ada@example.com'" } },
+            { "key": "enduser.id", "value": { "stringValue": "user-9137" } }
+          ]
+        },
+        {
+          "traceId": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "spanId": "3333333333333333",
+          "kind": 2,
+          "startTimeUnixNano": "1700000000050000000",
+          "endTimeUnixNano": "1700000000051000000",
+          "attributes": [
+            { "key": "http.route", "value": { "stringValue": "/nowhere" } }
+          ]
+        }
+      ] } ]
+    }
+  ]
+}
+"#;
+
+fn staged_runtime_repo() -> (tempfile::TempDir, String) {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let root = temp.path();
+    let repo = root.to_str().expect("utf8 path").to_string();
+    runtime_repo(root);
+    fs::write(root.join("spans.json"), OTLP_EXPORT).expect("write export");
+    index_repo(&repo);
+    (temp, repo)
+}
+
+#[test]
+fn a_trace_export_joins_to_the_index_and_reports_how_it_joined() {
+    let (_temp, repo) = staged_runtime_repo();
+
+    let imported = json_output(
+        &repo,
+        &["runtime", "import", "spans.json", "--format", "json"],
+    );
+    let data = &imported["data"];
+
+    assert_eq!(data["outcome"], "stored");
+    assert_eq!(data["format"], "otlp-json");
+    assert_eq!(data["observations"], 4);
+    assert_eq!(
+        data["attributed"], 2,
+        "the mounted route and the indexed table join; the outbound client span \
+         and the unknown route do not: {imported}"
+    );
+    assert!(
+        data["index"]["tables"].as_u64().expect("tables") >= 1,
+        "the schema path needs an indexed table to join to: {imported}"
+    );
+    assert_eq!(
+        data["route_joins"]["mount_suffix"], 1,
+        "the index holds /orders/:id and the tracer reported /api/orders/{{id}}: {imported}"
+    );
+    assert_eq!(data["route_joins"]["exact"], 0);
+    assert_eq!(
+        data["sampling"]["modal_adjusted_count"], 4,
+        "ot=th:c is one span in four"
+    );
+    assert_eq!(
+        data["sampling"]["unknown"], 2,
+        "two spans carried no threshold, so their share of the count is a floor"
+    );
+    assert_eq!(data["window"]["duration_seconds"], 0);
+    assert!(
+        data["index"]["routes"].as_u64().expect("routes") >= 1,
+        "the join had something to join against: {imported}"
+    );
+}
+
+#[test]
+fn re_importing_the_same_bytes_changes_nothing() {
+    let (_temp, repo) = staged_runtime_repo();
+
+    let first = json_output(
+        &repo,
+        &["runtime", "import", "spans.json", "--format", "json"],
+    );
+    let second = json_output(
+        &repo,
+        &["runtime", "import", "spans.json", "--format", "json"],
+    );
+
+    assert_eq!(first["data"]["outcome"], "stored");
+    assert_eq!(second["data"]["outcome"], "unchanged");
+    assert_eq!(
+        first["data"]["source_digest"],
+        second["data"]["source_digest"]
+    );
+}
+
+#[test]
+fn the_runtime_report_is_byte_identical_across_runs() {
+    let (_temp, repo) = staged_runtime_repo();
+    ovecc(&repo, &["runtime", "import", "spans.json"]);
+
+    let first = ovecc(&repo, &["runtime", "--format", "json", "--unattributed"]);
+    let second = ovecc(&repo, &["runtime", "--format", "json", "--unattributed"]);
+
+    assert_eq!(first.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8_lossy(&first.stdout),
+        String::from_utf8_lossy(&second.stdout),
+        "runtime output must not vary run to run on one snapshot"
+    );
+}
+
+#[test]
+fn production_traffic_the_contract_forbids_becomes_a_gating_finding() {
+    let (_temp, repo) = staged_runtime_repo();
+    ovecc(&repo, &["runtime", "import", "spans.json"]);
+
+    let report = json_output(&repo, &["architecture", "diff", "--format", "json"]);
+    let divergences = findings_of(&report, "architecture/runtime-divergence");
+
+    assert_eq!(
+        divergences.len(),
+        1,
+        "web calls db in production and the contract never declared it: {report}"
+    );
+    assert!(
+        divergences[0].0.starts_with("web called db"),
+        "{:?}",
+        divergences[0]
+    );
+    assert_eq!(
+        ovecc(&repo, &["architecture", "check"]).status.code(),
+        Some(1),
+        "at runtime = \"high\" the verdict gates the build"
+    );
+
+    index_repo(&repo);
+    let violations = json_output(&repo, &["violations", "--format", "json"]);
+    assert_eq!(
+        findings_of(&violations, "architecture/runtime-divergence").len(),
+        1,
+        "the evidence reaches the ordinary findings surface after the next index, so \
+         baselines, SARIF, and --fail-on need no runtime-specific code: {violations}"
+    );
+}
+
+/// A change review answers "what did this change introduce". Traffic a
+/// deployment made is not that, so importing evidence must never make the next
+/// commit answer for it — however loudly the contract reports the divergence
+/// on the state-scoped surfaces.
+#[test]
+fn a_change_review_never_blames_a_commit_for_deployed_traffic() {
+    let (temp, repo) = staged_runtime_repo();
+    let root = temp.path();
+    index_repo(&repo);
+
+    ovecc(&repo, &["runtime", "import", "spans.json"]);
+    write_source(root, "src/web/extra.ts", "export const extra = 1;\n");
+    index_repo(&repo);
+
+    let review = json_output(&repo, &["review", "--format", "json"]);
+    let named: Vec<&str> = review["data"]["new_findings"]
+        .as_array()
+        .expect("new findings")
+        .iter()
+        .filter_map(|finding| finding["rule_name"].as_str())
+        .collect();
+    assert!(
+        !named.contains(&"architecture/runtime-divergence"),
+        "the change added a file; it did not make production call anything: {review}"
+    );
+    assert_eq!(
+        ovecc(&repo, &["review"]).status.code(),
+        Some(0),
+        "the change is clean, so the change gate passes"
+    );
+    assert_eq!(
+        ovecc(&repo, &["gate"]).status.code(),
+        Some(0),
+        "gate counts the same change-scoped findings review names"
+    );
+
+    // The state-scoped surfaces still carry it in full.
+    let contract = json_output(&repo, &["architecture", "diff", "--format", "json"]);
+    assert_eq!(
+        findings_of(&contract, "architecture/runtime-divergence").len(),
+        1,
+        "{contract}"
+    );
+}
+
+#[test]
+fn the_runtime_family_stays_advisory_until_the_contract_raises_it() {
+    let (temp, repo) = staged_runtime_repo();
+    write_contract(
+        temp.path(),
+        &RUNTIME_CONTRACT.replace("runtime = \"high\"", "runtime = \"off\""),
+    );
+    ovecc(&repo, &["runtime", "import", "spans.json"]);
+
+    let report = json_output(&repo, &["architecture", "diff", "--format", "json"]);
+
+    assert!(
+        findings_of(&report, "architecture/runtime-divergence").is_empty(),
+        "runtime = \"off\" silences the family entirely: {report}"
+    );
+    assert_eq!(
+        ovecc(&repo, &["architecture", "check"]).status.code(),
+        Some(0)
+    );
+}
+
+#[test]
+fn a_bound_parameter_in_a_query_never_reaches_the_stored_evidence() {
+    let (temp, repo) = staged_runtime_repo();
+    ovecc(&repo, &["runtime", "import", "spans.json"]);
+
+    let stored = fs::read(temp.path().join(".ovecc").join("graph.db")).expect("read database");
+    let text = String::from_utf8_lossy(&stored);
+
+    for secret in ["ada@example.com", "SELECT * FROM orders", "user-9137"] {
+        assert!(
+            !text.contains(secret),
+            "'{secret}' came in on an attribute outside the allow-list and must not be stored"
+        );
+    }
+}
+
+#[test]
+fn trace_ids_are_hashed_unless_the_witnesses_flag_asks_for_them() {
+    let (temp, repo) = staged_runtime_repo();
+    let raw_trace_id = "4bf92f3577b34da6a3ce929d0e0e4736";
+
+    ovecc(&repo, &["runtime", "import", "spans.json"]);
+    let hashed = fs::read(temp.path().join(".ovecc").join("graph.db")).expect("read database");
+    assert!(
+        !String::from_utf8_lossy(&hashed).contains(raw_trace_id),
+        "the default must not put a backend pivot in a committed directory"
+    );
+
+    ovecc(&repo, &["runtime", "import", "spans.json", "--witnesses"]);
+    let report = json_output(&repo, &["runtime", "--format", "json"]);
+    let witnesses = report["data"]["edges"][0]["witnesses"]
+        .as_array()
+        .expect("witnesses");
+    assert_eq!(witnesses[0], raw_trace_id, "{report}");
+}
+
+#[test]
+fn unattributed_spans_are_reported_with_the_reason_they_did_not_join() {
+    let (_temp, repo) = staged_runtime_repo();
+    ovecc(&repo, &["runtime", "import", "spans.json"]);
+
+    let report = json_output(&repo, &["runtime", "--format", "json", "--unattributed"]);
+    let shapes = report["data"]["unattributed"]
+        .as_array()
+        .expect("unattributed array");
+
+    let reasons: Vec<&str> = shapes
+        .iter()
+        .map(|shape| shape["reason"].as_str().expect("reason"))
+        .collect();
+    assert!(
+        reasons.contains(&"route_not_indexed"),
+        "/nowhere matches no indexed route: {report}"
+    );
+    for shape in shapes {
+        for key in shape["attribute_keys"].as_array().expect("keys") {
+            assert!(
+                key != "db.query.text" && key != "enduser.id",
+                "a shape names attribute keys, never values, and only allow-listed ones: {shape}"
+            );
+        }
+    }
+}
+
+#[test]
+fn every_command_behaves_identically_when_no_evidence_was_imported() {
+    let (_temp, repo) = staged_runtime_repo();
+
+    let report = json_output(&repo, &["runtime", "--format", "json"]);
+    assert_eq!(report["data"]["has_evidence"], false);
+    assert!(report["data"]["snapshot"].is_null());
+
+    let contract = json_output(&repo, &["architecture", "diff", "--format", "json"]);
+    assert!(
+        findings_of(&contract, "architecture/runtime-divergence").is_empty(),
+        "no import means nobody looked, never that nothing ran: {contract}"
+    );
+    assert_eq!(
+        ovecc(&repo, &["architecture", "check"]).status.code(),
+        Some(0)
+    );
+
+    let text = ovecc(&repo, &["runtime"]);
+    assert!(
+        String::from_utf8_lossy(&text.stdout).contains("nobody looked"),
+        "{}",
+        String::from_utf8_lossy(&text.stdout)
+    );
+}
+
+#[test]
+fn an_export_piped_on_stdin_imports_exactly_as_a_file_does() {
+    let (temp, repo) = staged_runtime_repo();
+    let from_file = json_output(
+        &repo,
+        &["runtime", "import", "spans.json", "--format", "json"],
+    );
+
+    let piped = Command::new(env!("CARGO_BIN_EXE_ovecc"))
+        .args([
+            "--repo", &repo, "runtime", "import", "-", "--format", "json",
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            use std::io::Write;
+            child
+                .stdin
+                .take()
+                .expect("stdin")
+                .write_all(OTLP_EXPORT.as_bytes())?;
+            child.wait_with_output()
+        })
+        .expect("pipe the export");
+
+    let piped: serde_json::Value = serde_json::from_slice(&piped.stdout).expect("json envelope");
+    assert_eq!(piped["data"]["provider"], "stdin");
+    assert_eq!(
+        piped["data"]["outcome"], "unchanged",
+        "same bytes, same digest"
+    );
+    assert_eq!(
+        piped["data"]["source_digest"],
+        from_file["data"]["source_digest"]
+    );
+    let _ = temp;
+}
+
+#[test]
+fn a_payload_that_is_not_telemetry_fails_loudly_rather_than_importing_nothing() {
+    let (temp, repo) = staged_runtime_repo();
+    fs::write(temp.path().join("wrong.json"), "{\"resourceMetrics\":[]}").expect("write");
+
+    let failed = ovecc(&repo, &["runtime", "import", "wrong.json"]);
+
+    assert_ne!(failed.status.code(), Some(0));
+    assert!(
+        String::from_utf8_lossy(&failed.stderr).contains("format"),
+        "{}",
+        String::from_utf8_lossy(&failed.stderr)
+    );
+}
