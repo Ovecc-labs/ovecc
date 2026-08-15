@@ -16,7 +16,7 @@
 
   <p>
     <a href="https://github.com/Ovecc-labs/ovecc/actions/workflows/ci.yml"><img src="https://github.com/Ovecc-labs/ovecc/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
-    <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache--2.0-blue?style=flat-square" alt="License" /></a>
+    <a href="LICENSE"><img src="https://img.shields.io/badge/License-MPL--2.0-blue?style=flat-square" alt="License" /></a>
     <a href="../../releases/latest"><img src="https://img.shields.io/badge/Release-latest-00d2b4?style=flat-square" alt="Latest release" /></a>
     <img src="https://img.shields.io/badge/Built%20with-Rust-dea584?style=flat-square&logo=rust" alt="Rust" />
   </p>
@@ -312,6 +312,11 @@ Ten library crates and one binary, each documented in its own `README.md` (plus
 
 ## License
 
-Apache-2.0; see [LICENSE](LICENSE). Portions are adapted from
-[fallow](https://github.com/fallow-rs/fallow) (MIT); third-party attributions are
-in [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).
+MPL-2.0; see [LICENSE](LICENSE). Every file in this repository is covered by it
+unless the file itself carries a different `SPDX-License-Identifier` header. Files
+with a different header are adapted from
+[fallow](https://github.com/fallow-rs/fallow) and remain MIT; third-party
+attributions are in [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).
+
+Releases up to and including v0.2.5 were published under Apache-2.0 and remain
+available under it.
