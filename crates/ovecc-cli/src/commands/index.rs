@@ -206,6 +206,22 @@ pub(crate) fn module_depth_hint(paths: &ProjectPaths, configured_depth: usize) -
     ))
 }
 
+/// The notices an index run collects before it starts, printed under the report
+/// it belongs to. Only the text renderer takes them: the machine formats would
+/// need a field for something a human reads once and acts on.
+pub(crate) fn render_index_hints(
+    format: OutputFormat,
+    ignore_wired: Option<&str>,
+    depth_hint: Option<String>,
+) {
+    if format != OutputFormat::Text {
+        return;
+    }
+    for message in [ignore_wired, depth_hint.as_deref()].into_iter().flatten() {
+        println!("{message}");
+    }
+}
+
 /// What the coverage step did, or `None` when no tracefile was configured and
 /// none of the conventional paths exist — the common case, and not worth a line.
 fn coverage_line(report: &IndexReport) -> Option<String> {
