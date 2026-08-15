@@ -947,6 +947,10 @@ fn smell_findings(
 /// or deliberate scaffolding: the canonical secret/SAST false positive. Down to
 /// Low, not dropped. Rust's inline `#[cfg(test)]` scopes are invisible to the
 /// path heuristics, so the parser stamps those (file, line) sites instead.
+///
+/// CI workflows join them: a real secret there is written `${{ secrets.NAME }}`
+/// and never appears in the file, so a literal value is one someone chose to
+/// publish, usually a throwaway key for a test container.
 fn downrank_test_security(
     findings: &mut [FindingRecord],
     security_patterns: &[(String, SecurityPatternFact)],
@@ -965,6 +969,7 @@ fn downrank_test_security(
             && finding.severity != ovecc_core::facts::Severity::Low
             && finding.evidence.iter().any(|evidence| {
                 is_test_file(&evidence.file_path)
+                    || is_ci_workflow(&evidence.file_path)
                     || is_standalone_entry(&evidence.file_path)
                     || evidence.line.is_some_and(|line| {
                         test_scoped_patterns.contains(&(evidence.file_path.as_str(), line))
@@ -974,6 +979,10 @@ fn downrank_test_security(
             finding.severity = ovecc_core::facts::Severity::Low;
         }
     }
+}
+
+fn is_ci_workflow(path: &str) -> bool {
+    path.starts_with(".github/workflows/") || path.starts_with(".github/actions/")
 }
 
 /// A long or complex test function is scaffolding, not production debt: a

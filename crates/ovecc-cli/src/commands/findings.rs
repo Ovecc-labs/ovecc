@@ -350,6 +350,17 @@ pub(crate) fn render_security(report: &SecurityReport, format: OutputFormat) -> 
                 report.permissive_cors,
                 report.tainted_flows
             );
+            // A repository that ships fixtures of fake leaked credentials to
+            // exercise its own detection has every finding land in one. Without
+            // the split the count reads as that many leaks.
+            let downranked = report
+                .findings
+                .iter()
+                .filter(|finding| finding.severity == Severity::Low)
+                .count();
+            if downranked > 0 {
+                println!("  {downranked} of them in test or fixture files, ranked low");
+            }
             for finding in &report.findings {
                 println!();
                 anstream::println!("{} {}", severity_tag(finding.severity), finding.title);

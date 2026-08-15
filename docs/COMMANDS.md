@@ -535,8 +535,15 @@ sources **plus every file Git tracks**. The source walk respects `.gitignore`,
 which is right for architecture and wrong for credentials, because the usual
 way a secret reaches a whole team is a `.env` committed before someone added it
 to `.gitignore` — it stays in every clone while every ignore-aware scanner skips
-it. Documentation and example paths are excluded from that second pass: they
-exist to show what a credential looks like.
+it.
+
+That second pass sorts each tracked path into one of three cases. Lockfiles,
+locale bundles, patches, and anything the source walk itself dropped as
+vendored, built, or generated are not read at all: their values are content
+hashes or display strings, and entropy calls every line of them a secret.
+Documentation and `.example` templates are read for provider patterns only, so
+a real `ghp_`-prefixed token committed into one still surfaces while the
+invented values they exist to show do not. Everything else is read in full.
 
 ```
 Security findings: 15    secrets 8, insecure 7, tainted-flows 0

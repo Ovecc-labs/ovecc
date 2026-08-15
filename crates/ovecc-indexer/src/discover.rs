@@ -141,7 +141,7 @@ pub fn is_excluded_component(name: &str) -> bool {
 /// keys off unambiguous signals (names, head markers, minification), never file
 /// size alone, and reads only the head so a marker deep in a real file or a
 /// mid-file `@ts-nocheck` never triggers.
-fn looks_generated(path: &Path) -> bool {
+pub(crate) fn looks_generated(path: &Path) -> bool {
     if let Some(name) = path.file_name().and_then(|value| value.to_str()) {
         let lower = name.to_ascii_lowercase();
         if lower.contains(".min.") || lower.contains("-wasm.") || lower.contains(".wasm.") {

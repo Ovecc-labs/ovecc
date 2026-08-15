@@ -49,8 +49,10 @@ pub fn relative_path(root: &Path, path: &Path) -> Result<String> {
 /// naming pattern (`.test.`, `.spec.`, `_test.go`, `test_*.py`, …).
 pub fn is_test_path(path: &str) -> bool {
     // `testdata/` is the Go convention and the Go toolchain itself skips it;
-    // `__fixtures__/` is the JS sibling of `__tests__/` and `__mocks__/`.
-    const TEST_DIRS: [&str; 9] = [
+    // `__fixtures__/` is the JS sibling of `__tests__/` and `__mocks__/`;
+    // `testing/` holds end-to-end suites and the responses they recorded, which
+    // is how a captured OAuth exchange ends up committed.
+    const TEST_DIRS: [&str; 10] = [
         "__tests__/",
         "__mocks__/",
         "__fixtures__/",
@@ -60,6 +62,7 @@ pub fn is_test_path(path: &str) -> bool {
         "tests/",
         "test/",
         "testdata/",
+        "testing/",
     ];
     if TEST_DIRS
         .iter()
