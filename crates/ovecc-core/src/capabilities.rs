@@ -731,7 +731,7 @@ pub fn rule_definitions() -> BTreeMap<String, MetaRule> {
         (
             "unused-type".to_string(),
             rule(
-                "A type-only export (interface/type alias) never imported by a reachable module.",
+                "A type-only export (interface/type alias) never imported by a reachable module, and not named in any exported declaration's signature.",
                 "low",
             ),
         ),

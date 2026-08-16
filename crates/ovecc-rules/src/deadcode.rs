@@ -70,6 +70,10 @@ pub struct DeadCodeInput<'a> {
     /// index. A file no import reaches but some literal names is *not* known to
     /// be dead — see [`literal_reference`].
     pub path_literals: &'a [(String, PathLiteralFact)],
+    /// `(file_path, type_name)` for every type named inside an exported
+    /// declaration. Such a type is public surface even though nothing imports
+    /// it by name, so it is not an unused export.
+    pub signature_types: &'a [(String, String)],
 }
 
 /// A re-export forward hop: `(from_file, name) -> (to_file, name)`. Usage flows
@@ -283,6 +287,12 @@ fn flag_unused_exports(
     used: &HashSet<(&str, &str)>,
     out: &mut Vec<FindingRecord>,
 ) {
+    let signature_types: HashSet<(&str, &str)> = input
+        .signature_types
+        .iter()
+        .map(|(file, name)| (file.as_str(), name.as_str()))
+        .collect();
+
     for (file, export) in input.exports {
         // High-precision skips: entry points (public surface), re-export
         // forwards, the default export, and unreachable modules (covered by
@@ -295,6 +305,16 @@ fn flag_unused_exports(
             continue;
         }
         if used.contains(&(file.as_str(), export.name.as_str())) {
+            continue;
+        }
+        // A type named in an exported declaration's signature is public surface
+        // reached *through* that declaration, not by name — the options type of
+        // an exported function, its return type, the element type of what it
+        // returns. Reachability cannot see that, so it called each one unused
+        // and `fix` planned to drop the `export`, leaving callers unable to
+        // annotate a value the module had just handed them. The rule was
+        // technically right and the remedy was backwards.
+        if export.is_type_only && signature_types.contains(&(file.as_str(), export.name.as_str())) {
             continue;
         }
         // Type-only exports are reported under the same `UnusedExport` kind (so
@@ -626,6 +646,7 @@ mod tests {
             exports: &exports,
             imports: &[],
             path_literals: &[],
+            signature_types: &[],
         };
         assert!(analyze(&input).is_empty());
     }
@@ -652,6 +673,7 @@ mod tests {
             exports: &exports,
             imports: &imports,
             path_literals: &[],
+            signature_types: &[],
         };
         let findings = analyze(&input);
         let unused: Vec<_> = findings
@@ -688,6 +710,7 @@ mod tests {
             exports: &exports,
             imports: &imports,
             path_literals: &[],
+            signature_types: &[],
         };
         let findings = analyze(&input);
         let found = findings
@@ -712,6 +735,7 @@ mod tests {
             exports: &exports,
             imports: &[],
             path_literals: &[],
+            signature_types: &[],
         };
         let findings = analyze(&input);
         assert!(
@@ -727,6 +751,68 @@ mod tests {
             value: value.to_string(),
             line,
         }
+    }
+
+    #[test]
+    fn a_type_in_an_exported_signature_is_public_surface_not_dead() {
+        // `HttpApp` is the return type of the exported `createHttpServer`, so a
+        // caller can hold one without ever importing the name. Reachability sees
+        // no importer and used to call it unused, and `fix` planned to drop the
+        // `export` — after which the caller could no longer annotate the value
+        // it was handed. `Orphaned` names nothing and stays flagged.
+        let files = vec!["src/index.ts".to_string(), "src/http.ts".to_string()];
+        let mut public_type = export_at("HttpApp", 3);
+        public_type.is_type_only = true;
+        let mut orphan_type = export_at("Orphaned", 9);
+        orphan_type.is_type_only = true;
+        let exports = vec![
+            ("src/http.ts".to_string(), export_at("createHttpServer", 1)),
+            ("src/http.ts".to_string(), public_type),
+            ("src/http.ts".to_string(), orphan_type),
+        ];
+        let imports = vec![ImportEdge {
+            source_file: "src/index.ts".to_string(),
+            target_file: "src/http.ts".to_string(),
+            imported_names: vec!["createHttpServer".to_string()],
+            is_namespace: false,
+        }];
+        let signature_types = vec![("src/http.ts".to_string(), "HttpApp".to_string())];
+        let input = DeadCodeInput {
+            repository_id: "r",
+            snapshot_id: None,
+            files: &files,
+            entry_points: &entry(&["src/index.ts"]),
+            exports: &exports,
+            imports: &imports,
+            path_literals: &[],
+            signature_types: &signature_types,
+        };
+        let findings = analyze(&input);
+
+        assert!(
+            !findings.iter().any(|f| f.title.contains("HttpApp")),
+            "a type in an exported signature is not dead: {findings:?}"
+        );
+        let orphan = findings
+            .iter()
+            .find(|f| f.title.contains("Orphaned"))
+            .expect("a type no signature names is still unused");
+        assert_eq!(orphan.rule_name.as_deref(), Some("unused-type"));
+
+        // The exemption is type-only: an exported *value* sharing a name with a
+        // signature type is still judged on whether anything imports it.
+        let mut value_exports = exports.clone();
+        value_exports.push(("src/http.ts".to_string(), export_at("HttpApp", 20)));
+        let with_value = DeadCodeInput {
+            exports: &value_exports,
+            ..input
+        };
+        assert!(
+            analyze(&with_value)
+                .iter()
+                .any(|f| f.title.starts_with("Unused export: HttpApp")),
+            "the value export must still be judged"
+        );
     }
 
     #[test]
@@ -753,6 +839,7 @@ mod tests {
             exports: &[],
             imports: &[],
             path_literals: &path_literals,
+            signature_types: &[],
         };
         let findings = analyze(&input);
 
@@ -827,6 +914,7 @@ mod tests {
             exports: &[],
             imports: &[],
             path_literals: &path_literals,
+            signature_types: &[],
         };
         let description = analyze(&input)
             .into_iter()
@@ -865,6 +953,7 @@ mod tests {
             exports: &exports,
             imports: &imports,
             path_literals: &[],
+            signature_types: &[],
         };
         let findings = analyze(&input);
         let widgets = findings
@@ -906,6 +995,7 @@ mod tests {
             exports: &exports,
             imports: &imports,
             path_literals: &[],
+            signature_types: &[],
         };
         let findings = analyze(&input);
         let dups = findings
@@ -943,6 +1033,7 @@ mod tests {
             exports: &exports,
             imports: &imports,
             path_literals: &[],
+            signature_types: &[],
         };
         // `import *` uses the whole module, so neither export is unused.
         assert!(

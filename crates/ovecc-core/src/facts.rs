@@ -701,6 +701,13 @@ pub struct FileFacts {
     /// TS/JS extractor; feeds dead-code analysis.
     #[serde(default)]
     pub exports: Vec<ExportFact>,
+    /// Type names appearing inside an exported declaration: the options type of
+    /// an exported function, its return type, the element type of what it
+    /// returns. Part of the module's public surface even though nothing imports
+    /// them by name, so dead-code analysis must not call them unused. Populated
+    /// by the oxc TS/JS extractor.
+    #[serde(default)]
+    pub exported_signature_types: Vec<String>,
     /// Ambient capability uses (network, storage, clock, ...), one entry per
     /// distinct API with its first line and occurrence count. Populated by
     /// the TS/JS extractor; judged by the architecture contract's

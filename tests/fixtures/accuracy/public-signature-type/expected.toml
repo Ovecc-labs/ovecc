@@ -1,0 +1,22 @@
+# A type named in an exported declaration's signature is public surface reached
+# *through* that declaration, not by name. Calling it unused was technically
+# right and the remedy — dropping its `export` — was backwards: the caller could
+# no longer annotate the value it had just been handed.
+command = "deadcode"
+
+[[require]]
+rule = "unused-type"
+path = "src/http.ts"
+title = "OrphanedOptions"
+
+[[deny]]
+rule = "unused-type"
+title = "CreateHttpServerOptions"
+
+[[deny]]
+rule = "unused-type"
+title = "HttpApp"
+
+[[deny]]
+rule = "unused-type"
+title = "DeadLetterRecord"

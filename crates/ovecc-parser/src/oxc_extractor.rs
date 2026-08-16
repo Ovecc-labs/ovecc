@@ -22,13 +22,19 @@ use oxc_parser::Parser;
 use oxc_semantic::ScopeFlags;
 use oxc_span::{SourceType, Span as OxcSpan};
 
-/// Extracts `(exports, complexity)` from one JS/TS source via oxc. Returns
-/// `None` for non-JS languages or on a hard parser panic (the caller then keeps
-/// the tree-sitter facts unchanged).
-pub fn extract(
-    source: &str,
-    language: SourceLanguage,
-) -> Option<(Vec<ExportFact>, Vec<ComplexityFact>)> {
+/// What oxc contributes that tree-sitter cannot.
+pub struct OxcFacts {
+    pub exports: Vec<ExportFact>,
+    pub complexity: Vec<ComplexityFact>,
+    /// Type names appearing inside an exported declaration — the module's
+    /// public type surface, deduplicated and sorted.
+    pub signature_types: Vec<String>,
+}
+
+/// Extracts the oxc-only facts from one JS/TS source. Returns `None` for non-JS
+/// languages or on a hard parser panic (the caller then keeps the tree-sitter
+/// facts unchanged).
+pub fn extract(source: &str, language: SourceLanguage) -> Option<OxcFacts> {
     let source_type = match language {
         SourceLanguage::TypeScript => SourceType::ts(),
         SourceLanguage::Tsx => SourceType::tsx(),
@@ -52,7 +58,15 @@ pub fn extract(
             .cmp(&b.line)
             .then_with(|| a.qualified_name.cmp(&b.qualified_name))
     });
-    Some((walker.exports, walker.complexity))
+    // Source order carries no meaning here and the set is a membership test, so
+    // sorting and deduplicating keeps the parse cache small and byte-stable.
+    walker.signature_types.sort_unstable();
+    walker.signature_types.dedup();
+    Some(OxcFacts {
+        exports: walker.exports,
+        complexity: walker.complexity,
+        signature_types: walker.signature_types,
+    })
 }
 
 /// Byte offset of each line start (`offsets[0] == 0`).
@@ -93,6 +107,15 @@ struct OxcWalk<'s> {
     /// Name carried from an enclosing method/variable/`export default` onto the
     /// next anonymous function frame.
     pending_name: Option<String>,
+    /// Every type named inside an exported declaration — the options type of an
+    /// exported function, its return type, the element type of what it returns.
+    /// Nothing imports these by name, so reachability alone calls them unused
+    /// and `fix` offers to drop their `export`, which is exactly backwards: a
+    /// caller can then no longer annotate the value it was just handed.
+    signature_types: Vec<String>,
+    /// Nesting depth inside an exported declaration (`export` nests, e.g. a
+    /// class member's type inside an exported class).
+    exported_depth: usize,
 }
 
 impl<'s> OxcWalk<'s> {
@@ -103,6 +126,8 @@ impl<'s> OxcWalk<'s> {
             complexity: Vec::new(),
             stack: Vec::new(),
             pending_name: None,
+            signature_types: Vec::new(),
+            exported_depth: 0,
         }
     }
 
@@ -228,6 +253,16 @@ fn param_names(params: &FormalParameters<'_>) -> Vec<String> {
         names.push(ident.name.to_string());
     }
     names
+}
+
+/// The leading identifier of a type reference: `Options` for `Options`, and
+/// `NS` for `NS.Inner` — the qualified head is what an importer would name.
+fn type_name_head(name: &TSTypeName<'_>) -> Option<String> {
+    match name {
+        TSTypeName::IdentifierReference(identifier) => Some(identifier.name.to_string()),
+        TSTypeName::QualifiedName(qualified) => type_name_head(&qualified.left),
+        _ => None,
+    }
 }
 
 /// Exported names declared by an `export <decl>` (name, is_type_only).
@@ -406,7 +441,9 @@ impl<'a> Visit<'a> for OxcWalk<'a> {
                 });
             }
         }
+        self.exported_depth += 1;
         walk::walk_export_named_declaration(self, decl);
+        self.exported_depth -= 1;
     }
 
     fn visit_export_default_declaration(&mut self, decl: &ExportDefaultDeclaration<'a>) {
@@ -418,7 +455,22 @@ impl<'a> Visit<'a> for OxcWalk<'a> {
             re_export: None,
         });
         self.pending_name = Some("default".to_string());
+        self.exported_depth += 1;
         walk::walk_export_default_declaration(self, decl);
+        self.exported_depth -= 1;
+    }
+
+    /// A type named anywhere inside an exported declaration is part of that
+    /// module's public surface, whether or not anything imports it *by name*:
+    /// the options type of an exported function, its return type, the element
+    /// type of what it returns. See [`OxcWalk::signature_types`].
+    fn visit_ts_type_reference(&mut self, reference: &TSTypeReference<'a>) {
+        if self.exported_depth > 0
+            && let Some(name) = type_name_head(&reference.type_name)
+        {
+            self.signature_types.push(name);
+        }
+        walk::walk_ts_type_reference(self, reference);
     }
 
     fn visit_export_all_declaration(&mut self, decl: &ExportAllDeclaration<'a>) {
@@ -607,7 +659,7 @@ mod tests {
 
     #[test]
     fn extracts_named_and_default_exports() {
-        let (exports, _) = extract(
+        let OxcFacts { exports, .. } = extract(
             "export const a = 1;\nexport function f() {}\nexport default class C {}\n",
             SourceLanguage::TypeScript,
         )
@@ -619,8 +671,46 @@ mod tests {
     }
 
     #[test]
+    fn collects_the_types_an_exported_declaration_names() {
+        let OxcFacts {
+            signature_types, ..
+        } = extract(
+            "export interface CreateHttpServerOptions { port: number }\n\
+             export type HttpApp = { close(): void };\n\
+             export function createHttpServer(o: CreateHttpServerOptions): HttpApp {\n\
+               return { close() {} };\n\
+             }\n\
+             export function listDeadLetters(): DeadLetterRecord[] { return []; }\n\
+             interface Internal { hidden: PrivateDetail }\n\
+             function unexported(x: NeverPublic) { return x; }\n",
+            SourceLanguage::TypeScript,
+        )
+        .unwrap();
+
+        // Named in an exported signature: public surface, however it is reached.
+        for public in ["CreateHttpServerOptions", "HttpApp", "DeadLetterRecord"] {
+            assert!(
+                signature_types.contains(&public.to_string()),
+                "{public} missing from {signature_types:?}"
+            );
+        }
+        // Only an unexported declaration names these, so they stay judgeable.
+        for private in ["PrivateDetail", "NeverPublic"] {
+            assert!(
+                !signature_types.contains(&private.to_string()),
+                "{private} must not be credited: {signature_types:?}"
+            );
+        }
+        // Deduplicated and sorted, so the parse cache stays byte-stable.
+        let mut sorted = signature_types.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted, signature_types);
+    }
+
+    #[test]
     fn extracts_re_exports() {
-        let (exports, _) = extract(
+        let OxcFacts { exports, .. } = extract(
             "export { x as y } from './m';\nexport * from './n';\n",
             SourceLanguage::TypeScript,
         )
@@ -640,7 +730,7 @@ mod tests {
         // The dominant React/TS shape: arrow/function bound to a const, and the
         // common `useCallback`/`memo` higher-order wrappers. These must report
         // the binding name, not `<anonymous>`.
-        let (_exports, complexity) = extract(
+        let OxcFacts { complexity, .. } = extract(
             "const Foo = () => { if (a) { b(); } };\n\
              const bar = useCallback(() => { while (c) {} }, []);\n\
              function baz() {}\n\
@@ -661,7 +751,7 @@ mod tests {
 
     #[test]
     fn names_functions_bound_to_an_assignment_or_a_property() {
-        let (_exports, complexity) = extract(
+        let OxcFacts { complexity, .. } = extract(
             "exports.getTrajets = async (req, res) => { if (a) { b(); } };\n\
              module.exports.stop = function () { while (c) {} };\n\
              Service.prototype.run = function () { if (d) {} };\n\
@@ -697,7 +787,7 @@ mod tests {
     #[test]
     fn computes_complexity() {
         // cyclomatic = 1 + if + else-if + && = 4; an empty fn would be 1.
-        let (_, complexity) = extract(
+        let OxcFacts { complexity, .. } = extract(
             "function f(x) {\n  if (x > 0 && x < 10) { return 1; }\n  else if (x < 0) { return -1; }\n  return 0;\n}\n",
             SourceLanguage::TypeScript,
         )
@@ -710,7 +800,7 @@ mod tests {
 
     #[test]
     fn param_names_keep_identifiers_and_defaults_but_skip_destructuring() {
-        let (_, complexity) = extract(
+        let OxcFacts { complexity, .. } = extract(
             "function f(host, port = 8080, { deep }, [first], ...rest) { return host; }\n",
             SourceLanguage::TypeScript,
         )
@@ -722,7 +812,7 @@ mod tests {
 
     #[test]
     fn empty_function_is_cyclomatic_one() {
-        let (_, complexity) = extract(
+        let OxcFacts { complexity, .. } = extract(
             "function plain() { return 1; }\n",
             SourceLanguage::TypeScript,
         )

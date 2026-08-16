@@ -609,6 +609,13 @@ distinguishable from an analysis that never ran (no entry points, or no JS/TS
 sources for the unused-export pass; file reachability itself is
 language-agnostic).
 
+A type named in an **exported declaration's signature** — the options type of an
+exported function, its return type, the element type of what it returns — is
+public surface reached *through* that declaration rather than by name, so it is
+not an unused export. Reachability alone could not see this: it called each one
+dead, and `fix` planned to drop the `export`, after which a caller could no
+longer annotate the value the module had just handed it.
+
 The unreachable verdict is **ternary**, because "no import reaches it" is not
 "nothing runs it". A file some string literal in the index names is reported as
 `possibly-unused-file`, quoting the literal and where it was seen, and is never
