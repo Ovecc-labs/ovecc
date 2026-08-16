@@ -275,6 +275,15 @@ pub struct ComponentMetric {
 pub struct MetricsReport {
     pub components: Vec<ComponentMetric>,
     pub coupling_density: f64,
+    /// Which partition the density was measured over — always `components`
+    /// here, against `summary`'s `modules`. The two commands share the metric's
+    /// name over different graphs, so each states its own basis and fraction
+    /// rather than leaving the difference to be discovered as a contradiction.
+    pub coupling_basis: String,
+    /// The density's numerator: distinct edges between two components.
+    pub coupling_edges: usize,
+    /// The density's denominator: `n * (n - 1)` over the component count.
+    pub coupling_possible_edges: usize,
 }
 
 /// The component graph: nodes, deduplicated inter-component edges, coupling, and
@@ -479,6 +488,9 @@ pub fn metrics(
     MetricsReport {
         components: out,
         coupling_density,
+        coupling_basis: "components".to_string(),
+        coupling_edges: g.edges.len(),
+        coupling_possible_edges: possible,
     }
 }
 
@@ -780,7 +792,20 @@ fn detect_unstable_dependency(
 /// depended upon. The mirror "Zone of Uselessness" is deliberately left out for
 /// now — high abstractness is idiomatic in Go/Rust, so it is too FP-prone to ship
 /// on by default.
+///
+/// **Churn decides the severity**, because the detector's own "when not to act"
+/// says so: a stable, rarely-changing concrete core — mature value types, a
+/// branded-id module, an error hierarchy — sits deep in the Zone of Pain by
+/// design and costs nothing, and it is only painful once it *changes*. Ranking
+/// such a core alongside a genuine defect is how a report loses its reader. So
+/// the geometry decides *whether* to report and the history decides *how loudly*:
+/// a component churning above the hotspot floor keeps the full grade, one below
+/// it drops to Low, and one whose history cannot be read at all drops to Low too
+/// and says which of the two it is. That is the same "absolute floor over a
+/// relative score" shape as `hotspot_min_churn`, and it keeps the finding
+/// visible rather than suppressing it on a guess.
 fn detect_zone_of_pain(g: &ComponentGraph, config: &DiagnoseConfig, out: &mut Vec<Diagnosis>) {
+    let measurable_history = g.churn.values().sum::<f64>() >= config.evolutionary_min_history;
     for c in &g.components {
         let total = *g.total_types.get(c).unwrap_or(&0.0);
         if (total as usize) < config.zone_min_types {
@@ -795,10 +820,20 @@ fn detect_zone_of_pain(g: &ComponentGraph, config: &DiagnoseConfig, out: &mut Ve
         let i = instability(fi, fo);
         let d = (a + i - 1.0).abs();
         if d >= config.zone_distance && a < 0.3 && i < 0.5 {
-            let severity = if d >= 0.85 && fi >= 6 {
-                Severity::High
+            let churn = *g.churn.get(c).unwrap_or(&0.0);
+            let changes_often = measurable_history && churn >= config.hotspot_min_churn;
+            let severity = match (changes_often, d >= 0.85 && fi >= 6) {
+                (true, true) => Severity::High,
+                (true, false) => Severity::Medium,
+                // Rigid and widely depended upon, but nothing is paying for it
+                // yet — or nothing can tell. Reported, not ranked as a defect.
+                (false, _) => Severity::Low,
+            };
+            let churn_evidence = if measurable_history {
+                DiagEvidence::metric("churn", churn, config.hotspot_min_churn)
             } else {
-                Severity::Medium
+                // Ternary: no history is "unmeasured", never "never changes".
+                DiagEvidence::bare("churn_unmeasured", 1.0)
             };
             out.push(Diagnosis {
                 detector: "zone_of_pain".to_string(),
@@ -811,6 +846,7 @@ fn detect_zone_of_pain(g: &ComponentGraph, config: &DiagnoseConfig, out: &mut Ve
                     DiagEvidence::bare("abstractness", a),
                     DiagEvidence::bare("instability", i),
                     DiagEvidence::bare("fan_in", fi as f64),
+                    churn_evidence,
                 ],
                 principle: "Stable Abstractions Principle (main sequence)".to_string(),
                 severity,
@@ -1165,7 +1201,7 @@ fn remediation(detector: &str) -> Remediation {
         "zone_of_pain" => Remediation {
             summary: "A rigid, concrete core that many components depend on: introduce abstractions (interfaces/traits) so dependents rely on a stable contract, not the implementation.".to_string(),
             refactoring: "Dependency Inversion / Introduce abstraction (Stable Abstractions Principle)".to_string(),
-            when_not_to_act: Some("A stable, rarely-changing concrete core (e.g. mature value types) can sit in the Zone of Pain without harm; act when it changes often or blocks its dependents.".to_string()),
+            when_not_to_act: Some("A stable, rarely-changing concrete core (e.g. mature value types) can sit in the Zone of Pain without harm; act when it changes often or blocks its dependents. Severity already reflects this: a component whose churn is below the hotspot floor — or whose history cannot be read — is reported at Low, so a Medium or High here means the core is genuinely being paid for.".to_string()),
             language_notes: lang(&[
                 ("go", "Define interfaces at the consumers and depend on them; the concrete core implements them."),
                 ("rust", "Expose a trait for the stable surface; let dependents take `impl Trait`/`dyn Trait` instead of the concrete type."),
@@ -1355,10 +1391,10 @@ mod tests {
         assert!((core.distance - 0.75).abs() < 1e-9);
     }
 
-    #[test]
-    fn detects_a_zone_of_pain() {
-        // A concrete core (5 types, 0 abstract) that three components depend on
-        // and that depends on nothing → A = 0, I = 0, D = 1: the pain corner.
+    /// The pain corner: a concrete core (5 types, 0 abstract) that three
+    /// components depend on and that depends on nothing → A = 0, I = 0, D = 1.
+    /// `churn` is what the caller varies.
+    fn zone_of_pain_with(churn: HashMap<String, f64>) -> Option<Diagnosis> {
         let files = vec![
             "core/a.ts".to_string(),
             "c1/x.ts".to_string(),
@@ -1373,22 +1409,66 @@ mod tests {
         let abst: HashMap<String, (f64, f64)> = [("core/a.ts".to_string(), (0.0, 5.0))]
             .into_iter()
             .collect();
-        let report = diagnose(
+        diagnose(
             &files,
             &deps,
-            &HashMap::new(),
+            &churn,
             &HashMap::new(),
             &abst,
             &[],
             &DiagnoseConfig::default(),
-        );
-        let pain = report
-            .findings
-            .iter()
-            .find(|f| f.detector == "zone_of_pain")
-            .expect("zone_of_pain detected");
+        )
+        .findings
+        .into_iter()
+        .find(|f| f.detector == "zone_of_pain")
+    }
+
+    #[test]
+    fn detects_a_zone_of_pain() {
+        // Enough history to read, and this core is in it: genuinely painful.
+        let churn: HashMap<String, f64> = [
+            ("core/a.ts".to_string(), 40.0),
+            ("c1/x.ts".to_string(), 5.0),
+        ]
+        .into_iter()
+        .collect();
+        let pain = zone_of_pain_with(churn).expect("zone_of_pain detected");
         assert_eq!(pain.target, "core");
         assert!(pain.severity >= Severity::Medium);
+    }
+
+    #[test]
+    fn a_stable_concrete_core_is_reported_but_not_ranked_as_a_defect() {
+        // The detector's own "when not to act": mature value types, branded ids,
+        // an error hierarchy — deliberately concrete, deliberately depended on,
+        // and nobody is paying for it because it does not change. Ranking that
+        // beside a real defect is how a reader learns to skim the whole band.
+        let quiet: HashMap<String, f64> = [
+            ("core/a.ts".to_string(), 1.0),
+            ("c1/x.ts".to_string(), 40.0),
+        ]
+        .into_iter()
+        .collect();
+        let pain = zone_of_pain_with(quiet).expect("still reported, just not ranked");
+        assert_eq!(pain.severity, Severity::Low);
+        assert!(
+            pain.evidence.iter().any(|e| e.metric == "churn"),
+            "the churn that decided the grade must be in evidence: {:?}",
+            pain.evidence
+        );
+
+        // No history at all: "unmeasured", never "never changes". Same Low
+        // grade, but the evidence says which of the two it is.
+        let unmeasured = zone_of_pain_with(HashMap::new()).expect("geometry still reports");
+        assert_eq!(unmeasured.severity, Severity::Low);
+        assert!(
+            unmeasured
+                .evidence
+                .iter()
+                .any(|e| e.metric == "churn_unmeasured"),
+            "absence must not read as zero: {:?}",
+            unmeasured.evidence
+        );
     }
 
     #[test]

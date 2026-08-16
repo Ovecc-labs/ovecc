@@ -77,9 +77,30 @@ parse are counted here too, since every other figure covers only the rest.
 ```
 Files: 52                     Modules: 13
 Dependencies: 264             External dependencies: 137
-Cyclic module components: 0   Coupling density: 11.54%
+Cyclic module components: 0
+Coupling density (modules): 11.54% — 18 of 156 possible edges between 13 modules
 Risk score: Low
 ```
+
+Coupling density names the graph it measured, because `metrics` reports one too
+and the two are **not** the same number. `summary` divides distinct
+module-to-module edges by `n * (n - 1)` over the modules
+(`[architecture] module_depth`); `metrics` does the same over `[diagnose]`
+components, which is a different partition with its own excludes. Both are
+correct and both are deterministic — the fraction is printed so a reader can see
+which is which instead of finding the difference and doubting the tool. The
+`coupling_basis`, `coupling_edges`, and `coupling_possible_edges` JSON fields
+carry the same thing for machines.
+
+"Risk score" is **structural**: cycles, coupling density, and the top hotspot.
+It does not read the violation list, so clearing every medium finding can leave
+it unchanged — that is a scope, not a stuck number, and the line states its own
+inputs so the difference is visible rather than discovered.
+
+`summary` closes with a next-step footer. The most useful commands here are the
+least run: two full agent sessions used `index`, `summary`, and `violations` and
+never reached `advise`, `diagnose`, or `history`. A README is read once; output
+is read every run.
 
 "Cyclic module components" counts *strongly-connected components* over runtime
 imports. Two things follow, and both are intended:
@@ -340,13 +361,22 @@ principle it breaks, a curated remediation, a deterministic confidence, and a
 machine `fix` action.
 
 ```
-[High] Zone of Pain — component crates/ovecc-core/src  (confidence 0.87)
+[High] Zone of Pain — component crates/ovecc-core  (confidence 0.90)
   Principle: Stable Abstractions Principle (main sequence)
-  Evidence: distance=0.94 (>= 0.70), abstractness=0.06, instability=0, fan_in=9
+  Evidence: distance=0.99 (>= 0.70), abstractness=0.01, instability=0, fan_in=10,
+            churn=169 (>= 3)
   Fix: A rigid, concrete core that many components depend on: introduce
        abstractions so dependents rely on a stable contract. [Dependency Inversion]
   Action: introduce_abstraction (auto-fixable: no)
 ```
+
+Where a detector's *"when not to act"* can be measured, it decides the severity
+rather than being left to the reader. Zone of Pain is the worked example: the
+geometry decides whether to report, and churn decides how loudly. A rigid core
+that nothing is paying for — churn below the hotspot floor — is reported at
+**Low**, so a Medium or High means the core genuinely changes. A component whose
+history cannot be read carries `churn_unmeasured` and also drops to Low: absence
+is "unmeasured", never "never changes".
 
 Key flags: `--target <substr>`, `--severity`, `--group-by
 family|severity|component`, `--fail-on`. Formats: + `sarif`, `codeclimate`.
@@ -588,8 +618,26 @@ distinguishable from an analysis that never ran (no entry points, or no JS/TS
 sources for the unused-export pass; file reachability itself is
 language-agnostic).
 
+A type named in an **exported declaration's signature** — the options type of an
+exported function, its return type, the element type of what it returns — is
+public surface reached *through* that declaration rather than by name, so it is
+not an unused export. Reachability alone could not see this: it called each one
+dead, and `fix` planned to drop the `export`, after which a caller could no
+longer annotate the value the module had just handed it.
+
+The unreachable verdict is **ternary**, because "no import reaches it" is not
+"nothing runs it". A file some string literal in the index names is reported as
+`possibly-unused-file`, quoting the literal and where it was seen, and is never
+deleted by `fix --delete-files`; only a file nothing references at all is
+reported as `unused-file`. Entry points a runtime loads by URL — worker
+constructors and HTML `<script src>` — are resolved as real edges, so neither
+reads as dead in the first place.
+
 ```
 Dead code: 47 unused export(s), 46 unused file(s), 0 unused dependency(ies), 0 unlisted dependency(ies)
+
+[Low] Possibly unused file: tasks/build.ts
+  tasks/build.ts:1 (referenced-by-literal)
 ```
 
 ### `ovecc fix [--apply] [--rule <rule>] [--delete-files]`
@@ -608,6 +656,10 @@ passed. Reachability sees import edges, and a file a CI step runs, a task runner
 invokes, or another file names in a string has none: on hono, `--apply` used to
 delete two scripts a workflow executes. Every other fix edits a line and is read
 back against the index; a deletion cannot be checked that way, so it asks.
+
+A `possibly-unused-file` — one some string literal in the index names — is not
+deletable at all, with or without `--delete-files`. That finding is a prompt to
+check, not a verdict to act on.
 
 ```
 Fix plan: 5 change(s), 0 skipped — dry-run (pass --apply to write)

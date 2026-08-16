@@ -1,0 +1,27 @@
+# A worker names its entry module by URL, so no `import` edge reaches it and
+# reachability used to call both live files dead — the one dead-code error that
+# costs a user source. Widening it must not cost the true positive in orphan.ts.
+command = "deadcode"
+
+[[require]]
+rule = "unused-file"
+path = "src/orphan.ts"
+
+[[deny]]
+rule = "unused-file"
+path = "src/signature-worker.ts"
+
+[[deny]]
+rule = "unused-file"
+path = "src/plain-worker.js"
+
+# The pool shape binds the URL once and constructs N workers from it, so the
+# construction names a variable rather than a literal. Resolving only the
+# inline form would miss what a real pool actually looks like.
+[[deny]]
+rule = "unused-file"
+path = "src/pool-worker.ts"
+
+[[deny]]
+rule = "possibly-unused-file"
+path = "src/pool-worker.ts"

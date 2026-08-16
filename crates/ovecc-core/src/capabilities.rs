@@ -717,14 +717,21 @@ pub fn rule_definitions() -> BTreeMap<String, MetaRule> {
         (
             "unused-file".to_string(),
             rule(
-                "A file is reachable from no entry point and imported by nothing.",
+                "Nothing in the index references the file: no import reaches it and no string literal names it.",
+                "low",
+            ),
+        ),
+        (
+            "possibly-unused-file".to_string(),
+            rule(
+                "No import reaches the file, but a string literal in the index names it — it may be loaded dynamically, so `fix --delete-files` will not remove it.",
                 "low",
             ),
         ),
         (
             "unused-type".to_string(),
             rule(
-                "A type-only export (interface/type alias) never imported by a reachable module.",
+                "A type-only export (interface/type alias) never imported by a reachable module, and not named in any exported declaration's signature.",
                 "low",
             ),
         ),

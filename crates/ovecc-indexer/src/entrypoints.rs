@@ -20,6 +20,8 @@ use std::path::Path;
 /// - **files a command line runs** — `package.json` scripts and the `.github`
 ///   workflows and composite actions, where a script is named by path and
 ///   nothing ever imports it;
+/// - **scripts an HTML page loads** — `<script src>`, which is how every
+///   non-bundled page pulls in its JavaScript and leaves no import edge behind;
 /// - **Cargo crate roots** — every crate's `src/main.rs`, `src/bin/*.rs`,
 ///   `build.rs` (invoked by Cargo, nothing imports them) and `src/lib.rs`:
 ///   cross-crate `use` edges resolve *through* the crate root straight to the
@@ -37,6 +39,7 @@ pub(crate) fn detect_entry_points(root: &Path, files: &[FileRecord]) -> HashSet<
 
     collect_manifest_entries(root, &file_paths, &mut entries);
     collect_command_entries(root, &file_paths, &mut entries);
+    collect_html_entries(root, &file_paths, &mut entries);
     collect_cargo_entries(root, files, &file_paths, &mut entries);
     for file in files {
         if is_default_entry(&file.path)
@@ -110,6 +113,165 @@ fn collect_command_entries(root: &Path, file_paths: &HashSet<&str>, entries: &mu
             }
         }
     }
+}
+
+/// Scripts an HTML page loads. `<script type="module" src="/app.js">` is how a
+/// page without a bundler pulls in its JavaScript: no import edge exists, so
+/// reachability sees an orphan and `fix --delete-files` offers to delete a file
+/// the page does not run without.
+///
+/// Only `<script src>` is read. A `<link href>` names a stylesheet or a
+/// preload, and no stylesheet is in the graph to reach, so scanning for it would
+/// add scope without adding an entry point.
+///
+/// The specifier is resolved against the page's *own* directory first, because
+/// a `src` is a server path and the page's directory is what the server usually
+/// roots: `viewer/index.html` loading `/app.js` means `viewer/app.js`.
+fn collect_html_entries(root: &Path, file_paths: &HashSet<&str>, entries: &mut HashSet<String>) {
+    for (dir, html) in find_html_pages(root) {
+        for source in script_sources(&html) {
+            // A remote script (`https:`, `//cdn`) is nothing this repository
+            // holds, and a query or fragment is cache-busting, not the path.
+            let spec = source
+                .split(['?', '#'])
+                .next()
+                .unwrap_or_default()
+                .trim_start_matches('/');
+            // `//cdn/x.js` and `https://cdn/x.js` alike name a remote script.
+            if spec.is_empty() || source.contains("//") {
+                continue;
+            }
+            let anchored = collapse_relative(&format!("{dir}{spec}"));
+            if let Some(resolved) = resolve_entry_spec("", &anchored, file_paths) {
+                entries.insert(resolved);
+            }
+        }
+    }
+}
+
+/// Every HTML page in the tree as `(its directory with a trailing slash, its
+/// text)`. The walk mirrors source discovery — ignore-aware and pruning the
+/// vendored directories — so a `node_modules` demo page cannot seed entries.
+fn find_html_pages(root: &Path) -> Vec<(String, String)> {
+    let mut builder = WalkBuilder::new(root);
+    builder
+        .hidden(false)
+        .parents(true)
+        .git_ignore(true)
+        .git_exclude(true);
+    builder.filter_entry(|entry| {
+        entry.depth() == 0
+            || entry
+                .file_name()
+                .to_str()
+                .map(|name| !crate::discover::is_excluded_component(name))
+                .unwrap_or(true)
+    });
+
+    let mut pages = Vec::new();
+    for entry in builder.build().flatten() {
+        let path = entry.path();
+        if !path.is_file()
+            || !matches!(
+                path.extension()
+                    .and_then(|value| value.to_str())
+                    .map(str::to_ascii_lowercase)
+                    .as_deref(),
+                Some("html") | Some("htm")
+            )
+        {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        let dir = path
+            .parent()
+            .and_then(|parent| parent.strip_prefix(root).ok())
+            .map(ovecc_core::util::normalize_path)
+            .unwrap_or_default();
+        pages.push((
+            if dir.is_empty() {
+                String::new()
+            } else {
+                format!("{dir}/")
+            },
+            text,
+        ));
+    }
+    // The walk yields in filesystem order; sorting keeps a repo with two pages
+    // naming the same script from depending on it.
+    pages.sort();
+    pages
+}
+
+/// Collapses `.`/`..` segments in a repo-relative path, so a page loading
+/// `../shared/app.js` still lands on an indexed file rather than silently
+/// resolving to nothing — a missed entry point is the expensive direction here,
+/// since it reads back as "unreachable file".
+fn collapse_relative(path: &str) -> String {
+    let mut segments: Vec<&str> = Vec::new();
+    for segment in path.split('/') {
+        match segment {
+            "" | "." => {}
+            ".." => {
+                segments.pop();
+            }
+            other => segments.push(other),
+        }
+    }
+    segments.join("/")
+}
+
+/// The `src` of every `<script>` tag in `html`. A tolerant scan, not a parse:
+/// the attribute is all that is wanted, and an HTML grammar would be a new
+/// dependency and a new failure mode for a page that need not even be valid.
+fn script_sources(html: &str) -> Vec<String> {
+    // ASCII-lowercasing maps only ASCII bytes, so every offset below is still a
+    // valid boundary in `html` itself even when the page holds UTF-8 text.
+    let lower = html.to_ascii_lowercase();
+    let mut sources = Vec::new();
+    let mut cursor = 0usize;
+    while let Some(offset) = lower[cursor..].find("<script") {
+        let open = cursor + offset;
+        let close = lower[open..]
+            .find('>')
+            .map_or(html.len(), |index| open + index);
+        if let Some(source) = attribute_value(&html[open..close], "src") {
+            sources.push(source);
+        }
+        cursor = close.max(open + 1);
+    }
+    sources
+}
+
+/// The value of attribute `name` in one tag's text, quoted or bare. `None` when
+/// the tag does not carry it — a `<script>` with inline code, typically.
+fn attribute_value(tag: &str, name: &str) -> Option<String> {
+    let lower = tag.to_ascii_lowercase();
+    let mut cursor = 0usize;
+    while let Some(offset) = lower[cursor..].find(name) {
+        let start = cursor + offset;
+        cursor = start + name.len();
+        // A whole attribute, not the tail of another one (`data-src`).
+        if start == 0 || !lower.as_bytes()[start - 1].is_ascii_whitespace() {
+            continue;
+        }
+        let Some(rest) = tag[cursor..].trim_start().strip_prefix('=') else {
+            continue;
+        };
+        let rest = rest.trim_start();
+        let value = match rest.chars().next() {
+            Some(quote @ ('"' | '\'')) => rest[quote.len_utf8()..].split(quote).next(),
+            // Bare values are legal HTML and end at the first whitespace.
+            Some(_) => rest.split_whitespace().next(),
+            None => None,
+        };
+        if let Some(value) = value.filter(|value| !value.is_empty()) {
+            return Some(value.to_string());
+        }
+    }
+    None
 }
 
 /// Every YAML file under `directory`, read as raw text: a workflow's `run:`
@@ -366,6 +528,94 @@ mod tests {
         assert!(specs.contains(&"./dist/feature.js".to_string()));
         assert!(specs.contains(&"./dist/cli.js".to_string()));
         assert!(specs.contains(&"./dist/index.d.ts".to_string()));
+    }
+
+    #[test]
+    fn reads_script_sources_out_of_a_page() {
+        let html = r#"
+<!doctype html>
+<html>
+  <head>
+    <link rel="stylesheet" href="./styles.css">
+    <script type="module" src="/app.js"></script>
+    <script SRC='./legacy.js' defer></script>
+    <script src=bare.js></script>
+    <script data-src="./decoy.js"></script>
+    <script>console.log("inline");</script>
+    <script type="module" src="https://cdn.example.com/vendor.js"></script>
+  </head>
+  <body>é</body>
+</html>
+"#;
+        assert_eq!(
+            script_sources(html),
+            vec![
+                "/app.js".to_string(),
+                "./legacy.js".to_string(),
+                "bare.js".to_string(),
+                "https://cdn.example.com/vendor.js".to_string(),
+            ],
+            "tag case, quote style, and bare values all count; \
+             `data-src` and inline scripts do not"
+        );
+    }
+
+    #[test]
+    fn collapses_relative_page_paths() {
+        assert_eq!(collapse_relative("viewer/app.js"), "viewer/app.js");
+        assert_eq!(collapse_relative("viewer/./app.js"), "viewer/app.js");
+        assert_eq!(
+            collapse_relative("viewer/../shared/app.js"),
+            "shared/app.js"
+        );
+        assert_eq!(collapse_relative("app.js"), "app.js");
+    }
+
+    #[test]
+    fn html_script_tags_become_entry_points() {
+        use ovecc_core::legacy::SourceLanguage;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("viewer")).unwrap();
+        std::fs::create_dir_all(root.join("shared")).unwrap();
+        // A `src` is a server path: the page's own directory is the server root,
+        // so `/app.js` on `viewer/index.html` means `viewer/app.js`.
+        std::fs::write(
+            root.join("viewer/index.html"),
+            "<script type=\"module\" src=\"/app.js\"></script>\n\
+             <script src=\"../shared/util.js\"></script>\n\
+             <script src=\"https://cdn.example.com/vendor.js\"></script>\n",
+        )
+        .unwrap();
+        let file = |path: &str| FileRecord {
+            id: String::new(),
+            repository_id: String::new(),
+            path: path.to_string(),
+            absolute_path: root.join(path),
+            language: SourceLanguage::JavaScript,
+            content_hash: String::new(),
+            size_bytes: 0,
+            module_id: String::new(),
+            module_name: String::new(),
+        };
+        let files = vec![
+            file("viewer/app.js"),
+            file("shared/util.js"),
+            file("viewer/orphan.js"),
+        ];
+        let entries = detect_entry_points(root, &files);
+        assert!(
+            entries.contains("viewer/app.js"),
+            "the page's script must be an entry: {entries:?}"
+        );
+        assert!(
+            entries.contains("shared/util.js"),
+            "a script above the page must resolve too: {entries:?}"
+        );
+        assert!(
+            !entries.contains("viewer/orphan.js"),
+            "no page loads it, so widening reachability must not credit it: {entries:?}"
+        );
     }
 
     #[test]

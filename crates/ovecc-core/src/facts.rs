@@ -523,7 +523,9 @@ impl FindingKind {
             FindingKind::UnusedFile => FixSpec::new(
                 "remove_unused_file",
                 true,
-                "Delete this unreachable file (no entry point reaches it).",
+                "Delete this file once you have confirmed nothing outside the index runs it. \
+                 Reported as `possibly-unused-file` instead, and never deleted, when some string \
+                 literal names it.",
             ),
             FindingKind::UnusedExport => FixSpec::new(
                 "remove_unused_export",
@@ -699,6 +701,13 @@ pub struct FileFacts {
     /// TS/JS extractor; feeds dead-code analysis.
     #[serde(default)]
     pub exports: Vec<ExportFact>,
+    /// Type names appearing inside an exported declaration: the options type of
+    /// an exported function, its return type, the element type of what it
+    /// returns. Part of the module's public surface even though nothing imports
+    /// them by name, so dead-code analysis must not call them unused. Populated
+    /// by the oxc TS/JS extractor.
+    #[serde(default)]
+    pub exported_signature_types: Vec<String>,
     /// Ambient capability uses (network, storage, clock, ...), one entry per
     /// distinct API with its first line and occurrence count. Populated by
     /// the TS/JS extractor; judged by the architecture contract's
@@ -716,6 +725,48 @@ pub struct FileFacts {
     /// yields facts, so this is the only signal that the extraction is partial.
     #[serde(default)]
     pub parse_errors: bool,
+    /// String literals that could name a file. Reachability follows `import`
+    /// edges, but a task runner, a config, or a path handed to `readFile` names
+    /// its target as a string and leaves no edge — so these are what keeps
+    /// dead-code analysis from claiming a file nothing *imports* is a file
+    /// nothing *references*.
+    #[serde(default)]
+    pub path_literals: Vec<PathLiteralFact>,
+}
+
+/// A string literal that could name a file, with the line it sits on.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PathLiteralFact {
+    pub value: String,
+    pub line: u32,
+}
+
+/// The most path-shaped literals a single file contributes. A generated blob
+/// can hold thousands; the set only has to witness *that* a name is referenced,
+/// so a bound keeps the parse cache small without weakening the answer. Applied
+/// in source order, so which literals survive is deterministic.
+pub const MAX_PATH_LITERALS_PER_FILE: usize = 64;
+
+/// True when a string literal could name a file: a bounded, whitespace-free
+/// value whose last segment carries a short extension.
+///
+/// Deliberately loose, and deliberately not a list of source extensions — the
+/// precise test is equality against an *indexed file's* name, which the
+/// dead-code analysis does. This only decides what is worth carrying there, and
+/// it must stay language-agnostic: a Python `"tasks/build.py"`, a Go
+/// `"config.yaml"`, and a JS `"./worker.ts"` are all the same question.
+pub fn looks_like_path_literal(value: &str) -> bool {
+    const MAX_LENGTH: usize = 256;
+    if value.is_empty() || value.len() > MAX_LENGTH || value.chars().any(char::is_whitespace) {
+        return false;
+    }
+    let name = value.rsplit(['/', '\\']).next().unwrap_or(value);
+    let Some((stem, extension)) = name.rsplit_once('.') else {
+        return false;
+    };
+    !stem.is_empty()
+        && (1..=4).contains(&extension.len())
+        && extension.chars().all(|c| c.is_ascii_alphanumeric())
 }
 
 /// A security-relevant pattern found in source, classified into a finding by
@@ -1115,6 +1166,37 @@ pub struct FactBatch {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn path_literals_keep_file_shaped_strings_across_languages() {
+        // The same question in every language: could this string name a file?
+        for value in [
+            "./worker.ts",
+            "worker.ts",
+            "src/workers/signature-worker.ts",
+            "tasks/build.py",
+            "config.yaml",
+            "app.js",
+            "C:\\jobs\\run.go",
+        ] {
+            assert!(looks_like_path_literal(value), "{value}");
+        }
+        // No extension, or nothing a path resolver would ever be handed.
+        for value in [
+            "",
+            "application/json",
+            "SELECT * FROM users",
+            "a name with spaces.ts",
+            "trailing.",
+            ".hidden",
+            "too.longextension",
+            "sha256.a1b2c3d4e5f6",
+        ] {
+            assert!(!looks_like_path_literal(value), "{value}");
+        }
+        // Bounded, so a minified blob cannot bloat the parse cache.
+        assert!(!looks_like_path_literal(&format!("{}.ts", "x".repeat(300))));
+    }
 
     #[test]
     fn severity_orders_low_to_critical_and_serializes_lowercase() {

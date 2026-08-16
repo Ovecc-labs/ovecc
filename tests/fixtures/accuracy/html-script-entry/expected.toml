@@ -1,0 +1,16 @@
+# `<script src>` is how a page without a bundler loads its JavaScript, and it
+# leaves no import edge. The page's script must anchor reachability — and carry
+# what it imports — without crediting a sibling nothing loads.
+command = "deadcode"
+
+[[require]]
+rule = "unused-file"
+path = "viewer/unused.js"
+
+[[deny]]
+rule = "unused-file"
+path = "viewer/app.js"
+
+[[deny]]
+rule = "unused-file"
+path = "viewer/render.js"

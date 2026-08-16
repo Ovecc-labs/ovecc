@@ -152,6 +152,21 @@ fn fix_unused_file(
     apply: bool,
     delete_files: bool,
 ) -> FixAction {
+    // Some string in the index names this file, so "nothing imports it" is not
+    // "nothing runs it" — a task runner or a dynamic load would look exactly
+    // like this. No flag makes that deletable: the finding is a prompt to check,
+    // not a verdict to act on.
+    if finding.rule_name.as_deref() == Some("possibly-unused-file") {
+        return action(
+            finding,
+            "remove_unused_file",
+            file,
+            "skipped",
+            "not deleted: a string literal in the index names this file — see the finding \
+             for which one"
+                .to_string(),
+        );
+    }
     // Reachability proves nothing imports the file, which is not the same as
     // nothing running it: a CI step, a task runner, or a path passed as a string
     // all leave the graph empty. Every other fix here edits a line and is read
@@ -163,7 +178,8 @@ fn fix_unused_file(
             "remove_unused_file",
             file,
             "skipped",
-            "delete file (no entry point reaches it) — pass --delete-files to write".to_string(),
+            "delete file (nothing in the index references it) — pass --delete-files to write"
+                .to_string(),
         );
     }
     let absolute = root.join(file);
@@ -190,7 +206,7 @@ fn fix_unused_file(
         "remove_unused_file",
         file,
         done(apply),
-        "delete file (no entry point reaches it)".to_string(),
+        "delete file (nothing in the index references it)".to_string(),
     )
 }
 

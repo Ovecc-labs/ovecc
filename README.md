@@ -152,8 +152,14 @@ The binary is `ovecc` (`crates/ovecc-cli`).
 ```sh
 ovecc index .                 # parse, resolve, and persist the model into .ovecc/
 ovecc summary                 # coupling, density, cycles, risk score
-ovecc violations              # architecture + security findings, with file:line
+ovecc advise src/server.ts    # the agent-facing surface: findings for one file, each with a fix
 ovecc diagnose                # named architectural smells, evidence + curated remediation
+ovecc history max_cyclomatic  # trend one metric across every index run — is it getting better?
+ovecc violations              # architecture + security findings, with file:line
+ovecc violations --write-baseline   # accept today's backlog; later runs surface only what is new
+ovecc metrics                 # per-component fan-in/out, instability, abstractness, distance
+ovecc components              # the components the graph recovers, and what they hold
+ovecc coupling                # files that change together but do not import each other
 ovecc security                # secrets, insecure patterns, weak crypto, tainted flows
 ovecc audit                   # offline OSV dependency vulnerabilities
 ovecc impact Billing          # blast radius of a change
@@ -173,6 +179,12 @@ ovecc export graph --html     # interactive dependency-graph viewer, one self-co
 ovecc capabilities            # machine-readable contract: commands, metrics, rules, exit codes
 ovecc mcp                     # MCP server over stdio: expose every command as an agent tool
 ```
+
+If you only ever run three of these, run `advise` before editing a file,
+`diagnose` instead of `violations` (same findings, plus the fix and when *not*
+to act), and `history` to see whether the codebase is improving. `summary`
+prints these as a footer, because a list read once loses to output read every
+run.
 
 Every command renders as `text`, `json`, `ndjson`, or `markdown` via `--format`
 (plus `sarif` for GitHub code scanning and `codeclimate` for GitLab Code Quality)

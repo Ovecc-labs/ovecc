@@ -23,8 +23,8 @@
 use crate::security;
 use ovecc_core::facts::{
     ApiFact, ApiKind, CallFact, CallKind, ComplexityFact, FileFacts, ImportFact, ImportFactKind,
-    ParseFailure, SecurityPatternFact, SecurityPatternKind, SourceFile, Span, SymbolFact,
-    SymbolKind,
+    MAX_PATH_LITERALS_PER_FILE, ParseFailure, PathLiteralFact, SecurityPatternFact,
+    SecurityPatternKind, SourceFile, Span, SymbolFact, SymbolKind, looks_like_path_literal,
 };
 use ovecc_core::lang::SourceLanguage;
 use ovecc_core::traits::LanguageAdapter;
@@ -141,6 +141,8 @@ struct Walk<'a> {
     apis: Vec<ApiFact>,
     complexity: Vec<ComplexityFact>,
     suppressed: Vec<u32>,
+    /// File-shaped string literals, capped at [`MAX_PATH_LITERALS_PER_FILE`].
+    path_literals: Vec<PathLiteralFact>,
     /// Depth of enclosing Rust test scopes (`#[cfg(test)] mod`, `#[test] fn`):
     /// security patterns emitted while > 0 are test vectors, not production
     /// code, and get `in_test_code` so the indexer can down-rank them.
@@ -185,6 +187,7 @@ impl<'a> Walk<'a> {
             apis: Vec::new(),
             complexity: Vec::new(),
             suppressed: Vec::new(),
+            path_literals: Vec::new(),
             test_depth: 0,
             qualified_seen: std::collections::HashSet::new(),
             mod_child_prefix: mod_child_prefix(path),
@@ -245,6 +248,7 @@ impl<'a> Walk<'a> {
             apis: self.apis,
             complexity: self.complexity,
             suppressed_lines: self.suppressed,
+            path_literals: self.path_literals,
             ..FileFacts::default()
         }
     }
@@ -272,6 +276,7 @@ impl<'a> Walk<'a> {
         // appear, then keep descending (a string nests nothing of interest).
         if is_string_literal(node.kind()) {
             self.scan_string_secret(node);
+            self.scan_path_literal(node);
         }
 
         // An inline `// ovecc-ignore` (or `# ovecc-ignore` in Python)
@@ -859,6 +864,24 @@ impl<'a> Walk<'a> {
             && let Some(label) = security::provider_secret(&text)
         {
             self.push_security(security::secret_fact(span_of(node).start_line, label));
+        }
+    }
+
+    /// Keeps a string literal that could name a file. What it is *for* lives in
+    /// [`FileFacts::path_literals`]: reachability follows imports, and a path
+    /// spelled as a string leaves no import to follow.
+    fn scan_path_literal(&mut self, node: Node<'a>) {
+        if self.path_literals.len() >= MAX_PATH_LITERALS_PER_FILE {
+            return;
+        }
+        if let Some(text) = node_text(node, self.source) {
+            let value = unquote_string(&text);
+            if looks_like_path_literal(&value) {
+                self.path_literals.push(PathLiteralFact {
+                    value,
+                    line: span_of(node).start_line,
+                });
+            }
         }
     }
 

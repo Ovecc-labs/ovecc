@@ -65,7 +65,16 @@ use std::path::{Path, PathBuf};
 // empty and every deny_capabilities check would pass vacuously.
 // v20: FileFacts gains `parse_errors`; cached v19 facts would deserialize
 // `false` and hide the parse-error diagnostic on unchanged files.
-const PARSE_CACHE_VERSION: &str = "v21";
+// v21: FileFacts gains `request_inputs`; cached v20 facts would deserialize
+// empty and a tainted flow would never see the client input that fed it.
+// v22: FileFacts gains `path_literals` and `exported_signature_types`, and
+// worker constructors now emit import facts. Cached v21 facts would deserialize
+// both lists empty — so a live file a literal names would still be reported
+// deletable, and a type in an exported signature would still read as dead,
+// which is precisely what the two additions exist to prevent. Both v21s were
+// minted independently (this branch's and main's), so the merge has to move
+// past the collision rather than keep one number meaning two fact shapes.
+const PARSE_CACHE_VERSION: &str = "v22";
 
 pub fn index_repository(
     paths: &ProjectPaths,
@@ -796,6 +805,39 @@ fn deadcode_findings(
                 .map(move |export| (path.clone(), export.clone()))
         })
         .collect();
+    // A module's public type surface: what its exported declarations name in
+    // their signatures, which no importer names directly.
+    let signature_types: Vec<(String, String)> = input
+        .parsed
+        .file_facts
+        .iter()
+        .flat_map(|(path, facts)| {
+            facts
+                .exported_signature_types
+                .iter()
+                .map(move |name| (path.clone(), name.clone()))
+        })
+        .collect();
+    // The backstop against calling a dynamically-loaded file dead. Order does
+    // not reach the result — `deadcode` ranks candidates explicitly — but
+    // sorting keeps the collection itself reproducible.
+    let mut path_literals: Vec<(String, ovecc_core::facts::PathLiteralFact)> = input
+        .parsed
+        .file_facts
+        .iter()
+        .flat_map(|(path, facts)| {
+            facts
+                .path_literals
+                .iter()
+                .map(move |literal| (path.clone(), literal.clone()))
+        })
+        .collect();
+    path_literals.sort_by(|left, right| {
+        left.0
+            .cmp(&right.0)
+            .then_with(|| left.1.line.cmp(&right.1.line))
+            .then_with(|| left.1.value.cmp(&right.1.value))
+    });
     let import_edges: Vec<ovecc_rules::deadcode::ImportEdge> = input
         .dependencies
         .iter()
@@ -832,6 +874,8 @@ fn deadcode_findings(
         entry_points: input.entry_points,
         exports: &export_facts,
         imports: &import_edges,
+        path_literals: &path_literals,
+        signature_types: &signature_types,
     });
     let unused_exports = findings
         .iter()
@@ -1534,11 +1578,12 @@ fn process_file(
             // Exports and per-function complexity come from oxc: tree-sitter
             // cannot produce them. oxc stays behind the parser boundary.
             if core_lang.is_js_family()
-                && let Some((exports, complexity)) =
+                && let Some(oxc) =
                     ovecc_parser::oxc_extractor::extract(&source_input.contents, core_lang)
             {
-                facts.exports = exports;
-                facts.complexity = complexity;
+                facts.exports = oxc.exports;
+                facts.complexity = oxc.complexity;
+                facts.exported_signature_types = oxc.signature_types;
             }
             cache.store(&file.content_hash, &facts);
             ProcessedFile {
