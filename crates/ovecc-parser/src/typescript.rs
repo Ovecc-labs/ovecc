@@ -866,6 +866,12 @@ impl<'a> Extractor<'a> {
             self.security
                 .push(security::eval_fact(self.line(node), "new Function", caller));
         }
+        // A worker names its entry module by URL, never by `import`, so without
+        // this the module has no in-edge at all and reachability calls a live
+        // file dead — the one dead-code error that costs a user source.
+        if matches!(callee_name.as_str(), "Worker" | "SharedWorker") {
+            self.push_worker_import(node);
+        }
         let argless = node
             .child_by_field_name("arguments")
             .map(|arguments| arguments.named_child_count() == 0)
@@ -983,6 +989,59 @@ impl<'a> Extractor<'a> {
         }
     }
 
+    /// Records a worker constructor's entry module as a side-effect dynamic
+    /// import: the runtime executes that module, it does not consume any of its
+    /// exports, so no name is credited — exactly the `import "./side-effect"`
+    /// shape the dead-code analysis already understands.
+    ///
+    /// Both mainstream forms are read, and only those:
+    /// `new Worker(new URL("./w.ts", import.meta.url))` — the canonical form in
+    /// the `worker_threads` docs and the only one that survives bundling — and
+    /// the plain `new Worker("./w.ts")`. A computed specifier is deliberately
+    /// left alone: it cannot be known statically, and guessing would be worse
+    /// than the honest gap the unused-file literal backstop reports.
+    fn push_worker_import(&mut self, call: Node<'_>) {
+        let Some(arguments) = call.child_by_field_name("arguments") else {
+            return;
+        };
+        let Some(specifier) = self.worker_specifier(arguments) else {
+            return;
+        };
+        self.imports.push(ImportFact {
+            specifier,
+            line: self.line(call),
+            kind: ImportFactKind::Dynamic,
+            imported_names: Vec::new(),
+        });
+    }
+
+    /// The literal module specifier in a worker constructor's first argument,
+    /// in either accepted form. `None` for anything computed.
+    fn worker_specifier(&self, arguments: Node<'_>) -> Option<String> {
+        let mut cursor = arguments.walk();
+        let first = arguments.named_children(&mut cursor).next()?;
+        match first.kind() {
+            "string" => module_path_specifier(&string_literal_value(self.text(first))?, false),
+            "new_expression" => {
+                let constructor = first.child_by_field_name("constructor")?;
+                if self.text(constructor) != "URL" {
+                    return None;
+                }
+                let url_arguments = first.child_by_field_name("arguments")?;
+                let mut url_cursor = url_arguments.walk();
+                let literal = url_arguments.named_children(&mut url_cursor).next()?;
+                if literal.kind() != "string" {
+                    return None;
+                }
+                // `new URL(spec, base)` always resolves `spec` against `base`, so
+                // a bare `"w.ts"` names the sibling file — which the module
+                // resolver would otherwise read as a package name.
+                module_path_specifier(&string_literal_value(self.text(literal))?, true)
+            }
+            _ => None,
+        }
+    }
+
     fn push_call_import(&mut self, call: Node<'_>, kind: ImportFactKind) {
         let Some(arguments) = call.child_by_field_name("arguments") else {
             return;
@@ -1095,6 +1154,31 @@ fn string_literal_value(raw: &str) -> Option<String> {
     } else {
         None
     }
+}
+
+/// Narrows a runtime-loaded literal to one that can name a file in *this*
+/// repository, returning the specifier the module resolver should be asked
+/// about. Anything carrying a URL scheme — `https:`, `data:`, `blob:`, and a
+/// Windows drive letter alike — names no repo-relative file and would only add
+/// a junk external module, so it is dropped rather than resolved. When
+/// `relative_base` is set the literal is resolved against a base URL, so a bare
+/// `"w.ts"` is the sibling file and gets the `./` the resolver needs to read it
+/// as a path instead of a package name.
+fn module_path_specifier(raw: &str, relative_base: bool) -> Option<String> {
+    let specifier = raw.trim();
+    if specifier.is_empty() {
+        return None;
+    }
+    let has_scheme = specifier
+        .find(':')
+        .is_some_and(|colon| !specifier[..colon].contains('/'));
+    if has_scheme && !specifier.starts_with('.') {
+        return None;
+    }
+    if specifier.starts_with('.') || specifier.starts_with('/') {
+        return Some(specifier.to_string());
+    }
+    relative_base.then(|| format!("./{specifier}"))
 }
 
 /// Collects identifier names under an `import_clause` (default, namespace, and
@@ -1469,6 +1553,85 @@ const d = require("./legacy");
             .find(|i| i.specifier == "./legacy")
             .unwrap();
         assert_eq!(legacy.kind, ImportFactKind::Require);
+    }
+
+    #[test]
+    fn worker_entry_points_become_import_edges() {
+        // A worker names its entry by URL, so nothing `import`s it and
+        // reachability used to call a live file dead. Both mainstream forms
+        // must produce an edge; a computed specifier must produce none.
+        let facts = extract(
+            r#"
+new Worker(new URL("./signature-worker.ts", import.meta.url));
+new Worker(new URL("sibling.ts", import.meta.url));
+new SharedWorker("./shared-worker.js");
+new Worker(workerPath);
+new Worker(new URL(computed, import.meta.url));
+new Worker("https://cdn.example.com/w.js");
+new Worker("blob:1234");
+"#,
+            SourceLanguage::TypeScript,
+        );
+
+        let specifiers: Vec<&str> = facts
+            .imports
+            .iter()
+            .map(|import| import.specifier.as_str())
+            .collect();
+        assert!(
+            specifiers.contains(&"./signature-worker.ts"),
+            "{specifiers:?}"
+        );
+        // Resolved against `import.meta.url`, so a bare literal is the sibling
+        // file, not a package.
+        assert!(specifiers.contains(&"./sibling.ts"), "{specifiers:?}");
+        assert!(specifiers.contains(&"./shared-worker.js"), "{specifiers:?}");
+        // Nothing knowable, and nothing repo-local: no edge, no guess.
+        assert_eq!(specifiers.len(), 3, "{specifiers:?}");
+
+        // A worker executes its module rather than consuming exports, so the
+        // edge credits no name — the side-effect import shape.
+        let worker = facts
+            .imports
+            .iter()
+            .find(|import| import.specifier == "./signature-worker.ts")
+            .unwrap();
+        assert_eq!(worker.kind, ImportFactKind::Dynamic);
+        assert!(worker.imported_names.is_empty());
+    }
+
+    #[test]
+    fn a_runtime_literal_resolves_only_when_it_can_name_a_repo_file() {
+        assert_eq!(
+            module_path_specifier("./w.ts", false).as_deref(),
+            Some("./w.ts")
+        );
+        assert_eq!(
+            module_path_specifier("/abs/w.ts", false).as_deref(),
+            Some("/abs/w.ts")
+        );
+        // Bare literals are siblings only when resolved against a base URL.
+        assert_eq!(module_path_specifier("w.ts", false), None);
+        assert_eq!(
+            module_path_specifier("w.ts", true).as_deref(),
+            Some("./w.ts")
+        );
+        // Schemes name nothing in the repository, drive letters included.
+        for scheme in [
+            "https://cdn/w.js",
+            "data:text/javascript,0",
+            "blob:1234",
+            "file:///w.js",
+            "C:/w.js",
+        ] {
+            assert_eq!(module_path_specifier(scheme, true), None, "{scheme}");
+        }
+        // A colon inside a relative path is a path, not a scheme.
+        assert_eq!(
+            module_path_specifier("./a:b/w.ts", false).as_deref(),
+            Some("./a:b/w.ts")
+        );
+        assert_eq!(module_path_specifier("   ", true), None);
     }
 
     #[test]

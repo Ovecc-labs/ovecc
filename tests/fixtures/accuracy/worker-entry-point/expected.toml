@@ -1,0 +1,16 @@
+# A worker names its entry module by URL, so no `import` edge reaches it and
+# reachability used to call both live files dead — the one dead-code error that
+# costs a user source. Widening it must not cost the true positive in orphan.ts.
+command = "deadcode"
+
+[[require]]
+rule = "unused-file"
+path = "src/orphan.ts"
+
+[[deny]]
+rule = "unused-file"
+path = "src/signature-worker.ts"
+
+[[deny]]
+rule = "unused-file"
+path = "src/plain-worker.js"
