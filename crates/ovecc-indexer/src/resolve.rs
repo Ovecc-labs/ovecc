@@ -60,6 +60,9 @@ pub struct ResolvedFacts {
     pub schema_accesses: Vec<SchemaAccessEdge>,
     /// sinks for code/command injection.
     pub dangerous_sinks: Vec<DangerousSink>,
+    /// Symbols that read something the client sends. A taint flow is only a
+    /// flow if one of these sits on its path.
+    pub client_inputs: Vec<String>,
 }
 
 /// A symbol that is a dangerous-call taint sink.
@@ -112,6 +115,7 @@ struct LinkState {
     schema_objects: Vec<SchemaObjectRecord>,
     schema_accesses: Vec<SchemaAccessEdge>,
     dangerous_sinks: Vec<DangerousSink>,
+    client_inputs: Vec<String>,
     seen_schema: HashMap<(String, String), ()>,
     seen_access: HashMap<(String, String, &'static str), ()>,
     module_init: HashMap<String, String>,
@@ -129,6 +133,7 @@ pub fn resolve_facts(units: &[ResolveUnit<'_>]) -> ResolvedFacts {
         state.resolve_apis(unit, &index);
         state.resolve_schema(unit, &index);
         state.resolve_sinks(unit, &index);
+        state.resolve_client_inputs(unit, &index);
     }
 
     symbols.extend(state.synthesized);
@@ -150,6 +155,8 @@ pub fn resolve_facts(units: &[ResolveUnit<'_>]) -> ResolvedFacts {
     state
         .dangerous_sinks
         .dedup_by(|a, b| a.symbol_id == b.symbol_id && a.label == b.label);
+    state.client_inputs.sort();
+    state.client_inputs.dedup();
 
     ResolvedFacts {
         symbols,
@@ -158,6 +165,7 @@ pub fn resolve_facts(units: &[ResolveUnit<'_>]) -> ResolvedFacts {
         schema_objects: state.schema_objects,
         schema_accesses: state.schema_accesses,
         dangerous_sinks: state.dangerous_sinks,
+        client_inputs: state.client_inputs,
     }
 }
 
@@ -386,6 +394,18 @@ impl LinkState {
                         detail: None,
                     },
                 });
+            }
+        }
+    }
+
+    /// Symbols that read client-sent request data, the taint sources.
+    fn resolve_client_inputs(&mut self, unit: &ResolveUnit<'_>, index: &SymbolIndex) {
+        for input in &unit.facts.request_inputs {
+            if let Some(symbol_id) = index
+                .by_qualified
+                .get(&(unit.path.to_string(), input.caller_qualified_name.clone()))
+            {
+                self.client_inputs.push(symbol_id.clone());
             }
         }
     }

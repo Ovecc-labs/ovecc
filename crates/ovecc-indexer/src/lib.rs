@@ -65,7 +65,7 @@ use std::path::{Path, PathBuf};
 // empty and every deny_capabilities check would pass vacuously.
 // v20: FileFacts gains `parse_errors`; cached v19 facts would deserialize
 // `false` and hide the parse-error diagnostic on unchanged files.
-const PARSE_CACHE_VERSION: &str = "v20";
+const PARSE_CACHE_VERSION: &str = "v21";
 
 pub fn index_repository(
     paths: &ProjectPaths,
@@ -573,9 +573,12 @@ fn taint_findings(input: &AnalysisInput<'_>) -> Vec<FindingRecord> {
     ovecc_dataflow::analyze(
         input.repository_id,
         Some(input.snapshot_id),
-        &flow_nodes,
-        &flow_edges,
-        &dangerous_sinks,
+        &ovecc_dataflow::FlowGraph {
+            nodes: &flow_nodes,
+            edges: &flow_edges,
+            dangerous: &dangerous_sinks,
+            client_inputs: &resolved.client_inputs,
+        },
         &flow_locations,
         ovecc_dataflow::DEFAULT_FLOW_DEPTH,
     )

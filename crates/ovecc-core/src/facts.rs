@@ -705,6 +705,12 @@ pub struct FileFacts {
     /// `deny_capabilities`.
     #[serde(default)]
     pub capability_uses: Vec<CapabilityFact>,
+    /// Reads of a value the client sends (`req.body`, `req.query`, ...),
+    /// attributed to the enclosing callable. Taint has a source only where one
+    /// of these appears, so a route that reaches the database without touching
+    /// any of them carries nothing the caller controls.
+    #[serde(default)]
+    pub request_inputs: Vec<RequestInputFact>,
     /// The parse tree contained `ERROR`/`MISSING` nodes: the file has syntax
     /// the grammar could not fully parse. Tree-sitter recovers and still
     /// yields facts, so this is the only signal that the extraction is partial.
@@ -752,6 +758,30 @@ impl SecurityPatternKind {
         matches!(self, Self::DynamicEval | Self::CommandExec)
     }
 }
+
+/// A read of request data the client controls. Deduplicated per enclosing
+/// callable and expression, like [`CapabilityFact`], so a handler that reads
+/// `req.body` in ten branches yields one fact.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RequestInputFact {
+    /// Qualified name of the enclosing callable. A read outside one is not
+    /// recorded: `req` only exists inside a handler, so a match at module level
+    /// is a variable that happens to carry the name.
+    pub caller_qualified_name: String,
+    /// The expression as written, e.g. `req.body`.
+    pub expression: String,
+    pub line: u32,
+}
+
+/// The request members a client fills in. `headers` and `cookies` are here for
+/// the same reason as `body`: the caller chooses what they contain.
+pub const REQUEST_INPUT_MEMBERS: &[&str] =
+    &["body", "query", "params", "headers", "cookies", "rawBody"];
+
+/// The names an HTTP request is bound to. Express hands it to every handler as
+/// the first argument, and the two spellings below cover what the ecosystem
+/// writes.
+pub const REQUEST_OBJECTS: &[&str] = &["req", "request"];
 
 /// A use of an ambient JS/TS capability: an API that performs I/O or draws on
 /// a source of non-determinism. Detected unconditionally and deduplicated per
