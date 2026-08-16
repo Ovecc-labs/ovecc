@@ -65,12 +65,16 @@ use std::path::{Path, PathBuf};
 // empty and every deny_capabilities check would pass vacuously.
 // v20: FileFacts gains `parse_errors`; cached v19 facts would deserialize
 // `false` and hide the parse-error diagnostic on unchanged files.
-// v21: FileFacts gains `path_literals` and `exported_signature_types`, and
-// worker constructors now emit import facts. Cached v20 facts would deserialize
+// v21: FileFacts gains `request_inputs`; cached v20 facts would deserialize
+// empty and a tainted flow would never see the client input that fed it.
+// v22: FileFacts gains `path_literals` and `exported_signature_types`, and
+// worker constructors now emit import facts. Cached v21 facts would deserialize
 // both lists empty — so a live file a literal names would still be reported
 // deletable, and a type in an exported signature would still read as dead,
-// which is precisely what the two additions exist to prevent.
-const PARSE_CACHE_VERSION: &str = "v21";
+// which is precisely what the two additions exist to prevent. Both v21s were
+// minted independently (this branch's and main's), so the merge has to move
+// past the collision rather than keep one number meaning two fact shapes.
+const PARSE_CACHE_VERSION: &str = "v22";
 
 pub fn index_repository(
     paths: &ProjectPaths,
@@ -578,9 +582,12 @@ fn taint_findings(input: &AnalysisInput<'_>) -> Vec<FindingRecord> {
     ovecc_dataflow::analyze(
         input.repository_id,
         Some(input.snapshot_id),
-        &flow_nodes,
-        &flow_edges,
-        &dangerous_sinks,
+        &ovecc_dataflow::FlowGraph {
+            nodes: &flow_nodes,
+            edges: &flow_edges,
+            dangerous: &dangerous_sinks,
+            client_inputs: &resolved.client_inputs,
+        },
         &flow_locations,
         ovecc_dataflow::DEFAULT_FLOW_DEPTH,
     )

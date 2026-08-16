@@ -19,9 +19,10 @@
 use crate::security;
 use ovecc_core::facts::{
     ApiFact, ApiKind, CallFact, CallKind, CapabilityFact, CapabilityKind, FileFacts, ImportFact,
-    ImportFactKind, MAX_PATH_LITERALS_PER_FILE, ParseFailure, PathLiteralFact, SchemaAccess,
-    SchemaObjectKind, SchemaRefFact, SecurityPatternFact, SourceFile, Span, SymbolFact, SymbolKind,
-    Visibility, looks_like_path_literal,
+    ImportFactKind, MAX_PATH_LITERALS_PER_FILE, ParseFailure, PathLiteralFact,
+    REQUEST_INPUT_MEMBERS, REQUEST_OBJECTS, RequestInputFact, SchemaAccess, SchemaObjectKind,
+    SchemaRefFact, SecurityPatternFact, SourceFile, Span, SymbolFact, SymbolKind, Visibility,
+    looks_like_path_literal,
 };
 use ovecc_core::lang::SourceLanguage;
 use ovecc_core::traits::LanguageAdapter;
@@ -116,6 +117,9 @@ struct Extractor<'a> {
     /// distinct API keeps the facts bounded on files that touch the DOM in
     /// every function.
     capabilities: std::collections::BTreeMap<(CapabilityKind, String), (u32, u32)>,
+    /// (enclosing callable, expression) → first line, for reads of client-sent
+    /// request data.
+    request_inputs: std::collections::BTreeMap<(String, String), u32>,
     /// AST node id → synthetic handler name, for inline route handlers whose
     /// body must be visited inside its own callable frame.
     pending_handlers: std::collections::HashMap<usize, String>,
@@ -137,6 +141,7 @@ impl<'a> Extractor<'a> {
             path_literals: Vec::new(),
             worker_urls: std::collections::HashMap::new(),
             capabilities: std::collections::BTreeMap::new(),
+            request_inputs: std::collections::BTreeMap::new(),
             pending_handlers: std::collections::HashMap::new(),
         }
     }
@@ -184,6 +189,17 @@ impl<'a> Extractor<'a> {
             })
             .collect();
         capability_uses.sort_by(|a, b| a.line.cmp(&b.line).then_with(|| a.api.cmp(&b.api)));
+        let request_inputs: Vec<RequestInputFact> = self
+            .request_inputs
+            .into_iter()
+            .map(
+                |((caller_qualified_name, expression), line)| RequestInputFact {
+                    caller_qualified_name,
+                    expression,
+                    line,
+                },
+            )
+            .collect();
         FileFacts {
             symbols: self.symbols,
             imports: self.imports,
@@ -195,6 +211,7 @@ impl<'a> Extractor<'a> {
             local_types: self.local_types,
             path_literals: self.path_literals,
             capability_uses,
+            request_inputs,
             // complexity + exports are computed by the oxc extractor, not here.
             ..FileFacts::default()
         }
@@ -315,6 +332,7 @@ impl<'a> Extractor<'a> {
             }
             "member_expression" => {
                 self.extract_member_capability(node);
+                self.extract_request_input(node);
             }
             "pair" => {
                 self.extract_permissive_cors(node);
@@ -747,6 +765,43 @@ impl<'a> Extractor<'a> {
     /// skipped to keep one logical use at one count. In a chain only the
     /// innermost member has the bare ambient identifier as its object, so a
     /// chain records once.
+    /// Records a read of client-sent request data, attributed to the enclosing
+    /// callable.
+    ///
+    /// Matching the member read rather than what is done with it is deliberate:
+    /// `const { id } = req.params` and `req.query.page` both go through one, and
+    /// destructuring is how most handlers take their input. `req.query.page`
+    /// arrives here as the inner `req.query`, since the outer member's object is
+    /// itself a member expression.
+    fn extract_request_input(&mut self, node: Node<'_>) {
+        let Some(object) = node
+            .child_by_field_name("object")
+            .filter(|object| object.kind() == "identifier")
+        else {
+            return;
+        };
+        let object = self.text(object).to_string();
+        if !REQUEST_OBJECTS.contains(&object.as_str()) {
+            return;
+        }
+        let Some(property) = node.child_by_field_name("property") else {
+            return;
+        };
+        let property = self.text(property).to_string();
+        if !REQUEST_INPUT_MEMBERS.contains(&property.as_str()) {
+            return;
+        }
+        let Some(caller) = self.current_caller() else {
+            return;
+        };
+        let key = (caller, format!("{object}.{property}"));
+        let line = self.line(node);
+        self.request_inputs
+            .entry(key)
+            .and_modify(|first| *first = (*first).min(line))
+            .or_insert(line);
+    }
+
     fn extract_member_capability(&mut self, node: Node<'_>) {
         let Some(object) = node
             .child_by_field_name("object")
@@ -1914,6 +1969,41 @@ app.post("/users", (req, res) => {
             .iter()
             .find(|use_| use_.api == api)
             .cloned()
+    }
+
+    #[test]
+    fn attributes_client_input_reads_to_the_handler_that_makes_them() {
+        let facts = extract(
+            r#"
+export async function listTrips(req, res) {
+    const { page } = req.query;
+    const filter = req.query.filter;
+    return res.json(await repo.find(page, filter));
+}
+
+export async function publicStats(req, res) {
+    return res.json(await repo.count());
+}
+
+const label = req.body;
+"#,
+            SourceLanguage::TypeScript,
+        );
+        let inputs: Vec<(&str, &str)> = facts
+            .request_inputs
+            .iter()
+            .map(|input| {
+                (
+                    input.caller_qualified_name.as_str(),
+                    input.expression.as_str(),
+                )
+            })
+            .collect();
+        // Two reads in one handler fold into one fact; the handler that only
+        // counts rows contributes nothing; a read outside any callable has no
+        // handler to blame and is dropped.
+        assert_eq!(inputs, vec![("listTrips", "req.query")], "{inputs:?}");
+        assert_eq!(facts.request_inputs[0].line, 3, "first occurrence");
     }
 
     #[test]

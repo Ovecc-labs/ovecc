@@ -13,12 +13,16 @@
 //! - **Propagation**: a depth-bounded forward BFS over `handles` + `calls`
 //!   edges. A sink reached from a source is a candidate tainted flow, reported
 //!   with the full path as evidence.
+//! - **Requirement**: some symbol on the path must read client-sent request
+//!   data (`req.body`, `req.query`, ...). A route that reaches a table without
+//!   any of them carries nothing the caller controls, so it is not a flow. A
+//!   public endpoint listing a public table is the case this exists to drop.
 //!
 //! **Honest limitation:** this is *control-flow reachability*, an
-//! over-approximation — it proves that input *can* reach a DB operation
-//! through the call graph, not that a specific tainted value flows into the
-//! sink argument. Precise value tracking (SSA, points-to/alias, dynamic
-//! dispatch resolution) is a future refinement to prune false positives.
+//! over-approximation — it proves that a handler which reads client input *can*
+//! reach a DB operation through the call graph, not that the tainted value is
+//! the one flowing into the sink argument. Precise value tracking (SSA,
+//! points-to/alias, dynamic dispatch resolution) is a future refinement.
 //! Findings are therefore Medium/High and explicitly framed as "requires review".
 
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -47,25 +51,38 @@ pub struct FlowLocations {
     pub dangerous: HashMap<String, Evidence>,
 }
 
+/// The graph a flow analysis runs over, with the two symbol sets that give it
+/// its endpoints.
+#[derive(Debug, Clone, Copy)]
+pub struct FlowGraph<'a> {
+    pub nodes: &'a [BlastNode],
+    pub edges: &'a [BlastEdge],
+    /// Symbols that execute code or a command: `(symbol id, "eval" | "command")`.
+    pub dangerous: &'a [(String, String)],
+    /// Symbols that read client-sent request data.
+    pub client_inputs: &'a [String],
+}
+
 /// Analyzes source→sink reachability and returns one finding per distinct
 /// (source API, sink symbol, table) flow.
 pub fn analyze(
     repository_id: &str,
     snapshot_id: Option<&str>,
-    nodes: &[BlastNode],
-    edges: &[BlastEdge],
-    dangerous: &[(String, String)],
+    graph: &FlowGraph<'_>,
     locations: &FlowLocations,
     max_depth: usize,
 ) -> Vec<FindingRecord> {
-    let node_by_id: HashMap<&str, &BlastNode> =
-        nodes.iter().map(|node| (node.id.as_str(), node)).collect();
+    let node_by_id: HashMap<&str, &BlastNode> = graph
+        .nodes
+        .iter()
+        .map(|node| (node.id.as_str(), node))
+        .collect();
 
     // Forward adjacency over propagation edges, and the DB-access adjacency
     // (symbol → tables it reads/writes) that marks SQL sinks.
     let mut forward: HashMap<&str, Vec<&str>> = HashMap::new();
     let mut db_access: HashMap<&str, Vec<(&str, &str)>> = HashMap::new();
-    for edge in edges {
+    for edge in graph.edges {
         match edge.kind.as_str() {
             "handles" | "calls" => forward
                 .entry(edge.source.as_str())
@@ -79,26 +96,27 @@ pub fn analyze(
         }
     }
     // Dangerous-call sinks: symbol → label ("eval" | "command").
-    let dangerous_by_id: HashMap<&str, &str> = dangerous
+    let dangerous_by_id: HashMap<&str, &str> = graph
+        .dangerous
         .iter()
         .map(|(id, label)| (id.as_str(), label.as_str()))
         .collect();
+    let walk = Walk {
+        forward,
+        db_access,
+        dangerous_by_id,
+        client_inputs: graph.client_inputs.iter().map(String::as_str).collect(),
+        node_by_id,
+        locations,
+        max_depth,
+    };
 
     let mut findings = Vec::new();
     let mut seen_flows: HashSet<(String, String, String)> = HashSet::new();
 
     // Each API node is a taint source.
-    for source in nodes.iter().filter(|node| node.kind == "api") {
-        let flows = trace_flows(
-            source,
-            &forward,
-            &db_access,
-            &dangerous_by_id,
-            &node_by_id,
-            locations,
-            max_depth,
-        );
-        for flow in flows {
+    for source in graph.nodes.iter().filter(|node| node.kind == "api") {
+        for flow in trace_flows(source, &walk) {
             let dedup_key = (
                 source.id.clone(),
                 flow.sink_symbol_id.clone(),
@@ -113,6 +131,17 @@ pub fn analyze(
 
     findings.sort_by(|a, b| a.id.0.cmp(&b.id.0));
     findings
+}
+
+/// The adjacency the BFS reads, built once and shared by every source.
+struct Walk<'a> {
+    forward: HashMap<&'a str, Vec<&'a str>>,
+    db_access: HashMap<&'a str, Vec<(&'a str, &'a str)>>,
+    dangerous_by_id: HashMap<&'a str, &'a str>,
+    client_inputs: HashSet<&'a str>,
+    node_by_id: HashMap<&'a str, &'a BlastNode>,
+    locations: &'a FlowLocations,
+    max_depth: usize,
 }
 
 struct Flow {
@@ -209,25 +238,38 @@ impl Flow {
 }
 
 /// Depth-bounded forward BFS from one source, collecting every sink reached
-/// (DB reads/writes and dangerous calls).
-fn trace_flows(
-    source: &BlastNode,
-    forward: &HashMap<&str, Vec<&str>>,
-    db_access: &HashMap<&str, Vec<(&str, &str)>>,
-    dangerous_by_id: &HashMap<&str, &str>,
-    node_by_id: &HashMap<&str, &BlastNode>,
-    locations: &FlowLocations,
-    max_depth: usize,
-) -> Vec<Flow> {
+/// (DB reads/writes and dangerous calls) once the path carries client input.
+///
+/// The visited set is keyed by `(node, carries input)` rather than by node
+/// alone. A node reachable both through a symbol that reads the request and
+/// through one that does not would otherwise keep whichever path arrived first,
+/// and BFS order has nothing to do with which of the two is the real flow.
+fn trace_flows(source: &BlastNode, walk: &Walk<'_>) -> Vec<Flow> {
+    let Walk {
+        forward,
+        db_access,
+        dangerous_by_id,
+        client_inputs,
+        node_by_id,
+        locations,
+        max_depth,
+    } = walk;
     let mut flows = Vec::new();
-    let mut visited: HashSet<&str> = HashSet::new();
-    visited.insert(source.id.as_str());
-    let mut queue: VecDeque<(&str, Vec<String>, usize)> =
-        VecDeque::from([(source.id.as_str(), vec![source.label.clone()], 0usize)]);
+    let mut visited: HashSet<(&str, bool)> = HashSet::new();
+    visited.insert((source.id.as_str(), false));
+    let mut queue: VecDeque<(&str, Vec<String>, usize, bool)> = VecDeque::from([(
+        source.id.as_str(),
+        vec![source.label.clone()],
+        0usize,
+        false,
+    )]);
 
-    while let Some((current, path, depth)) = queue.pop_front() {
+    while let Some((current, path, depth, carried)) = queue.pop_front() {
+        // A symbol that both reads the request and queries the table is one
+        // node, so the source check runs before the sink checks.
+        let tainted = carried || client_inputs.contains(current);
         // DB sink?
-        if let Some(accesses) = db_access.get(current) {
+        if tainted && let Some(accesses) = db_access.get(current) {
             for (table_id, access) in accesses {
                 let table_label = node_by_id
                     .get(table_id)
@@ -247,8 +289,10 @@ fn trace_flows(
                 });
             }
         }
-        // Dangerous-call sink (eval / command exec)?
-        if let Some(label) = dangerous_by_id.get(current) {
+        // Dangerous-call sink (eval / command exec)? An `eval` on a constant is
+        // still reported, by the security pattern rule that owns it; this layer
+        // only claims the ones a caller can steer.
+        if tainted && let Some(label) = dangerous_by_id.get(current) {
             flows.push(Flow {
                 sink_symbol_id: current.to_string(),
                 sink_kind: (*label).to_string(),
@@ -257,7 +301,7 @@ fn trace_flows(
                 sink_evidence: locations.dangerous.get(current).cloned(),
             });
         }
-        if depth >= max_depth {
+        if depth >= *max_depth {
             continue;
         }
         if let Some(neighbors) = forward.get(current) {
@@ -265,14 +309,14 @@ fn trace_flows(
             sorted.sort_unstable();
             sorted.dedup();
             for neighbor in sorted {
-                if !visited.insert(neighbor) {
+                if !visited.insert((neighbor, tainted)) {
                     continue;
                 }
                 let mut next_path = path.clone();
                 if let Some(node) = node_by_id.get(neighbor) {
                     next_path.push(node.label.clone());
                 }
-                queue.push_back((neighbor, next_path, depth + 1));
+                queue.push_back((neighbor, next_path, depth + 1, tainted));
             }
         }
     }
@@ -299,6 +343,26 @@ mod tests {
             kind: kind.to_string(),
         }
     }
+    /// The default bound, no snapshot, no dangerous calls: what every test but
+    /// the depth and eval ones runs.
+    fn flows(
+        nodes: &[BlastNode],
+        edges: &[BlastEdge],
+        client_inputs: &[String],
+    ) -> Vec<FindingRecord> {
+        analyze(
+            "r",
+            None,
+            &FlowGraph {
+                nodes,
+                edges,
+                dangerous: &[],
+                client_inputs,
+            },
+            &FlowLocations::default(),
+            DEFAULT_FLOW_DEPTH,
+        )
+    }
 
     #[test]
     fn finds_flow_from_api_to_db_write() {
@@ -319,9 +383,12 @@ mod tests {
         let findings = analyze(
             "repo:test",
             Some("snap"),
-            &nodes,
-            &edges,
-            &[],
+            &FlowGraph {
+                nodes: &nodes,
+                edges: &edges,
+                dangerous: &[],
+                client_inputs: &["s:handler".to_string()],
+            },
             &FlowLocations::default(),
             DEFAULT_FLOW_DEPTH,
         );
@@ -347,16 +414,7 @@ mod tests {
             edge("a:1", "s:handler", "handles"),
             edge("s:repo", "t:customers", "writes"),
         ];
-        let findings = analyze(
-            "repo:test",
-            None,
-            &nodes,
-            &edges,
-            &[],
-            &FlowLocations::default(),
-            DEFAULT_FLOW_DEPTH,
-        );
-        assert!(findings.is_empty());
+        assert!(flows(&nodes, &edges, &["s:handler".to_string()]).is_empty());
     }
 
     #[test]
@@ -375,9 +433,12 @@ mod tests {
         let findings = analyze(
             "repo:test",
             None,
-            &nodes,
-            &edges,
-            &dangerous,
+            &FlowGraph {
+                nodes: &nodes,
+                edges: &edges,
+                dangerous: &dangerous,
+                client_inputs: &["s:handler".to_string()],
+            },
             &FlowLocations::default(),
             DEFAULT_FLOW_DEPTH,
         );
@@ -397,17 +458,49 @@ mod tests {
             edge("a:1", "s:handler", "handles"),
             edge("s:handler", "t:customers", "reads"),
         ];
-        let findings = analyze(
-            "repo:test",
-            None,
-            &nodes,
-            &edges,
-            &[],
-            &FlowLocations::default(),
-            DEFAULT_FLOW_DEPTH,
-        );
+        let findings = flows(&nodes, &edges, &["s:handler".to_string()]);
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].severity, Severity::Medium);
+    }
+
+    #[test]
+    fn a_route_that_never_reads_the_request_is_not_a_flow() {
+        // `GET /stats/public` listing a public table: reachability says the
+        // route touches the table, and there is nothing the caller can steer.
+        let nodes = vec![
+            node("a:1", "api", "GET /stats/public"),
+            node("s:handler", "symbol", "publicStats"),
+            node("t:trips", "table", "trips"),
+        ];
+        let edges = vec![
+            edge("a:1", "s:handler", "handles"),
+            edge("s:handler", "t:trips", "reads"),
+        ];
+        let findings = flows(&nodes, &edges, &[]);
+        assert!(findings.is_empty(), "{findings:?}");
+    }
+
+    #[test]
+    fn input_read_below_the_handler_still_reaches_the_sink() {
+        // The handler passes `req` down; the service is what reads it. The
+        // second path exists so the shorter untainted one is dequeued first,
+        // which is what the (node, tainted) visited key is for.
+        let nodes = vec![
+            node("a:1", "api", "GET /trips"),
+            node("s:h", "symbol", "listTrips"),
+            node("s:svc", "symbol", "TripService.list"),
+            node("s:repo", "symbol", "TripRepo.find"),
+            node("t:trips", "table", "trips"),
+        ];
+        let edges = vec![
+            edge("a:1", "s:h", "handles"),
+            edge("s:h", "s:repo", "calls"),
+            edge("s:h", "s:svc", "calls"),
+            edge("s:svc", "s:repo", "calls"),
+            edge("s:repo", "t:trips", "reads"),
+        ];
+        let findings = flows(&nodes, &edges, &["s:svc".to_string()]);
+        assert_eq!(findings.len(), 1, "{findings:?}");
     }
 
     #[test]
@@ -428,14 +521,18 @@ mod tests {
             edge("s:b", "s:c", "calls"),
             edge("s:c", "t:x", "writes"),
         ];
-        assert!(analyze("r", None, &nodes, &edges, &[], &FlowLocations::default(), 2).is_empty());
+        let graph = FlowGraph {
+            nodes: &nodes,
+            edges: &edges,
+            dangerous: &[],
+            client_inputs: &["s:h".to_string()],
+        };
+        assert!(analyze("r", None, &graph, &FlowLocations::default(), 2).is_empty());
         assert_eq!(
             analyze(
                 "r",
                 None,
-                &nodes,
-                &edges,
-                &[],
+                &graph,
                 &FlowLocations::default(),
                 DEFAULT_FLOW_DEPTH
             )
@@ -458,16 +555,7 @@ mod tests {
             edge("s:repo", "t:customers", "writes"),
             edge("s:repo", "t:customers", "writes"),
         ];
-        let findings = analyze(
-            "r",
-            None,
-            &nodes,
-            &edges,
-            &[],
-            &FlowLocations::default(),
-            DEFAULT_FLOW_DEPTH,
-        );
-        assert_eq!(findings.len(), 1);
+        assert_eq!(flows(&nodes, &edges, &["s:repo".to_string()]).len(), 1);
     }
 
     #[test]
@@ -484,15 +572,7 @@ mod tests {
             edge("s:h", "t:a", "writes"),
             edge("s:h", "t:b", "reads"),
         ];
-        let findings = analyze(
-            "r",
-            None,
-            &nodes,
-            &edges,
-            &[],
-            &FlowLocations::default(),
-            DEFAULT_FLOW_DEPTH,
-        );
+        let findings = flows(&nodes, &edges, &["s:h".to_string()]);
         assert_eq!(findings.len(), 2, "distinct tables are distinct flows");
     }
 }
