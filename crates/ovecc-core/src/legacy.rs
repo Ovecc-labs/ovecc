@@ -197,6 +197,15 @@ pub struct IndexReport {
     /// but is partial, so their facts may be incomplete.
     #[serde(default)]
     pub files_with_parse_errors: usize,
+    /// The paths behind that count, so the warning is actionable. Capped at
+    /// [`MAX_LISTED_PARSE_ERROR_FILES`]; the count above stays exact.
+    #[serde(default)]
+    pub parse_error_files: Vec<String>,
+    /// Git-tracked files outside the source walk that were read for secrets:
+    /// a `.env` committed before it was git-ignored is invisible to every
+    /// ignore-aware scan, and is where a leaked credential usually lives.
+    #[serde(default)]
+    pub tracked_files_scanned: usize,
     /// Per-file failures that did not abort the run.
     pub parse_failures: Vec<IndexFailure>,
     /// The coverage tracefile this run read, if any was configured or found.
@@ -206,6 +215,11 @@ pub struct IndexReport {
     #[serde(default)]
     pub timings: crate::report::IndexTimings,
 }
+
+/// How many syntax-error paths an index report carries. A repository with a
+/// generated or vendored subtree can have hundreds; the first few are what
+/// tells you whether the rest are worth chasing.
+pub const MAX_LISTED_PARSE_ERROR_FILES: usize = 10;
 
 /// A non-fatal per-file indexing failure.
 #[derive(Debug, Clone, Serialize, Deserialize)]

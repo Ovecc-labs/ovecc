@@ -30,6 +30,14 @@ const INIT_CONFIG_TEMPLATE: &str = r#"# ovecc configuration - every key is optio
 # config-only usages cause false positives).
 # detect_unused_deps = true
 
+[architecture]
+# How many directory levels below the repository root name a module. 1 makes
+# `backend/services/pay.js` part of `backend`; 2 makes it `backend/services`.
+# Too shallow and every file lands in a handful of modules that never import
+# each other, so cycles, boundary violations and coupling density all read 0 for
+# want of edges. `ovecc summary` says so when it detects that shape.
+# module_depth = 1
+
 # --- governance: declarative architecture rules, enforced at index time ---
 # [[rules.boundaries]]
 # name = "billing must not depend on user"
@@ -49,6 +57,17 @@ const INIT_CONFIG_TEMPLATE: &str = r#"# ovecc configuration - every key is optio
 # min_confidence = 0.5
 "#;
 
+/// The template, with `module_depth` uncommented at the detected value when the
+/// repository's layout needs one other than the default.
+fn config_template(module_depth: Option<usize>) -> String {
+    match module_depth {
+        None => INIT_CONFIG_TEMPLATE.to_string(),
+        Some(depth) => {
+            INIT_CONFIG_TEMPLATE.replace("# module_depth = 1", &format!("module_depth = {depth}"))
+        }
+    }
+}
+
 pub(crate) fn run_init(paths: &ProjectPaths, force: bool) -> Result<u8> {
     let config_path = paths.ovecc_dir.join("config.toml");
     if config_path.exists() && !force {
@@ -58,11 +77,26 @@ pub(crate) fn run_init(paths: &ProjectPaths, force: bool) -> Result<u8> {
         );
     } else {
         std::fs::create_dir_all(&paths.ovecc_dir)?;
-        std::fs::write(&config_path, INIT_CONFIG_TEMPLATE)?;
+        let depth = ovecc_indexer::suggest_module_depth(&paths.root);
+        std::fs::write(&config_path, config_template(depth))?;
         println!("Wrote {}", config_path.display());
+        if let Some(depth) = depth {
+            println!(
+                "Set module_depth = {depth}: the code sits under several top-level \
+                 directories, and the default of 1 would make each of them a single \
+                 module with no dependencies between them."
+            );
+        }
     }
 
-    wire_gitignore(&paths.root)?;
+    match wire_gitignore(&paths.root)? {
+        GitignoreOutcome::AlreadyCovered => println!(".gitignore already covers .ovecc/"),
+        other => {
+            if let Some(message) = other.change() {
+                println!("{message}");
+            }
+        }
+    }
 
     println!();
     println!("Next steps:");
@@ -84,18 +118,42 @@ const OVECC_IGNORE_BLOCK: &str = "# ovecc local state (database + parse cache); 
      !.ovecc/architecture.toml\n\
      !.ovecc/architecture/\n";
 
+/// What [`wire_gitignore`] did, so `init` can confirm a no-op while `index`
+/// stays quiet about one.
+pub(crate) enum GitignoreOutcome {
+    NotAGitRepository,
+    AlreadyCovered,
+    Upgraded,
+    Added,
+}
+
+impl GitignoreOutcome {
+    /// The line to print, or `None` when nothing changed.
+    fn change(&self) -> Option<&'static str> {
+        match self {
+            Self::NotAGitRepository | Self::AlreadyCovered => None,
+            Self::Upgraded => Some(
+                "Upgraded the .ovecc/ ignore to keep .ovecc/architecture.toml and its \
+                 baseline trackable",
+            ),
+            Self::Added => {
+                Some("Added .ovecc/* to .gitignore (contract and baseline stay trackable)")
+            }
+        }
+    }
+}
+
 /// Git-ignores the local `.ovecc/` state while keeping the architecture
 /// contract trackable. An ovecc-written blanket `.ovecc/` line from an
 /// earlier version is upgraded in place; a granular block is left alone.
-pub(crate) fn wire_gitignore(root: &Path) -> Result<u8> {
+pub(crate) fn wire_gitignore(root: &Path) -> Result<GitignoreOutcome> {
     if !root.join(".git").exists() {
-        return Ok(0);
+        return Ok(GitignoreOutcome::NotAGitRepository);
     }
     let gitignore = root.join(".gitignore");
     let current = std::fs::read_to_string(&gitignore).unwrap_or_default();
     if current.lines().any(|line| line.trim() == ".ovecc/*") {
-        println!(".gitignore already covers .ovecc/");
-        return Ok(0);
+        return Ok(GitignoreOutcome::AlreadyCovered);
     }
     let blanket = |line: &str| matches!(line.trim(), ".ovecc" | ".ovecc/" | "/.ovecc" | "/.ovecc/");
     if current.lines().any(blanket) {
@@ -110,11 +168,7 @@ pub(crate) fn wire_gitignore(root: &Path) -> Result<u8> {
             })
             .collect();
         std::fs::write(&gitignore, updated.join("\n") + "\n")?;
-        println!(
-            "Upgraded the .ovecc/ ignore to keep .ovecc/architecture.toml and its \
-             baseline trackable"
-        );
-        return Ok(0);
+        return Ok(GitignoreOutcome::Upgraded);
     }
     let mut updated = current;
     if !updated.is_empty() && !updated.ends_with('\n') {
@@ -122,8 +176,50 @@ pub(crate) fn wire_gitignore(root: &Path) -> Result<u8> {
     }
     updated.push_str(OVECC_IGNORE_BLOCK);
     std::fs::write(&gitignore, updated)?;
-    println!("Added .ovecc/* to .gitignore (contract and baseline stay trackable)");
-    Ok(0)
+    Ok(GitignoreOutcome::Added)
+}
+
+/// `ovecc index` on a repository that was never `init`ed used to leave a
+/// multi-megabyte `.ovecc/` untracked in someone else's `git status`, with
+/// nothing to stop it being committed. Indexing writes the ignore rule itself
+/// when it is the one creating the directory.
+pub(crate) fn wire_gitignore_for_index(paths: &ProjectPaths) -> Result<Option<&'static str>> {
+    if paths.ovecc_dir.exists() {
+        return Ok(None);
+    }
+    Ok(wire_gitignore(&paths.root)?.change())
+}
+
+/// Warns when the default module depth collapses this layout, for the user who
+/// went straight to `ovecc index` and so has no config file to read the option
+/// off. Silent once a config exists: the value is then a choice, not a default.
+pub(crate) fn module_depth_hint(paths: &ProjectPaths, configured_depth: usize) -> Option<String> {
+    if configured_depth != 1 || paths.ovecc_dir.join("config.toml").exists() {
+        return None;
+    }
+    let depth = ovecc_indexer::suggest_module_depth(&paths.root)?;
+    Some(format!(
+        "The code sits under several top-level directories, so at the default depth each \
+         of them is one module and no module imports another: cycles, boundary violations \
+         and coupling density will read 0. Run `ovecc init` to write a config with \
+         module_depth = {depth}, or set it by hand under [architecture]."
+    ))
+}
+
+/// The notices an index run collects before it starts, printed under the report
+/// it belongs to. Only the text renderer takes them: the machine formats would
+/// need a field for something a human reads once and acts on.
+pub(crate) fn render_index_hints(
+    format: OutputFormat,
+    ignore_wired: Option<&str>,
+    depth_hint: Option<String>,
+) {
+    if format != OutputFormat::Text {
+        return;
+    }
+    for message in [ignore_wired, depth_hint.as_deref()].into_iter().flatten() {
+        println!("{message}");
+    }
 }
 
 /// What the coverage step did, or `None` when no tracefile was configured and
@@ -139,6 +235,112 @@ fn coverage_line(report: &IndexReport) -> Option<String> {
     })
 }
 
+/// The syntax-error paths, plus a tail line when the count exceeds what the
+/// report carries. A bare count is not actionable: the answer to "which file?"
+/// has to be in the same output.
+fn parse_error_file_lines(report: &IndexReport) -> Vec<String> {
+    let mut lines: Vec<String> = report.parse_error_files.clone();
+    let remaining = report
+        .files_with_parse_errors
+        .saturating_sub(report.parse_error_files.len());
+    if remaining > 0 {
+        lines.push(format!("... and {remaining} more"));
+    }
+    lines
+}
+
+/// The counters shared by the text and markdown renderings, in print order.
+fn counters(report: &IndexReport) -> Vec<(&'static str, String)> {
+    let mut rows = vec![
+        ("Files scanned", report.files_scanned.to_string()),
+        ("Files indexed", report.files_indexed.to_string()),
+        ("Files parsed", report.files_parsed.to_string()),
+        ("Files from cache", report.files_from_cache.to_string()),
+        ("Modules", report.modules.to_string()),
+        ("Dependencies", report.dependencies.to_string()),
+        (
+            "External dependencies",
+            report.external_dependencies.to_string(),
+        ),
+        ("Symbols", report.symbols.to_string()),
+        ("Calls", report.calls.to_string()),
+        ("APIs", report.apis.to_string()),
+        ("Tables", report.tables.to_string()),
+        ("Commits ingested", report.commits_ingested.to_string()),
+    ];
+    if report.tracked_files_scanned > 0 {
+        rows.push((
+            "Tracked non-source files scanned for secrets",
+            report.tracked_files_scanned.to_string(),
+        ));
+    }
+    rows
+}
+
+/// The counter block both renderers print. They differ only in how a line
+/// opens, so markdown passes its bullet and text passes nothing.
+fn render_counters(report: &IndexReport, bullet: &str) {
+    for (label, value) in counters(report) {
+        println!("{bullet}{label}: {value}");
+    }
+    if let Some(line) = coverage_line(report) {
+        println!("{bullet}{line}");
+    }
+    if report.files_with_parse_errors > 0 {
+        println!(
+            "{bullet}Files with syntax errors: {} (facts may be partial)",
+            report.files_with_parse_errors
+        );
+        for line in parse_error_file_lines(report) {
+            println!("  {bullet}{line}");
+        }
+    }
+}
+
+fn render_markdown(report: &IndexReport) {
+    println!("# Ovecc index");
+    println!();
+    println!("- Repository: `{}`", report.repository_root);
+    println!("- Snapshot: `{}`", report.snapshot_id);
+    render_counters(report, "- ");
+    if !report.parse_failures.is_empty() {
+        println!();
+        println!("## Parse failures");
+        println!();
+        for failure in &report.parse_failures {
+            println!("- `{}`: {}", failure.path, failure.message);
+        }
+    }
+}
+
+fn render_text(report: &IndexReport) {
+    // A clean run from cache changed nothing worth fifteen lines: one
+    // line says "stop re-indexing" to a human and an agent alike.
+    if report.files_parsed == 0 && report.parse_failures.is_empty() {
+        println!(
+            "Index up to date: {} files ({} from cache), snapshot {}.",
+            report.files_indexed, report.files_from_cache, report.snapshot_id
+        );
+        // Coverage is read on every run, unchanged tree or not, so a
+        // tracefile that broke since last time has to say so here too.
+        if let Some(line) = coverage_line(report) {
+            println!("{line}");
+        }
+        return;
+    }
+    println!("Indexed repository: {}", report.repository_root);
+    println!("Database: {}", report.database_path);
+    println!("Snapshot: {}", report.snapshot_id);
+    render_counters(report, "");
+    if !report.parse_failures.is_empty() {
+        println!();
+        println!("Parse failures: {}", report.parse_failures.len());
+        for failure in &report.parse_failures {
+            println!("  {}: {}", failure.path, failure.message);
+        }
+    }
+}
+
 pub(crate) fn render_index_report(report: &IndexReport, format: OutputFormat) -> Result<()> {
     match format {
         OutputFormat::Json | OutputFormat::Sarif | OutputFormat::Codeclimate => {
@@ -148,88 +350,8 @@ pub(crate) fn render_index_report(report: &IndexReport, format: OutputFormat) ->
             emit_ndjson_meta("index", &meta_for("index"))?;
             println!("{}", ndjson_line("index", report)?);
         }
-        OutputFormat::Markdown => {
-            println!("# Ovecc index");
-            println!();
-            println!("- Repository: `{}`", report.repository_root);
-            println!("- Snapshot: `{}`", report.snapshot_id);
-            println!("- Files scanned: {}", report.files_scanned);
-            println!("- Files indexed: {}", report.files_indexed);
-            println!("- Files parsed: {}", report.files_parsed);
-            println!("- Files from cache: {}", report.files_from_cache);
-            println!("- Modules: {}", report.modules);
-            println!("- Dependencies: {}", report.dependencies);
-            println!("- External dependencies: {}", report.external_dependencies);
-            println!("- Symbols: {}", report.symbols);
-            println!("- Calls: {}", report.calls);
-            println!("- APIs: {}", report.apis);
-            println!("- Tables: {}", report.tables);
-            println!("- Commits ingested: {}", report.commits_ingested);
-            if let Some(line) = coverage_line(report) {
-                println!("- {line}");
-            }
-            if report.files_with_parse_errors > 0 {
-                println!(
-                    "- Files with syntax errors: {} (facts may be partial)",
-                    report.files_with_parse_errors
-                );
-            }
-            if !report.parse_failures.is_empty() {
-                println!();
-                println!("## Parse failures");
-                println!();
-                for failure in &report.parse_failures {
-                    println!("- `{}`: {}", failure.path, failure.message);
-                }
-            }
-        }
-        OutputFormat::Text => {
-            // A clean run from cache changed nothing worth fifteen lines: one
-            // line says "stop re-indexing" to a human and an agent alike.
-            if report.files_parsed == 0 && report.parse_failures.is_empty() {
-                println!(
-                    "Index up to date: {} files ({} from cache), snapshot {}.",
-                    report.files_indexed, report.files_from_cache, report.snapshot_id
-                );
-                // Coverage is read on every run, unchanged tree or not, so a
-                // tracefile that broke since last time has to say so here too.
-                if let Some(line) = coverage_line(report) {
-                    println!("{line}");
-                }
-                return Ok(());
-            }
-            println!("Indexed repository: {}", report.repository_root);
-            println!("Database: {}", report.database_path);
-            println!("Snapshot: {}", report.snapshot_id);
-            println!("Files scanned: {}", report.files_scanned);
-            println!("Files indexed: {}", report.files_indexed);
-            println!("Files parsed: {}", report.files_parsed);
-            println!("Files from cache: {}", report.files_from_cache);
-            println!("Modules: {}", report.modules);
-            println!("Dependencies: {}", report.dependencies);
-            println!("External dependencies: {}", report.external_dependencies);
-            println!("Symbols: {}", report.symbols);
-            println!("Calls: {}", report.calls);
-            println!("APIs: {}", report.apis);
-            println!("Tables: {}", report.tables);
-            println!("Commits ingested: {}", report.commits_ingested);
-            if let Some(line) = coverage_line(report) {
-                println!("{line}");
-            }
-            if report.files_with_parse_errors > 0 {
-                println!(
-                    "Files with syntax errors: {} (facts may be partial)",
-                    report.files_with_parse_errors
-                );
-            }
-            if !report.parse_failures.is_empty() {
-                println!();
-                println!("Parse failures: {}", report.parse_failures.len());
-                for failure in &report.parse_failures {
-                    println!("  {}: {}", failure.path, failure.message);
-                }
-            }
-        }
+        OutputFormat::Markdown => render_markdown(report),
+        OutputFormat::Text => render_text(report),
     }
     Ok(())
 }

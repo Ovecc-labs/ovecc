@@ -68,6 +68,8 @@ under its own license (predominantly MIT or Apache-2.0). Notable ones:
 - **petgraph**, **serde**, **clap**, **chrono**, **rayon**, **gix**, **ignore**,
   **globset**, **toml**, **anyhow**, **thiserror**, **sha2**, **semver**:
   MIT or Apache-2.0.
+- **uluru** (an LRU cache reached through `selectors`): MPL-2.0. It is linked
+  unmodified, so its file-level copyleft asks nothing beyond this notice.
 
 For the authoritative, complete list of dependency licenses, run:
 

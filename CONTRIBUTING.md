@@ -56,9 +56,9 @@ ovecc itself — CI enforces this with the `self-review` job.
 
 ## Licensing and the DCO
 
-Ovecc is Apache-2.0, and contributions come in under the same license
+Ovecc is MPL-2.0, and contributions come in under the same license
 (inbound = outbound): by opening a pull request you agree that your change is
-licensed under Apache-2.0. We use the
+licensed under MPL-2.0. We use the
 [Developer Certificate of Origin](https://developercertificate.org/) rather than
 a CLA, so sign off each commit to certify that you wrote the change or have the
 right to submit it under this license:

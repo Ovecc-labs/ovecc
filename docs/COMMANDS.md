@@ -25,6 +25,12 @@ Sets up a repository: writes a fully commented `.ovecc/config.toml` (every
 value shown is the default), adds `.ovecc/` to `.gitignore`, and prints the
 first commands to run. Idempotent; `--force` overwrites the config.
 
+When the code sits under several top-level directories (`backend/` +
+`frontend/` rather than a single `src/`), `init` writes `module_depth = 2`
+instead of the default and says why: at depth 1 each of those directories is
+one module, no module imports another, and cycles, boundary violations and
+coupling density all read 0 for want of edges.
+
 `--agent` also wires the repository's coding agent (Claude Code hooks in
 `.claude/settings.json`) to query the graph before a broad text search: the
 block fails open the moment ovecc cannot answer, so the agent is never
@@ -41,6 +47,10 @@ differential sync). Everything below reads this model.
 ```
 Files: 52   Modules: 13   Dependencies: 264   Commits ingested: 99
 ```
+
+Running `index` on a repository that was never `init`ed writes the `.ovecc/`
+ignore rule itself, so the database cannot be committed by accident, and warns
+when the default module depth would collapse the layout.
 
 Key flags: `--exclude <glob>` (adds to the built-in `node_modules`/`target`/…
 excludes), `--no-git`, `--stats` (phase timings + peak memory).
@@ -519,6 +529,21 @@ and tainted source→sink flows (HTTP route → SQL/eval/exec, for named *and*
 inline arrow handlers, with `file:line` evidence for the sink and the route).
 Deterministic, offline, no LLM. Findings in test code (test dirs *and* Rust
 inline `#[cfg(test)]`) are down-ranked to Low, not hidden.
+
+Secrets are scanned over a wider set than the rest of ovecc: the indexed
+sources **plus every file Git tracks**. The source walk respects `.gitignore`,
+which is right for architecture and wrong for credentials, because the usual
+way a secret reaches a whole team is a `.env` committed before someone added it
+to `.gitignore` — it stays in every clone while every ignore-aware scanner skips
+it.
+
+That second pass sorts each tracked path into one of three cases. Lockfiles,
+locale bundles, patches, and anything the source walk itself dropped as
+vendored, built, or generated are not read at all: their values are content
+hashes or display strings, and entropy calls every line of them a secret.
+Documentation and `.example` templates are read for provider patterns only, so
+a real `ghp_`-prefixed token committed into one still surfaces while the
+invented values they exist to show do not. Everything else is read in full.
 
 ```
 Security findings: 15    secrets 8, insecure 7, tainted-flows 0

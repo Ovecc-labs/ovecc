@@ -282,6 +282,60 @@ fn binding_name(declarator: &VariableDeclarator<'_>) -> Option<String> {
         .map(|id| id.name.to_string())
 }
 
+/// Dotted path of a static member chain (`module.exports.handler`). A computed
+/// access or a call breaks the chain and yields `None`.
+fn member_path(expr: &Expression<'_>) -> Option<String> {
+    match expr {
+        Expression::Identifier(id) => Some(id.name.to_string()),
+        Expression::ThisExpression(_) => Some("this".to_string()),
+        Expression::StaticMemberExpression(member) => Some(format!(
+            "{}.{}",
+            member_path(&member.object)?,
+            member.property.name
+        )),
+        _ => None,
+    }
+}
+
+/// Name written by an assignment: the bare identifier, or the dotted path of a
+/// static member target.
+fn assignment_target_name(target: &AssignmentTarget<'_>) -> Option<String> {
+    let path = match target {
+        AssignmentTarget::AssignmentTargetIdentifier(id) => id.name.to_string(),
+        AssignmentTarget::StaticMemberExpression(member) => {
+            format!("{}.{}", member_path(&member.object)?, member.property.name)
+        }
+        _ => return None,
+    };
+    Some(strip_noise_segments(&path))
+}
+
+/// Drops the path segments that carry no information: `exports.handler` and
+/// `module.exports.handler` are both `handler`, `Foo.prototype.bar` is `Foo.bar`.
+/// Without this every CommonJS handler in a file would share the `exports.`
+/// prefix, which is exactly the noise the qualified name exists to remove.
+fn strip_noise_segments(path: &str) -> String {
+    let segments: Vec<&str> = path.split('.').collect();
+    let mut kept: Vec<&str> = Vec::with_capacity(segments.len());
+    for (index, segment) in segments.iter().enumerate() {
+        let leading = kept.is_empty();
+        let noise = match *segment {
+            "module" => leading && segments.get(index + 1) == Some(&"exports"),
+            "exports" | "this" => leading,
+            "prototype" => true,
+            _ => false,
+        };
+        if !noise {
+            kept.push(segment);
+        }
+    }
+    if kept.is_empty() {
+        path.to_string()
+    } else {
+        kept.join(".")
+    }
+}
+
 /// True when an initializer *is* a function, or wraps one in a common React
 /// higher-order call (`useCallback`, `useMemo`, `memo`, `forwardRef`,
 /// `observer`) — so `const Foo = () => {}` and `const f = useCallback(() => {})`
@@ -420,6 +474,17 @@ impl<'a> Visit<'a> for OxcWalk<'a> {
         walk::walk_variable_declarator(self, declarator);
     }
 
+    fn visit_object_property(&mut self, property: &ObjectProperty<'a>) {
+        // `module.exports = { getTrajets: async () => {} }`, and object
+        // literals of handlers or of test cases.
+        if initializer_is_function(&property.value)
+            && let Some(name) = property.key.static_name()
+        {
+            self.pending_name = Some(name.to_string());
+        }
+        walk::walk_object_property(self, property);
+    }
+
     // -- complexity: decision points -----------------------------------------
 
     fn visit_if_statement(&mut self, stmt: &IfStatement<'a>) {
@@ -509,6 +574,15 @@ impl<'a> Visit<'a> for OxcWalk<'a> {
         ) {
             self.cyc();
         }
+        // `exports.getTrajets = async (req, res) => {}` is the dominant Node
+        // and Express handler shape; without this every one of them lands in
+        // the complexity list as `<anonymous>`, unsortable and impossible to
+        // follow across runs.
+        if initializer_is_function(&expr.right)
+            && let Some(name) = assignment_target_name(&expr.left)
+        {
+            self.pending_name = Some(name);
+        }
         walk::walk_assignment_expression(self, expr);
     }
 
@@ -583,6 +657,41 @@ mod tests {
         assert!(names.contains(&"baz"), "{names:?}");
         // The bare arrow passed to `serve(...)` has no binding — stays anonymous.
         assert!(names.contains(&"<anonymous>"), "{names:?}");
+    }
+
+    #[test]
+    fn names_functions_bound_to_an_assignment_or_a_property() {
+        let (_exports, complexity) = extract(
+            "exports.getTrajets = async (req, res) => { if (a) { b(); } };\n\
+             module.exports.stop = function () { while (c) {} };\n\
+             Service.prototype.run = function () { if (d) {} };\n\
+             module.exports = { create: () => { if (e) {} }, remove() { if (f) {} } };\n\
+             app.use(() => { if (g) {} });\n",
+            SourceLanguage::JavaScript,
+        )
+        .unwrap();
+        let names: Vec<&str> = complexity
+            .iter()
+            .map(|c| c.qualified_name.as_str())
+            .collect();
+        assert!(names.contains(&"getTrajets"), "{names:?}");
+        assert!(names.contains(&"stop"), "{names:?}");
+        assert!(names.contains(&"Service.run"), "{names:?}");
+        assert!(names.contains(&"create"), "{names:?}");
+        assert!(names.contains(&"remove"), "{names:?}");
+        // A callback with no binding still has no name to report.
+        assert!(names.contains(&"<anonymous>"), "{names:?}");
+    }
+
+    #[test]
+    fn strips_only_the_uninformative_path_segments() {
+        assert_eq!(strip_noise_segments("exports.handler"), "handler");
+        assert_eq!(strip_noise_segments("module.exports.handler"), "handler");
+        assert_eq!(strip_noise_segments("this.handler"), "handler");
+        assert_eq!(strip_noise_segments("Foo.prototype.bar"), "Foo.bar");
+        // `exports` below a real object is a property like any other.
+        assert_eq!(strip_noise_segments("api.exports.run"), "api.exports.run");
+        assert_eq!(strip_noise_segments("controller.login"), "controller.login");
     }
 
     #[test]

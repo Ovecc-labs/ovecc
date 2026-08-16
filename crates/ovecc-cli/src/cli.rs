@@ -23,7 +23,7 @@ use crate::commands::{
         render_deadcode, render_fix, render_health, render_security, render_violations,
     },
     history::{render_history, render_history_index},
-    index::{render_index_report, render_index_timings, run_init},
+    index::{render_index_hints, render_index_report, render_index_timings, run_init},
     load_config, open_store,
     query::{build_context_slice, load_impact, render_blast, render_explanation, run_query},
     resolve_ref,
@@ -686,8 +686,12 @@ fn run_command(cli: Cli) -> Result<u8> {
                 ..Default::default()
             };
             let config = OveccConfig::load(&paths.root, &overrides)?;
+            let ignore_wired = crate::commands::index::wire_gitignore_for_index(&paths)?;
+            let depth_hint =
+                crate::commands::index::module_depth_hint(&paths, config.architecture.module_depth);
             let report = index_repository(&paths, &config, no_git)?;
             render_index_report(&report, config.output.default_format)?;
+            render_index_hints(config.output.default_format, ignore_wired, depth_hint);
             if stats {
                 render_index_timings(&report.timings);
             }

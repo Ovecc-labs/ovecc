@@ -141,7 +141,7 @@ pub fn is_excluded_component(name: &str) -> bool {
 /// keys off unambiguous signals (names, head markers, minification), never file
 /// size alone, and reads only the head so a marker deep in a real file or a
 /// mid-file `@ts-nocheck` never triggers.
-fn looks_generated(path: &Path) -> bool {
+pub(crate) fn looks_generated(path: &Path) -> bool {
     if let Some(name) = path.file_name().and_then(|value| value.to_str()) {
         let lower = name.to_ascii_lowercase();
         if lower.contains(".min.") || lower.contains("-wasm.") || lower.contains(".wasm.") {
@@ -207,6 +207,65 @@ pub(crate) fn language_for_path(path: &Path) -> Option<SourceLanguage> {
 /// what lives inside them. A leading container is skipped when naming a module so
 /// `src/billing/...` is `billing`, not `src`.
 const MODULE_CONTAINERS: &[&str] = &["src", "app", "packages", "apps", "services", "crates"];
+
+/// The module depth this layout needs, when the default of 1 would collapse it.
+///
+/// Depth 1 names a module after the first directory below the repository root,
+/// which is right for `src/billing/...` and wrong for `backend/` + `frontend/`:
+/// there, every file lands in one of two modules, no module imports another,
+/// and cycles, boundary violations and coupling density all read 0 for want of
+/// edges. The signal for that layout is two or more top-level directories that
+/// hold source and are not themselves module containers. Returns `None` when
+/// depth 1 already separates the code.
+pub fn suggest_module_depth(root: &Path) -> Option<usize> {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return None;
+    };
+    let mut source_dirs = 0usize;
+    for entry in entries.flatten() {
+        if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.starts_with('.') || is_excluded_component(&name) {
+            continue;
+        }
+        if MODULE_CONTAINERS.contains(&name.as_str()) {
+            // `src/`, `packages/` and friends are already stepped over when a
+            // module is named, so depth 1 reaches the right level under them.
+            return None;
+        }
+        if contains_source(&entry.path(), 3) {
+            source_dirs += 1;
+        }
+    }
+    (source_dirs >= 2).then_some(2)
+}
+
+/// Whether a directory holds any source file within `depth` levels. Bounded so
+/// the check stays a handful of `read_dir` calls on a large repository.
+fn contains_source(dir: &Path, depth: usize) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    let mut subdirectories = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().to_string();
+        if is_excluded_component(&name) {
+            continue;
+        }
+        match entry.file_type() {
+            Ok(kind) if kind.is_dir() => subdirectories.push(path),
+            Ok(_) if language_for_path(&path).is_some() => return true,
+            _ => {}
+        }
+    }
+    depth > 1
+        && subdirectories
+            .iter()
+            .any(|child| contains_source(child, depth - 1))
+}
 
 /// The explicit `[[architecture.modules]]` mapping that governs `relative`, when
 /// the `configured`/`hybrid` strategy is active. The longest matching
@@ -405,6 +464,33 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(infer_module_name("src/vs/editor/foo.ts", &depth0), "vs");
+    }
+
+    #[test]
+    fn no_single_depth_describes_a_grouped_monorepo() {
+        // A `packages/` that mixes flat packages with scoped grouping
+        // directories has no right depth. Depth 1 folds a whole scope into one
+        // module, so every package under it shares a name. Depth 2 splits the
+        // flat packages instead, since their own next segment is `src`. That is
+        // why `suggest_module_depth` stays silent once a container sits at the
+        // root.
+        let depth1 = ArchitectureConfig::default();
+        let depth2 = ArchitectureConfig {
+            module_depth: 2,
+            ..Default::default()
+        };
+        assert_eq!(
+            infer_module_name("packages/@scope/config/src/index.ts", &depth1),
+            "scope"
+        );
+        assert_eq!(
+            infer_module_name("packages/@scope/api-types/src/index.ts", &depth1),
+            "scope"
+        );
+        assert_eq!(
+            infer_module_name("packages/cli/src/commands/start.ts", &depth2),
+            "cli/src"
+        );
     }
 
     #[test]

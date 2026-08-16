@@ -7,6 +7,65 @@ changes).
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-08-15
+
+### Changed
+
+- The licence is MPL-2.0. Releases up to and including v0.2.5 were published
+  under Apache-2.0 and remain available under it; the change applies from this
+  release forward. Files carrying a different `SPDX-License-Identifier` header
+  are adapted from fallow and stay MIT.
+- `security` reports far fewer credentials. Across 19 repositories (182k tracked
+  files, 26M lines) the rule went from 97 findings to 29, keeping all 4 confirmed
+  leaks, the 2 published web keys held as recall guards, and the 10 deliberately
+  committed CI credentials. Counting those deliberate credentials as correct,
+  precision goes from 0.23 to 0.55.
+
+  Most of that comes from one change: the name-plus-entropy tier now runs only
+  on settings files, meaning `.env*`, `.yaml`, `.toml`, `.ini`, `.tfvars`,
+  Dockerfiles and the rest of the formats whose whole content is values the
+  program runs with. Entropy decides from a value's shape alone, and every
+  opaque identifier in a codebase has that shape, so the other 98% of lines
+  produced noise and no credentials.
+
+  This costs recall, deliberately. A hardcoded credential in a `.sh` or a `.py`
+  is now caught only if it matches a provider format. All 6 credentials found
+  across those repositories sit in `.env` or `.yaml` files, and two
+  false-negative sweeps over the same repositories found no leak the rule
+  missed, but the surface is smaller than it was. Five credentials stopped being
+  reported and all five were committed on purpose: two Nx Cloud tokens in
+  `nx.json`, which JSON not being a settings format puts out of reach, and three
+  published defaults in a self-hosting `.env.example`.
+- A `-----BEGIN ... PRIVATE KEY-----` line reports only when base64 key material
+  follows it. The header is a format marker, and any page documenting the format
+  spells it out in full.
+- A token whose body carries a filler word (`example`, `test`, `your`, `xxx`,
+  `redacted`) or six identical characters in a row is documentation, not a
+  credential. This replaces the hardcoded pair of AWS example keys with a rule
+  that covers every provider.
+- A file whose name ends in `.example`, `.sample`, `.template`, `.dist` or
+  `.tpl` keeps the provider patterns and loses the entropy tier. A template
+  ships so a newcomer can copy it, and its values are filler by convention, but
+  a real token committed into one is still a leak.
+- A name ending in `id` binds an identifier, not a credential: `client_id` ships
+  in every redirect URL and `ACCESS_KEY_ID` sits next to the secret rather than
+  being one. Vault's AppRole is the exception, since `secret_id` is the half you
+  authenticate with, so "secret" in the name wins over the `id` ending.
+- Lockfiles, `go.sum`, patches, locale bundles, and anything the source walk
+  itself dropped as vendored, built or generated are no longer read at all.
+  Their values are content hashes or display strings, and entropy called every
+  line of them a secret.
+- A value that is not ASCII is not a credential. Every provider format is ASCII,
+  as are base64, hex and JWT, while the scripts that write without spaces walk
+  past the whitespace guard and score one distinct codepoint per glyph: a
+  translated "this key is shown only once" outscores most real keys.
+- A literal in `.github/workflows` or `.github/actions` ranks Low, alongside test
+  files. A real secret there is written `${{ secrets.NAME }}` and never appears
+  in the file, so a literal value is one someone chose to publish. `security` now
+  prints how many findings sit in test or fixture files, since a repository that
+  ships fixtures of fake credentials to exercise its own detection otherwise
+  reads as that many leaks.
+
 ## [0.2.5] - 2026-08-12
 
 ### Fixed

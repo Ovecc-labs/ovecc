@@ -26,4 +26,4 @@ This package is a thin launcher. The binary itself ships in a platform package
 downloaded and there is no install script to run.
 
 Full documentation, the architecture contract format, and the CI gate are in the
-[repository](https://github.com/Ovecc-labs/ovecc). Apache-2.0.
+[repository](https://github.com/Ovecc-labs/ovecc). MPL-2.0.
