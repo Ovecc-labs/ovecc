@@ -793,6 +793,26 @@ fn deadcode_findings(
                 .map(move |export| (path.clone(), export.clone()))
         })
         .collect();
+    // The backstop against calling a dynamically-loaded file dead. Order does
+    // not reach the result — `deadcode` ranks candidates explicitly — but
+    // sorting keeps the collection itself reproducible.
+    let mut path_literals: Vec<(String, ovecc_core::facts::PathLiteralFact)> = input
+        .parsed
+        .file_facts
+        .iter()
+        .flat_map(|(path, facts)| {
+            facts
+                .path_literals
+                .iter()
+                .map(move |literal| (path.clone(), literal.clone()))
+        })
+        .collect();
+    path_literals.sort_by(|left, right| {
+        left.0
+            .cmp(&right.0)
+            .then_with(|| left.1.line.cmp(&right.1.line))
+            .then_with(|| left.1.value.cmp(&right.1.value))
+    });
     let import_edges: Vec<ovecc_rules::deadcode::ImportEdge> = input
         .dependencies
         .iter()
@@ -829,6 +849,7 @@ fn deadcode_findings(
         entry_points: input.entry_points,
         exports: &export_facts,
         imports: &import_edges,
+        path_literals: &path_literals,
     });
     let unused_exports = findings
         .iter()

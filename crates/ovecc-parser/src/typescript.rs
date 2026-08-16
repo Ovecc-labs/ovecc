@@ -19,8 +19,9 @@
 use crate::security;
 use ovecc_core::facts::{
     ApiFact, ApiKind, CallFact, CallKind, CapabilityFact, CapabilityKind, FileFacts, ImportFact,
-    ImportFactKind, ParseFailure, SchemaAccess, SchemaObjectKind, SchemaRefFact,
-    SecurityPatternFact, SourceFile, Span, SymbolFact, SymbolKind, Visibility,
+    ImportFactKind, MAX_PATH_LITERALS_PER_FILE, ParseFailure, PathLiteralFact, SchemaAccess,
+    SchemaObjectKind, SchemaRefFact, SecurityPatternFact, SourceFile, Span, SymbolFact, SymbolKind,
+    Visibility, looks_like_path_literal,
 };
 use ovecc_core::lang::SourceLanguage;
 use ovecc_core::traits::LanguageAdapter;
@@ -106,6 +107,8 @@ struct Extractor<'a> {
     security: Vec<SecurityPatternFact>,
     suppressed: Vec<u32>,
     local_types: Vec<(String, String)>,
+    /// File-shaped string literals, capped at [`MAX_PATH_LITERALS_PER_FILE`].
+    path_literals: Vec<PathLiteralFact>,
     /// (capability, api) → (first line, occurrence count). One fact per
     /// distinct API keeps the facts bounded on files that touch the DOM in
     /// every function.
@@ -128,6 +131,7 @@ impl<'a> Extractor<'a> {
             security: Vec::new(),
             suppressed: Vec::new(),
             local_types: Vec::new(),
+            path_literals: Vec::new(),
             capabilities: std::collections::BTreeMap::new(),
             pending_handlers: std::collections::HashMap::new(),
         }
@@ -185,6 +189,7 @@ impl<'a> Extractor<'a> {
             security_patterns: self.security,
             suppressed_lines: self.suppressed,
             local_types: self.local_types,
+            path_literals: self.path_literals,
             capability_uses,
             // complexity + exports are computed by the oxc extractor, not here.
             ..FileFacts::default()
@@ -316,6 +321,7 @@ impl<'a> Extractor<'a> {
             "string" | "template_string" => {
                 self.extract_schema_ref(node);
                 self.extract_secret(node);
+                self.extract_path_literal(node);
             }
             // A callable named in value position (`pipe(fn)`, `{ key: handler }`,
             // a decorator, a returned function) is a real dependency the call
@@ -886,6 +892,23 @@ impl<'a> Extractor<'a> {
             line: self.line(node),
             receiver: None,
         });
+    }
+
+    /// Keeps a string literal that could name a file. What it is *for* lives in
+    /// [`FileFacts::path_literals`]: reachability follows imports, and a path
+    /// spelled as a string leaves no import to follow.
+    fn extract_path_literal(&mut self, node: Node<'_>) {
+        if self.path_literals.len() >= MAX_PATH_LITERALS_PER_FILE {
+            return;
+        }
+        let raw = self.text(node);
+        let value = string_literal_value(raw).unwrap_or_else(|| raw.to_string());
+        if looks_like_path_literal(&value) {
+            self.path_literals.push(PathLiteralFact {
+                value,
+                line: self.line(node),
+            });
+        }
     }
 
     /// Hardcoded-secret detection on a string/template literal: provider

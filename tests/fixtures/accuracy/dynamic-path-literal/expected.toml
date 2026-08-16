@@ -1,0 +1,20 @@
+# "No import reaches it" is not "nothing runs it". A file some string literal
+# names is reported as a question and withheld from `fix --delete-files`; a file
+# nothing references at all keeps the flat verdict.
+command = "deadcode"
+
+[[require]]
+rule = "possibly-unused-file"
+path = "tasks/build.ts"
+
+[[require]]
+rule = "unused-file"
+path = "src/orphan.ts"
+
+[[deny]]
+rule = "unused-file"
+path = "tasks/build.ts"
+
+[[deny]]
+rule = "possibly-unused-file"
+path = "src/orphan.ts"

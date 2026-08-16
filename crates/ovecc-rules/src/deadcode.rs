@@ -10,6 +10,27 @@
 //! files, and barrels with reachable sources, and reports nothing at all when no
 //! entry points are detected — better silent than crying wolf.
 //!
+//! **The unreachable verdict is ternary.** "No import reaches it" is not "no
+//! one runs it": a task runner, a container command, or a path handed to
+//! `readFile` names its target as a string and leaves no edge. So a file some
+//! *literal* names is reported as `possibly-unused-file`, quoting the literal
+//! and where it was seen, and is withheld from `fix --delete-files`; only a file
+//! nothing references at all is reported as `unused-file`. The direction of the
+//! bias is deliberate: a missed dead file is cruft, a live file called dead is
+//! a deletion.
+//!
+//! ## Limitations
+//!
+//! - A specifier assembled at runtime (`` `./${name}.ts` ``, a path read from
+//!   config) is invisible to both halves. Neither the import graph nor the
+//!   literal backstop can see it, and neither pretends to.
+//! - The literal backstop matches on a file's name plus a trailing run of its
+//!   directories, not on a resolved path — two files with the same name in
+//!   different directories are not told apart. It over-matches by design.
+//! - A file named only from *outside* the index (a Dockerfile `CMD`, a
+//!   deployment manifest) still reads as unreferenced. The `unused-file`
+//!   description says so rather than implying the check was exhaustive.
+//!
 //! Ported from fallow (crates/{graph/src/graph/reachability.rs,
 //! graph/src/graph/re_exports, core/src/analyze/unused_exports.rs,
 //! unused_files.rs}), MIT (c) 2026 Bart Waardenburg. See THIRD-PARTY-NOTICES.md.
@@ -17,7 +38,9 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use chrono::Utc;
-use ovecc_core::facts::{EntityRef, Evidence, ExportFact, FindingKind, FindingRecord, Severity};
+use ovecc_core::facts::{
+    EntityRef, Evidence, ExportFact, FindingKind, FindingRecord, PathLiteralFact, Severity,
+};
 use ovecc_core::graph::NodeKind;
 use ovecc_core::id::{FindingId, RepositoryId, SnapshotId};
 
@@ -43,6 +66,10 @@ pub struct DeadCodeInput<'a> {
     pub exports: &'a [(String, ExportFact)],
     /// Resolved internal import edges (including re-export forwards).
     pub imports: &'a [ImportEdge],
+    /// `(file_path, literal)` for every file-shaped string literal in the
+    /// index. A file no import reaches but some literal names is *not* known to
+    /// be dead — see [`literal_reference`].
+    pub path_literals: &'a [(String, PathLiteralFact)],
 }
 
 /// A re-export forward hop: `(from_file, name) -> (to_file, name)`. Usage flows
@@ -326,6 +353,7 @@ fn flag_unused_files(
             .or_default()
             .push(edge.source_file.as_str());
     }
+    let literals_by_name = index_literals_by_name(input.path_literals);
 
     for file in input.files {
         let path = file.as_str();
@@ -347,19 +375,121 @@ fn flag_unused_files(
         if imported_by_reachable {
             continue;
         }
+        // Absence is ternary here, and collapsing it is what lets an agent
+        // delete live code: "no import reaches it" and "nothing references it"
+        // are different claims, and only the second justifies a deletion.
+        let (title, description, rule, detail) = match literal_reference(
+            &literals_by_name,
+            reachable,
+            path,
+        ) {
+            Some(reference) => (
+                format!("Possibly unused file: {file}"),
+                format!(
+                    "No import reaches {file}, but {} names \"{}\" at line {}. A task runner, a \
+                     config, or a path passed as a string leaves no import edge, so this file may \
+                     well be live — confirm before removing it. `fix --delete-files` will not \
+                     touch it.",
+                    reference.file, reference.literal.value, reference.literal.line
+                ),
+                "possibly-unused-file",
+                Some("referenced-by-literal"),
+            ),
+            None => (
+                format!("Unused file: {file}"),
+                format!(
+                    "Nothing in the index references {file}: no import reaches it and no string \
+                     literal names it. Verify nothing outside the index runs it (a CI step, a \
+                     container command) before removing it."
+                ),
+                "unused-file",
+                None,
+            ),
+        };
         out.push(finding(
             input,
             FindingKind::UnusedFile,
             Severity::Low,
             file,
             1,
-            format!("Unused file: {file}"),
-            format!("{file} is not reachable from any entry point and nothing imports it."),
+            title,
+            description,
             None,
-            "unused-file",
-            None,
+            rule,
+            detail,
         ));
     }
+}
+
+/// One file naming another by string literal.
+struct LiteralReference<'a> {
+    file: &'a str,
+    literal: &'a PathLiteralFact,
+}
+
+/// The literal, if any, by which some *other* indexed file names `path`.
+///
+/// The match is on the file's name plus any trailing run of its directories
+/// (`worker.ts`, `workers/worker.ts`, …), which is what a literal actually
+/// spells — `"./workers/worker.ts"` and `"src/workers/worker.ts"` both name the
+/// same file from different roots, and neither is a path this analysis can
+/// resolve. Over-matching only costs a finding demoted to "possibly unused";
+/// under-matching costs a live file called dead, so the bias is deliberate.
+///
+/// A file naming itself proves nothing, and is excluded. Among several
+/// referencing files the reachable ones sort first — a literal in live code is
+/// the stronger witness — then by file and line, so the answer is deterministic.
+fn literal_reference<'a>(
+    literals_by_name: &HashMap<&'a str, Vec<(&'a str, &'a PathLiteralFact)>>,
+    reachable: &HashSet<&str>,
+    path: &str,
+) -> Option<LiteralReference<'a>> {
+    let mut best: Option<((bool, &str, u32), &PathLiteralFact)> = None;
+    for (holder, literal) in literals_by_name.get(file_name(path))?.iter().copied() {
+        if holder == path || !names_file(&literal.value, path) {
+            continue;
+        }
+        let rank = (!reachable.contains(holder), holder, literal.line);
+        if best.is_none_or(|(current, _)| rank < current) {
+            best = Some((rank, literal));
+        }
+    }
+    best.map(|((_, file, _), literal)| LiteralReference { file, literal })
+}
+
+/// Literals bucketed by the file name they end in, so a candidate is checked
+/// against the handful of literals that could possibly name it rather than
+/// against every literal in the repository. `names_file` still decides each
+/// match; this only narrows what it is asked about, keeping the pass linear in
+/// the number of literals instead of quadratic against the file list.
+fn index_literals_by_name(
+    literals: &[(String, PathLiteralFact)],
+) -> HashMap<&str, Vec<(&str, &PathLiteralFact)>> {
+    let mut by_name: HashMap<&str, Vec<(&str, &PathLiteralFact)>> = HashMap::new();
+    for (holder, literal) in literals {
+        by_name
+            .entry(file_name(&literal.value))
+            .or_default()
+            .push((holder.as_str(), literal));
+    }
+    by_name
+}
+
+/// The last `/`- or `\`-delimited segment of a path or literal.
+fn file_name(path: &str) -> &str {
+    path.rsplit(['/', '\\']).next().unwrap_or(path)
+}
+
+/// True when `literal` spells `path`'s file name, optionally with some of its
+/// leading directories. Leading `./` and `/` are stripped, and comparison is on
+/// '/'-separated segments so `worker.ts` never matches `my-worker.ts`.
+fn names_file(literal: &str, path: &str) -> bool {
+    let literal = literal.replace('\\', "/");
+    let literal = literal.trim_start_matches("./").trim_start_matches('/');
+    if literal.is_empty() {
+        return false;
+    }
+    path == literal || path.ends_with(&format!("/{literal}"))
 }
 
 /// A barrel (re-export-only file) whose re-export targets are reachable is kept
@@ -495,6 +625,7 @@ mod tests {
             entry_points: &HashSet::new(),
             exports: &exports,
             imports: &[],
+            path_literals: &[],
         };
         assert!(analyze(&input).is_empty());
     }
@@ -520,6 +651,7 @@ mod tests {
             entry_points: &entry(&["src/index.ts"]),
             exports: &exports,
             imports: &imports,
+            path_literals: &[],
         };
         let findings = analyze(&input);
         let unused: Vec<_> = findings
@@ -555,6 +687,7 @@ mod tests {
             entry_points: &entry(&["src/index.ts"]),
             exports: &exports,
             imports: &imports,
+            path_literals: &[],
         };
         let findings = analyze(&input);
         let found = findings
@@ -578,6 +711,7 @@ mod tests {
             entry_points: &entry(&["src/index.ts"]),
             exports: &exports,
             imports: &[],
+            path_literals: &[],
         };
         let findings = analyze(&input);
         assert!(
@@ -585,6 +719,123 @@ mod tests {
                 .iter()
                 .any(|f| f.kind == FindingKind::UnusedFile && f.title.contains("orphan")),
             "{findings:?}"
+        );
+    }
+
+    fn literal(value: &str, line: u32) -> PathLiteralFact {
+        PathLiteralFact {
+            value: value.to_string(),
+            line,
+        }
+    }
+
+    #[test]
+    fn a_file_named_by_a_literal_is_only_possibly_unused() {
+        // The failure that costs a user source: a task runner names its script
+        // as a string, no import edge exists, and the file reads as dead. It
+        // must be reported — but as a question, not a verdict, naming the
+        // literal that raised it.
+        let files = vec![
+            "src/index.ts".to_string(),
+            "tasks/build.ts".to_string(),
+            "src/orphan.ts".to_string(),
+        ];
+        let path_literals = vec![
+            ("src/index.ts".to_string(), literal("tasks/build.ts", 7)),
+            // A file naming itself proves nothing.
+            ("src/orphan.ts".to_string(), literal("src/orphan.ts", 2)),
+        ];
+        let input = DeadCodeInput {
+            repository_id: "r",
+            snapshot_id: None,
+            files: &files,
+            entry_points: &entry(&["src/index.ts"]),
+            exports: &[],
+            imports: &[],
+            path_literals: &path_literals,
+        };
+        let findings = analyze(&input);
+
+        let build = findings
+            .iter()
+            .find(|f| f.title.contains("tasks/build.ts"))
+            .expect("a literal-named file is still reported");
+        assert_eq!(build.kind, FindingKind::UnusedFile);
+        assert_eq!(build.rule_name.as_deref(), Some("possibly-unused-file"));
+        assert!(build.title.starts_with("Possibly unused file"));
+        assert_eq!(
+            build.evidence[0].detail.as_deref(),
+            Some("referenced-by-literal")
+        );
+        assert!(
+            build.description.contains("src/index.ts") && build.description.contains("line 7"),
+            "the witness must be named: {}",
+            build.description
+        );
+
+        // Nothing else names it, so the flat verdict survives — the backstop
+        // must not swallow the true positive.
+        let orphan = findings
+            .iter()
+            .find(|f| f.title.contains("src/orphan.ts"))
+            .expect("a genuinely unreferenced file stays unused-file");
+        assert_eq!(orphan.rule_name.as_deref(), Some("unused-file"));
+        assert!(orphan.title.starts_with("Unused file"));
+        assert!(orphan.evidence[0].detail.is_none());
+    }
+
+    #[test]
+    fn a_literal_matches_a_file_by_name_and_trailing_directories() {
+        // A literal spells a path from whatever root its reader uses, and none
+        // of those roots is knowable here. Matching the name plus any trailing
+        // run of directories covers them; matching a bare name substring would
+        // let `worker.ts` claim `my-worker.ts`.
+        assert!(names_file("worker.ts", "src/jobs/worker.ts"));
+        assert!(names_file("jobs/worker.ts", "src/jobs/worker.ts"));
+        assert!(names_file("./jobs/worker.ts", "src/jobs/worker.ts"));
+        assert!(names_file("/src/jobs/worker.ts", "src/jobs/worker.ts"));
+        assert!(names_file("src\\jobs\\worker.ts", "src/jobs/worker.ts"));
+        assert!(names_file("src/jobs/worker.ts", "src/jobs/worker.ts"));
+        // Not a segment boundary, and not the same file.
+        assert!(!names_file("my-worker.ts", "src/jobs/worker.ts"));
+        assert!(!names_file("worker.ts", "src/jobs/my-worker.ts"));
+        assert!(!names_file("other/worker.ts", "src/jobs/worker.ts"));
+        assert!(!names_file("", "src/jobs/worker.ts"));
+    }
+
+    #[test]
+    fn a_live_witness_is_preferred_and_the_choice_is_stable() {
+        // Several files can name the same target. A literal sitting in reachable
+        // code is the stronger witness, and whichever is chosen must not depend
+        // on iteration order.
+        let files = vec![
+            "src/index.ts".to_string(),
+            "src/dead.ts".to_string(),
+            "tasks/build.ts".to_string(),
+        ];
+        // `src/dead.ts` sorts before `src/index.ts`, so only the reachability
+        // rank can put the live witness first.
+        let path_literals = vec![
+            ("src/dead.ts".to_string(), literal("tasks/build.ts", 1)),
+            ("src/index.ts".to_string(), literal("tasks/build.ts", 9)),
+        ];
+        let input = DeadCodeInput {
+            repository_id: "r",
+            snapshot_id: None,
+            files: &files,
+            entry_points: &entry(&["src/index.ts"]),
+            exports: &[],
+            imports: &[],
+            path_literals: &path_literals,
+        };
+        let description = analyze(&input)
+            .into_iter()
+            .find(|f| f.title.contains("tasks/build.ts"))
+            .expect("reported")
+            .description;
+        assert!(
+            description.contains("src/index.ts") && description.contains("line 9"),
+            "the reachable witness must win: {description}"
         );
     }
 
@@ -613,6 +864,7 @@ mod tests {
             entry_points: &entry(&["src/index.ts"]),
             exports: &exports,
             imports: &imports,
+            path_literals: &[],
         };
         let findings = analyze(&input);
         let widgets = findings
@@ -653,6 +905,7 @@ mod tests {
             entry_points: &entry(&["src/index.ts"]),
             exports: &exports,
             imports: &imports,
+            path_literals: &[],
         };
         let findings = analyze(&input);
         let dups = findings
@@ -689,6 +942,7 @@ mod tests {
             entry_points: &entry(&["src/index.ts"]),
             exports: &exports,
             imports: &imports,
+            path_literals: &[],
         };
         // `import *` uses the whole module, so neither export is unused.
         assert!(

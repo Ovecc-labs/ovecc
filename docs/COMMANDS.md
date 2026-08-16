@@ -588,8 +588,19 @@ distinguishable from an analysis that never ran (no entry points, or no JS/TS
 sources for the unused-export pass; file reachability itself is
 language-agnostic).
 
+The unreachable verdict is **ternary**, because "no import reaches it" is not
+"nothing runs it". A file some string literal in the index names is reported as
+`possibly-unused-file`, quoting the literal and where it was seen, and is never
+deleted by `fix --delete-files`; only a file nothing references at all is
+reported as `unused-file`. Entry points a runtime loads by URL — worker
+constructors and HTML `<script src>` — are resolved as real edges, so neither
+reads as dead in the first place.
+
 ```
 Dead code: 47 unused export(s), 46 unused file(s), 0 unused dependency(ies), 0 unlisted dependency(ies)
+
+[Low] Possibly unused file: tasks/build.ts
+  tasks/build.ts:1 (referenced-by-literal)
 ```
 
 ### `ovecc fix [--apply] [--rule <rule>] [--delete-files]`
@@ -608,6 +619,10 @@ passed. Reachability sees import edges, and a file a CI step runs, a task runner
 invokes, or another file names in a string has none: on hono, `--apply` used to
 delete two scripts a workflow executes. Every other fix edits a line and is read
 back against the index; a deletion cannot be checked that way, so it asks.
+
+A `possibly-unused-file` — one some string literal in the index names — is not
+deletable at all, with or without `--delete-files`. That finding is a prompt to
+check, not a verdict to act on.
 
 ```
 Fix plan: 5 change(s), 0 skipped — dry-run (pass --apply to write)
