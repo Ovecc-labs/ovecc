@@ -84,6 +84,8 @@ enum ScanMode {
     Full,
     /// Provider patterns only.
     ProvidersOnly,
+    /// Provider patterns, minus the ones a page about the format spells out.
+    Documentation,
     /// Not read at all.
     Skip,
 }
@@ -98,50 +100,68 @@ enum ScanMode {
 /// Entropy decides from a value's shape alone, and every opaque identifier in a
 /// codebase has that shape, so it runs on settings files and nowhere else.
 /// Everything else still worth reading keeps the provider patterns, which name
-/// an issuer and do not guess.
+/// an issuer and do not guess. Documentation is separated from the rest of that
+/// group only because a page explaining a key format prints the format.
 fn scan_mode(relative: &str) -> ScanMode {
     let mut segments: Vec<&str> = relative.split('/').collect();
     let Some(file) = segments.pop() else {
         return ScanMode::Skip;
     };
-    let mut documented = false;
-    for segment in &segments {
-        let lower = segment.to_ascii_lowercase();
-        if crate::discover::is_excluded_component(segment) || LOCALE_DIRS.contains(&lower.as_str())
-        {
-            return ScanMode::Skip;
-        }
-        documented |= DOCUMENTATION_DIRS.contains(&lower.as_str());
+    if segments.iter().any(|segment| is_skipped_dir(segment)) {
+        return ScanMode::Skip;
     }
     let name = file.to_ascii_lowercase();
     let extension = name.rsplit_once('.').map(|(_, value)| value);
-    if MANIFEST_NAMES.contains(&name.as_str())
-        || extension.is_some_and(|value| MANIFEST_EXTENSIONS.contains(&value))
-    {
+    if is_manifest(&name, extension) {
         return ScanMode::Skip;
     }
-    if documented
-        || extension.is_some_and(|value| DOCUMENTATION_EXTENSIONS.contains(&value))
-        || TEMPLATE_SUFFIXES
-            .iter()
-            .any(|suffix| name.ends_with(suffix))
+    if segments.iter().any(|segment| is_documentation_dir(segment))
+        || is_documentation(&name, extension)
     {
-        return ScanMode::ProvidersOnly;
+        return ScanMode::Documentation;
     }
-    // `.env`, `.env.production`, `env.txt`: the extension is the wrong end of
-    // the name to read, so the stem carries the signal. A name that says
-    // "credentials" or "secrets" makes the same claim in any format.
-    let settings = name.starts_with(".env")
-        || name.starts_with("env.")
-        || name.contains("credential")
-        || name.contains("secret")
-        || SETTINGS_NAMES.contains(&name.as_str())
-        || extension.is_some_and(|value| SETTINGS_EXTENSIONS.contains(&value));
-    if settings {
+    if is_settings(&name, extension) {
         ScanMode::Full
     } else {
         ScanMode::ProvidersOnly
     }
+}
+
+/// A directory whose contents are never read: the source walk already drops it,
+/// or it holds translations.
+fn is_skipped_dir(segment: &str) -> bool {
+    crate::discover::is_excluded_component(segment)
+        || LOCALE_DIRS.contains(&segment.to_ascii_lowercase().as_str())
+}
+
+fn is_documentation_dir(segment: &str) -> bool {
+    DOCUMENTATION_DIRS.contains(&segment.to_ascii_lowercase().as_str())
+}
+
+fn is_manifest(name: &str, extension: Option<&str>) -> bool {
+    MANIFEST_NAMES.contains(&name)
+        || extension.is_some_and(|value| MANIFEST_EXTENSIONS.contains(&value))
+}
+
+/// Prose, or a file shipped to be copied. Both hold credential-shaped values
+/// that were written to be read rather than used.
+fn is_documentation(name: &str, extension: Option<&str>) -> bool {
+    extension.is_some_and(|value| DOCUMENTATION_EXTENSIONS.contains(&value))
+        || TEMPLATE_SUFFIXES
+            .iter()
+            .any(|suffix| name.ends_with(suffix))
+}
+
+/// `.env`, `.env.production`, `env.txt`: the extension is the wrong end of the
+/// name to read, so the stem carries the signal. A name that says "credentials"
+/// or "secrets" makes the same claim in any format.
+fn is_settings(name: &str, extension: Option<&str>) -> bool {
+    name.starts_with(".env")
+        || name.starts_with("env.")
+        || name.contains("credential")
+        || name.contains("secret")
+        || SETTINGS_NAMES.contains(&name)
+        || extension.is_some_and(|value| SETTINGS_EXTENSIONS.contains(&value))
 }
 
 pub(crate) struct TrackedScan {
@@ -202,12 +222,14 @@ pub(crate) fn scan(
 ///
 /// Only the PEM header is conditional. Every other pattern matches an opaque
 /// value, so the match itself is the evidence; a header is a format marker, and
-/// what makes it a key is the body underneath.
+/// what makes it a key is the body underneath. Documentation is the one surface
+/// where a body underneath still proves nothing, because a page about the format
+/// prints a whole key to show what one looks like.
 fn reports(provider: &str, mode: ScanMode, lines: &[&str], index: usize) -> bool {
     if provider != ovecc_parser::security::PRIVATE_KEY_LABEL {
         return true;
     }
-    mode == ScanMode::Full && pem_body_follows(lines, index)
+    mode != ScanMode::Documentation && pem_body_follows(lines, index)
 }
 
 /// True when a PEM header is followed by enough base64 to be key material,
@@ -241,44 +263,41 @@ fn longest_base64_run(text: &str) -> usize {
 }
 
 /// The `(label, line)` of every credential in a plain-text file.
+fn scan_text(contents: &str, mode: ScanMode) -> Vec<(String, u32)> {
+    let lines: Vec<&str> = contents.lines().collect();
+    (0..lines.len())
+        .filter_map(|index| {
+            secret_on_line(&lines, index, mode).map(|label| (label, index as u32 + 1))
+        })
+        .collect()
+}
+
+/// The label one line earns, if any. Takes the whole file because a PEM header
+/// is only a key when its body follows.
 ///
 /// When the line binds a name, both checks run against the value alone. Reading
 /// a provider pattern off the whole line instead loses the name, and the name is
 /// what says the value is filler: `placeholder="sk_live_…"` is a Stripe key by
 /// shape and a label by intent. A line that binds nothing, a PEM header, is
 /// still matched whole.
-fn scan_text(contents: &str, mode: ScanMode) -> Vec<(String, u32)> {
-    let lines: Vec<&str> = contents.lines().collect();
-    let mut hits = Vec::new();
-    for (index, raw) in lines.iter().enumerate() {
-        let line = index as u32 + 1;
-        let text = raw.trim();
-        if text.is_empty() || text.starts_with('#') || text.starts_with("//") {
-            continue;
-        }
-        let Some((name, value)) = assignment(text) else {
-            if let Some(provider) = provider_secret(text)
-                && reports(provider, mode, &lines, index)
-            {
-                hits.push((provider.to_string(), line));
-            }
-            continue;
-        };
-        if is_filler_name(name) {
-            continue;
-        }
-        if let Some(provider) = provider_secret(value) {
-            if reports(provider, mode, &lines, index) {
-                hits.push((provider.to_string(), line));
-            }
-        } else if mode == ScanMode::Full
-            && is_secret_name(name)
-            && looks_like_high_entropy_secret(value)
-        {
-            hits.push((format!("high-entropy value assigned to {name}"), line));
-        }
+fn secret_on_line(lines: &[&str], index: usize, mode: ScanMode) -> Option<String> {
+    let text = lines[index].trim();
+    if text.is_empty() || text.starts_with('#') || text.starts_with("//") {
+        return None;
     }
-    hits
+    let Some((name, value)) = assignment(text) else {
+        let provider = provider_secret(text)?;
+        return reports(provider, mode, lines, index).then(|| provider.to_string());
+    };
+    if is_filler_name(name) {
+        return None;
+    }
+    if let Some(provider) = provider_secret(value) {
+        return reports(provider, mode, lines, index).then(|| provider.to_string());
+    }
+    let entropy =
+        mode == ScanMode::Full && is_secret_name(name) && looks_like_high_entropy_secret(value);
+    entropy.then(|| format!("high-entropy value assigned to {name}"))
 }
 
 /// Splits `NAME=value` or `name: value` at its first separator, dropping a
@@ -422,7 +441,7 @@ mod tests {
             "apps/api/.env.local.sample",
             "config/settings.yml.template",
         ] {
-            assert_eq!(scan_mode(path), ScanMode::ProvidersOnly, "{path}");
+            assert_eq!(scan_mode(path), ScanMode::Documentation, "{path}");
         }
         // The shape this scan exists for: a `.env` committed under any name,
         // and the formats and names that make the same claim about their
@@ -479,7 +498,7 @@ mod tests {
                     CRON_API_KEY=1234567890abcdef1234567890abcdef\n";
         let full = scan_text(text, ScanMode::Full);
         assert_eq!(full.len(), 2, "{full:?}");
-        let template = scan_text(text, ScanMode::ProvidersOnly);
+        let template = scan_text(text, ScanMode::Documentation);
         assert_eq!(template.len(), 1, "{template:?}");
         assert!(template[0].0.contains("GitHub"), "{template:?}");
     }
@@ -500,12 +519,13 @@ mod tests {
                 "{text}"
             );
         }
-        // The same header over a real body is reported, and only in Full mode:
-        // a doc page shows the shape, a `.env` holds the value.
+        // The same header over a real body is a key wherever it sits, except on
+        // the one surface that prints a whole key to explain the format.
         let key = "-----BEGIN PRIVATE KEY-----\n\
                    MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC7VJTUt9Us8cKj\n";
         assert_eq!(scan_text(key, ScanMode::Full).len(), 1);
-        assert!(scan_text(key, ScanMode::ProvidersOnly).is_empty());
+        assert_eq!(scan_text(key, ScanMode::ProvidersOnly).len(), 1);
+        assert!(scan_text(key, ScanMode::Documentation).is_empty());
     }
 
     #[test]
