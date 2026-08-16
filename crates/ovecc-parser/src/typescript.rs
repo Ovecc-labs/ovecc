@@ -109,6 +109,9 @@ struct Extractor<'a> {
     local_types: Vec<(String, String)>,
     /// File-shaped string literals, capped at [`MAX_PATH_LITERALS_PER_FILE`].
     path_literals: Vec<PathLiteralFact>,
+    /// `const u = new URL("./w.ts", import.meta.url)` bindings, so a
+    /// `new Worker(u)` later in the file still resolves to `./w.ts`.
+    worker_urls: std::collections::HashMap<String, String>,
     /// (capability, api) → (first line, occurrence count). One fact per
     /// distinct API keeps the facts bounded on files that touch the DOM in
     /// every function.
@@ -132,6 +135,7 @@ impl<'a> Extractor<'a> {
             suppressed: Vec::new(),
             local_types: Vec::new(),
             path_literals: Vec::new(),
+            worker_urls: std::collections::HashMap::new(),
             capabilities: std::collections::BTreeMap::new(),
             pending_handlers: std::collections::HashMap::new(),
         }
@@ -964,6 +968,16 @@ impl<'a> Extractor<'a> {
         {
             self.local_types
                 .push((name.to_string(), self.text(constructor).to_string()));
+            // A worker pool binds its entry URL once and constructs N workers
+            // from it — `const u = new URL("./w.ts", import.meta.url)` then
+            // `new Worker(u)` in a loop. That is the shape a pool *has*, so
+            // resolving only the inline form would miss the common case.
+            if self.text(constructor) == "URL"
+                && let Some(arguments) = value.child_by_field_name("arguments")
+                && let Some(specifier) = url_literal_specifier(self.source, arguments)
+            {
+                self.worker_urls.insert(name.to_string(), specifier);
+            }
         }
     }
 
@@ -1017,12 +1031,14 @@ impl<'a> Extractor<'a> {
     /// exports, so no name is credited — exactly the `import "./side-effect"`
     /// shape the dead-code analysis already understands.
     ///
-    /// Both mainstream forms are read, and only those:
+    /// Three mainstream forms are read, and only those:
     /// `new Worker(new URL("./w.ts", import.meta.url))` — the canonical form in
-    /// the `worker_threads` docs and the only one that survives bundling — and
-    /// the plain `new Worker("./w.ts")`. A computed specifier is deliberately
-    /// left alone: it cannot be known statically, and guessing would be worse
-    /// than the honest gap the unused-file literal backstop reports.
+    /// the `worker_threads` docs and the only one that survives bundling — the
+    /// same URL bound to a local `const` first, which is the shape every worker
+    /// *pool* has (bind once, construct N in a loop), and the plain
+    /// `new Worker("./w.ts")`. A computed specifier is deliberately left alone:
+    /// it cannot be known statically, and guessing would be worse than the
+    /// honest gap the unused-file literal backstop reports.
     fn push_worker_import(&mut self, call: Node<'_>) {
         let Some(arguments) = call.child_by_field_name("arguments") else {
             return;
@@ -1039,7 +1055,7 @@ impl<'a> Extractor<'a> {
     }
 
     /// The literal module specifier in a worker constructor's first argument,
-    /// in either accepted form. `None` for anything computed.
+    /// in any accepted form. `None` for anything computed.
     fn worker_specifier(&self, arguments: Node<'_>) -> Option<String> {
         let mut cursor = arguments.walk();
         let first = arguments.named_children(&mut cursor).next()?;
@@ -1050,17 +1066,12 @@ impl<'a> Extractor<'a> {
                 if self.text(constructor) != "URL" {
                     return None;
                 }
-                let url_arguments = first.child_by_field_name("arguments")?;
-                let mut url_cursor = url_arguments.walk();
-                let literal = url_arguments.named_children(&mut url_cursor).next()?;
-                if literal.kind() != "string" {
-                    return None;
-                }
-                // `new URL(spec, base)` always resolves `spec` against `base`, so
-                // a bare `"w.ts"` names the sibling file — which the module
-                // resolver would otherwise read as a package name.
-                module_path_specifier(&string_literal_value(self.text(literal))?, true)
+                url_literal_specifier(self.source, first.child_by_field_name("arguments")?)
             }
+            // A URL bound earlier in this file. `const` cannot be used before
+            // its declaration, and the walk is in source order, so the binding
+            // is always already recorded when the construction is reached.
+            "identifier" => self.worker_urls.get(self.text(first)).cloned(),
             _ => None,
         }
     }
@@ -1177,6 +1188,20 @@ fn string_literal_value(raw: &str) -> Option<String> {
     } else {
         None
     }
+}
+
+/// The module specifier of a `new URL(spec, base)` argument list, when `spec` is
+/// a literal. `new URL` always resolves `spec` against `base`, so a bare
+/// `"w.ts"` names the sibling file — which the module resolver would otherwise
+/// read as a package name.
+fn url_literal_specifier(source: &[u8], arguments: Node<'_>) -> Option<String> {
+    let mut cursor = arguments.walk();
+    let literal = arguments.named_children(&mut cursor).next()?;
+    if literal.kind() != "string" {
+        return None;
+    }
+    let raw = literal.utf8_text(source).ok()?;
+    module_path_specifier(&string_literal_value(raw)?, true)
 }
 
 /// Narrows a runtime-loaded literal to one that can name a file in *this*
@@ -1588,6 +1613,9 @@ const d = require("./legacy");
 new Worker(new URL("./signature-worker.ts", import.meta.url));
 new Worker(new URL("sibling.ts", import.meta.url));
 new SharedWorker("./shared-worker.js");
+// The pool shape: bind the URL once, construct N workers from it.
+const poolUrl = new URL("./pool-worker.ts", import.meta.url);
+for (let i = 0; i < size; i += 1) { new Worker(poolUrl); }
 new Worker(workerPath);
 new Worker(new URL(computed, import.meta.url));
 new Worker("https://cdn.example.com/w.js");
@@ -1609,8 +1637,11 @@ new Worker("blob:1234");
         // file, not a package.
         assert!(specifiers.contains(&"./sibling.ts"), "{specifiers:?}");
         assert!(specifiers.contains(&"./shared-worker.js"), "{specifiers:?}");
+        // The pool form: the construction names a variable, not a literal, and
+        // still resolves through the binding.
+        assert!(specifiers.contains(&"./pool-worker.ts"), "{specifiers:?}");
         // Nothing knowable, and nothing repo-local: no edge, no guess.
-        assert_eq!(specifiers.len(), 3, "{specifiers:?}");
+        assert_eq!(specifiers.len(), 4, "{specifiers:?}");
 
         // A worker executes its module rather than consuming exports, so the
         // edge credits no name — the side-effect import shape.

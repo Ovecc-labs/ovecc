@@ -14,3 +14,14 @@ path = "src/signature-worker.ts"
 [[deny]]
 rule = "unused-file"
 path = "src/plain-worker.js"
+
+# The pool shape binds the URL once and constructs N workers from it, so the
+# construction names a variable rather than a literal. Resolving only the
+# inline form would miss what a real pool actually looks like.
+[[deny]]
+rule = "unused-file"
+path = "src/pool-worker.ts"
+
+[[deny]]
+rule = "possibly-unused-file"
+path = "src/pool-worker.ts"
