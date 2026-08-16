@@ -369,6 +369,42 @@ fn coupling_density_line(report: &SummaryReport) -> String {
     )
 }
 
+/// What actually drove the risk score.
+///
+/// It is a *structural* grade — cycles, coupling density, top hotspot — and it
+/// does not read the violation list at all. So a session that clears every
+/// medium finding can watch it sit still, which looks broken. Naming its inputs
+/// costs one line and replaces "the number is stuck" with "the number is not
+/// about that".
+fn risk_inputs(report: &SummaryReport) -> String {
+    let mut inputs = vec![format!(
+        "{} cyclic component(s)",
+        report.circular_dependencies
+    )];
+    inputs.push(format!("coupling {:.2}%", report.coupling_density * 100.0));
+    if let Some(hotspot) = report.hotspots.first() {
+        inputs.push(format!(
+            "top hotspot {} (score {})",
+            hotspot.module, hotspot.score
+        ));
+    }
+    format!(
+        "structural only — from {}; it does not read the violation list, so `ovecc violations` \
+         can be clean while this is not",
+        inputs.join(", ")
+    )
+}
+
+/// Where to go next. The most useful commands in this tool are the least run:
+/// an agent handed the README still reached for `summary`, `violations`, and
+/// `index` and never found `advise`, `diagnose`, or `history`. Documentation is
+/// read once; output is read every run, so the pointer belongs here.
+fn next_steps() -> &'static str {
+    "Next: ovecc diagnose (named smells + fixes) · ovecc advise <file> (before editing) · \
+     ovecc history <metric> (is it getting better?) · ovecc violations --write-baseline \
+     (accept today's backlog, gate only what is new)"
+}
+
 pub(crate) fn render_summary_report(report: &SummaryReport, format: OutputFormat) -> Result<()> {
     match format {
         OutputFormat::Json | OutputFormat::Sarif | OutputFormat::Codeclimate => {
@@ -403,7 +439,11 @@ pub(crate) fn render_summary_report(report: &SummaryReport, format: OutputFormat
             );
             println!("- Boundary violations: {}", report.boundary_violations);
             println!("- {}", coupling_density_line(report));
-            println!("- Risk score: **{}**", report.risk_score.as_str());
+            println!(
+                "- Risk score: **{}** — {}",
+                report.risk_score.as_str(),
+                risk_inputs(report)
+            );
             if let Some(note) = intra_module_cycles_note(report) {
                 println!();
                 println!("> {note}");
@@ -429,6 +469,8 @@ pub(crate) fn render_summary_report(report: &SummaryReport, format: OutputFormat
                     );
                 }
             }
+            println!();
+            println!("_{}_", next_steps());
         }
         OutputFormat::Text => {
             println!("Repository: {}", report.repository_root);
@@ -449,6 +491,7 @@ pub(crate) fn render_summary_report(report: &SummaryReport, format: OutputFormat
             println!("Boundary violations: {}", report.boundary_violations);
             println!("{}", coupling_density_line(report));
             anstream::println!("Risk score: {}", risk_tag(report.risk_score));
+            println!("  ({})", risk_inputs(report));
             if let Some(note) = isolated_components_note(report) {
                 println!("  ({note})");
             }
@@ -467,6 +510,8 @@ pub(crate) fn render_summary_report(report: &SummaryReport, format: OutputFormat
                     );
                 }
             }
+            println!();
+            println!("{}", next_steps());
         }
     }
     Ok(())
@@ -541,6 +586,44 @@ mod tests {
         let line = coupling_density_line(&lone);
         assert!(line.contains("(modules)"), "{line}");
         assert!(!line.contains("possible edges"), "{line}");
+    }
+
+    #[test]
+    fn the_risk_score_says_what_it_is_and_is_not_made_of() {
+        // Clearing every medium violation leaves this score untouched, because
+        // it never read them. Stated inline, that is a scope; left unstated, it
+        // reads as a number that ignores your work.
+        let mut with_hotspot = report(57, 0, 15, 0.1238);
+        with_hotspot.hotspots.push(ovecc_core::legacy::Hotspot {
+            module: "http".to_string(),
+            score: 32,
+            fan_in: 1,
+            fan_out: 10,
+            instability: 0.91,
+        });
+        let inputs = risk_inputs(&with_hotspot);
+        assert!(inputs.contains("0 cyclic component(s)"), "{inputs}");
+        assert!(inputs.contains("coupling 12.38%"), "{inputs}");
+        assert!(inputs.contains("top hotspot http (score 32)"), "{inputs}");
+        assert!(
+            inputs.contains("does not read the violation list"),
+            "{inputs}"
+        );
+
+        // No hotspot is not a blank clause; the other inputs still show.
+        let bare = risk_inputs(&report(4, 0, 1, 0.0));
+        assert!(bare.contains("cyclic component(s)"), "{bare}");
+        assert!(!bare.contains("top hotspot"), "{bare}");
+    }
+
+    #[test]
+    fn the_footer_points_at_the_commands_nobody_finds() {
+        // Two full agent sessions used index/summary/violations and never
+        // reached advise, diagnose, or history — the three worth reaching for.
+        let footer = next_steps();
+        for command in ["diagnose", "advise", "history", "--write-baseline"] {
+            assert!(footer.contains(command), "{command} missing from: {footer}");
+        }
     }
 
     #[test]

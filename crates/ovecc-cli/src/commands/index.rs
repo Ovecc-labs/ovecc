@@ -235,6 +235,19 @@ fn coverage_line(report: &IndexReport) -> Option<String> {
     })
 }
 
+/// Says so when no history was ingested. `Commits ingested: 0` on its own reads
+/// as a fact about the repository; it is really a fact about what ran. Churn is
+/// then 0 for every module, and a reader can reasonably conclude the codebase
+/// has no hotspots when that analysis never happened. `hotspots` and `coupling`
+/// already report their own "n/a"; this is the line that says it at the source.
+fn no_history_line(commits_ingested: usize) -> Option<String> {
+    (commits_ingested == 0).then(|| {
+        "No git history found — churn, hotspots ranking, coupling, ownership and selfcheck \
+         are unavailable, not zero"
+            .to_string()
+    })
+}
+
 /// The syntax-error paths, plus a tail line when the count exceeds what the
 /// report carries. A bare count is not actionable: the answer to "which file?"
 /// has to be in the same output.
@@ -284,6 +297,9 @@ fn render_counters(report: &IndexReport, bullet: &str) {
         println!("{bullet}{label}: {value}");
     }
     if let Some(line) = coverage_line(report) {
+        println!("{bullet}{line}");
+    }
+    if let Some(line) = no_history_line(report.commits_ingested) {
         println!("{bullet}{line}");
     }
     if report.files_with_parse_errors > 0 {
@@ -364,5 +380,19 @@ mod tests {
     fn init_template_references_only_existing_docs() {
         assert!(!INIT_CONFIG_TEMPLATE.contains("DIAGNOSE.md"));
         assert!(INIT_CONFIG_TEMPLATE.contains("docs/COMMANDS.md"));
+    }
+
+    #[test]
+    fn an_index_without_history_says_which_analyses_did_not_run() {
+        // Every churn-based metric reads 0 without history, which is
+        // indistinguishable from a codebase that genuinely has no hotspots.
+        // Absence is ternary: say "unavailable", never imply "none".
+        let line = no_history_line(0).expect("0 commits must be explained");
+        for feature in ["churn", "hotspots", "coupling", "ownership", "selfcheck"] {
+            assert!(line.contains(feature), "{feature} missing from: {line}");
+        }
+        assert!(line.contains("not zero"), "{line}");
+
+        assert!(no_history_line(1).is_none());
     }
 }

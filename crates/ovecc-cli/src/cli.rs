@@ -433,8 +433,11 @@ pub enum Command {
         /// The file, module, or symbol to advise on.
         target: String,
     },
-    /// Report per-module architecture metrics: fan-in/out, coupling, Martin
-    /// instability, aggregate complexity, and churn, plus repo coupling density.
+    /// Report per-component architecture metrics: fan-in/out, coupling, Martin
+    /// instability, aggregate complexity, and churn, plus the coupling density
+    /// over components. Components are `[diagnose] component_depth`, not
+    /// `summary`'s modules, so the two coupling densities differ by design —
+    /// each names its basis.
     Metrics {
         /// Scope to a single file or module (substring match).
         #[arg(long)]

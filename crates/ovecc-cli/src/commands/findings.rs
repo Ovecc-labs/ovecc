@@ -185,6 +185,11 @@ fn violations_json(
         "total": findings.len(),
         "shown": shown.len(),
         "offset": offset,
+        // `shown < total` already says this, and `note` is non-null exactly when
+        // it holds — but both need a reader who thought to compare. A machine
+        // consumer that reads `findings` and stops silently drops the rest, so
+        // the condition gets its own boolean rather than staying implied.
+        "truncated": shown.len() < findings.len(),
         "by_severity": by_severity,
         "by_rule": by_rule,
         "findings": shown,

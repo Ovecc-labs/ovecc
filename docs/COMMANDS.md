@@ -92,6 +92,16 @@ which is which instead of finding the difference and doubting the tool. The
 `coupling_basis`, `coupling_edges`, and `coupling_possible_edges` JSON fields
 carry the same thing for machines.
 
+"Risk score" is **structural**: cycles, coupling density, and the top hotspot.
+It does not read the violation list, so clearing every medium finding can leave
+it unchanged — that is a scope, not a stuck number, and the line states its own
+inputs so the difference is visible rather than discovered.
+
+`summary` closes with a next-step footer. The most useful commands here are the
+least run: two full agent sessions used `index`, `summary`, and `violations` and
+never reached `advise`, `diagnose`, or `history`. A README is read once; output
+is read every run.
+
 "Cyclic module components" counts *strongly-connected components* over runtime
 imports. Two things follow, and both are intended:
 
