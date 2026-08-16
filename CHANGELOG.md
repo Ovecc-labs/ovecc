@@ -7,7 +7,28 @@ changes).
 
 ## [Unreleased]
 
+### Changed
+
+- A tainted flow now requires a symbol on its path to read client-sent request
+  data (`req.body`, `req.query`, `req.params`, `req.headers`, `req.cookies`).
+  Reachability alone said that any route touching a table was a flow, so a
+  public endpoint listing a public table came out at Medium next to a real
+  injection. On the repository this was reported from, the rule goes from 28
+  flows to 17 and adds none: the 11 it drops are routes with nothing the caller
+  can steer, including one whose only input is `req.user`, which the auth
+  middleware fills in from a verified token. Every flow it keeps takes a path
+  parameter or a body.
+
+  `eval` and command execution are gated the same way. They lose no coverage:
+  the pattern rules that own them report them whether or not a caller can reach
+  them.
+
 ### Fixed
+
+- A key name no longer carries the byte-order mark of the file it was read
+  from. PowerShell writes UTF-8 with a BOM, and a BOM is a format character
+  rather than whitespace, so a finding on the first line of such a file read
+  `assigned to \u{feff}JWT_SECRET`.
 
 - A PEM private key committed to an ordinary file is reported again. The header
   only counted as a key when the file was a settings file, on top of needing a

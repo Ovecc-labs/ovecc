@@ -264,7 +264,11 @@ fn longest_base64_run(text: &str) -> usize {
 
 /// The `(label, line)` of every credential in a plain-text file.
 fn scan_text(contents: &str, mode: ScanMode) -> Vec<(String, u32)> {
-    let lines: Vec<&str> = contents.lines().collect();
+    // PowerShell writes UTF-8 with a byte-order mark, and a BOM is a format
+    // character rather than whitespace, so trimming a line leaves it stuck to
+    // the front of the first key's name.
+    let text = contents.strip_prefix('\u{feff}').unwrap_or(contents);
+    let lines: Vec<&str> = text.lines().collect();
     (0..lines.len())
         .filter_map(|index| {
             secret_on_line(&lines, index, mode).map(|label| (label, index as u32 + 1))
@@ -375,6 +379,16 @@ mod tests {
         let lines: Vec<u32> = hits.iter().map(|(_, line)| *line).collect();
         assert_eq!(lines, vec![3, 4], "{hits:?}");
         assert!(hits[1].0.contains("GitHub"), "{hits:?}");
+    }
+
+    #[test]
+    fn a_byte_order_mark_does_not_stick_to_the_first_key() {
+        let hits = scan_text(
+            "\u{feff}JWT_SECRET=1234567890abcdef1234567890abcdef\n",
+            ScanMode::Full,
+        );
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert!(hits[0].0.ends_with("assigned to JWT_SECRET"), "{hits:?}");
     }
 
     #[test]
