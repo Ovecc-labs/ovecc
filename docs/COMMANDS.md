@@ -361,13 +361,22 @@ principle it breaks, a curated remediation, a deterministic confidence, and a
 machine `fix` action.
 
 ```
-[High] Zone of Pain — component crates/ovecc-core/src  (confidence 0.87)
+[High] Zone of Pain — component crates/ovecc-core  (confidence 0.90)
   Principle: Stable Abstractions Principle (main sequence)
-  Evidence: distance=0.94 (>= 0.70), abstractness=0.06, instability=0, fan_in=9
+  Evidence: distance=0.99 (>= 0.70), abstractness=0.01, instability=0, fan_in=10,
+            churn=169 (>= 3)
   Fix: A rigid, concrete core that many components depend on: introduce
        abstractions so dependents rely on a stable contract. [Dependency Inversion]
   Action: introduce_abstraction (auto-fixable: no)
 ```
+
+Where a detector's *"when not to act"* can be measured, it decides the severity
+rather than being left to the reader. Zone of Pain is the worked example: the
+geometry decides whether to report, and churn decides how loudly. A rigid core
+that nothing is paying for — churn below the hotspot floor — is reported at
+**Low**, so a Medium or High means the core genuinely changes. A component whose
+history cannot be read carries `churn_unmeasured` and also drops to Low: absence
+is "unmeasured", never "never changes".
 
 Key flags: `--target <substr>`, `--severity`, `--group-by
 family|severity|component`, `--fail-on`. Formats: + `sarif`, `codeclimate`.
