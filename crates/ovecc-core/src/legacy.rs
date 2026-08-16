@@ -250,6 +250,19 @@ pub struct SummaryReport {
     pub intra_module_cycles: usize,
     pub boundary_violations: usize,
     pub coupling_density: f64,
+    /// Which partition `coupling_density` was measured over. `summary` measures
+    /// **modules** (`[architecture] module_depth`); `metrics` measures
+    /// **components** (`[diagnose] component_depth`, minus its excludes). Two
+    /// different graphs, so two legitimately different numbers under one name —
+    /// naming the basis is what stops the pair reading as nondeterminism.
+    #[serde(default)]
+    pub coupling_basis: String,
+    /// The density's numerator: distinct internal edges between two modules.
+    #[serde(default)]
+    pub coupling_edges: usize,
+    /// The density's denominator: `n * (n - 1)` over the module count.
+    #[serde(default)]
+    pub coupling_possible_edges: usize,
     pub hotspots: Vec<Hotspot>,
     pub risk_score: RiskLevel,
 }

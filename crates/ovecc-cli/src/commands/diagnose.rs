@@ -656,6 +656,34 @@ pub(crate) fn load_metrics_report(
     Ok(report)
 }
 
+/// Names the graph the density was measured over, and shows the fraction.
+///
+/// `summary` reports a "coupling density" too, over modules rather than
+/// `[diagnose]` components — a different partition with different excludes, so
+/// the two numbers differ on the same snapshot. That reads as nondeterminism
+/// unless each says what it counted, and determinism is the thing this tool
+/// sells.
+fn coupling_density_line(report: &ovecc_graph::diagnose::MetricsReport) -> String {
+    let basis = if report.coupling_basis.is_empty() {
+        "component"
+    } else {
+        report.coupling_basis.trim_end_matches('s')
+    };
+    let density = format!(
+        "Coupling density ({basis}s): {:.2}%",
+        report.coupling_density * 100.0
+    );
+    if report.coupling_possible_edges == 0 {
+        return density;
+    }
+    format!(
+        "{density} — {} of {} possible edges between {} {basis}s",
+        report.coupling_edges,
+        report.coupling_possible_edges,
+        report.components.len()
+    )
+}
+
 pub(crate) fn render_metrics(
     report: &ovecc_graph::diagnose::MetricsReport,
     format: OutputFormat,
@@ -673,7 +701,7 @@ pub(crate) fn render_metrics(
         OutputFormat::Markdown => {
             println!("# Metrics");
             println!();
-            println!("Coupling density: {:.2}%", report.coupling_density * 100.0);
+            println!("{}", coupling_density_line(report));
             println!();
             println!(
                 "| Component | Files | Fan-in | Fan-out | Coupling | Instability | Abstractness | Distance | Complexity | Churn |"
@@ -697,9 +725,9 @@ pub(crate) fn render_metrics(
         }
         OutputFormat::Text => {
             println!(
-                "Metrics: {} component(s), coupling density {:.2}%",
+                "Metrics: {} component(s), {}",
                 report.components.len(),
-                report.coupling_density * 100.0
+                coupling_density_line(report).to_lowercase()
             );
             for m in &report.components {
                 println!();

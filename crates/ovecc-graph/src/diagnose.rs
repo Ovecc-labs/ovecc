@@ -275,6 +275,15 @@ pub struct ComponentMetric {
 pub struct MetricsReport {
     pub components: Vec<ComponentMetric>,
     pub coupling_density: f64,
+    /// Which partition the density was measured over — always `components`
+    /// here, against `summary`'s `modules`. The two commands share the metric's
+    /// name over different graphs, so each states its own basis and fraction
+    /// rather than leaving the difference to be discovered as a contradiction.
+    pub coupling_basis: String,
+    /// The density's numerator: distinct edges between two components.
+    pub coupling_edges: usize,
+    /// The density's denominator: `n * (n - 1)` over the component count.
+    pub coupling_possible_edges: usize,
 }
 
 /// The component graph: nodes, deduplicated inter-component edges, coupling, and
@@ -479,6 +488,9 @@ pub fn metrics(
     MetricsReport {
         components: out,
         coupling_density,
+        coupling_basis: "components".to_string(),
+        coupling_edges: g.edges.len(),
+        coupling_possible_edges: possible,
     }
 }
 

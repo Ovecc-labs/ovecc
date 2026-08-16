@@ -344,6 +344,31 @@ fn isolated_components_note(report: &SummaryReport) -> Option<String> {
     })
 }
 
+/// Names the graph the density was measured over, and shows the fraction.
+///
+/// `metrics` reports a "coupling density" too, over `[diagnose]` components
+/// rather than modules — a different partition with different excludes, so the
+/// two numbers differ on the same snapshot. That reads as nondeterminism unless
+/// each says what it counted, and determinism is the thing this tool sells.
+fn coupling_density_line(report: &SummaryReport) -> String {
+    let basis = if report.coupling_basis.is_empty() {
+        "module"
+    } else {
+        report.coupling_basis.trim_end_matches('s')
+    };
+    let density = format!(
+        "Coupling density ({basis}s): {:.2}%",
+        report.coupling_density * 100.0
+    );
+    if report.coupling_possible_edges == 0 {
+        return density;
+    }
+    format!(
+        "{density} — {} of {} possible edges between {} {basis}s",
+        report.coupling_edges, report.coupling_possible_edges, report.modules
+    )
+}
+
 pub(crate) fn render_summary_report(report: &SummaryReport, format: OutputFormat) -> Result<()> {
     match format {
         OutputFormat::Json | OutputFormat::Sarif | OutputFormat::Codeclimate => {
@@ -377,10 +402,7 @@ pub(crate) fn render_summary_report(report: &SummaryReport, format: OutputFormat
                 report.circular_dependencies
             );
             println!("- Boundary violations: {}", report.boundary_violations);
-            println!(
-                "- Coupling density: {:.2}%",
-                report.coupling_density * 100.0
-            );
+            println!("- {}", coupling_density_line(report));
             println!("- Risk score: **{}**", report.risk_score.as_str());
             if let Some(note) = intra_module_cycles_note(report) {
                 println!();
@@ -425,7 +447,7 @@ pub(crate) fn render_summary_report(report: &SummaryReport, format: OutputFormat
                 println!("  ({note})");
             }
             println!("Boundary violations: {}", report.boundary_violations);
-            println!("Coupling density: {:.2}%", report.coupling_density * 100.0);
+            println!("{}", coupling_density_line(report));
             anstream::println!("Risk score: {}", risk_tag(report.risk_score));
             if let Some(note) = isolated_components_note(report) {
                 println!("  ({note})");
@@ -468,6 +490,9 @@ mod tests {
             intra_module_cycles: 0,
             boundary_violations: 0,
             coupling_density: density,
+            coupling_basis: "modules".to_string(),
+            coupling_edges: 0,
+            coupling_possible_edges: 0,
             hotspots: Vec::new(),
             risk_score: RiskLevel::Low,
         }
@@ -490,6 +515,32 @@ mod tests {
         assert!(note.starts_with("2 further cycle(s)"), "{note}");
         assert!(note.contains("ovecc diagnose"), "{note}");
         assert!(note.contains("module_depth"), "{note}");
+    }
+
+    #[test]
+    fn coupling_density_names_the_graph_it_measured() {
+        // `metrics` prints a "coupling density" over a different partition, so
+        // the same snapshot yields two different numbers. Naming the basis and
+        // showing the fraction is what keeps that from reading as a tool that
+        // cannot make up its mind — which, for a tool that sells determinism,
+        // costs more than the number is worth.
+        let mut sized = report(57, 0, 15, 0.1238);
+        sized.coupling_edges = 26;
+        sized.coupling_possible_edges = 210;
+        let line = coupling_density_line(&sized);
+        assert!(line.contains("(modules)"), "{line}");
+        assert!(line.contains("12.38%"), "{line}");
+        assert!(
+            line.contains("26 of 210 possible edges between 15 modules"),
+            "{line}"
+        );
+
+        // A single module has no possible edge, so the fraction says nothing
+        // and is left off rather than printed as "0 of 0".
+        let lone = report(4, 0, 1, 0.0);
+        let line = coupling_density_line(&lone);
+        assert!(line.contains("(modules)"), "{line}");
+        assert!(!line.contains("possible edges"), "{line}");
     }
 
     #[test]

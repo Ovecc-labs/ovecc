@@ -57,6 +57,9 @@ pub fn summarize(
         intra_module_cycles: cycles::intra_module_cycle_count(dependencies),
         boundary_violations,
         coupling_density: analysis.coupling_density,
+        coupling_basis: "modules".to_string(),
+        coupling_edges: analysis.edges,
+        coupling_possible_edges: analysis.possible_edges,
         hotspots: analysis.hotspots,
         risk_score,
     }
@@ -308,6 +311,13 @@ pub fn strongly_connected_modules(
 struct ModuleAnalysis {
     cycle_count: usize,
     coupling_density: f64,
+    /// The density's own numerator and denominator. `summary` and `metrics`
+    /// both say "coupling density" over *different* partitions — modules here,
+    /// `[diagnose] component_depth` components there — so the two numbers
+    /// legitimately differ. Carrying the fraction lets each report state what it
+    /// measured instead of leaving a reader to find the contradiction.
+    edges: usize,
+    possible_edges: usize,
     hotspots: Vec<Hotspot>,
 }
 
@@ -388,6 +398,8 @@ fn analyze_modules(modules: &[String], dependencies: &[DependencyRecord]) -> Mod
     ModuleAnalysis {
         cycle_count,
         coupling_density,
+        edges: local_edges.len(),
+        possible_edges,
         hotspots,
     }
 }

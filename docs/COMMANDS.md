@@ -77,9 +77,20 @@ parse are counted here too, since every other figure covers only the rest.
 ```
 Files: 52                     Modules: 13
 Dependencies: 264             External dependencies: 137
-Cyclic module components: 0   Coupling density: 11.54%
+Cyclic module components: 0
+Coupling density (modules): 11.54% — 18 of 156 possible edges between 13 modules
 Risk score: Low
 ```
+
+Coupling density names the graph it measured, because `metrics` reports one too
+and the two are **not** the same number. `summary` divides distinct
+module-to-module edges by `n * (n - 1)` over the modules
+(`[architecture] module_depth`); `metrics` does the same over `[diagnose]`
+components, which is a different partition with its own excludes. Both are
+correct and both are deterministic — the fraction is printed so a reader can see
+which is which instead of finding the difference and doubting the tool. The
+`coupling_basis`, `coupling_edges`, and `coupling_possible_edges` JSON fields
+carry the same thing for machines.
 
 "Cyclic module components" counts *strongly-connected components* over runtime
 imports. Two things follow, and both are intended:
