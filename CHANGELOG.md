@@ -7,6 +7,8 @@ changes).
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-08-16
+
 ### Changed
 
 - A tainted flow now requires a symbol on its path to read client-sent request
