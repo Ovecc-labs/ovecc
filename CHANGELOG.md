@@ -9,6 +9,15 @@ changes).
 
 ### Fixed
 
+- `unlisted-dependency` no longer reads imports from languages a `package.json`
+  cannot declare. The rule compared every indexed import against the manifests,
+  so a repository with a Python service or a Go binary beside its Node packages
+  got a Medium finding for `import contextlib`, `#include <iostream>` or
+  `import "fmt"`. On a large polyglot repository it goes from 96 findings to 38,
+  dropping all 58 that came from `.py`, `.cpp`, `.go`, `.cu` and `.c` files and
+  no JavaScript or TypeScript one; on a monorepo with a Go sub-server, from 23
+  to 8.
+
 - A Rust `use x as y;` no longer folds the alias into the import specifier.
   `use ovecc_graph as graph;` was recorded as an import of `ovecc_graphasgraph`,
   an edge to a crate that does not exist, which then surfaced as an undeclared
