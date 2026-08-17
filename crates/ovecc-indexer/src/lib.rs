@@ -74,7 +74,10 @@ use std::path::{Path, PathBuf};
 // which is precisely what the two additions exist to prevent. Both v21s were
 // minted independently (this branch's and main's), so the merge has to move
 // past the collision rather than keep one number meaning two fact shapes.
-const PARSE_CACHE_VERSION: &str = "v22";
+// v23: a Rust `use x as y;` no longer folds the alias into the import
+// specifier. Cached v22 facts carry the folded form, which resolves to no crate
+// and reads back as an undeclared external package.
+const PARSE_CACHE_VERSION: &str = "v23";
 
 pub fn index_repository(
     paths: &ProjectPaths,

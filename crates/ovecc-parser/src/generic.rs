@@ -1108,13 +1108,11 @@ impl<'a> Walk<'a> {
                 collect_go_import_paths(node, self.source, &mut out);
                 out
             }
-            SourceLanguage::Rust => {
-                // `use a::b::c;` -> the whole clause text, whitespace-normalized.
-                field_text(node, "argument", self.source)
-                    .map(|t| t.split_whitespace().collect::<String>())
-                    .into_iter()
-                    .collect()
-            }
+            SourceLanguage::Rust => node
+                .child_by_field_name("argument")
+                .and_then(|argument| rust_use_path(argument, self.source))
+                .into_iter()
+                .collect(),
             SourceLanguage::Cpp => field_text(node, "path", self.source)
                 .map(|p| strip_include(&p))
                 .into_iter()
@@ -1279,6 +1277,38 @@ fn span_of(node: Node<'_>) -> Span {
 
 fn node_text(node: Node<'_>, source: &[u8]) -> Option<String> {
     node.utf8_text(source).ok().map(|s| s.to_string())
+}
+
+/// The paths a Rust `use` clause names, with every `as` alias dropped.
+///
+/// The alias is not part of the path: `use ovecc_graph as graph;` imports the
+/// crate `ovecc_graph`, and reading the clause whole gave `ovecc_graphasgraph`.
+/// Aliases nest, so `{Read as _, Write}` needs the same treatment one level
+/// down. Everything else keeps the shape the import resolver expects: `::`
+/// between segments, a brace group for a list.
+fn rust_use_path(node: Node<'_>, source: &[u8]) -> Option<String> {
+    match node.kind() {
+        "use_as_clause" => rust_use_path(node.child_by_field_name("path")?, source),
+        "scoped_use_list" => {
+            let list = rust_use_path(node.child_by_field_name("list")?, source)?;
+            match node.child_by_field_name("path") {
+                Some(path) => Some(format!("{}::{list}", rust_use_path(path, source)?)),
+                None => Some(list),
+            }
+        }
+        "use_list" => {
+            let mut cursor = node.walk();
+            let items: Vec<Node<'_>> = node.named_children(&mut cursor).collect();
+            drop(cursor);
+            let paths: Vec<String> = items
+                .into_iter()
+                .filter(|child| !child.kind().ends_with("comment"))
+                .filter_map(|child| rust_use_path(child, source))
+                .collect();
+            Some(format!("{{{}}}", paths.join(",")))
+        }
+        _ => node_text(node, source).map(|text| text.split_whitespace().collect()),
+    }
 }
 
 /// Depth-first: the first `identifier` at or below `node`.
@@ -1738,6 +1768,32 @@ mod tests {
         // …while type-associated calls and crate-local paths are not.
         assert!(!specifiers.iter().any(|s| s.starts_with("Command")));
         assert!(!specifiers.iter().any(|s| s.starts_with("crate::")));
+    }
+
+    #[test]
+    fn a_rust_use_alias_is_not_part_of_the_imported_path() {
+        let facts = extract(
+            SourceLanguage::Rust,
+            "use ovecc_graph as graph;\n\
+             use std::fmt::Write as _;\n\
+             use std::io::{Read as R, Write};\n\
+             use serde::{de::Error as _, Deserialize};\n\
+             use std::collections::HashMap;\n\
+             use std::sync::atomic::*;\n",
+        );
+        let specifiers: Vec<&str> = facts.imports.iter().map(|i| i.specifier.as_str()).collect();
+        assert_eq!(
+            specifiers,
+            [
+                "ovecc_graph",
+                "std::fmt::Write",
+                "std::io::{Read,Write}",
+                "serde::{de::Error,Deserialize}",
+                "std::collections::HashMap",
+                "std::sync::atomic::*",
+            ],
+            "{specifiers:?}"
+        );
     }
 
     fn extract_at(path: &str, contents: &str) -> FileFacts {

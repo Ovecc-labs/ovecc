@@ -7,6 +7,13 @@ changes).
 
 ## [Unreleased]
 
+### Fixed
+
+- A Rust `use x as y;` no longer folds the alias into the import specifier.
+  `use ovecc_graph as graph;` was recorded as an import of `ovecc_graphasgraph`,
+  an edge to a crate that does not exist, which then surfaced as an undeclared
+  dependency.
+
 ## [0.3.1] - 2026-08-16
 
 ### Changed
