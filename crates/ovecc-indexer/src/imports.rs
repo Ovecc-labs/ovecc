@@ -794,6 +794,21 @@ fn unresolved_target_name(specifier: &str, target: &ImportTarget) -> String {
 mod tests {
     use super::*;
 
+    /// An indexed Rust file at `path`; only the path drives resolution.
+    fn rust_file(path: &str) -> FileRecord {
+        FileRecord {
+            id: format!("f:{path}"),
+            repository_id: "r".to_string(),
+            path: path.to_string(),
+            absolute_path: PathBuf::from(path),
+            language: SourceLanguage::Rust,
+            content_hash: "h".to_string(),
+            size_bytes: 0,
+            module_id: "m".to_string(),
+            module_name: "m".to_string(),
+        }
+    }
+
     #[test]
     fn generates_language_specific_import_candidates() {
         assert_eq!(
@@ -944,22 +959,11 @@ mod tests {
 
     #[test]
     fn resolves_workspace_crate_imports_through_cargo_map() {
-        let file = |path: &str| FileRecord {
-            id: format!("f:{path}"),
-            repository_id: "r".to_string(),
-            path: path.to_string(),
-            absolute_path: PathBuf::from(path),
-            language: SourceLanguage::Rust,
-            content_hash: "h".to_string(),
-            size_bytes: 0,
-            module_id: "m".to_string(),
-            module_name: "m".to_string(),
-        };
         let files = [
-            file("crates/ovecc-core/src/lib.rs"),
-            file("crates/ovecc-core/src/facts.rs"),
-            file("crates/ovecc-core/src/id/mod.rs"),
-            file("crates/ovecc-cli/src/main.rs"),
+            rust_file("crates/ovecc-core/src/lib.rs"),
+            rust_file("crates/ovecc-core/src/facts.rs"),
+            rust_file("crates/ovecc-core/src/id/mod.rs"),
+            rust_file("crates/ovecc-cli/src/main.rs"),
         ];
         let by_path: HashMap<String, FileRecord> =
             files.iter().map(|f| (f.path.clone(), f.clone())).collect();
@@ -1003,22 +1007,11 @@ mod tests {
 
     #[test]
     fn a_mod_declared_below_the_crate_root_reaches_its_child_file() {
-        let file = |path: &str| FileRecord {
-            id: format!("f:{path}"),
-            repository_id: "r".to_string(),
-            path: path.to_string(),
-            absolute_path: PathBuf::from(path),
-            language: SourceLanguage::Rust,
-            content_hash: "h".to_string(),
-            size_bytes: 0,
-            module_id: "m".to_string(),
-            module_name: "m".to_string(),
-        };
         let files = [
-            file("src/lib.rs"),
-            file("src/tests.rs"),
-            file("src/foo.rs"),
-            file("src/foo/tests.rs"),
+            rust_file("src/lib.rs"),
+            rust_file("src/tests.rs"),
+            rust_file("src/foo.rs"),
+            rust_file("src/foo/tests.rs"),
         ];
         let by_path: HashMap<String, FileRecord> =
             files.iter().map(|f| (f.path.clone(), f.clone())).collect();
@@ -1056,20 +1049,9 @@ mod tests {
         // workspace map (tracing is not a workspace crate) nor the suffix
         // fallback (bare paths yield no candidates now) may link them, or the
         // graph grows a phantom edge and, closing back, a phantom cycle.
-        let file = |path: &str| FileRecord {
-            id: format!("f:{path}"),
-            repository_id: "r".to_string(),
-            path: path.to_string(),
-            absolute_path: PathBuf::from(path),
-            language: SourceLanguage::Rust,
-            content_hash: "h".to_string(),
-            size_bytes: 0,
-            module_id: "m".to_string(),
-            module_name: "m".to_string(),
-        };
         let files = [
-            file("crates/telemetry/src/tracing.rs"),
-            file("crates/telemetry/src/lib.rs"),
+            rust_file("crates/telemetry/src/tracing.rs"),
+            rust_file("crates/telemetry/src/lib.rs"),
         ];
         let by_path: HashMap<String, FileRecord> =
             files.iter().map(|f| (f.path.clone(), f.clone())).collect();
