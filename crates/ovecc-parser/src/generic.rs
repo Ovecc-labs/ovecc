@@ -1108,9 +1108,8 @@ impl<'a> Walk<'a> {
                 collect_go_import_paths(node, self.source, &mut out);
                 out
             }
-            SourceLanguage::Rust => node
-                .child_by_field_name("argument")
-                .and_then(|argument| rust_use_path(argument, self.source))
+            SourceLanguage::Rust => field_text(node, "argument", self.source)
+                .map(|clause| strip_use_aliases(&clause))
                 .into_iter()
                 .collect(),
             SourceLanguage::Cpp => field_text(node, "path", self.source)
@@ -1279,36 +1278,25 @@ fn node_text(node: Node<'_>, source: &[u8]) -> Option<String> {
     node.utf8_text(source).ok().map(|s| s.to_string())
 }
 
-/// The paths a Rust `use` clause names, with every `as` alias dropped.
-///
-/// The alias is not part of the path: `use ovecc_graph as graph;` imports the
-/// crate `ovecc_graph`, and reading the clause whole gave `ovecc_graphasgraph`.
-/// Aliases nest, so `{Read as _, Write}` needs the same treatment one level
-/// down. Everything else keeps the shape the import resolver expects: `::`
-/// between segments, a brace group for a list.
-fn rust_use_path(node: Node<'_>, source: &[u8]) -> Option<String> {
-    match node.kind() {
-        "use_as_clause" => rust_use_path(node.child_by_field_name("path")?, source),
-        "scoped_use_list" => {
-            let list = rust_use_path(node.child_by_field_name("list")?, source)?;
-            match node.child_by_field_name("path") {
-                Some(path) => Some(format!("{}::{list}", rust_use_path(path, source)?)),
-                None => Some(list),
-            }
-        }
-        "use_list" => {
-            let mut cursor = node.walk();
-            let items: Vec<Node<'_>> = node.named_children(&mut cursor).collect();
-            drop(cursor);
-            let paths: Vec<String> = items
-                .into_iter()
-                .filter(|child| !child.kind().ends_with("comment"))
-                .filter_map(|child| rust_use_path(child, source))
-                .collect();
-            Some(format!("{{{}}}", paths.join(",")))
-        }
-        _ => node_text(node, source).map(|text| text.split_whitespace().collect()),
+/// A Rust `use` clause with its `as` aliases dropped, whitespace-normalized.
+/// Taking the clause whole gave `ovecc_graphasgraph` for `use ovecc_graph as
+/// graph;`. An alias ends at the next `,` or `}`, which keeps `Write` in
+/// `{Read as _, Write}`.
+fn strip_use_aliases(clause: &str) -> String {
+    // Collapse first, so an alias broken across lines is still ` as `.
+    let spaced = clause.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut out = String::with_capacity(spaced.len());
+    let mut rest = spaced.as_str();
+    while let Some(at) = rest.find(" as ") {
+        out.push_str(&rest[..at]);
+        let after = &rest[at + " as ".len()..];
+        rest = &after[after.find([',', '}']).unwrap_or(after.len())..];
     }
+    out.push_str(rest);
+    out.retain(|c| !c.is_whitespace());
+    // rustfmt writes a trailing comma in a multi-line group; it would otherwise
+    // reach the graph as part of the module name.
+    out.replace(",}", "}")
 }
 
 /// Depth-first: the first `identifier` at or below `node`.
@@ -1779,7 +1767,9 @@ mod tests {
              use std::io::{Read as R, Write};\n\
              use serde::{de::Error as _, Deserialize};\n\
              use std::collections::HashMap;\n\
-             use std::sync::atomic::*;\n",
+             use std::sync::atomic::*;\n\
+             use tracing::instrument\n    as trace;\n\
+             use serde_json::{Map, Value,};\n",
         );
         let specifiers: Vec<&str> = facts.imports.iter().map(|i| i.specifier.as_str()).collect();
         assert_eq!(
@@ -1791,6 +1781,10 @@ mod tests {
                 "serde::{de::Error,Deserialize}",
                 "std::collections::HashMap",
                 "std::sync::atomic::*",
+                // An alias split over two lines is still an alias, and the
+                // trailing comma rustfmt leaves in a group is not a segment.
+                "tracing::instrument",
+                "serde_json::{Map,Value}",
             ],
             "{specifiers:?}"
         );
