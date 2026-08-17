@@ -1544,6 +1544,37 @@ fn unresolved_relative_imports_are_flagged_and_never_counted_as_packages() {
 }
 
 #[test]
+fn a_second_index_does_not_report_the_history_it_already_holds_as_missing() {
+    let temp = git_repo();
+    let root = temp.path();
+    let repo = root.to_str().expect("utf8 path").to_string();
+    write_source(root, "src/index.ts", "export const app = 1;\n");
+    git(root, &["add", "."]);
+    git(root, &["commit", "-q", "-m", "first"]);
+
+    let first = ovecc(&repo, &["index"]);
+    let first = String::from_utf8_lossy(&first.stdout).to_string();
+    assert!(
+        first.contains("Commits ingested: 1"),
+        "one commit in the window: {first}"
+    );
+
+    // Edit a file without committing, so the next index has work to do and
+    // prints the full counter block while writing no commits.
+    write_source(root, "src/index.ts", "export const app = 2;\n");
+    let second = ovecc(&repo, &["index"]);
+    let second = String::from_utf8_lossy(&second.stdout).to_string();
+    assert!(
+        second.contains("Commits ingested: 1"),
+        "the window is still one commit: {second}"
+    );
+    assert!(
+        !second.contains("No git history found"),
+        "the history is right there: {second}"
+    );
+}
+
+#[test]
 fn a_phantom_dependency_is_only_read_from_the_languages_the_manifest_governs() {
     let temp = tempfile::tempdir().expect("temp dir");
     let root = temp.path();

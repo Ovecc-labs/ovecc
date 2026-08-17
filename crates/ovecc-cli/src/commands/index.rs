@@ -235,11 +235,12 @@ fn coverage_line(report: &IndexReport) -> Option<String> {
     })
 }
 
-/// Says so when no history was ingested. `Commits ingested: 0` on its own reads
-/// as a fact about the repository; it is really a fact about what ran. Churn is
-/// then 0 for every module, and a reader can reasonably conclude the codebase
-/// has no hotspots when that analysis never happened. `hotspots` and `coupling`
-/// already report their own "n/a"; this is the line that says it at the source.
+/// Says so when the repository has no history to read. `Commits ingested: 0` on
+/// its own reads as a fact about the repository; it is really a fact about what
+/// ran. Churn is then 0 for every module, and a reader can reasonably conclude
+/// the codebase has no hotspots when that analysis never happened. `hotspots`
+/// and `coupling` already report their own "n/a"; this is the line that says it
+/// at the source.
 fn no_history_line(commits_ingested: usize) -> Option<String> {
     (commits_ingested == 0).then(|| {
         "No git history found — churn, hotspots ranking, coupling, ownership and selfcheck \

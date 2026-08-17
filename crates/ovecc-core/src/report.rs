@@ -212,6 +212,7 @@ pub struct IndexReport {
     pub calls: usize,
     pub apis: usize,
     pub tables: usize,
+    /// Commits in the ingested history window, not the rows this run wrote.
     pub commits_ingested: usize,
     /// Per-file parser failures surfaced instead of aborting.
     pub parse_failures: Vec<ParseFailure>,

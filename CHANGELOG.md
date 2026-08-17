@@ -29,6 +29,13 @@ changes).
   `fix --delete-files` offered to remove it. Across 14 production monorepos, 25
   of the 46 `bin` paths declared carry no `./`.
 
+- `index` no longer reports a repository as having no git history when it is
+  re-indexing one it already holds. Git ingestion is differential, so a second
+  run writes no commits, and the line derived from that count claimed churn,
+  hotspots, coupling, ownership and selfcheck were unavailable while `summary`
+  answered from that same history. The count is now the size of the ingested
+  window.
+
 ## [0.3.1] - 2026-08-16
 
 ### Changed

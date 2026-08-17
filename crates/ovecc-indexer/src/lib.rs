@@ -1291,7 +1291,11 @@ const GIT_WINDOW_DAYS: u32 = 365;
 const GIT_MAX_COMMITS: usize = 5000;
 
 /// Pulls recent Git history, persists commits + file changes, and returns the
-/// HEAD sha, the number of newly ingested commits, and per-file ownership.
+/// HEAD sha, the number of commits the window holds, and per-file ownership.
+///
+/// The count is the window, not what this run wrote: `upsert_git_facts` is
+/// differential, so a re-index writes nothing, and a count of writes reads back
+/// as "this repository has no history".
 fn ingest_git(
     store: &mut ArchitectureStore,
     repository_id: &str,
@@ -1329,10 +1333,10 @@ fn ingest_git(
             });
         }
     }
-    let ingested = store.upsert_git_facts(repository_id, &commits, &changes)?;
+    store.upsert_git_facts(repository_id, &commits, &changes)?;
     backfill_fix_classification(store, repository_id)?;
     let ownership = store.ownership_metrics(repository_id)?;
-    Ok((history.head_sha, ingested, ownership))
+    Ok((history.head_sha, commits.len(), ownership))
 }
 
 /// Classifies commits stored before the `is_fix` columns existed, from the
