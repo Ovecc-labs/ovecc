@@ -377,11 +377,16 @@ fn manifest_entry_specs(manifest: &serde_json::Value) -> Vec<String> {
     specs
 }
 
-/// Recursively gathers relative-path string leaves (`"./..."`) from an `exports`
-/// or `bin` value, descending condition maps, subpath maps, and arrays.
+/// Recursively gathers the path string leaves of an `exports` or `bin` value,
+/// descending condition maps, subpath maps, and arrays.
+///
+/// A leading `./` is not required: `exports` mandates one, `bin` does not, and
+/// both spellings are common. Requiring it left the launcher of a published CLI
+/// reading back as an unreachable file. Every leaf here is a path, and
+/// `resolve_entry_spec` drops anything that names no indexed file.
 fn collect_relative_paths(value: &serde_json::Value, out: &mut Vec<String>) {
     match value {
-        serde_json::Value::String(string) if string.starts_with('.') => out.push(string.clone()),
+        serde_json::Value::String(string) => out.push(string.clone()),
         serde_json::Value::Array(items) => {
             for item in items {
                 collect_relative_paths(item, out);
@@ -528,6 +533,18 @@ mod tests {
         assert!(specs.contains(&"./dist/feature.js".to_string()));
         assert!(specs.contains(&"./dist/cli.js".to_string()));
         assert!(specs.contains(&"./dist/index.d.ts".to_string()));
+
+        // `bin` without a leading `./`, in both the map and shorthand forms.
+        let bare = serde_json::json!({
+            "main": "index.js",
+            "bin": { "tool": "bin/tool.js" }
+        });
+        let specs = manifest_entry_specs(&bare);
+        assert!(specs.contains(&"index.js".to_string()), "{specs:?}");
+        assert!(specs.contains(&"bin/tool.js".to_string()), "{specs:?}");
+
+        let shorthand = serde_json::json!({ "bin": "cli.js" });
+        assert_eq!(manifest_entry_specs(&shorthand), ["cli.js"]);
     }
 
     #[test]

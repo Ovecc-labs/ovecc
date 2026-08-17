@@ -23,6 +23,12 @@ changes).
   an edge to a crate that does not exist, which then surfaced as an undeclared
   dependency.
 
+- A file the package manifest declares as `bin` is reachable even when the path
+  carries no leading `./`. `exports` requires one and `bin` does not, so the
+  launcher of a published CLI read back as an unreachable file and
+  `fix --delete-files` offered to remove it. Across 14 production monorepos, 25
+  of the 46 `bin` paths declared carry no `./`.
+
 ## [0.3.1] - 2026-08-16
 
 ### Changed
