@@ -99,7 +99,7 @@ pub(crate) fn resolve_dependencies(
                 SourceLanguage::Rust => {
                     resolve_rust_workspace_import(&cargo_crates, &import.specifier, file_by_path)
                         .or_else(|| {
-                            resolve_suffix_unique(
+                            resolve_most_specific(
                                 &rust_import_candidates(&file.path, &import.specifier),
                                 &suffix_index,
                                 file_by_path,
@@ -514,6 +514,31 @@ fn resolve_suffix_unique(
         }
     }
     chosen.and_then(|path| file_by_path.get(&path).cloned())
+}
+
+/// Resolves the first candidate that matches exactly one indexed file, for a
+/// list already ordered from most to least specific.
+///
+/// Rust's fallback candidate is the parent module's own file, which usually
+/// exists too, so [`resolve_suffix_unique`]'s all-must-agree rule discarded the
+/// specific match along with it. C++ keeps that stricter rule: its two
+/// candidates are different files an include path chooses between.
+fn resolve_most_specific(
+    candidates: &[String],
+    suffix_index: &HashMap<String, Vec<String>>,
+    file_by_path: &HashMap<String, FileRecord>,
+) -> Option<FileRecord> {
+    for candidate in candidates {
+        let Some(paths) = suffix_index.get(candidate) else {
+            continue;
+        };
+        let distinct: std::collections::BTreeSet<&String> = paths.iter().collect();
+        if distinct.len() != 1 {
+            return None; // ambiguous at the most specific level that matched
+        }
+        return file_by_path.get(&paths[0]).cloned();
+    }
+    None
 }
 
 /// Resolves a Go import (a package directory) to a representative file in that
@@ -974,6 +999,54 @@ mod tests {
         );
         // Unknown crates stay external for the caller's fallback.
         assert_eq!(path_of("serde::Deserialize"), None);
+    }
+
+    #[test]
+    fn a_mod_declared_below_the_crate_root_reaches_its_child_file() {
+        let file = |path: &str| FileRecord {
+            id: format!("f:{path}"),
+            repository_id: "r".to_string(),
+            path: path.to_string(),
+            absolute_path: PathBuf::from(path),
+            language: SourceLanguage::Rust,
+            content_hash: "h".to_string(),
+            size_bytes: 0,
+            module_id: "m".to_string(),
+            module_name: "m".to_string(),
+        };
+        let files = [
+            file("src/lib.rs"),
+            file("src/tests.rs"),
+            file("src/foo.rs"),
+            file("src/foo/tests.rs"),
+        ];
+        let by_path: HashMap<String, FileRecord> =
+            files.iter().map(|f| (f.path.clone(), f.clone())).collect();
+        let suffixes = build_path_suffix_index(&files);
+        let path_of = |source: &str, specifier: &str| {
+            resolve_most_specific(
+                &rust_import_candidates(source, specifier),
+                &suffixes,
+                &by_path,
+            )
+            .map(|f| f.path)
+        };
+
+        // `foo.rs` is also a candidate here, and it exists: the specific match
+        // has to win rather than cancel it out.
+        assert_eq!(
+            path_of("src/foo.rs", "self::foo::tests"),
+            Some("src/foo/tests.rs".to_string())
+        );
+        assert_eq!(
+            path_of("src/lib.rs", "self::tests"),
+            Some("src/tests.rs".to_string())
+        );
+        // An item imported from a sibling module still lands on that module.
+        assert_eq!(
+            path_of("src/lib.rs", "self::foo::helper"),
+            Some("src/foo.rs".to_string())
+        );
     }
 
     #[test]

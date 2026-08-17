@@ -9,6 +9,15 @@ changes).
 
 ### Fixed
 
+- A Rust `mod x;` declared below the crate root now reaches its child file. The
+  candidate list is ordered from most to least specific, and the fallback
+  candidate is the parent module's own file, which usually exists too; requiring
+  every candidate to agree discarded the specific match along with the fallback,
+  so the child read as unreachable and `fix --delete-files` offered it. Declared
+  from a crate root the specifier has a single segment and no fallback, which is
+  why only nested modules broke. On clap this resolves two imports that were
+  counted as external packages, and changes nothing else there or on ripgrep.
+
 - `unlisted-dependency` no longer reads imports from languages a `package.json`
   cannot declare. The rule compared every indexed import against the manifests,
   so a repository with a Python service or a Go binary beside its Node packages
