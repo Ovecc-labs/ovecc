@@ -68,6 +68,17 @@ The machine-readable contract: every command, every metric and rule (with a
 definition), the severity vocabulary, exit codes, output formats. An agent
 calls this first and needs nothing else to drive the tool.
 
+### `ovecc version`
+
+The release and the JSON envelope's `schema_version`, in any `--format`. Needs
+no index and no repository — both numbers are compiled into the binary. `-v`,
+`-V` and `--version` print the first line only, for a human:
+
+```
+ovecc 0.3.1
+schema_version: 1
+```
+
 ### `ovecc summary`
 
 One-screen health: files, modules, dependency counts, cyclic module components,

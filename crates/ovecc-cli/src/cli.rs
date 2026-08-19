@@ -30,6 +30,7 @@ use crate::commands::{
     review::{build_review_report, render_full_report, render_review},
     selfcheck::{load_selfcheck, render_selfcheck},
     summary::{load_hotspots, load_summary, render_hotspots, render_summary_report},
+    version::{build_version_report, render_version},
 };
 use crate::render::{SUPPRESS_META, emit_json, meta_for, report_run_stats};
 use anyhow::Result;
@@ -46,9 +47,16 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 
 #[derive(Debug, Parser)]
-#[command(name = "ovecc", version)]
+#[command(name = "ovecc", version, disable_version_flag = true)]
 #[command(about = "Deterministic architecture intelligence for repositories")]
 pub struct Cli {
+    // Clap's own short for this is `-V`, but `-v` is what people type. `-v` is
+    // the short, and `-V` stays an alias so a script already using it keeps
+    // working. `ovecc version` gives the same facts in any `--format`.
+    /// Print the release and exit.
+    #[arg(short = 'v', short_alias = 'V', long, action = clap::ArgAction::Version)]
+    version: Option<bool>,
+
     #[arg(long, global = true, value_name = "PATH")]
     repo: Option<PathBuf>,
 
@@ -184,6 +192,9 @@ pub enum Command {
     /// List every command, metric, rule, severity, exit code, and format Ovecc
     /// supports — the machine-readable contract for AI agents.
     Capabilities,
+    /// Print the release and the JSON schema version, in any `--format`. The
+    /// same facts as `--version`, shaped for a caller that has to parse them.
+    Version,
     /// Show current architecture health.
     Summary,
     /// Analyze blast radius for a module.
@@ -736,6 +747,12 @@ fn run_command(cli: Cli) -> Result<u8> {
             let paths = ProjectPaths::resolve(cli.repo.unwrap_or_else(|| PathBuf::from(".")))?;
             let config = load_config(&paths, format_override)?;
             render_capabilities(config.output.default_format)?;
+            Ok(0)
+        }
+        Command::Version => {
+            let paths = ProjectPaths::resolve(cli.repo.unwrap_or_else(|| PathBuf::from(".")))?;
+            let config = load_config(&paths, format_override)?;
+            render_version(&build_version_report(), config.output.default_format)?;
             Ok(0)
         }
         Command::Summary => {

@@ -50,6 +50,13 @@ pub const COMMANDS: &[CommandSpec] = &[
         read_only: true,
     },
     CommandSpec {
+        name: "version",
+        summary: "Print the release and the JSON schema version. Needs no index and no repository.",
+        key_params: &["--format json"],
+        output: "The binary's version and the schema_version its envelope conforms to.",
+        read_only: true,
+    },
+    CommandSpec {
         name: "summary",
         summary: "Show current architecture health at a glance.",
         key_params: &[],
