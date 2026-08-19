@@ -74,7 +74,14 @@ use std::path::{Path, PathBuf};
 // which is precisely what the two additions exist to prevent. Both v21s were
 // minted independently (this branch's and main's), so the merge has to move
 // past the collision rather than keep one number meaning two fact shapes.
-const PARSE_CACHE_VERSION: &str = "v22";
+// v23: a Rust `use x as y;` no longer folds the alias into the import
+// specifier. Cached v22 facts carry the folded form, which resolves to no crate
+// and reads back as an undeclared external package.
+// v24: this merge. A v22 cache is this branch's fact shape without the alias
+// fix, and a v23 cache is main's alias fix without `path_literals` or
+// `exported_signature_types`. Neither describes the merged extractor, so both
+// have to be invalidated rather than one of the two numbers reused.
+const PARSE_CACHE_VERSION: &str = "v24";
 
 pub fn index_repository(
     paths: &ProjectPaths,
@@ -1288,7 +1295,11 @@ const GIT_WINDOW_DAYS: u32 = 365;
 const GIT_MAX_COMMITS: usize = 5000;
 
 /// Pulls recent Git history, persists commits + file changes, and returns the
-/// HEAD sha, the number of newly ingested commits, and per-file ownership.
+/// HEAD sha, the number of commits the window holds, and per-file ownership.
+///
+/// The count is the window, not what this run wrote: `upsert_git_facts` is
+/// differential, so a re-index writes nothing, and a count of writes reads back
+/// as "this repository has no history".
 fn ingest_git(
     store: &mut ArchitectureStore,
     repository_id: &str,
@@ -1326,10 +1337,10 @@ fn ingest_git(
             });
         }
     }
-    let ingested = store.upsert_git_facts(repository_id, &commits, &changes)?;
+    store.upsert_git_facts(repository_id, &commits, &changes)?;
     backfill_fix_classification(store, repository_id)?;
     let ownership = store.ownership_metrics(repository_id)?;
-    Ok((history.head_sha, ingested, ownership))
+    Ok((history.head_sha, commits.len(), ownership))
 }
 
 /// Classifies commits stored before the `is_fix` columns existed, from the

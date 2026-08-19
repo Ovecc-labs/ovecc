@@ -7,11 +7,7 @@
   </p>
 
   <p>
-    Ovecc reads your repo once and builds a deterministic, offline model of it,
-    then answers the hard questions: what breaks if I change this, where are the
-    cycles, what's coupled, dead, or insecure. And it lets you write your
-    architecture down as a contract, so the build fails when the code drifts.<br/>
-    It runs locally, stays fully deterministic, and never puts an LLM in the loop.
+    Rust, one binary, no runtime. Runs offline, with no LLM in the loop.
   </p>
 
   <p>
@@ -27,9 +23,9 @@
 
 ## What is Ovecc
 
-Ovecc reads your repository once and builds a deterministic, persistent model of
-it: every file, import, symbol, and call. From that single index it answers the
-questions you actually ask about a codebase:
+Ovecc reads your repository once and builds a persistent model of it: every
+file, import, symbol, and call. From that single index it answers the questions
+you ask about a codebase:
 
 - What breaks if I change this? (`impact`)
 - Where are the dependency cycles and the tight coupling? (`query`, `summary`)
@@ -37,15 +33,24 @@ questions you actually ask about a codebase:
 - What is insecure, and which dependencies have known CVEs? (`security`, `audit`)
 - Where is the churn, and who owns this code? (`hotspots`)
 
-It runs on your machine, gives byte-identical answers every run, and never
-treats an LLM as the source of truth: it's an architecture database with
-deterministic commands, usable from the CLI, in CI, or by a coding agent over
-MCP.
+It is an architecture database with deterministic commands, driven from the CLI,
+from CI, or by a coding agent over MCP.
 
 <img src="docs/img/graph-hero.png" alt="React's dependency graph in ovecc's offline viewer" width="100%" />
 <p align="center"><i>React's dependency graph, rendered by <code>ovecc export graph --html</code> into a single file you can open directly, no server or CDN needed.</i></p>
 
-Measured performance and answer accuracy on real repositories are in
+### What it costs an agent
+
+Asking whether a new import closes a dependency cycle, on zod, with Claude
+Sonnet 4.6:
+
+| | Tokens | Cost |
+| --- | --- | --- |
+| Agent reading files | 528,865 | $1.63 |
+| Agent + ovecc over MCP | 58,906 | $0.22 |
+
+One run, one model, one question, and agent runs are not deterministic. Method
+and the cases where ovecc loses are in
 [docs/benchmark/BENCHMARKS.md](docs/benchmark/BENCHMARKS.md).
 
 ## Write your architecture down, and hold the code to it

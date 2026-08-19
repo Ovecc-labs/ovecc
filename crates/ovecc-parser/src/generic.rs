@@ -1108,13 +1108,10 @@ impl<'a> Walk<'a> {
                 collect_go_import_paths(node, self.source, &mut out);
                 out
             }
-            SourceLanguage::Rust => {
-                // `use a::b::c;` -> the whole clause text, whitespace-normalized.
-                field_text(node, "argument", self.source)
-                    .map(|t| t.split_whitespace().collect::<String>())
-                    .into_iter()
-                    .collect()
-            }
+            SourceLanguage::Rust => field_text(node, "argument", self.source)
+                .map(|clause| strip_use_aliases(&clause))
+                .into_iter()
+                .collect(),
             SourceLanguage::Cpp => field_text(node, "path", self.source)
                 .map(|p| strip_include(&p))
                 .into_iter()
@@ -1279,6 +1276,27 @@ fn span_of(node: Node<'_>) -> Span {
 
 fn node_text(node: Node<'_>, source: &[u8]) -> Option<String> {
     node.utf8_text(source).ok().map(|s| s.to_string())
+}
+
+/// A Rust `use` clause with its `as` aliases dropped, whitespace-normalized.
+/// Taking the clause whole gave `ovecc_graphasgraph` for `use ovecc_graph as
+/// graph;`. An alias ends at the next `,` or `}`, which keeps `Write` in
+/// `{Read as _, Write}`.
+fn strip_use_aliases(clause: &str) -> String {
+    // Collapse first, so an alias broken across lines is still ` as `.
+    let spaced = clause.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut out = String::with_capacity(spaced.len());
+    let mut rest = spaced.as_str();
+    while let Some(at) = rest.find(" as ") {
+        out.push_str(&rest[..at]);
+        let after = &rest[at + " as ".len()..];
+        rest = &after[after.find([',', '}']).unwrap_or(after.len())..];
+    }
+    out.push_str(rest);
+    out.retain(|c| !c.is_whitespace());
+    // rustfmt writes a trailing comma in a multi-line group; it would otherwise
+    // reach the graph as part of the module name.
+    out.replace(",}", "}")
 }
 
 /// Depth-first: the first `identifier` at or below `node`.
@@ -1738,6 +1756,38 @@ mod tests {
         // …while type-associated calls and crate-local paths are not.
         assert!(!specifiers.iter().any(|s| s.starts_with("Command")));
         assert!(!specifiers.iter().any(|s| s.starts_with("crate::")));
+    }
+
+    #[test]
+    fn a_rust_use_alias_is_not_part_of_the_imported_path() {
+        let facts = extract(
+            SourceLanguage::Rust,
+            "use ovecc_graph as graph;\n\
+             use std::fmt::Write as _;\n\
+             use std::io::{Read as R, Write};\n\
+             use serde::{de::Error as _, Deserialize};\n\
+             use std::collections::HashMap;\n\
+             use std::sync::atomic::*;\n\
+             use tracing::instrument\n    as trace;\n\
+             use serde_json::{Map, Value,};\n",
+        );
+        let specifiers: Vec<&str> = facts.imports.iter().map(|i| i.specifier.as_str()).collect();
+        assert_eq!(
+            specifiers,
+            [
+                "ovecc_graph",
+                "std::fmt::Write",
+                "std::io::{Read,Write}",
+                "serde::{de::Error,Deserialize}",
+                "std::collections::HashMap",
+                "std::sync::atomic::*",
+                // An alias split over two lines is still an alias, and the
+                // trailing comma rustfmt leaves in a group is not a segment.
+                "tracing::instrument",
+                "serde_json::{Map,Value}",
+            ],
+            "{specifiers:?}"
+        );
     }
 
     fn extract_at(path: &str, contents: &str) -> FileFacts {

@@ -98,6 +98,16 @@ fn is_plausible_npm_segment(segment: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
 }
 
+/// True when a file imports npm packages, the only kind a `package.json`
+/// declares. A repository shipping a Python service or a Go binary beside its
+/// Node packages still has one manifest at the root, and `import contextlib`
+/// is not a phantom dependency there.
+fn imports_npm_packages(path: &str) -> bool {
+    path.rsplit_once('.')
+        .and_then(|(_, extension)| ovecc_core::lang::SourceLanguage::from_extension(extension))
+        .is_some_and(ovecc_core::lang::SourceLanguage::is_js_family)
+}
+
 /// Tokens a manifest `scripts` map invokes — the words of every script command.
 /// A dependency whose name (or well-known binary) appears here is used even
 /// without an import (`tsc`, `jest`, `eslint`, ...).
@@ -232,11 +242,13 @@ pub(crate) fn detect_unused_dependencies(
     findings
 }
 
-/// Phantom dependencies: packages imported by indexed source but declared in
-/// no `package.json` section — they resolve only via hoisting or a transitive
-/// install and break on a lockfile change. Precise by construction (the import
-/// is a fact; the absent declaration is a fact), so this runs unconditionally.
-/// Silent when the repo has no manifests at all (non-Node repositories).
+/// Phantom dependencies: packages imported by indexed JavaScript or TypeScript
+/// but declared in no `package.json` section — they resolve only via hoisting
+/// or a transitive install and break on a lockfile change. Precise by
+/// construction (the import is a fact; the absent declaration is a fact), so
+/// this runs unconditionally. Silent when the repo has no manifests at all
+/// (non-Node repositories) and, within a repo that has one, silent about the
+/// languages it does not govern.
 pub(crate) fn detect_unlisted_dependencies(
     root: &Path,
     repository_id: &str,
@@ -247,47 +259,8 @@ pub(crate) fn detect_unlisted_dependencies(
     if manifests.is_empty() {
         return Vec::new();
     }
-    let mut declared: HashSet<String> = HashSet::new();
-    for (_, manifest) in &manifests {
-        for section in [
-            "dependencies",
-            "devDependencies",
-            "peerDependencies",
-            "optionalDependencies",
-        ] {
-            if let Some(deps) = manifest.get(section).and_then(|value| value.as_object()) {
-                declared.extend(deps.keys().cloned());
-            }
-        }
-        // A workspace package's own name is importable inside the monorepo.
-        if let Some(name) = manifest.get("name").and_then(|value| value.as_str()) {
-            declared.insert(name.to_string());
-        }
-    }
-    // First import site per package root, deterministic (min by file, line).
-    let mut first_use: std::collections::BTreeMap<String, (String, usize)> =
-        std::collections::BTreeMap::new();
-    for dependency in dependencies {
-        if !dependency.is_external_package() {
-            continue;
-        }
-        let Some(package_root) = external_package_root(&dependency.specifier) else {
-            continue;
-        };
-        let site = (
-            dependency.source_file_path.clone(),
-            dependency.evidence_line,
-        );
-        first_use
-            .entry(package_root)
-            .and_modify(|existing| {
-                if site < *existing {
-                    existing.clone_from(&site);
-                }
-            })
-            .or_insert(site);
-    }
-    first_use
+    let declared = declared_packages(&manifests);
+    first_import_sites(dependencies)
         .into_iter()
         .filter(|(package_root, _)| !declared.contains(package_root))
         .map(
@@ -319,6 +292,58 @@ pub(crate) fn detect_unlisted_dependencies(
             },
         )
         .collect()
+}
+
+/// Every package name the manifests declare, from any section. A workspace
+/// package's own name goes in too: it is importable inside the monorepo.
+fn declared_packages(manifests: &[(String, serde_json::Value)]) -> HashSet<String> {
+    let mut declared = HashSet::new();
+    for (_, manifest) in manifests {
+        for section in [
+            "dependencies",
+            "devDependencies",
+            "peerDependencies",
+            "optionalDependencies",
+        ] {
+            if let Some(deps) = manifest.get(section).and_then(|value| value.as_object()) {
+                declared.extend(deps.keys().cloned());
+            }
+        }
+        if let Some(name) = manifest.get("name").and_then(|value| value.as_str()) {
+            declared.insert(name.to_string());
+        }
+    }
+    declared
+}
+
+/// The first import site of every npm package root, as `(file, line)`. Ordered
+/// and minimised so the reported site does not depend on walk order.
+fn first_import_sites(
+    dependencies: &[ovecc_core::legacy::DependencyRecord],
+) -> std::collections::BTreeMap<String, (String, usize)> {
+    let mut first_use = std::collections::BTreeMap::new();
+    for dependency in dependencies {
+        if !dependency.is_external_package() || !imports_npm_packages(&dependency.source_file_path)
+        {
+            continue;
+        }
+        let Some(package_root) = external_package_root(&dependency.specifier) else {
+            continue;
+        };
+        let site = (
+            dependency.source_file_path.clone(),
+            dependency.evidence_line,
+        );
+        first_use
+            .entry(package_root)
+            .and_modify(|existing| {
+                if site < *existing {
+                    existing.clone_from(&site);
+                }
+            })
+            .or_insert(site);
+    }
+    first_use
 }
 
 /// Evidence detail for an unlisted dependency.

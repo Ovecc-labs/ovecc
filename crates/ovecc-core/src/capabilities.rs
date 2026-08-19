@@ -514,7 +514,7 @@ pub fn metric_definitions() -> BTreeMap<String, MetaMetric> {
         (
             "commits_ingested".to_string(),
             metric(
-                "Git commits ingested this run; 0 means no git history.",
+                "Git commits in the ingested history window; 0 means no git history.",
                 "[0, inf)",
                 "0 disables churn/ownership signals",
             ),

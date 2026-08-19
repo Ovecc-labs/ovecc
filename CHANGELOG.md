@@ -7,6 +7,44 @@ changes).
 
 ## [Unreleased]
 
+### Fixed
+
+- A Rust `mod x;` declared below the crate root now reaches its child file. The
+  candidate list is ordered from most to least specific, and the fallback
+  candidate is the parent module's own file, which usually exists too; requiring
+  every candidate to agree discarded the specific match along with the fallback,
+  so the child read as unreachable and `fix --delete-files` offered it. Declared
+  from a crate root the specifier has a single segment and no fallback, which is
+  why only nested modules broke. On clap this resolves two imports that were
+  counted as external packages, and changes nothing else there or on ripgrep.
+
+- `unlisted-dependency` no longer reads imports from languages a `package.json`
+  cannot declare. The rule compared every indexed import against the manifests,
+  so a repository with a Python service or a Go binary beside its Node packages
+  got a Medium finding for `import contextlib`, `#include <iostream>` or
+  `import "fmt"`. On a large polyglot repository it goes from 96 findings to 38,
+  dropping all 58 that came from `.py`, `.cpp`, `.go`, `.cu` and `.c` files and
+  no JavaScript or TypeScript one; on a monorepo with a Go sub-server, from 23
+  to 8.
+
+- A Rust `use x as y;` no longer folds the alias into the import specifier.
+  `use ovecc_graph as graph;` was recorded as an import of `ovecc_graphasgraph`,
+  an edge to a crate that does not exist, which then surfaced as an undeclared
+  dependency.
+
+- A file the package manifest declares as `bin` is reachable even when the path
+  carries no leading `./`. `exports` requires one and `bin` does not, so the
+  launcher of a published CLI read back as an unreachable file and
+  `fix --delete-files` offered to remove it. Across 14 production monorepos, 25
+  of the 46 `bin` paths declared carry no `./`.
+
+- `index` no longer reports a repository as having no git history when it is
+  re-indexing one it already holds. Git ingestion is differential, so a second
+  run writes no commits, and the line derived from that count claimed churn,
+  hotspots, coupling, ownership and selfcheck were unavailable while `summary`
+  answered from that same history. The count is now the size of the ingested
+  window.
+
 ## [0.3.1] - 2026-08-16
 
 ### Changed

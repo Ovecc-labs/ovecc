@@ -908,6 +908,17 @@ fn write_source(root: &Path, rel: &str, body: &str) {
     fs::write(path, body).expect("write source");
 }
 
+/// One evidence field of every finding a command reports under a given rule.
+fn rule_evidence(repo: &str, args: &[&str], rule: &str, field: &str) -> Vec<String> {
+    json_output(repo, args)["data"]["findings"]
+        .as_array()
+        .expect("findings array")
+        .iter()
+        .filter(|finding| finding["rule_name"] == rule)
+        .map(|finding| finding["evidence"][0][field].to_string())
+        .collect()
+}
+
 fn json_output(repo: &str, args: &[&str]) -> serde_json::Value {
     let out = ovecc(repo, args);
     assert_eq!(
@@ -1530,6 +1541,93 @@ fn unresolved_relative_imports_are_flagged_and_never_counted_as_packages() {
             "{level} nodes: {externals:?}"
         );
     }
+}
+
+#[test]
+fn a_second_index_does_not_report_the_history_it_already_holds_as_missing() {
+    let temp = git_repo();
+    let root = temp.path();
+    let repo = root.to_str().expect("utf8 path").to_string();
+    write_source(root, "src/index.ts", "export const app = 1;\n");
+    git(root, &["add", "."]);
+    git(root, &["commit", "-q", "-m", "first"]);
+
+    let first = ovecc(&repo, &["index"]);
+    let first = String::from_utf8_lossy(&first.stdout).to_string();
+    assert!(
+        first.contains("Commits ingested: 1"),
+        "one commit in the window: {first}"
+    );
+
+    // Edit a file without committing, so the next index has work to do and
+    // prints the full counter block while writing no commits.
+    write_source(root, "src/index.ts", "export const app = 2;\n");
+    let second = ovecc(&repo, &["index"]);
+    let second = String::from_utf8_lossy(&second.stdout).to_string();
+    assert!(
+        second.contains("Commits ingested: 1"),
+        "the window is still one commit: {second}"
+    );
+    assert!(
+        !second.contains("No git history found"),
+        "the history is right there: {second}"
+    );
+}
+
+#[test]
+fn a_phantom_dependency_is_only_read_from_the_languages_the_manifest_governs() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let root = temp.path();
+    let repo = root.to_str().expect("utf8 path").to_string();
+
+    fs::write(
+        root.join("package.json"),
+        "{ \"name\": \"polyglot-demo\", \"dependencies\": { \"lodash\": \"^4.17.21\" } }",
+    )
+    .expect("manifest");
+    write_source(
+        root,
+        "src/app.ts",
+        "import { chunk } from \"lodash\";\n\
+         import express from \"express\";\n\
+         export const app = [chunk, express];\n",
+    );
+    // Every import below is a standard library or another ecosystem's
+    // dependency, and a package.json declares none of them.
+    write_source(
+        root,
+        "services/worker.py",
+        "import contextlib\nimport dataclasses\nimport requests\n\n\ndef run():\n    return requests\n",
+    );
+    write_source(
+        root,
+        "cmd/main.go",
+        "package main\n\nimport (\n\t\"fmt\"\n\t\"github.com/spf13/cobra\"\n)\n\nfunc main() { fmt.Println(cobra.Command{}) }\n",
+    );
+    write_source(
+        root,
+        "native/tool.cpp",
+        "#include <iostream>\n#include \"Logger.h\"\n\nint main() { return 0; }\n",
+    );
+
+    let indexed = ovecc(&repo, &["index", "--no-git"]);
+    assert!(
+        indexed.status.success(),
+        "index failed: {}",
+        String::from_utf8_lossy(&indexed.stderr)
+    );
+
+    let unlisted = rule_evidence(
+        &repo,
+        &["deadcode", "--format", "json"],
+        "unlisted-dependency",
+        "symbol",
+    );
+    assert_eq!(
+        unlisted,
+        ["\"express\""],
+        "only the TypeScript import a package.json could declare"
+    );
 }
 
 #[test]

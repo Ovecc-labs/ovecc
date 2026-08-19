@@ -99,7 +99,7 @@ pub(crate) fn resolve_dependencies(
                 SourceLanguage::Rust => {
                     resolve_rust_workspace_import(&cargo_crates, &import.specifier, file_by_path)
                         .or_else(|| {
-                            resolve_suffix_unique(
+                            resolve_most_specific(
                                 &rust_import_candidates(&file.path, &import.specifier),
                                 &suffix_index,
                                 file_by_path,
@@ -516,6 +516,31 @@ fn resolve_suffix_unique(
     chosen.and_then(|path| file_by_path.get(&path).cloned())
 }
 
+/// Resolves the first candidate that matches exactly one indexed file, for a
+/// list already ordered from most to least specific.
+///
+/// Rust's fallback candidate is the parent module's own file, which usually
+/// exists too, so [`resolve_suffix_unique`]'s all-must-agree rule discarded the
+/// specific match along with it. C++ keeps that stricter rule: its two
+/// candidates are different files an include path chooses between.
+fn resolve_most_specific(
+    candidates: &[String],
+    suffix_index: &HashMap<String, Vec<String>>,
+    file_by_path: &HashMap<String, FileRecord>,
+) -> Option<FileRecord> {
+    for candidate in candidates {
+        let Some(paths) = suffix_index.get(candidate) else {
+            continue;
+        };
+        let distinct: std::collections::BTreeSet<&String> = paths.iter().collect();
+        if distinct.len() != 1 {
+            return None; // ambiguous at the most specific level that matched
+        }
+        return file_by_path.get(&paths[0]).cloned();
+    }
+    None
+}
+
 /// Resolves a Go import (a package directory) to a representative file in that
 /// package, when the candidate matches files in exactly one directory.
 fn resolve_go_package(
@@ -769,6 +794,21 @@ fn unresolved_target_name(specifier: &str, target: &ImportTarget) -> String {
 mod tests {
     use super::*;
 
+    /// An indexed Rust file at `path`; only the path drives resolution.
+    fn rust_file(path: &str) -> FileRecord {
+        FileRecord {
+            id: format!("f:{path}"),
+            repository_id: "r".to_string(),
+            path: path.to_string(),
+            absolute_path: PathBuf::from(path),
+            language: SourceLanguage::Rust,
+            content_hash: "h".to_string(),
+            size_bytes: 0,
+            module_id: "m".to_string(),
+            module_name: "m".to_string(),
+        }
+    }
+
     #[test]
     fn generates_language_specific_import_candidates() {
         assert_eq!(
@@ -919,22 +959,11 @@ mod tests {
 
     #[test]
     fn resolves_workspace_crate_imports_through_cargo_map() {
-        let file = |path: &str| FileRecord {
-            id: format!("f:{path}"),
-            repository_id: "r".to_string(),
-            path: path.to_string(),
-            absolute_path: PathBuf::from(path),
-            language: SourceLanguage::Rust,
-            content_hash: "h".to_string(),
-            size_bytes: 0,
-            module_id: "m".to_string(),
-            module_name: "m".to_string(),
-        };
         let files = [
-            file("crates/ovecc-core/src/lib.rs"),
-            file("crates/ovecc-core/src/facts.rs"),
-            file("crates/ovecc-core/src/id/mod.rs"),
-            file("crates/ovecc-cli/src/main.rs"),
+            rust_file("crates/ovecc-core/src/lib.rs"),
+            rust_file("crates/ovecc-core/src/facts.rs"),
+            rust_file("crates/ovecc-core/src/id/mod.rs"),
+            rust_file("crates/ovecc-cli/src/main.rs"),
         ];
         let by_path: HashMap<String, FileRecord> =
             files.iter().map(|f| (f.path.clone(), f.clone())).collect();
@@ -977,26 +1006,52 @@ mod tests {
     }
 
     #[test]
+    fn a_mod_declared_below_the_crate_root_reaches_its_child_file() {
+        let files = [
+            rust_file("src/lib.rs"),
+            rust_file("src/tests.rs"),
+            rust_file("src/foo.rs"),
+            rust_file("src/foo/tests.rs"),
+        ];
+        let by_path: HashMap<String, FileRecord> =
+            files.iter().map(|f| (f.path.clone(), f.clone())).collect();
+        let suffixes = build_path_suffix_index(&files);
+        let path_of = |source: &str, specifier: &str| {
+            resolve_most_specific(
+                &rust_import_candidates(source, specifier),
+                &suffixes,
+                &by_path,
+            )
+            .map(|f| f.path)
+        };
+
+        // `foo.rs` is also a candidate here, and it exists: the specific match
+        // has to win rather than cancel it out.
+        assert_eq!(
+            path_of("src/foo.rs", "self::foo::tests"),
+            Some("src/foo/tests.rs".to_string())
+        );
+        assert_eq!(
+            path_of("src/lib.rs", "self::tests"),
+            Some("src/tests.rs".to_string())
+        );
+        // An item imported from a sibling module still lands on that module.
+        assert_eq!(
+            path_of("src/lib.rs", "self::foo::helper"),
+            Some("src/foo.rs".to_string())
+        );
+    }
+
+    #[test]
     fn a_bare_external_crate_does_not_resolve_to_a_homonymous_local_file() {
         // The Turborepo regression: a crate ships a local `tracing.rs` module,
         // and other files `use tracing::…` the external crate. Neither the
         // workspace map (tracing is not a workspace crate) nor the suffix
         // fallback (bare paths yield no candidates now) may link them, or the
         // graph grows a phantom edge and, closing back, a phantom cycle.
-        let file = |path: &str| FileRecord {
-            id: format!("f:{path}"),
-            repository_id: "r".to_string(),
-            path: path.to_string(),
-            absolute_path: PathBuf::from(path),
-            language: SourceLanguage::Rust,
-            content_hash: "h".to_string(),
-            size_bytes: 0,
-            module_id: "m".to_string(),
-            module_name: "m".to_string(),
-        };
         let files = [
-            file("crates/telemetry/src/tracing.rs"),
-            file("crates/telemetry/src/lib.rs"),
+            rust_file("crates/telemetry/src/tracing.rs"),
+            rust_file("crates/telemetry/src/lib.rs"),
         ];
         let by_path: HashMap<String, FileRecord> =
             files.iter().map(|f| (f.path.clone(), f.clone())).collect();
