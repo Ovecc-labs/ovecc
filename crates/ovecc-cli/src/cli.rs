@@ -671,13 +671,12 @@ fn write_export(path: &Path, page: &str) -> Result<()> {
     Ok(())
 }
 
-/// A written path as output should carry it: repo-relative POSIX, per the
-/// convention every other path in every format follows. A path the caller aimed
-/// outside the repository has no repo-relative form, so it is reported
-/// normalized and absolute rather than guessed at.
 fn report_path(root: &Path, path: &Path) -> String {
-    ovecc_core::util::relative_path(root, path)
-        .unwrap_or_else(|_| ovecc_core::util::normalize_path(path))
+    let resolved = std::fs::canonicalize(path)
+        .map(|resolved| ovecc_core::util::simplify_verbatim(&resolved).unwrap_or(resolved))
+        .unwrap_or_else(|_| path.to_path_buf());
+    ovecc_core::util::relative_path(root, &resolved)
+        .unwrap_or_else(|_| ovecc_core::util::normalize_path(&resolved))
 }
 
 /// The repo/format resolution the search primitives share; folding it keeps
@@ -1211,8 +1210,6 @@ mod tests {
             report_path(root, &root.join("out").join("graph.html")),
             "out/graph.html"
         );
-        // Outside the repository there is no repo-relative form to report, so
-        // the path is normalized rather than invented.
         assert_eq!(
             report_path(root, Path::new("/tmp/graph.html")),
             "/tmp/graph.html"

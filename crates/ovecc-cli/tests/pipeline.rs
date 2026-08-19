@@ -2478,6 +2478,17 @@ export const b = a;
     );
     assert_eq!(summary["data"]["html"], "out/viewer.html", "{summary}");
     assert!(root.join("out").join("viewer.html").is_file());
+
+    let indirect = root.join("out").join("..").join("out").join("viewer.html");
+    let indirect = indirect.to_str().expect("utf8 path");
+    let summary = json_output(
+        &repo,
+        &["export", "graph", "--html", indirect, "--format", "json"],
+    );
+    assert_eq!(
+        summary["data"]["html"], "out/viewer.html",
+        "a non-canonical path must still report repo-relative: {summary}"
+    );
 }
 
 #[test]
