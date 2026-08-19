@@ -50,6 +50,13 @@ pub const COMMANDS: &[CommandSpec] = &[
         read_only: true,
     },
     CommandSpec {
+        name: "version",
+        summary: "Print the release and the JSON schema version. Needs no index and no repository.",
+        key_params: &["--format json"],
+        output: "The binary's version and the schema_version its envelope conforms to.",
+        read_only: true,
+    },
+    CommandSpec {
         name: "summary",
         summary: "Show current architecture health at a glance.",
         key_params: &[],
@@ -254,7 +261,7 @@ pub const COMMANDS: &[CommandSpec] = &[
         name: "export graph",
         summary: "Export the dependency graph (module + file levels) as JSON, or as a self-contained offline HTML viewer via --html.",
         key_params: &["--html"],
-        output: "Sorted nodes and edges per level; with --html, the path of the written viewer file.",
+        output: "Sorted nodes and edges per level; with --html, the repo-relative path of the written viewer file (.ovecc/exports/graph.html by default).",
         read_only: true,
     },
     CommandSpec {

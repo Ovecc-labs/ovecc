@@ -77,7 +77,11 @@ use std::path::{Path, PathBuf};
 // v23: a Rust `use x as y;` no longer folds the alias into the import
 // specifier. Cached v22 facts carry the folded form, which resolves to no crate
 // and reads back as an undeclared external package.
-const PARSE_CACHE_VERSION: &str = "v23";
+// v24: this merge. A v22 cache is this branch's fact shape without the alias
+// fix, and a v23 cache is main's alias fix without `path_literals` or
+// `exported_signature_types`. Neither describes the merged extractor, so both
+// have to be invalidated rather than one of the two numbers reused.
+const PARSE_CACHE_VERSION: &str = "v24";
 
 pub fn index_repository(
     paths: &ProjectPaths,

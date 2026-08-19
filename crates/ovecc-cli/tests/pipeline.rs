@@ -2430,3 +2430,100 @@ fn a_feature_behind_one_barrel_is_one_subsystem_however_many_slices_it_has() {
         "clustering does not see it; diagnosis does: {diagnosed}"
     );
 }
+
+#[test]
+fn the_graph_viewer_lands_under_ovecc_unless_a_path_says_otherwise() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let root = temp.path();
+    let repo = root.to_str().expect("utf8 path").to_string();
+    write_source(
+        root,
+        "src/a.ts",
+        "export const a = 1;
+",
+    );
+    write_source(
+        root,
+        "src/b.ts",
+        "import { a } from \"./a\";
+export const b = a;
+",
+    );
+    index_repo(&repo);
+
+    // No value: the run picks the destination, and it is generated state, so it
+    // belongs beside the database rather than loose in the working tree.
+    let summary = json_output(&repo, &["export", "graph", "--html", "--format", "json"]);
+    assert_eq!(
+        summary["data"]["html"], ".ovecc/exports/graph.html",
+        "the default viewer path must be reported repo-relative under .ovecc: {summary}"
+    );
+    assert!(
+        root.join(".ovecc/exports/graph.html").is_file(),
+        "the viewer must actually be written there"
+    );
+    assert!(
+        !root.join("ovecc-graph.html").exists(),
+        "nothing may be dropped in the working tree any more"
+    );
+
+    // An explicit path is still obeyed exactly, including a directory that does
+    // not exist yet. It is resolved against the caller's working directory, as
+    // before, so the test names it absolutely rather than relative to --repo.
+    let explicit = root.join("out").join("viewer.html");
+    let explicit = explicit.to_str().expect("utf8 path");
+    let summary = json_output(
+        &repo,
+        &["export", "graph", "--html", explicit, "--format", "json"],
+    );
+    assert_eq!(summary["data"]["html"], "out/viewer.html", "{summary}");
+    assert!(root.join("out").join("viewer.html").is_file());
+
+    let indirect = root.join("out").join("..").join("out").join("viewer.html");
+    let indirect = indirect.to_str().expect("utf8 path");
+    let summary = json_output(
+        &repo,
+        &["export", "graph", "--html", indirect, "--format", "json"],
+    );
+    assert_eq!(
+        summary["data"]["html"], "out/viewer.html",
+        "a non-canonical path must still report repo-relative: {summary}"
+    );
+}
+
+#[test]
+fn every_way_of_asking_for_the_version_answers_without_an_index() {
+    // No index, and no `.ovecc/` at all: the version is a fact about the binary,
+    // so needing a repository first would be the bug.
+    let temp = tempfile::tempdir().expect("temp dir");
+    let repo = temp.path().to_str().expect("utf8 path").to_string();
+    let expected = format!("ovecc {}", env!("CARGO_PKG_VERSION"));
+
+    for flag in ["-v", "-V", "--version"] {
+        let out = ovecc(&repo, &[flag]);
+        assert_eq!(out.status.code(), Some(0), "{flag} exited non-zero");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            expected,
+            "{flag} must print the one-line version"
+        );
+    }
+
+    let out = ovecc(&repo, &["version"]);
+    assert_eq!(out.status.code(), Some(0), "`version` exited non-zero");
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut lines = text.lines();
+    assert_eq!(
+        lines.next(),
+        Some(expected.as_str()),
+        "the first line must match `--version` byte for byte: {text}"
+    );
+    assert_eq!(lines.next(), Some("schema_version: 1"), "{text}");
+
+    let json = json_output(&repo, &["version", "--format", "json"]);
+    assert_eq!(json["data"]["version"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(
+        json["data"]["schema_version"], json["schema_version"],
+        "the reported contract must be the one the envelope was written to: {json}"
+    );
+}

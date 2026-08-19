@@ -25,6 +25,7 @@ pub(crate) mod review;
 pub(crate) mod search;
 pub(crate) mod selfcheck;
 pub(crate) mod summary;
+pub(crate) mod version;
 
 /// Resolves a CLI ref argument for `diff`/`drift`. Snapshot keywords
 /// (`latest`/`previous`/`base`) and `snapshot:` IDs pass through unchanged;

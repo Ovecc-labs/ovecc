@@ -30,6 +30,7 @@ use crate::commands::{
     review::{build_review_report, render_full_report, render_review},
     selfcheck::{load_selfcheck, render_selfcheck},
     summary::{load_hotspots, load_summary, render_hotspots, render_summary_report},
+    version::{build_version_report, render_version},
 };
 use crate::render::{SUPPRESS_META, emit_json, meta_for, report_run_stats};
 use anyhow::Result;
@@ -42,13 +43,20 @@ use ovecc_core::legacy::ImpactDirection;
 use ovecc_core::query::Query;
 use ovecc_core::traits::ExplanationProvider;
 use ovecc_indexer::index_repository;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 
 #[derive(Debug, Parser)]
-#[command(name = "ovecc", version)]
+#[command(name = "ovecc", version, disable_version_flag = true)]
 #[command(about = "Deterministic architecture intelligence for repositories")]
 pub struct Cli {
+    // Clap's own short for this is `-V`, but `-v` is what people type. `-v` is
+    // the short, and `-V` stays an alias so a script already using it keeps
+    // working. `ovecc version` gives the same facts in any `--format`.
+    /// Print the release and exit.
+    #[arg(short = 'v', short_alias = 'V', long, action = clap::ArgAction::Version)]
+    version: Option<bool>,
+
     #[arg(long, global = true, value_name = "PATH")]
     repo: Option<PathBuf>,
 
@@ -184,6 +192,9 @@ pub enum Command {
     /// List every command, metric, rule, severity, exit code, and format Ovecc
     /// supports — the machine-readable contract for AI agents.
     Capabilities,
+    /// Print the release and the JSON schema version, in any `--format`. The
+    /// same facts as `--version`, shaped for a caller that has to parse them.
+    Version,
     /// Show current architecture health.
     Summary,
     /// Analyze blast radius for a module.
@@ -543,9 +554,11 @@ pub enum ExportCommand {
     /// ships inside the binary: no CDN, no runtime dependency, opens offline).
     Graph {
         /// Write the interactive HTML viewer to this path instead of printing
-        /// JSON. Without a value, writes `ovecc-graph.html`.
-        #[arg(long, value_name = "PATH", num_args = 0..=1, default_missing_value = "ovecc-graph.html")]
-        html: Option<PathBuf>,
+        /// JSON. Without a value, writes `.ovecc/exports/graph.html`, so a
+        /// generated artifact lands with the rest of the run's state instead of
+        /// in the working tree. An explicit path is used exactly as given.
+        #[arg(long, value_name = "PATH", num_args = 0..=1)]
+        html: Option<Option<PathBuf>>,
     },
 }
 
@@ -637,6 +650,35 @@ fn unresolved_target_envelope(input: &str, candidates: &[(String, String)]) -> S
     .to_string()
 }
 
+/// Writes a generated artifact, creating the directory it lands in. The default
+/// destination is under `.ovecc/`, which a fresh clone will not have until
+/// something creates it, and a caller who names `out/graph.html` means the same
+/// thing — so the parent is made either way rather than only for our own path.
+fn write_export(path: &Path, page: &str) -> Result<()> {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent).map_err(|error| {
+            ovecc_core::error::OveccError::Repository {
+                message: format!("failed to create {}: {error}", parent.display()),
+            }
+        })?;
+    }
+    std::fs::write(path, page).map_err(|error| ovecc_core::error::OveccError::Repository {
+        message: format!("failed to write {}: {error}", path.display()),
+    })?;
+    Ok(())
+}
+
+fn report_path(root: &Path, path: &Path) -> String {
+    let resolved = std::fs::canonicalize(path)
+        .map(|resolved| ovecc_core::util::simplify_verbatim(&resolved).unwrap_or(resolved))
+        .unwrap_or_else(|_| path.to_path_buf());
+    ovecc_core::util::relative_path(root, &resolved)
+        .unwrap_or_else(|_| ovecc_core::util::normalize_path(&resolved))
+}
+
 /// The repo/format resolution the search primitives share; folding it keeps
 /// the two dispatch arms from cloning the setup preamble a third time.
 fn search_setup(
@@ -704,6 +746,12 @@ fn run_command(cli: Cli) -> Result<u8> {
             let paths = ProjectPaths::resolve(cli.repo.unwrap_or_else(|| PathBuf::from(".")))?;
             let config = load_config(&paths, format_override)?;
             render_capabilities(config.output.default_format)?;
+            Ok(0)
+        }
+        Command::Version => {
+            let paths = ProjectPaths::resolve(cli.repo.unwrap_or_else(|| PathBuf::from(".")))?;
+            let config = load_config(&paths, format_override)?;
+            render_version(&build_version_report(), config.output.default_format)?;
             Ok(0)
         }
         Command::Summary => {
@@ -878,15 +926,16 @@ fn run_command(cli: Cli) -> Result<u8> {
             let export = crate::export_graph::build(repository, &files, &deps);
             match html {
                 None => emit_json("export graph", &export, meta_for("export graph"))?,
-                Some(path) => {
+                Some(requested) => {
+                    // No value means the run picks the destination, and that is
+                    // `.ovecc/`: the viewer is generated state, like the
+                    // snapshots and the database beside it, and dropping it in
+                    // the working tree left every user to gitignore it.
+                    let path = requested.unwrap_or_else(|| paths.exports_dir.join("graph.html"));
                     let page = crate::export_graph::render_html(&export)?;
-                    std::fs::write(&path, &page).map_err(|error| {
-                        ovecc_core::error::OveccError::Repository {
-                            message: format!("failed to write {}: {error}", path.display()),
-                        }
-                    })?;
+                    write_export(&path, &page)?;
                     let summary = serde_json::json!({
-                        "html": path.to_string_lossy(),
+                        "html": report_path(&paths.root, &path),
                         "bytes": page.len(),
                         "modules": export.modules.nodes.len(),
                         "files": export.files.nodes.len(),
@@ -1151,6 +1200,19 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .contains("table:customers")
+        );
+    }
+
+    #[test]
+    fn a_written_path_is_reported_repo_relative_and_posix() {
+        let root = Path::new("/repo");
+        assert_eq!(
+            report_path(root, &root.join("out").join("graph.html")),
+            "out/graph.html"
+        );
+        assert_eq!(
+            report_path(root, Path::new("/tmp/graph.html")),
+            "/tmp/graph.html"
         );
     }
 

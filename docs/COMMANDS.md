@@ -68,6 +68,17 @@ The machine-readable contract: every command, every metric and rule (with a
 definition), the severity vocabulary, exit codes, output formats. An agent
 calls this first and needs nothing else to drive the tool.
 
+### `ovecc version`
+
+The release and the JSON envelope's `schema_version`, in any `--format`. Needs
+no index and no repository — both numbers are compiled into the binary. `-v`,
+`-V` and `--version` print the first line only, for a human:
+
+```
+ovecc 0.3.1
+schema_version: 1
+```
+
 ### `ovecc summary`
 
 One-screen health: files, modules, dependency counts, cyclic module components,
@@ -461,13 +472,15 @@ external LLM or tool. Nothing is sent anywhere; it just prints.
 The whole dependency graph as data: module-level and file-level nodes and
 edges, sorted so an unchanged database exports byte-identical output, ready
 for Graphviz, d3, or any external tool. With `--html`, writes a
-self-contained interactive viewer instead (default `ovecc-graph.html`):
-force-directed canvas, module/file views, search, external-dependency toggle,
-per-node detail panel. The renderer ships inside the binary (no CDN, no
-runtime dependency); the file opens offline.
+self-contained interactive viewer instead (default `.ovecc/exports/graph.html`,
+beside the rest of the run's generated state; an explicit path is used exactly
+as given, resolved against the working directory): force-directed canvas,
+module/file views, search, external-dependency toggle, per-node detail panel.
+The renderer ships inside the binary (no CDN, no runtime dependency); the file
+opens offline.
 
 ```
-{ "html": "ovecc-graph.html", "bytes": 158014, "modules": 209, "files": 252, "file_edges": 535 }
+{ "html": ".ovecc/exports/graph.html", "bytes": 158014, "modules": 209, "files": 252, "file_edges": 535 }
 ```
 
 ### `ovecc grep <pattern> [path...] [--limit]`
