@@ -461,13 +461,15 @@ external LLM or tool. Nothing is sent anywhere; it just prints.
 The whole dependency graph as data: module-level and file-level nodes and
 edges, sorted so an unchanged database exports byte-identical output, ready
 for Graphviz, d3, or any external tool. With `--html`, writes a
-self-contained interactive viewer instead (default `ovecc-graph.html`):
-force-directed canvas, module/file views, search, external-dependency toggle,
-per-node detail panel. The renderer ships inside the binary (no CDN, no
-runtime dependency); the file opens offline.
+self-contained interactive viewer instead (default `.ovecc/exports/graph.html`,
+beside the rest of the run's generated state; an explicit path is used exactly
+as given, resolved against the working directory): force-directed canvas,
+module/file views, search, external-dependency toggle, per-node detail panel.
+The renderer ships inside the binary (no CDN, no runtime dependency); the file
+opens offline.
 
 ```
-{ "html": "ovecc-graph.html", "bytes": 158014, "modules": 209, "files": 252, "file_edges": 535 }
+{ "html": ".ovecc/exports/graph.html", "bytes": 158014, "modules": 209, "files": 252, "file_edges": 535 }
 ```
 
 ### `ovecc grep <pattern> [path...] [--limit]`

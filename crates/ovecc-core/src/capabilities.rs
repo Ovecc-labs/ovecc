@@ -254,7 +254,7 @@ pub const COMMANDS: &[CommandSpec] = &[
         name: "export graph",
         summary: "Export the dependency graph (module + file levels) as JSON, or as a self-contained offline HTML viewer via --html.",
         key_params: &["--html"],
-        output: "Sorted nodes and edges per level; with --html, the path of the written viewer file.",
+        output: "Sorted nodes and edges per level; with --html, the repo-relative path of the written viewer file (.ovecc/exports/graph.html by default).",
         read_only: true,
     },
     CommandSpec {

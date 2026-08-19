@@ -2430,3 +2430,52 @@ fn a_feature_behind_one_barrel_is_one_subsystem_however_many_slices_it_has() {
         "clustering does not see it; diagnosis does: {diagnosed}"
     );
 }
+
+#[test]
+fn the_graph_viewer_lands_under_ovecc_unless_a_path_says_otherwise() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let root = temp.path();
+    let repo = root.to_str().expect("utf8 path").to_string();
+    write_source(
+        root,
+        "src/a.ts",
+        "export const a = 1;
+",
+    );
+    write_source(
+        root,
+        "src/b.ts",
+        "import { a } from \"./a\";
+export const b = a;
+",
+    );
+    index_repo(&repo);
+
+    // No value: the run picks the destination, and it is generated state, so it
+    // belongs beside the database rather than loose in the working tree.
+    let summary = json_output(&repo, &["export", "graph", "--html", "--format", "json"]);
+    assert_eq!(
+        summary["data"]["html"], ".ovecc/exports/graph.html",
+        "the default viewer path must be reported repo-relative under .ovecc: {summary}"
+    );
+    assert!(
+        root.join(".ovecc/exports/graph.html").is_file(),
+        "the viewer must actually be written there"
+    );
+    assert!(
+        !root.join("ovecc-graph.html").exists(),
+        "nothing may be dropped in the working tree any more"
+    );
+
+    // An explicit path is still obeyed exactly, including a directory that does
+    // not exist yet. It is resolved against the caller's working directory, as
+    // before, so the test names it absolutely rather than relative to --repo.
+    let explicit = root.join("out").join("viewer.html");
+    let explicit = explicit.to_str().expect("utf8 path");
+    let summary = json_output(
+        &repo,
+        &["export", "graph", "--html", explicit, "--format", "json"],
+    );
+    assert_eq!(summary["data"]["html"], "out/viewer.html", "{summary}");
+    assert!(root.join("out").join("viewer.html").is_file());
+}

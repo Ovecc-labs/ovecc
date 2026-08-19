@@ -42,7 +42,7 @@ use ovecc_core::legacy::ImpactDirection;
 use ovecc_core::query::Query;
 use ovecc_core::traits::ExplanationProvider;
 use ovecc_indexer::index_repository;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 
 #[derive(Debug, Parser)]
@@ -543,9 +543,11 @@ pub enum ExportCommand {
     /// ships inside the binary: no CDN, no runtime dependency, opens offline).
     Graph {
         /// Write the interactive HTML viewer to this path instead of printing
-        /// JSON. Without a value, writes `ovecc-graph.html`.
-        #[arg(long, value_name = "PATH", num_args = 0..=1, default_missing_value = "ovecc-graph.html")]
-        html: Option<PathBuf>,
+        /// JSON. Without a value, writes `.ovecc/exports/graph.html`, so a
+        /// generated artifact lands with the rest of the run's state instead of
+        /// in the working tree. An explicit path is used exactly as given.
+        #[arg(long, value_name = "PATH", num_args = 0..=1)]
+        html: Option<Option<PathBuf>>,
     },
 }
 
@@ -635,6 +637,36 @@ fn unresolved_target_envelope(input: &str, candidates: &[(String, String)]) -> S
         }
     })
     .to_string()
+}
+
+/// Writes a generated artifact, creating the directory it lands in. The default
+/// destination is under `.ovecc/`, which a fresh clone will not have until
+/// something creates it, and a caller who names `out/graph.html` means the same
+/// thing — so the parent is made either way rather than only for our own path.
+fn write_export(path: &Path, page: &str) -> Result<()> {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent).map_err(|error| {
+            ovecc_core::error::OveccError::Repository {
+                message: format!("failed to create {}: {error}", parent.display()),
+            }
+        })?;
+    }
+    std::fs::write(path, page).map_err(|error| ovecc_core::error::OveccError::Repository {
+        message: format!("failed to write {}: {error}", path.display()),
+    })?;
+    Ok(())
+}
+
+/// A written path as output should carry it: repo-relative POSIX, per the
+/// convention every other path in every format follows. A path the caller aimed
+/// outside the repository has no repo-relative form, so it is reported
+/// normalized and absolute rather than guessed at.
+fn report_path(root: &Path, path: &Path) -> String {
+    ovecc_core::util::relative_path(root, path)
+        .unwrap_or_else(|_| ovecc_core::util::normalize_path(path))
 }
 
 /// The repo/format resolution the search primitives share; folding it keeps
@@ -878,15 +910,16 @@ fn run_command(cli: Cli) -> Result<u8> {
             let export = crate::export_graph::build(repository, &files, &deps);
             match html {
                 None => emit_json("export graph", &export, meta_for("export graph"))?,
-                Some(path) => {
+                Some(requested) => {
+                    // No value means the run picks the destination, and that is
+                    // `.ovecc/`: the viewer is generated state, like the
+                    // snapshots and the database beside it, and dropping it in
+                    // the working tree left every user to gitignore it.
+                    let path = requested.unwrap_or_else(|| paths.exports_dir.join("graph.html"));
                     let page = crate::export_graph::render_html(&export)?;
-                    std::fs::write(&path, &page).map_err(|error| {
-                        ovecc_core::error::OveccError::Repository {
-                            message: format!("failed to write {}: {error}", path.display()),
-                        }
-                    })?;
+                    write_export(&path, &page)?;
                     let summary = serde_json::json!({
-                        "html": path.to_string_lossy(),
+                        "html": report_path(&paths.root, &path),
                         "bytes": page.len(),
                         "modules": export.modules.nodes.len(),
                         "files": export.files.nodes.len(),
@@ -1151,6 +1184,21 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .contains("table:customers")
+        );
+    }
+
+    #[test]
+    fn a_written_path_is_reported_repo_relative_and_posix() {
+        let root = Path::new("/repo");
+        assert_eq!(
+            report_path(root, &root.join("out").join("graph.html")),
+            "out/graph.html"
+        );
+        // Outside the repository there is no repo-relative form to report, so
+        // the path is normalized rather than invented.
+        assert_eq!(
+            report_path(root, Path::new("/tmp/graph.html")),
+            "/tmp/graph.html"
         );
     }
 
